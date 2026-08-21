@@ -2641,14 +2641,34 @@ fn runner_job_is_active(status: &str) -> bool {
     matches!(status, "agent_queued" | "running" | "stop_requested")
 }
 
+fn job_prestart_lifecycle_for_kind(kind: &str) -> Option<ShellCommandExecutionState> {
+    matches!(
+        kind,
+        "start_job" | "start_process_job" | "start_detached_process_job" | "start_script_job"
+    )
+    .then_some(ShellCommandExecutionState::NotStarted)
+}
+
 fn structured_prestart_lifecycle(
     request: &ShellAgentShellRequest,
 ) -> Option<ShellCommandExecutionState> {
-    matches!(
-        request.kind.as_str(),
-        "start_process_job" | "start_detached_process_job" | "start_script_job"
-    )
-    .then_some(ShellCommandExecutionState::NotStarted)
+    job_prestart_lifecycle_for_kind(request.kind.as_str())
+}
+
+fn post_spawn_interruption_lifecycle_for_kind(kind: &str) -> Option<ShellCommandExecutionState> {
+    (kind == "start_job").then_some(ShellCommandExecutionState::OutcomeUnknown)
+}
+
+fn raw_shell_job_terminal_lifecycle(
+    status: &str,
+    exit_code: Option<i32>,
+) -> ShellCommandExecutionState {
+    match status {
+        "timeout" | "timed_out" => ShellCommandExecutionState::TimedOut,
+        "completed" | "stopped" | "cancelled" => ShellCommandExecutionState::Completed,
+        "failed" if exit_code.is_some() => ShellCommandExecutionState::Completed,
+        _ => ShellCommandExecutionState::OutcomeUnknown,
+    }
 }
 
 fn job_update_from_snapshot(
@@ -4516,6 +4536,18 @@ impl JobManager {
             self.shutdown_rejection(&request);
             return;
         };
+        // Preserve the pre-start proof boundary explicitly. A stop/shutdown
+        // observed here is still known to precede ManagedChild::spawn; the
+        // fence below is intentionally repeated after spawn because that later
+        // race can no longer claim NotStarted.
+        if stop_requested.load(Ordering::SeqCst) {
+            self.fail_job(&request, "job stopped before start".to_string(), None);
+            return;
+        }
+        if self.shutting_down.load(Ordering::SeqCst) {
+            self.shutdown_rejection(&request);
+            return;
+        }
         let start = Instant::now();
         let mut command = commands.pop_front().expect("validated non-empty plan");
         let spawn = ManagedChild::spawn(&mut command);
@@ -4550,20 +4582,42 @@ impl JobManager {
         let mut stdout = child.child_mut().stdout.take();
         let mut stderr = child.child_mut().stderr.take();
         let mut child = Arc::new(Mutex::new(child));
-        let reject_for_shutdown = {
+        let post_spawn_rejection = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
-            if self.shutting_down.load(Ordering::SeqCst) || stop_requested.load(Ordering::SeqCst) {
-                true
+            if self.shutting_down.load(Ordering::SeqCst) {
+                Some("runner began shutdown after command start")
+            } else if stop_requested.load(Ordering::SeqCst) {
+                Some("job stop requested after command start")
             } else if let Some(job) = lock_unpoison(&self.jobs).get_mut(&job_id) {
                 job.child = Some(child.clone());
-                false
+                None
             } else {
-                true
+                Some("runner lost the Job record after command start")
             }
         };
-        if reject_for_shutdown {
+        if let Some(error) = post_spawn_rejection {
             let _ = terminate_managed_tree(&child);
-            self.shutdown_rejection(&request);
+            // ManagedChild::spawn succeeded before this fence. Even if the
+            // termination request succeeds, the user command may already have
+            // executed and we do not wait here for a trustworthy exit status.
+            // Raw shell must therefore remain conservatively started/unknown;
+            // never recycle the pre-start NotStarted evidence across this
+            // spawn boundary.
+            self.update_and_send(
+                &job_id,
+                RunnerJobDelta {
+                    status: "failed".to_string(),
+                    exit_code: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some(error.to_string()),
+                    command_execution_state: post_spawn_interruption_lifecycle_for_kind(
+                        request.kind.as_str(),
+                    ),
+                    finished: true,
+                    ..Default::default()
+                },
+            );
+            self.start_available_queued();
             return;
         }
         self.update_and_send(
@@ -4845,6 +4899,8 @@ impl JobManager {
                 });
                 break (step_status, out, err, progress);
             };
+            let command_execution_state = (!validation)
+                .then(|| raw_shell_job_terminal_lifecycle(&final_status.0, final_status.1));
             manager.update_and_send(
                 &job_id,
                 RunnerJobDelta {
@@ -4854,9 +4910,9 @@ impl JobManager {
                     exit_code: final_status.1,
                     duration_ms: Some(start.elapsed().as_millis() as u64),
                     error: final_status.2,
+                    command_execution_state,
                     validation_progress: final_progress,
                     finished: true,
-                    ..Default::default()
                 },
             );
             manager.start_available_queued();

@@ -5,8 +5,8 @@ use super::reconciliation::{
 };
 use super::state::{PendingShellRequest, ShellJobVisibility};
 use super::{
-    clamp_grace, job_recovery_grace_secs, now_ts, ShellClientRegistry, JOB_RECOVERY_GRACE_SECS,
-    MAX_OUTPUT_BYTES,
+    clamp_grace, job_recovery_grace_secs, now_ts, ShellClientRegistry, CLIENT_ONLINE_WINDOW_SECS,
+    JOB_RECOVERY_GRACE_SECS, MAX_OUTPUT_BYTES,
 };
 use crate::shell_protocol::{
     PersistentShellResult, ShellAgentJobUpdateRequest, ShellAgentPollRequest,
@@ -916,6 +916,172 @@ async fn projected_hidden_structured_terminal_is_suppressed_only_by_same_server_
     assert!(!serde_json::to_string(&recovered)
         .unwrap()
         .contains("private projected stdin"));
+}
+
+#[tokio::test]
+async fn projected_hidden_raw_shell_terminal_does_not_resurrect_on_same_instance_reconnect() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let job = registry
+        .start_job_with_metadata(
+            start_request("printf raw-shell"),
+            "tester".to_string(),
+            ShellJobStartMetadata {
+                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+                session_id: Some(SESSION_ID.to_string()),
+                project_cwd: Some("/srv/demo".to_string()),
+                purpose: Some("test".to_string()),
+                shell: Some("bash".to_string()),
+                visibility: ShellJobVisibility::HiddenUntilHandoff,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: CLIENT_ID.to_string(),
+            agent_instance_id: INSTANCE_A.to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("raw shell Job request");
+    assert_eq!(request.kind, "start_job");
+
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            1,
+            "running",
+            Some("raw started\n"),
+            false,
+        ))
+        .await
+        .unwrap();
+    let mut terminal_update = update(
+        INSTANCE_A,
+        &job.job_id,
+        2,
+        "completed",
+        Some("raw done\n"),
+        true,
+    );
+    terminal_update.command_execution_state = Some(ShellCommandExecutionState::Completed);
+    registry.update_job(terminal_update).await.unwrap();
+
+    let mut retained_snapshot = snapshot_from_request(
+        &job,
+        &request,
+        "completed",
+        2,
+        stream("raw started\nraw done\n", 1, false),
+    );
+    retained_snapshot.command_execution_state = Some(ShellCommandExecutionState::Completed);
+
+    assert!(
+        registry
+            .remove_projected_hidden_terminal_job_record(&job.job_id)
+            .await
+    );
+    assert!(registry.list_jobs(Some(10)).await.is_empty());
+
+    register(
+        &registry,
+        INSTANCE_A,
+        ShellJobInventory {
+            active_complete: true,
+            jobs: vec![retained_snapshot.clone()],
+        },
+    )
+    .await;
+
+    assert!(
+        registry.get_job(&job.job_id).await.is_err(),
+        "same-Server inventory replay must not resurrect a terminal hidden raw shell Job"
+    );
+    assert!(registry.list_jobs(Some(10)).await.is_empty());
+
+    let fresh_registry = ShellClientRegistry::default();
+    register(
+        &fresh_registry,
+        INSTANCE_A,
+        ShellJobInventory {
+            active_complete: true,
+            jobs: vec![retained_snapshot],
+        },
+    )
+    .await;
+    let recovered = fresh_registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(recovered.status, "completed");
+    assert!(recovered.recovered_after_server_restart);
+}
+
+#[tokio::test]
+async fn projected_hidden_terminal_removes_after_runner_instance_replacement() {
+    let registry = ShellClientRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let job = registry
+        .start_job_with_metadata(
+            start_request("printf projected-before-replacement"),
+            "tester".to_string(),
+            ShellJobStartMetadata {
+                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+                session_id: Some(SESSION_ID.to_string()),
+                project_cwd: Some("/srv/demo".to_string()),
+                purpose: Some("test".to_string()),
+                shell: Some("bash".to_string()),
+                visibility: ShellJobVisibility::HiddenUntilHandoff,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(ShellAgentPollRequest {
+            client_id: CLIENT_ID.to_string(),
+            agent_instance_id: INSTANCE_A.to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap()
+        .expect("hidden Job request");
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            1,
+            "completed",
+            Some("projected result\n"),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    registry
+        .set_last_seen_for_test(
+            CLIENT_ID,
+            now_ts().saturating_sub(CLIENT_ONLINE_WINDOW_SECS + 1),
+        )
+        .await;
+    register(&registry, INSTANCE_B, empty_inventory()).await;
+
+    assert!(
+        registry
+            .remove_projected_hidden_terminal_job_record(&job.job_id)
+            .await,
+        "a terminal result already projected to the caller must not remain hidden forever when the Runner lease changes"
+    );
+    let inner = registry.inner.lock().await;
+    assert!(!inner.jobs_by_id.contains_key(&job.job_id));
+    assert!(!inner.request_to_job.contains_key(&request.request_id));
+    assert!(inner
+        .clients
+        .get(CLIENT_ID)
+        .unwrap()
+        .projected_structured_terminal_suppressions
+        .is_empty());
 }
 
 #[tokio::test]

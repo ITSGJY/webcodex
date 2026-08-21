@@ -115,7 +115,7 @@ fn cargo_check_success_produces_validation_event() {
     assert!(event.get("input_summary").is_none());
     assert!(event["identity"]
         .as_str()
-        .is_some_and(|identity| identity.starts_with("command:")));
+        .is_some_and(|identity| identity.starts_with("target:")));
     assert_eq!(event["execution_source"], "cargo_check");
     assert_eq!(event["purpose"], "validation");
     assert_eq!(validation["parser"]["available"], false);
@@ -827,6 +827,164 @@ fn same_validation_identity_success_resolves_failure_without_deleting_history() 
         false
     );
     assert_eq!(validation["events_total"], 2);
+}
+
+#[test]
+fn structured_validation_target_resolves_equivalent_semantic_arguments() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        json!({
+            "project": "agent:eval:demo",
+            "cwd": "./crate/",
+            "filter": "  oversized_result  ",
+            "all_targets": true,
+            "all_features": false,
+            "no_default_features": false,
+            "features": "  serde  ",
+            "package": "  webcodex  ",
+            "no_run": false,
+            "timeout_secs": 30,
+        }),
+        false,
+        json!({"exit_code": 101}),
+    );
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        json!({
+            "project": "agent:eval:demo",
+            "cwd": "crate",
+            "filter": "oversized_result",
+            "all_targets": true,
+            "all_features": false,
+            "no_default_features": false,
+            "features": "serde",
+            "package": "webcodex",
+            "no_run": false,
+            "timeout_secs": 120,
+        }),
+        true,
+        json!({"exit_code": 0}),
+    );
+
+    let session = store.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&session);
+    assert_eq!(validation["resolved_failures"]["count"], 1);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    let identity = validation["resolved_failures"]["events"][0]["identity"]
+        .as_str()
+        .unwrap();
+    assert!(identity.starts_with("target:"), "{identity}");
+}
+
+#[test]
+fn same_validation_identity_success_in_another_project_does_not_resolve_failure() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:alpha".to_string()), None);
+    let shared_target = json!({
+        "cwd": "crate",
+        "package": "pkg",
+        "filter": "focus",
+        "features": "feat"
+    });
+
+    let mut failed = shared_target.clone();
+    failed["project"] = json!("agent:eval:alpha");
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        failed,
+        false,
+        json!({"exit_code": 101}),
+    );
+
+    let mut succeeded_elsewhere = shared_target;
+    succeeded_elsewhere["project"] = json!("agent:eval:bravo");
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        succeeded_elsewhere,
+        true,
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
+            "stderr_tail": "",
+        }),
+    );
+
+    let session = store.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&session);
+    assert_eq!(validation["resolved_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
+    assert_eq!(
+        validation["unresolved_failures"]["events"][0]["project"],
+        "agent:eval:alpha"
+    );
+}
+
+#[test]
+fn structured_validation_target_does_not_cross_semantic_scope() {
+    let cases = [
+        (
+            "cwd",
+            json!({"project":"agent:eval:demo","cwd":"crate_a","package":"pkg","filter":"focus","features":"feat"}),
+            json!({"project":"agent:eval:demo","cwd":"crate_b","package":"pkg","filter":"focus","features":"feat"}),
+        ),
+        (
+            "package",
+            json!({"project":"agent:eval:demo","cwd":"crate","package":"pkg_a","filter":"focus","features":"feat"}),
+            json!({"project":"agent:eval:demo","cwd":"crate","package":"pkg_b","filter":"focus","features":"feat"}),
+        ),
+        (
+            "filter",
+            json!({"project":"agent:eval:demo","cwd":"crate","package":"pkg","filter":"focus_a","features":"feat"}),
+            json!({"project":"agent:eval:demo","cwd":"crate","package":"pkg","filter":"focus_b","features":"feat"}),
+        ),
+        (
+            "features",
+            json!({"project":"agent:eval:demo","cwd":"crate","package":"pkg","filter":"focus","features":"feat_a"}),
+            json!({"project":"agent:eval:demo","cwd":"crate","package":"pkg","filter":"focus","features":"feat_b"}),
+        ),
+    ];
+
+    for (label, failed_args, successful_args) in cases {
+        let store = SessionStore::default();
+        let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "cargo_test",
+            failed_args,
+            false,
+            json!({"exit_code": 101}),
+        );
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "cargo_test",
+            successful_args,
+            true,
+            json!({"exit_code": 0}),
+        );
+
+        let session = store.summary(&session.session_id, Some(50)).unwrap();
+        let validation = validation_summary_for_session(&session);
+        assert_eq!(
+            validation["resolved_failures"]["count"], 0,
+            "{label}: {validation}"
+        );
+        assert_eq!(
+            validation["unresolved_failures"]["count"], 1,
+            "{label}: {validation}"
+        );
+    }
 }
 
 #[test]

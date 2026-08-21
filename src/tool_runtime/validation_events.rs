@@ -14,6 +14,9 @@ use super::session_context::{
     session_project_mismatch_result, unknown_session_result, SessionProjectMismatch,
 };
 use super::sessions::{SessionEvent, SessionSummary};
+use super::tool_audit::{
+    is_structured_validation_target_identity, structured_validation_target_identity,
+};
 use super::validation_parser::{
     ValidationDiagnostics, PARSER_KIND, PARSER_LIMITATIONS, PARSER_VERSION,
     VALIDATION_OUTPUT_METADATA_ABSENT_REASON,
@@ -452,10 +455,15 @@ fn classify_validation_failures(
     ValidationFailureSet,
     ValidationFailureSet,
 ) {
-    let mut latest_success_by_identity = HashMap::<String, usize>::new();
+    // Identity is meaningful only inside the exact resolved project. Workflow
+    // Sessions can explicitly record cross-project tool calls, so a successful
+    // validation in project B must never resolve a same-shaped failure from
+    // project A merely because cwd/package/filter/features match.
+    let mut latest_success_by_identity = HashMap::<(Option<String>, String), usize>::new();
     for (index, event) in events.iter().enumerate() {
         if event.success && validation_event_decides_historical_failure_status(event) {
-            latest_success_by_identity.insert(event.identity.clone(), index);
+            latest_success_by_identity
+                .insert((event.project.clone(), event.identity.clone()), index);
         }
     }
     let mut resolved = Vec::new();
@@ -465,7 +473,7 @@ fn classify_validation_failures(
             continue;
         }
         let is_resolved = latest_success_by_identity
-            .get(&event.identity)
+            .get(&(event.project.clone(), event.identity.clone()))
             .is_some_and(|success_index| *success_index > index);
         event.unresolved_failure = !is_resolved;
         if is_resolved {
@@ -798,6 +806,20 @@ fn execution_identity(
         .filter(|value| !value.is_empty())
     {
         return format!("assertion:{assertion}");
+    }
+    if validation_adapter_for_tool(tool_name).is_some() {
+        if let Some(input) = started.and_then(|event| event.input_summary.as_ref()) {
+            if let Some(identity) = input
+                .get("validation_target_id")
+                .and_then(Value::as_str)
+                .filter(|value| is_structured_validation_target_identity(value))
+            {
+                return identity.to_string();
+            }
+            if let Some(identity) = structured_validation_target_identity(tool_name, input) {
+                return identity;
+            }
+        }
     }
     let command = started
         .and_then(|event| event.input_summary.as_ref())

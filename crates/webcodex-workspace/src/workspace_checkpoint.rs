@@ -58,7 +58,7 @@ fn create_workspace_checkpoint_inner(root: &Path, include_untracked: bool) -> Re
         return Err(fail_extra(
             "sensitive_or_invalid_path",
             "checkpoint tracked diff contains a sensitive path",
-            vec![("path", json!(entry.path))],
+            vec![("path", json!(entry.path)), ("state_changed", json!(false))],
         ));
     }
 
@@ -851,12 +851,6 @@ pub fn sensitive_path(path: &str) -> bool {
         if part.starts_with(".env")
             || part.starts_with("agent.toml")
             || part.starts_with("webcodex.env")
-        {
-            return true;
-        }
-        if ["secret", "token", "credential", "password"]
-            .iter()
-            .any(|marker| part.contains(marker))
         {
             return true;
         }
