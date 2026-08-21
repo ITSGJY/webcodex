@@ -28,6 +28,9 @@ pub const SCOPE_COMPUTER_DISPLAY_READ: &str = "computer:display_read";
 pub const SCOPE_COMPUTER_POINTER_CONTROL: &str = "computer:pointer_control";
 pub const SCOPE_COMPUTER_CLIPBOARD_READ: &str = "computer:clipboard_read";
 pub const SCOPE_COMPUTER_CLIPBOARD_WRITE: &str = "computer:clipboard_write";
+/// Fixed authority for hosted access to Runner-owned third-party MCP tools.
+/// It is intentionally not implied by runtime, job, or project scopes.
+pub const SCOPE_MCP_BRIDGE: &str = "mcp:bridge";
 pub const SCOPE_AGENT_REGISTER: &str = "agent:register";
 pub const SCOPE_ADMIN: &str = "admin";
 
@@ -53,6 +56,7 @@ pub(crate) const KNOWN_SCOPES: &[&str] = &[
     SCOPE_COMPUTER_POINTER_CONTROL,
     SCOPE_COMPUTER_CLIPBOARD_READ,
     SCOPE_COMPUTER_CLIPBOARD_WRITE,
+    SCOPE_MCP_BRIDGE,
     SCOPE_RUNTIME_READ,
     SCOPE_PROJECT_READ,
     SCOPE_PROJECT_WRITE,
@@ -206,6 +210,9 @@ pub(crate) fn oauth_route_scope_policy_for_path_method(
 
         ("GET", "/mcp") => OAuthRouteScopePolicy::Require(SCOPE_RUNTIME_READ),
         ("POST", "/mcp") => OAuthRouteScopePolicy::BodyAware(OAuthBodyAwarePolicy::McpToolCall),
+        ("GET", path) | ("POST", path) if is_mcp_bridge_route(path) => {
+            OAuthRouteScopePolicy::Require(SCOPE_MCP_BRIDGE)
+        }
         ("POST", "/api/runtime/status") | ("POST", "/api/tools/list") => {
             OAuthRouteScopePolicy::Require(SCOPE_RUNTIME_READ)
         }
@@ -435,6 +442,13 @@ fn normalize_route_path(path: &str) -> String {
     }
 }
 
+fn is_mcp_bridge_route(path: &str) -> bool {
+    path == "/mcp/bridge"
+        || path
+            .strip_prefix("/mcp/bridge/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +458,7 @@ mod tests {
     #[test]
     fn validate_scopes_rejects_unknown() {
         assert!(validate_scopes(&["runtime:read".to_string()]).is_ok());
+        assert!(validate_scopes(&[SCOPE_MCP_BRIDGE.to_string()]).is_ok());
         assert!(validate_scopes(&["bogus:scope".to_string()]).is_err());
     }
 
@@ -542,6 +557,9 @@ mod tests {
     fn oauth_route_policy_simple_require_scopes() {
         for (method, path, scope) in [
             ("GET", "/mcp", SCOPE_RUNTIME_READ),
+            ("GET", "/mcp/bridge", SCOPE_MCP_BRIDGE),
+            ("GET", "/mcp/bridge/wc_mcpb_opaque", SCOPE_MCP_BRIDGE),
+            ("POST", "/mcp/bridge/wc_mcpb_opaque", SCOPE_MCP_BRIDGE),
             ("POST", "/api/runtime/status", SCOPE_RUNTIME_READ),
             ("POST", "/api/tools/list", SCOPE_RUNTIME_READ),
             ("POST", "/api/connector/task/start", SCOPE_RUNTIME_READ),
@@ -624,6 +642,21 @@ mod tests {
         assert!(
             enforce_route_scope(&shared, "POST", "/api/runtime-console/projects").is_ok(),
             "direct shared key should retain its existing project:read Runtime Console access"
+        );
+        assert_eq!(
+            enforce_route_scope(&pat, "GET", "/mcp/bridge"),
+            Err((
+                Some(SCOPE_MCP_BRIDGE),
+                "missing required scope: mcp:bridge".to_string()
+            )),
+            "ordinary runtime scope must not grant the MCP bridge"
+        );
+        let mut bridge_pat = pat.clone();
+        bridge_pat.scopes.push(SCOPE_MCP_BRIDGE.to_string());
+        assert!(enforce_route_scope(&bridge_pat, "GET", "/mcp/bridge").is_ok());
+        assert!(
+            enforce_route_scope(&shared, "GET", "/mcp/bridge").is_err(),
+            "Runner shared-key availability must not grant MCP bridge authority"
         );
         assert!(
             enforce_route_scope(&pat, "POST", "/api/oauth/clients/list").is_ok(),
@@ -801,6 +834,9 @@ mod tests {
             ("POST", "/api/audit/stats"),
             ("GET", "/mcp"),
             ("POST", "/mcp"),
+            ("GET", "/mcp/bridge"),
+            ("GET", "/mcp/bridge/wc_mcpb_opaque"),
+            ("POST", "/mcp/bridge/wc_mcpb_opaque"),
             ("GET", "/oauth/authorize"),
             ("POST", "/oauth/authorize/login"),
             ("POST", "/oauth/authorize/consent"),

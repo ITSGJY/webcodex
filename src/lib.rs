@@ -27,6 +27,7 @@ mod db;
 mod host_console_http;
 mod job_observation;
 mod mcp;
+mod mcp_bridge_http;
 mod model_surface;
 mod models;
 mod oauth_http;
@@ -49,8 +50,8 @@ mod users_http;
 pub(crate) use webcodex_admin as admin_cli;
 pub(crate) use webcodex_agent_config as agent_init;
 pub(crate) use webcodex_core::{
-    apply_edits_shared, artifact_policy, build_info, lsp_bridge, sensitive_paths, shell_protocol,
-    validation_bridge,
+    apply_edits_shared, artifact_policy, build_info, lsp_bridge, mcp_bridge, sensitive_paths,
+    shell_protocol, validation_bridge,
 };
 pub(crate) use webcodex_sandbox as command_sandbox;
 pub(crate) use webcodex_workspace::{project_context, project_overview, workspace_checkpoint};
@@ -465,7 +466,16 @@ only for local/trusted-network demos."
             Router::with_path("mcp")
                 .hoop(AuthMiddleware)
                 .get(mcp::mcp_info)
-                .post(mcp::mcp_post),
+                .post(mcp::mcp_post)
+                .push(
+                    Router::with_path("bridge")
+                        .get(mcp_bridge_http::bridge_list)
+                        .push(
+                            Router::with_path("{bridge_id}")
+                                .get(mcp_bridge_http::bridge_info)
+                                .post(mcp_bridge_http::bridge_post),
+                        ),
+                ),
         );
 
     // Read-only audit query API. Admin/debug surface only: NOT part of the

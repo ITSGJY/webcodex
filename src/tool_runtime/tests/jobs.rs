@@ -542,6 +542,7 @@ async fn run_shell_via_agent_lifecycle_error(
                 error: Some(error.to_string()),
             },
             command_execution_state: Some(execution_state),
+            mcp_bridge: None,
         })
         .await
         .unwrap();
@@ -850,6 +851,7 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
                 error: Some("runner timeout".to_string()),
             },
             command_execution_state: Some(ShellCommandExecutionState::TimedOut),
+            mcp_bridge: None,
         })
         .await
         .unwrap();

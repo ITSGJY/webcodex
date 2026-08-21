@@ -96,6 +96,35 @@ pub(crate) fn dispatch_request(
     if runtime.shutdown_flag().load(Ordering::SeqCst) {
         return Ok(false);
     }
+    if request.kind == "mcp_bridge" {
+        let request_id = request.request_id.clone();
+        let response = match request.mcp_bridge {
+            Some(operation) => runtime.mcp_bridge().handle(operation),
+            None => crate::mcp_bridge::McpBridgeResponse::error(
+                crate::mcp_bridge::McpBridgeDispatchState::NotStarted,
+                "invalid_bridge_request",
+                "Typed bridge operation is required; request was not started",
+            ),
+        };
+        return sink
+            .submit_mcp_bridge_result(request_id, response)
+            .map(|_| true);
+    }
+    if request.mcp_bridge.is_some() {
+        let result = CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(0),
+            error: Some(
+                "invalid_request: bridge payload is valid only for mcp_bridge requests; command was not started"
+                    .to_string(),
+            ),
+        };
+        return sink
+            .submit_result_with_metadata(request.request_id, result, config, runtime)
+            .map(|_| true);
+    }
     // Computer operations are an explicit typed protocol surface. Unknown
     // computer_* requests must never reach external providers or shell fallback.
     if request.kind.starts_with("computer_") && !is_computer_request_kind(&request.kind) {

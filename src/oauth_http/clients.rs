@@ -46,13 +46,14 @@ fn default_client_allowed_scopes() -> &'static [&'static str] {
 }
 
 #[cfg(test)]
-mod detached_scope_tests {
+mod legacy_default_scope_tests {
     use super::*;
 
     #[test]
-    fn legacy_default_client_does_not_gain_detached_execution_scope() {
+    fn legacy_default_client_does_not_gain_new_permission_scopes() {
         assert!(default_client_allowed_scopes().contains(&"job:run"));
         assert!(!default_client_allowed_scopes().contains(&"job:detach"));
+        assert!(!default_client_allowed_scopes().contains(&"mcp:bridge"));
     }
 }
 

@@ -212,6 +212,7 @@ const LEGACY_FORBIDDEN_PATHS: &[&str] = &[
     "/api/pairing/create",
     "/api/pairing/enroll",
     "/mcp",
+    "/mcp/bridge",
     "/openapi.json",
     // Browser console shells and their browser-only Runtime Console API are
     // intentionally NOT GPT Actions and must never appear in /openapi.json.

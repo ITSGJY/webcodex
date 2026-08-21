@@ -44,6 +44,59 @@ If the authentication menu offers **Access token/API key**, choose it, paste
 the bearer credential, and run **Scan Tools**. ChatGPT UI labels and
 availability can vary by workspace and rollout.
 
+## Runner stdio bridge
+
+The generic MCP bridge is separate from WebCodex's normal `/mcp` tool surface.
+An authenticated caller discovers its visible local providers with:
+
+```text
+GET https://your-domain.example/mcp/bridge
+```
+
+Each result has an opaque `bridge_id` and its own hosted endpoint:
+
+```text
+POST https://your-domain.example/mcp/bridge/<bridge_id>
+```
+
+Use that provider-specific URL as the MCP server URL. Tools from different
+providers are never merged with each other or into `/mcp`. The opaque id binds
+the exact Runner process and provider process identity; if either disappears or
+is replaced, the old resource fails closed instead of routing to a replacement.
+The discovery response does not expose executable paths, process ids, provider
+argv, environment values, or stderr.
+
+V1 is stateless JSON Streamable HTTP using MCP protocol version `2025-06-18`.
+It supports `initialize`, `notifications/initialized`, `ping`, `tools/list`,
+and `tools/call`. It deliberately does not provide resources, prompts,
+sampling, elicitation, roots, completion, subscriptions, server-to-client
+callbacks, MCP Apps, SSE compatibility, or arbitrary JSON-RPC tunneling.
+Downstream provider content is text-only in V1; image/binary content and
+excessive or malformed descriptors, schemas, arguments, messages, and results
+are rejected at bounded validation gates.
+
+Bridge routes require normal WebCodex authentication and the fixed
+`mcp:bridge` scope. Managed-user PATs and OAuth clients must opt in explicitly;
+the frozen default OAuth client scopes do not gain it. Direct shared keys,
+shared-key OAuth bridging, open-anonymous access, project-share credentials,
+and Runner transport tokens do not carry this scope. Scope possession is only
+the route gate: WebCodex also rechecks the principal's existing Runner
+owner/shared-key/project identity binding and the exact live Runner/provider
+identity when dispatching every `tools/call`. `tools/list` is discovery UX, not
+authoritative permission for a later call.
+
+Every third-party `tools/call` is treated as potentially effectful. WebCodex
+never automatically retries it after Runner dispatch. If the local provider
+may have received the call but its result is lost, the JSON-RPC error data
+reports `dispatchState: "outcome_unknown"`, `retryable: false`, and
+`reconciliationRequired: true`; inspect current external state and issue a new
+explicit call only when appropriate. Failures proven to occur before dispatch
+report `not_started`. Read-only discovery and `tools/list` are also bounded and
+do not silently change an opaque target identity.
+
+Runner-side configuration is documented in
+[Runner: Local stdio MCP providers](RUNNER.md#local-stdio-mcp-providers).
+
 ### OAuth2
 
 When OAuth is enabled on a managed/self-hosted Server, or by `webcodex share --auth oauth`, MCP clients can use

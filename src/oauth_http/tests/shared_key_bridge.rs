@@ -35,6 +35,7 @@ fn bridge_computer_scopes_use_explicit_closed_ceiling_without_changing_direct_au
         bridge_oauth_scopes(),
         crate::auth::DIRECT_SHARED_KEY_MODEL_SCOPES
     );
+    assert!(!bridge_oauth_scopes().contains(&"mcp:bridge"));
     assert_eq!(
         bridge_oauth_computer_enabled_scopes(),
         &[

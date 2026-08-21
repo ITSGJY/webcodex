@@ -1,4 +1,5 @@
 use super::auth::ShellClientAuthGroup;
+use crate::mcp_bridge::McpBridgeResponse;
 use crate::shell_protocol::{
     AgentBuildInfo, AgentHostContext, AgentPolicySummary, PersistentShellResult,
     ShellAgentProjectSummary, ShellAgentShellRequest, ShellClientCapabilities,
@@ -265,6 +266,10 @@ pub(super) struct ShellClientRegistryInner {
     /// from synchronous `ShellRunResponse` waiters so PersistentShell never
     /// enters the Job/run_shell model.
     pub(super) persistent_waiters: HashMap<String, oneshot::Sender<PersistentShellResult>>,
+    /// Waiters for the closed MCP bridge response contract. They remain
+    /// separate from shell stdout/stderr so bridge calls cannot become a raw
+    /// result tunnel.
+    pub(super) mcp_bridge_waiters: HashMap<String, oneshot::Sender<McpBridgeResponse>>,
     pub(super) queues_by_client: HashMap<String, VecDeque<String>>,
     pub(super) jobs_by_id: HashMap<String, ShellJobRecord>,
     pub(super) request_to_job: HashMap<String, String>,

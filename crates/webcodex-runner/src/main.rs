@@ -18,7 +18,8 @@ mod webcodex_runner;
 
 use webcodex_agent_config as agent_init;
 use webcodex_core::{
-    apply_edits_shared, artifact_policy, build_info, lsp_bridge, shell_protocol, validation_bridge,
+    apply_edits_shared, artifact_policy, build_info, lsp_bridge, mcp_bridge, shell_protocol,
+    validation_bridge,
 };
 use webcodex_sandbox as command_sandbox;
 use webcodex_workspace::{project_overview, workspace_checkpoint};
@@ -1905,6 +1906,10 @@ fn agent_register_capabilities(cfg: &AgentConfig) -> ShellClientCapabilities {
     // This binary implements resolve_or_register_project; do not trust config to
     // advertise a capability that the binary does not implement.
     capabilities.project_path_registration = true;
+    // This binary understands only the closed MCP bridge request enum and owns
+    // persistent stdio provider sessions. Older binaries omit the capability,
+    // so a newer Server will never send them this request kind.
+    capabilities.mcp_bridge = true;
     // `job_state_reconciliation` is on by default. A hidden, test/ops-only env
     // knob lets an E2E simulate a legacy runner that predates the capability
     // (it then has no job inventory and a disconnect falls straight to `lost`).

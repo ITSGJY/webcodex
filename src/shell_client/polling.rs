@@ -8,6 +8,9 @@ use super::validation::{
     validate_project_summary_count,
 };
 use super::{now_ts, ShellClientRegistry};
+use crate::mcp_bridge::{
+    validate_response as validate_mcp_bridge_response, McpBridgeDispatchState, McpBridgeResponse,
+};
 use crate::shell_protocol::{
     ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultPayload,
     ShellAgentResultRequest, ShellAgentShellRequest, ShellCommandExecutionState, ShellRunResponse,
@@ -179,8 +182,13 @@ impl ShellClientRegistry {
         payload: impl Into<ShellAgentResultPayload>,
     ) -> Result<(), String> {
         let payload = payload.into();
-        self.complete_checked(payload.result, payload.command_execution_state, None)
-            .await
+        self.complete_checked(
+            payload.result,
+            payload.command_execution_state,
+            payload.mcp_bridge,
+            None,
+        )
+        .await
     }
 
     /// Connection-scoped result entry point for long-lived transports. A
@@ -198,6 +206,7 @@ impl ShellClientRegistry {
         self.complete_checked(
             payload.result,
             payload.command_execution_state,
+            payload.mcp_bridge,
             Some(connection_id),
         )
         .await
@@ -207,6 +216,7 @@ impl ShellClientRegistry {
         &self,
         body: ShellAgentResultRequest,
         command_execution_state: Option<ShellCommandExecutionState>,
+        mcp_bridge: Option<crate::mcp_bridge::McpBridgeResponse>,
         expected_connection_id: Option<&str>,
     ) -> Result<(), String> {
         validate_id(&body.client_id, "client_id")?;
@@ -239,6 +249,42 @@ impl ShellClientRegistry {
         };
         if pending.request.client_id != body.client_id {
             return Err("request_id does not belong to client_id".to_string());
+        }
+        if pending.request.mcp_bridge.is_some() {
+            let response = match mcp_bridge {
+                Some(response)
+                    if command_execution_state.is_none()
+                        && body.exit_code.is_none()
+                        && body.stdout.is_none()
+                        && body.stderr.is_none()
+                        && body.duration_ms.is_none()
+                        && body.error.is_none()
+                        && validate_mcp_bridge_response(&response).is_ok() =>
+                {
+                    response
+                }
+                _ => McpBridgeResponse::error(
+                    if pending.dispatched {
+                        McpBridgeDispatchState::OutcomeUnknown
+                    } else {
+                        McpBridgeDispatchState::NotStarted
+                    },
+                    "invalid_runner_response",
+                    if pending.dispatched {
+                        "Runner returned an invalid bridge response after dispatch; downstream outcome is unknown and must not be retried automatically"
+                    } else {
+                        "Runner returned an invalid bridge response before provider dispatch"
+                    },
+                ),
+            };
+            let waiter = inner.mcp_bridge_waiters.remove(&body.request_id);
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(response);
+            }
+            return Ok(());
+        }
+        if mcp_bridge.is_some() {
+            return Err("unexpected MCP bridge result for non-bridge request".to_string());
         }
         let request_id = body.request_id.clone();
         let client_id = body.client_id.clone();

@@ -60,6 +60,46 @@ For WebSocket, the connection uses `Authorization: Bearer <token>` (with
 polling, every request carries the bearer header. QUIC sends the token inside
 the registration envelope.
 
+## Local stdio MCP providers
+
+A Runner can expose a statically configured local stdio MCP server through the
+Server's hosted MCP bridge. The Runner still makes only its existing outbound
+authenticated connection to the Server; the local MCP process does not listen
+on a network port, and the Server never connects to it directly.
+
+Configure each provider in `agent.toml` with a stable local id, display name,
+absolute executable, and literal argument array:
+
+```toml
+[mcp_bridge]
+request_timeout_secs = 30
+
+[[mcp_bridge.providers]]
+id = "local-tools"
+name = "Local tools"
+executable = "/opt/local-tools/bin/local-tools-mcp"
+args = ["--stdio", "--profile", "default"]
+```
+
+The executable is started directly with the listed argv and a cleared
+environment; this is not a shell command and values such as `$HOME` are not
+expanded. V1 has no provider-specific environment injection. Provider ids must
+be unique on one Runner, and the
+configured provider count, ids, names, executable/argv lengths, and timeout are
+bounded and validated when the configuration loads. Changing `[mcp_bridge]`
+requires a Runner restart.
+
+The process starts lazily on first tool discovery/call, completes MCP
+`initialize` plus `notifications/initialized` once, and remains alive for
+repeated `tools/list` and `tools/call`. A protocol failure, timeout, malformed
+response, stdout EOF, or child exit invalidates that process-local provider
+identity. WebCodex does not silently restart it under the old hosted endpoint;
+restart the Runner to create a fresh identity. Provider stderr is diagnostic
+only and is never parsed as MCP or returned through the hosted endpoint.
+
+See [MCP: Runner stdio bridge](MCP.md#runner-stdio-bridge) for endpoint,
+authentication, supported-method, and retry behavior.
+
 ## Registering projects
 
 Projects live on the Runner machine. The Runner registers allowed directories

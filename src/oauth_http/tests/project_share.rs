@@ -6,7 +6,12 @@ fn project_share_scope_ceiling_is_connector_only() {
     let normalized = normalize_project_share_oauth_scopes(Some(allowed), allowed).unwrap();
     assert_eq!(normalized, allowed);
 
-    for forbidden in ["account:manage", "computer:read", "agent:poll"] {
+    for forbidden in [
+        "account:manage",
+        "computer:read",
+        "agent:poll",
+        "mcp:bridge",
+    ] {
         let client_allowed = format!("{allowed} {forbidden}");
         assert!(matches!(
             normalize_project_share_oauth_scopes(Some(&client_allowed), &client_allowed),

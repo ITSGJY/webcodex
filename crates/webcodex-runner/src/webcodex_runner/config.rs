@@ -1,4 +1,5 @@
 use super::external_tools::ExternalToolRouter;
+use super::mcp_bridge::McpBridgeManager;
 use super::shutdown::lock_unpoison;
 use crate::agent_init::{
     effective_allowed_roots, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_TIMEOUT_SECS,
@@ -71,6 +72,40 @@ pub(crate) struct AgentConfig {
     pub(crate) ssh: SshConfig,
     #[serde(default)]
     pub(crate) tool_providers: ToolProvidersConfig,
+    /// Static Runner-owned stdio MCP providers exposed only through the
+    /// bounded hosted bridge.
+    #[serde(default)]
+    pub(crate) mcp_bridge: McpBridgeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct McpBridgeConfig {
+    #[serde(default = "default_mcp_bridge_request_timeout_secs")]
+    pub(crate) request_timeout_secs: u64,
+    #[serde(default)]
+    pub(crate) providers: Vec<McpBridgeProviderConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct McpBridgeProviderConfig {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) executable: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+}
+
+fn default_mcp_bridge_request_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for McpBridgeConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: default_mcp_bridge_request_timeout_secs(),
+            providers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -334,6 +369,7 @@ impl HotAgentConfig {
 
 pub(crate) struct ReloadableAgentConfig {
     startup: AgentConfig,
+    mcp_bridge: Arc<McpBridgeManager>,
     /// Config file path used by `reload()`. Config reload is a Unix feature
     /// (Windows marks reload as unsupported and never stores the path), but
     /// the reload logic is exercised by cross-platform tests.
@@ -356,6 +392,7 @@ impl ReloadableAgentConfig {
         let current = Arc::new(HotAgentConfig::new(1, &startup, status));
         let external_routers = vec![Arc::downgrade(&current.external_tools)];
         Self {
+            mcp_bridge: Arc::new(McpBridgeManager::new(&startup.mcp_bridge)),
             startup,
             #[cfg(any(unix, test))]
             path,
@@ -375,10 +412,15 @@ impl ReloadableAgentConfig {
 
     pub(crate) fn begin_shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        self.mcp_bridge.shutdown();
     }
 
     pub(crate) fn shutdown_flag(&self) -> &AtomicBool {
         &self.stopping
+    }
+
+    pub(crate) fn mcp_bridge(&self) -> &McpBridgeManager {
+        &self.mcp_bridge
     }
 
     /// Startup-owned managed temporary-project root. Like `projects_dir`, a
@@ -491,6 +533,7 @@ pub(crate) fn restart_required_fields(
         hostname,
         host_context,
         max_concurrent_jobs,
+        mcp_bridge,
         owner,
         poll_interval_ms,
         projects_dir,
@@ -958,7 +1001,67 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
             return Err("tool_providers.claude_code.timeout_secs must be > 0".to_string());
         }
     }
+    validate_mcp_bridge_config(&cfg.mcp_bridge)?;
     Ok(cfg)
+}
+
+fn validate_mcp_bridge_config(config: &McpBridgeConfig) -> Result<(), String> {
+    use crate::mcp_bridge::{
+        validate_provider_id, validate_provider_name, MCP_BRIDGE_MAX_PROVIDERS,
+    };
+    use std::collections::HashSet;
+
+    if !(1..=120).contains(&config.request_timeout_secs) {
+        return Err("mcp_bridge.request_timeout_secs must be between 1 and 120".to_string());
+    }
+    if config.providers.len() > MCP_BRIDGE_MAX_PROVIDERS {
+        return Err(format!(
+            "mcp_bridge.providers may contain at most {MCP_BRIDGE_MAX_PROVIDERS} entries"
+        ));
+    }
+    let mut ids = HashSet::new();
+    for provider in &config.providers {
+        validate_provider_id(&provider.id)
+            .map_err(|error| format!("mcp_bridge provider id is invalid: {error}"))?;
+        validate_provider_name(&provider.name)
+            .map_err(|error| format!("mcp_bridge provider name is invalid: {error}"))?;
+        if !ids.insert(provider.id.as_str()) {
+            return Err("mcp_bridge provider ids must be unique".to_string());
+        }
+        if provider.executable.is_empty()
+            || provider.executable.len() > 1_024
+            || provider.executable.contains('\0')
+            || !Path::new(&provider.executable).is_absolute()
+        {
+            return Err(format!(
+                "mcp_bridge provider '{}' executable must be an absolute path of at most 1024 bytes",
+                provider.id
+            ));
+        }
+        if provider.args.len() > 64 {
+            return Err(format!(
+                "mcp_bridge provider '{}' args may contain at most 64 entries",
+                provider.id
+            ));
+        }
+        let mut total = 0usize;
+        for argument in &provider.args {
+            if argument.len() > 4_096 || argument.contains('\0') {
+                return Err(format!(
+                    "mcp_bridge provider '{}' contains an invalid argument",
+                    provider.id
+                ));
+            }
+            total = total.saturating_add(argument.len()).saturating_add(1);
+        }
+        if total > 16 * 1024 {
+            return Err(format!(
+                "mcp_bridge provider '{}' args exceed 16384 bytes",
+                provider.id
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn hostname() -> Option<String> {

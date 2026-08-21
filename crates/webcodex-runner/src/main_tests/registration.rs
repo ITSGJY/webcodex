@@ -71,6 +71,7 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     assert!(caps.lsp_call_hierarchy);
     assert!(caps.project_lifecycle);
     assert!(caps.project_path_registration);
+    assert!(caps.mcp_bridge);
     assert_eq!(
         caps.computer_observe,
         cfg!(any(target_os = "macos", windows)),

@@ -228,6 +228,7 @@ fn agent_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        mcp_bridge: None,
         persistent_shell: None,
     }
 }

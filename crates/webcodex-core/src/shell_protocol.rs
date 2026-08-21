@@ -220,6 +220,10 @@ pub const SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE: &str = "project_lifecycle";
 /// atomically persist a new projects.d entry. Missing on older runners and
 /// therefore fails closed.
 pub const SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION: &str = "project_path_registration";
+/// Closed, typed access to statically configured Runner-owned stdio MCP
+/// providers. Missing on older Runners is false; the Server must never send a
+/// bridge request to a Runner that could interpret the request kind differently.
+pub const SHELL_CLIENT_CAPABILITY_MCP_BRIDGE: &str = "mcp_bridge";
 /// Same-process async job recovery across server restarts and transport
 /// reconnects. Missing on older runners and therefore defaults to `false`.
 /// Read-only native desktop/window observation. Missing on older Runners and
@@ -317,6 +321,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
     SHELL_CLIENT_CAPABILITY_PROJECT_LIFECYCLE,
     SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
+    SHELL_CLIENT_CAPABILITY_MCP_BRIDGE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_OBSERVE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH,
@@ -458,6 +463,11 @@ pub struct ShellClientCapabilities {
     /// fail-closed.
     #[serde(default)]
     pub project_path_registration: bool,
+    /// The Runner implements the bounded tool-only MCP provider lifecycle and
+    /// typed bridge request envelope. This is a rolling-upgrade fence, not an
+    /// authorization grant.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mcp_bridge: bool,
     /// Native read-only desktop/window observation. Missing on older Runners
     /// and therefore fail-closed.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -576,6 +586,7 @@ impl Default for ShellClientCapabilities {
             sandbox_inspect_commands: false,
             project_lifecycle: false,
             project_path_registration: false,
+            mcp_bridge: false,
             computer_observe: false,
             computer_application_discovery: false,
             computer_application_launch: false,
@@ -1405,6 +1416,10 @@ pub struct ShellAgentShellRequest {
     /// `job_id`/Job state and absent on all legacy request kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent_shell: Option<PersistentShellRequest>,
+    /// Closed, typed Runner-owned MCP bridge operation. This is deliberately
+    /// separate from shell/file fields and never carries arbitrary JSON-RPC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_bridge: Option<crate::mcp_bridge::McpBridgeRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1457,6 +1472,10 @@ pub struct ShellAgentResultPayload {
     pub result: ShellAgentResultRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_execution_state: Option<ShellCommandExecutionState>,
+    /// Typed MCP bridge result. Present only for a request whose
+    /// `mcp_bridge` field was present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_bridge: Option<crate::mcp_bridge::McpBridgeResponse>,
 }
 
 impl From<ShellAgentResultRequest> for ShellAgentResultPayload {
@@ -1464,6 +1483,7 @@ impl From<ShellAgentResultRequest> for ShellAgentResultPayload {
         Self {
             result,
             command_execution_state: None,
+            mcp_bridge: None,
         }
     }
 }
@@ -2665,6 +2685,7 @@ mod envelope_tests {
             lsp: None,
             sandbox: None,
             job_context: None,
+            mcp_bridge: None,
             persistent_shell: None,
         }
     }
@@ -2725,6 +2746,7 @@ mod envelope_tests {
             lsp: None,
             sandbox: None,
             job_context: None,
+            mcp_bridge: None,
             persistent_shell: None,
         }
     }
@@ -2835,6 +2857,7 @@ mod envelope_tests {
                 sandbox_inspect_commands: false,
                 project_lifecycle: false,
                 project_path_registration: false,
+                mcp_bridge: false,
                 computer_observe: false,
                 computer_application_discovery: false,
                 computer_application_launch: false,
@@ -3282,6 +3305,7 @@ mod envelope_tests {
             lsp: None,
             sandbox: None,
             job_context: None,
+            mcp_bridge: None,
             persistent_shell: None,
         };
         let env = AgentEnvelope::Request { request };
@@ -3769,6 +3793,7 @@ mod envelope_tests {
                     error: None,
                 },
                 command_execution_state: Some(ShellCommandExecutionState::Completed),
+                mcp_bridge: None,
             },
         };
         let json = result_env.to_json().unwrap();

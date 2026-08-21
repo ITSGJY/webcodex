@@ -20,6 +20,8 @@ client_id = "oe"
         auto_transport_plan(&cfg),
         vec![TRANSPORT_WEBSOCKET, TRANSPORT_POLLING]
     );
+    assert_eq!(cfg.mcp_bridge.request_timeout_secs, 30);
+    assert!(cfg.mcp_bridge.providers.is_empty());
 }
 
 #[test]
@@ -759,4 +761,85 @@ fn phase_e2_polling_dispatch_and_job_execution_concurrency_defaults_are_independ
     assert_eq!(POLLING_DISPATCH_MAX_IN_FLIGHT, 2);
     assert_eq!(DEFAULT_MAX_CONCURRENT_JOBS, 4);
     assert_ne!(POLLING_DISPATCH_MAX_IN_FLIGHT, DEFAULT_MAX_CONCURRENT_JOBS);
+}
+
+#[test]
+fn agent_config_accepts_static_literal_mcp_bridge_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    std::fs::write(
+        &path,
+        r#"
+server_url = "http://127.0.0.1:8000"
+token = "t"
+client_id = "oe"
+
+[mcp_bridge]
+request_timeout_secs = 7
+
+[[mcp_bridge.providers]]
+id = "local-tools"
+name = "Local tools"
+executable = "/usr/bin/example-mcp"
+args = ["--stdio", "$HOME", "$(id)"]
+"#,
+    )
+    .unwrap();
+
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.mcp_bridge.request_timeout_secs, 7);
+    assert_eq!(config.mcp_bridge.providers.len(), 1);
+    assert_eq!(
+        config.mcp_bridge.providers[0].args,
+        ["--stdio", "$HOME", "$(id)"]
+    );
+}
+
+#[test]
+fn agent_config_rejects_unsafe_or_ambiguous_mcp_bridge_identity() {
+    for (providers, expected) in [
+        (
+            r#"
+[[mcp_bridge.providers]]
+id = "local"
+name = "Local"
+executable = "relative-mcp"
+"#,
+            "executable must be an absolute path",
+        ),
+        (
+            r#"
+[[mcp_bridge.providers]]
+id = "duplicate"
+name = "First"
+executable = "/usr/bin/first"
+
+[[mcp_bridge.providers]]
+id = "duplicate"
+name = "Second"
+executable = "/usr/bin/second"
+"#,
+            "provider ids must be unique",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+server_url = "http://127.0.0.1:8000"
+token = "t"
+client_id = "oe"
+
+[mcp_bridge]
+request_timeout_secs = 30
+{providers}
+"#
+            ),
+        )
+        .unwrap();
+        let error = load_config(&path).unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
 }
