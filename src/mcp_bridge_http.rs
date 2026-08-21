@@ -18,7 +18,11 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
-const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_PROTOCOL_VERSION_2025_06_18: &str = "2025-06-18";
+const MCP_PROTOCOL_VERSION_2025_11_25: &str = "2025-11-25";
+const MCP_LATEST_PROTOCOL_VERSION: &str = MCP_PROTOCOL_VERSION_2025_11_25;
+#[cfg(test)]
+const MCP_PROTOCOL_VERSION: &str = MCP_PROTOCOL_VERSION_2025_06_18;
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const BRIDGE_ID_PREFIX: &str = "wc_mcpb_";
 const MAX_DISCOVERY_RUNNERS: usize = 16;
@@ -49,11 +53,21 @@ fn empty_object() -> Value {
     json!({})
 }
 
-fn validate_initialize_params(params: &Value) -> Result<(), &'static str> {
+fn supported_protocol_version(version: &str) -> bool {
+    matches!(
+        version,
+        MCP_PROTOCOL_VERSION_2025_06_18 | MCP_PROTOCOL_VERSION_2025_11_25
+    )
+}
+
+fn validate_initialize_params(params: &Value) -> Result<&str, &'static str> {
     let Some(params) = params.as_object() else {
         return Err("initialize params must be an object");
     };
-    if params.get("protocolVersion").and_then(Value::as_str) != Some(MCP_PROTOCOL_VERSION) {
+    let Some(protocol_version) = params.get("protocolVersion").and_then(Value::as_str) else {
+        return Err("initialize requires protocolVersion");
+    };
+    if !supported_protocol_version(protocol_version) {
         return Err("unsupported MCP protocol version");
     }
     if !params.get("capabilities").is_some_and(Value::is_object) {
@@ -75,7 +89,7 @@ fn validate_initialize_params(params: &Value) -> Result<(), &'static str> {
             return Err("initialize clientInfo requires bounded name and version");
         }
     }
-    Ok(())
+    Ok(protocol_version)
 }
 
 fn validate_protocol_header(req: &Request, method: &str) -> Result<(), &'static str> {
@@ -94,7 +108,7 @@ fn validate_protocol_header(req: &Request, method: &str) -> Result<(), &'static 
         // no dispatch authority and no response body, so tolerate only that
         // missing header while keeping every request/call strict.
         ("initialize", None) | ("notifications/initialized", None) => Ok(()),
-        (_, Some(version)) if version == MCP_PROTOCOL_VERSION => Ok(()),
+        (_, Some(version)) if supported_protocol_version(version) => Ok(()),
         (_, Some(_)) => Err("unsupported MCP-Protocol-Version"),
         (_, None) => Err("MCP-Protocol-Version is required after initialize"),
     }
@@ -282,7 +296,7 @@ pub async fn bridge_post(req: &mut Request, depot: &mut Depot, res: &mut Respons
                 request.id.clone(),
                 -32600,
                 message,
-                Some(json!({"supportedProtocolVersion": MCP_PROTOCOL_VERSION})),
+                Some(json!({"supportedProtocolVersion": MCP_LATEST_PROTOCOL_VERSION})),
             ),
         );
         return;
@@ -377,28 +391,25 @@ pub async fn bridge_post(req: &mut Request, depot: &mut Depot, res: &mut Respons
     }
     let id = request.id.clone();
     let response = match request.method.as_str() {
-        "initialize" => {
-            if let Err(message) = validate_initialize_params(&request.params) {
-                rpc_error(
-                    id,
-                    -32602,
-                    message,
-                    Some(json!({"supportedProtocolVersion": MCP_PROTOCOL_VERSION})),
-                )
-            } else {
-                rpc_result(
-                    id,
-                    json!({
-                        "protocolVersion": MCP_PROTOCOL_VERSION,
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {
-                            "name": format!("WebCodex MCP Bridge: {}", target.provider.name),
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }),
-                )
-            }
-        }
+        "initialize" => match validate_initialize_params(&request.params) {
+            Ok(protocol_version) => rpc_result(
+                id,
+                json!({
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {
+                        "name": format!("WebCodex MCP Bridge: {}", target.provider.name),
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            ),
+            Err(message) => rpc_error(
+                id,
+                -32602,
+                message,
+                Some(json!({"supportedProtocolVersion": MCP_LATEST_PROTOCOL_VERSION})),
+            ),
+        },
         "ping" => {
             if request
                 .params

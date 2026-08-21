@@ -286,6 +286,29 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
     );
     assert!(initialized["result"]["capabilities"]["tools"].is_object());
 
+    let mut latest_initialized = TestClient::post(format!("http://localhost{endpoint}"))
+        .json(&json!({
+            "jsonrpc":"2.0",
+            "id":19,
+            "method":"initialize",
+            "params":{
+                "protocolVersion": MCP_PROTOCOL_VERSION_2025_11_25,
+                "capabilities": {"tasks": {}},
+                "clientInfo": {"name": "chatgpt-compatible-test", "title": "ChatGPT", "version": "1"}
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        latest_initialized.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::OK
+    );
+    let latest_initialized = latest_initialized.take_json::<Value>().await.unwrap();
+    assert_eq!(
+        latest_initialized["result"]["protocolVersion"],
+        MCP_PROTOCOL_VERSION_2025_11_25
+    );
+
     let initialized_notification = TestClient::post(format!("http://localhost{endpoint}"))
         .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
         .send(&service)
@@ -315,6 +338,46 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
         .await
         .unwrap();
     assert_eq!(wrong_notification_version["error"]["code"], -32600);
+
+    let mut latest_ping = TestClient::post(format!("http://localhost{endpoint}"))
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_PROTOCOL_VERSION_2025_11_25,
+            true,
+        )
+        .json(&json!({"jsonrpc":"2.0","id":18,"method":"ping","params":{}}))
+        .send(&service)
+        .await;
+    assert_eq!(
+        latest_ping.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::OK
+    );
+    let latest_ping = latest_ping.take_json::<Value>().await.unwrap();
+    assert!(latest_ping["result"].is_object());
+
+    let mut unsupported_initialize = TestClient::post(format!("http://localhost{endpoint}"))
+        .json(&json!({
+            "jsonrpc":"2.0",
+            "id":17,
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2099-01-01",
+                "capabilities":{},
+                "clientInfo":{"name":"unsupported-test","version":"1"}
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        unsupported_initialize.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::OK
+    );
+    let unsupported_initialize = unsupported_initialize.take_json::<Value>().await.unwrap();
+    assert_eq!(unsupported_initialize["error"]["code"], -32602);
+    assert_eq!(
+        unsupported_initialize["error"]["data"]["supportedProtocolVersion"],
+        MCP_LATEST_PROTOCOL_VERSION
+    );
 
     let mut missing_version = TestClient::post(format!("http://localhost{endpoint}"))
         .json(&json!({"jsonrpc":"2.0","id":20,"method":"ping","params":{}}))
@@ -363,6 +426,22 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
     let runner = spawn_fake_runner(Arc::clone(&registry), Arc::clone(&calls));
     let listed = rpc(&service, &endpoint, 2, "tools/list", json!({})).await;
     assert_eq!(listed["result"]["tools"][0]["name"], "echo");
+
+    let mut latest_list = TestClient::post(format!("http://localhost{endpoint}"))
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_PROTOCOL_VERSION_2025_11_25,
+            true,
+        )
+        .json(&json!({"jsonrpc":"2.0","id":16,"method":"tools/list","params":{}}))
+        .send(&service)
+        .await;
+    assert_eq!(
+        latest_list.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::OK
+    );
+    let latest_list = latest_list.take_json::<Value>().await.unwrap();
+    assert_eq!(latest_list["result"]["tools"][0]["name"], "echo");
 
     for (id, expected) in [(3, "call-1:a"), (4, "call-2:b")] {
         let value = if id == 3 { "a" } else { "b" };
