@@ -76,11 +76,24 @@ fn oauth_hosted_bridge_audience_matches(
     if !ctx.is_oauth_token() {
         return true;
     }
-    if crate::oauth_resource::hosted_bridge_id_for_request_path(request_path).is_none() {
-        return true;
+
+    let token_bridge = ctx
+        .oauth_resource
+        .as_deref()
+        .and_then(|resource| crate::oauth_resource::hosted_bridge_resource(config, resource));
+    let request_bridge =
+        crate::oauth_resource::hosted_bridge_resource_for_request_path(config, request_path);
+
+    match (token_bridge, request_bridge) {
+        (Some(token), Some(request)) => token.uri == request.uri,
+        // An exact hosted-bridge audience is intentionally narrow: it must not
+        // become a bearer credential for the bridge collection, ordinary MCP,
+        // or unrelated WebCodex APIs merely because its scope set also contains
+        // permissions accepted by those routes.
+        (Some(_), None) => false,
+        (None, Some(request)) => ctx.oauth_resource.as_deref() == Some(request.uri.as_str()),
+        (None, None) => true,
     }
-    crate::oauth_resource::hosted_bridge_resource_for_request_path(config, request_path)
-        .is_some_and(|resource| ctx.oauth_resource.as_deref() == Some(resource.uri.as_str()))
 }
 
 fn render_oauth_invalid_audience(
@@ -97,7 +110,7 @@ fn render_oauth_invalid_audience(
     }
     res.render(Json(serde_json::json!({
         "error": "invalid_token",
-        "error_description": "access token audience does not match this MCP bridge resource",
+        "error_description": "access token audience does not match this protected resource",
     })));
     ctrl.skip_rest();
 }

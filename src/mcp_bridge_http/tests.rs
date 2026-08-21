@@ -501,7 +501,11 @@ async fn hosted_bridge_oauth_audience_is_exact_without_affecting_first_party_cre
         &db,
         &client,
         &user,
-        crate::auth::SCOPE_MCP_BRIDGE,
+        &format!(
+            "{} {}",
+            crate::auth::SCOPE_RUNTIME_READ,
+            crate::auth::SCOPE_MCP_BRIDGE
+        ),
         Some(&resource_a),
     );
     let mcp_token = seed_oauth_token(
@@ -550,6 +554,26 @@ async fn hosted_bridge_oauth_audience_is_exact_without_affecting_first_party_cre
     assert_eq!(
         generic_mcp_rejected.status_code,
         Some(StatusCode::UNAUTHORIZED)
+    );
+
+    let exact_token_on_ordinary_mcp = TestClient::get("http://localhost/mcp")
+        .bearer_auth(&token_a)
+        .send(&service)
+        .await;
+    assert_eq!(
+        exact_token_on_ordinary_mcp.status_code,
+        Some(StatusCode::UNAUTHORIZED),
+        "an exact bridge audience must not widen to ordinary /mcp even when the token also carries runtime:read"
+    );
+
+    let exact_token_on_bridge_collection = TestClient::get("http://localhost/mcp/bridge")
+        .bearer_auth(&token_a)
+        .send(&service)
+        .await;
+    assert_eq!(
+        exact_token_on_bridge_collection.status_code,
+        Some(StatusCode::UNAUTHORIZED),
+        "an exact bridge audience must not authorize the provider collection"
     );
 
     let ordinary_mcp = TestClient::get("http://localhost/mcp")
