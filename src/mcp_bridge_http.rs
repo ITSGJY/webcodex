@@ -47,6 +47,8 @@ struct ToolCallParams {
     name: String,
     #[serde(default = "empty_object")]
     arguments: Value,
+    #[serde(default)]
+    _meta: Option<serde_json::Map<String, Value>>,
 }
 
 fn empty_object() -> Value {

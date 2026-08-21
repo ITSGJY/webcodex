@@ -457,6 +457,24 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
+    let called_with_meta = rpc(
+        &service,
+        &endpoint,
+        15,
+        "tools/call",
+        json!({
+            "name": "echo",
+            "arguments": {"value": "with-meta"},
+            "_meta": {"progressToken": "chatgpt-tool-call"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        called_with_meta["result"]["content"][0]["text"],
+        "call-3:with-meta"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
     let unsupported = rpc(&service, &endpoint, 5, "resources/list", json!({})).await;
     assert_eq!(unsupported["error"]["code"], -32601);
 
