@@ -32,10 +32,15 @@ fn main() -> io::Result<()> {
                 if scenario == "init_timeout" {
                     thread::sleep(Duration::from_secs(3));
                 }
+                let capabilities = if scenario == "init_missing_tools" {
+                    r#"{}"#
+                } else {
+                    r#"{"tools":{}}"#
+                };
                 send(
                     &mut writer,
                     &format!(
-                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"fake-bridge","version":"1"}}}}}}"#
+                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2025-06-18","capabilities":{capabilities},"serverInfo":{{"name":"fake-bridge","version":"1"}}}}}}"#
                     ),
                 )?;
             }

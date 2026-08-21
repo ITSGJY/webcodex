@@ -141,6 +141,10 @@ pub(super) struct PendingShellRequest {
     pub(super) expected_client_owner: Option<String>,
     pub(super) expected_project_id: Option<String>,
     pub(super) expected_project_cwd: Option<String>,
+    /// Exact Runner process lease captured for an MCP bridge request. This is
+    /// revalidated under the registry lock immediately before dequeue so a
+    /// replacement Runner cannot consume stale bridge work.
+    pub(super) expected_mcp_bridge_agent_instance_id: Option<String>,
     pub(super) dispatched: bool,
 }
 

@@ -553,9 +553,27 @@ impl ProviderConnection {
     }
 
     fn terminate(&mut self) {
+        // Never let provider cleanup turn Runner shutdown into an unbounded
+        // wait. ManagedChild owns the complete process tree; force termination
+        // first, then spend one shared bounded deadline confirming tree exit
+        // and reaping the direct child. Drop remains the final fail-safe.
+        let deadline = Instant::now() + Duration::from_secs(1);
         let _ = self.child.terminate_tree();
-        let _ = self.child.wait_tree_exit(Duration::from_millis(500));
-        let _ = self.child.wait();
+        let _ = self
+            .child
+            .wait_tree_exit(deadline.saturating_duration_since(Instant::now()));
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10).min(remaining));
+                }
+            }
+        }
     }
 }
 
@@ -687,6 +705,10 @@ fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
     };
     if object.get("protocolVersion").and_then(Value::as_str) != Some(MCP_PROTOCOL_VERSION)
         || !object.get("capabilities").is_some_and(Value::is_object)
+        || !object
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("tools"))
+            .is_some_and(Value::is_object)
         || !implementation_field_valid("name")
         || !implementation_field_valid("version")
     {

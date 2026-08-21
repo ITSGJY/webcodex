@@ -153,6 +153,7 @@ pub(super) fn enqueue_pending_request_locked(
             expected_client_owner: None,
             expected_project_id: None,
             expected_project_cwd: None,
+            expected_mcp_bridge_agent_instance_id: None,
             dispatched: false,
         },
     );
@@ -1143,6 +1144,11 @@ impl ShellClientRegistry {
             None,
             None,
         )?;
+        inner
+            .pending_by_id
+            .get_mut(&request_id)
+            .expect("MCP bridge request was just enqueued")
+            .expected_mcp_bridge_agent_instance_id = Some(expected_agent_instance_id.to_string());
         inner.mcp_bridge_waiters.insert(request_id.clone(), tx);
         notify_client_locked(&inner, client_id);
         Ok((request_id, rx))

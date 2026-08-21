@@ -18,6 +18,15 @@ fn test_router(
     let runtime = Arc::new(ToolRuntime::new_for_tests_with_shell_clients(Arc::clone(
         &registry,
     )));
+    test_router_with_runtime(config, db, registry, runtime)
+}
+
+fn test_router_with_runtime(
+    config: Arc<crate::Config>,
+    db: Arc<crate::Database>,
+    registry: Arc<ShellClientRegistry>,
+    runtime: Arc<ToolRuntime>,
+) -> Router {
     Router::new()
         .hoop(affix_state::inject(config))
         .hoop(affix_state::inject(db))
@@ -148,7 +157,15 @@ fn spawn_fake_runner(
 }
 
 async fn rpc(service: &Service, endpoint: &str, id: u64, method: &str, params: Value) -> Value {
-    let mut response = TestClient::post(format!("http://localhost{endpoint}"))
+    let mut request = TestClient::post(format!("http://localhost{endpoint}")).add_header(
+        "accept",
+        "application/json, text/event-stream",
+        true,
+    );
+    if method != "initialize" {
+        request = request.add_header(MCP_PROTOCOL_VERSION_HEADER, MCP_PROTOCOL_VERSION, true);
+    }
+    let mut response = request
         .json(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -190,12 +207,25 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
     assert!(!endpoint.contains("bridge-http-runner"));
     assert!(!endpoint.contains("local-test"));
 
+    let exact_get = TestClient::get(format!("http://localhost{endpoint}"))
+        .send(&service)
+        .await;
+    assert_eq!(
+        exact_get.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "exact Streamable HTTP endpoint must return 405 when SSE is unsupported"
+    );
+
     let initialized = rpc(
         &service,
         &endpoint,
         1,
         "initialize",
-        json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "bridge-test-client", "version": "1"}
+        }),
     )
     .await;
     assert_eq!(
@@ -203,6 +233,50 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
         MCP_PROTOCOL_VERSION
     );
     assert!(initialized["result"]["capabilities"]["tools"].is_object());
+
+    let mut missing_version = TestClient::post(format!("http://localhost{endpoint}"))
+        .json(&json!({"jsonrpc":"2.0","id":20,"method":"ping","params":{}}))
+        .send(&service)
+        .await;
+    assert_eq!(
+        missing_version.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::BAD_REQUEST
+    );
+    let missing_version = missing_version.take_json::<Value>().await.unwrap();
+    assert_eq!(missing_version["error"]["code"], -32600);
+
+    let mut unknown_envelope = TestClient::post(format!("http://localhost{endpoint}"))
+        .add_header(MCP_PROTOCOL_VERSION_HEADER, MCP_PROTOCOL_VERSION, true)
+        .json(&json!({
+            "jsonrpc":"2.0",
+            "id":21,
+            "method":"ping",
+            "params":{},
+            "raw_jsonrpc":{}
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        unknown_envelope.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::BAD_REQUEST
+    );
+    let unknown_envelope = unknown_envelope.take_json::<Value>().await.unwrap();
+    assert_eq!(unknown_envelope["error"]["code"], -32600);
+
+    let oversized = format!(
+        r#"{{"jsonrpc":"2.0","id":22,"method":"ping","params":{{}},"junk":"{}"}}"#,
+        "x".repeat(MCP_BRIDGE_MAX_MESSAGE_BYTES)
+    );
+    let oversized = TestClient::post(format!("http://localhost{endpoint}"))
+        .add_header("content-type", "application/json", true)
+        .add_header(MCP_PROTOCOL_VERSION_HEADER, MCP_PROTOCOL_VERSION, true)
+        .body(oversized)
+        .send(&service)
+        .await;
+    assert_eq!(
+        oversized.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
 
     let listed = rpc(&service, &endpoint, 2, "tools/list", json!({})).await;
     assert_eq!(listed["result"]["tools"][0]["name"], "echo");
@@ -230,6 +304,68 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
         StatusCode::OK,
         "the pre-existing /mcp surface must remain independently mounted"
     );
+    runner.abort();
+}
+
+#[tokio::test]
+async fn hosted_bridge_respects_restricted_authority_before_tool_dispatch() {
+    let config = test_config(None);
+    let (_temp, db) = test_db();
+    let registry = Arc::new(ShellClientRegistry::default());
+    register_runner(&registry).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = spawn_fake_runner(Arc::clone(&registry), Arc::clone(&calls));
+    let runtime = ToolRuntime::new_for_tests_with_shell_clients(Arc::clone(&registry))
+        .with_permission_evaluator(
+            crate::tool_runtime::permissions::PermissionEvaluator::with_mode(
+                crate::tool_runtime::permissions::AuthorityMode::Restricted,
+            ),
+        );
+    let service = Service::new(test_router_with_runtime(
+        config,
+        db,
+        Arc::clone(&registry),
+        Arc::new(runtime),
+    ));
+
+    let mut discovery = TestClient::get("http://localhost/mcp/bridge")
+        .send(&service)
+        .await;
+    let discovery = discovery.take_json::<Value>().await.unwrap();
+    let endpoint = discovery["providers"][0]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = rpc(
+        &service,
+        &endpoint,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "restricted-test", "version": "1"}
+        }),
+    )
+    .await;
+
+    let mut denied = TestClient::post(format!("http://localhost{endpoint}"))
+        .add_header(MCP_PROTOCOL_VERSION_HEADER, MCP_PROTOCOL_VERSION, true)
+        .json(&json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{"name":"echo","arguments":{"value":"blocked"}}
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(
+        denied.status_code.unwrap_or(StatusCode::OK),
+        StatusCode::FORBIDDEN
+    );
+    let denied = denied.take_json::<Value>().await.unwrap();
+    assert_eq!(denied["error"]["data"]["dispatchState"], "not_started");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     runner.abort();
 }
 

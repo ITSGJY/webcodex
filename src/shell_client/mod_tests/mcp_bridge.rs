@@ -77,6 +77,52 @@ async fn bridge_enqueue_rechecks_owner_and_exact_runner_instance() {
 }
 
 #[tokio::test]
+async fn bridge_dequeue_rechecks_exact_runner_instance_after_replacement() {
+    let registry = ShellClientRegistry::default();
+    register_bridge_runner(&registry).await;
+    let mut alice = AuthContext::new(AuthKind::ApiToken);
+    alice.username = Some("alice".to_string());
+    let (_request_id, receiver) = registry
+        .enqueue_mcp_bridge(
+            "bridge-runner",
+            "bridge-instance",
+            discover_request(),
+            Some(&alice),
+            "test".to_string(),
+        )
+        .await
+        .unwrap();
+
+    // Simulate the narrow invariant violation between admission and dequeue.
+    // Normal replacement registration already drains synchronous requests, but
+    // dequeue itself must carry the exact process fence rather than relying on
+    // that separate lifecycle path forever.
+    {
+        let mut inner = registry.inner.lock().await;
+        inner
+            .clients
+            .get_mut("bridge-runner")
+            .unwrap()
+            .agent_instance_id = "replacement-instance".to_string();
+    }
+    let polled = registry
+        .poll(ShellAgentPollRequest {
+            client_id: "bridge-runner".to_string(),
+            agent_instance_id: "replacement-instance".to_string(),
+            projects: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        polled.is_none(),
+        "replacement Runner must not receive stale bridge work"
+    );
+    let response = receiver.await.unwrap();
+    assert_eq!(response.dispatch_state, McpBridgeDispatchState::NotStarted);
+    assert_eq!(response.error.as_ref().unwrap().code, "stale_runner");
+}
+
+#[tokio::test]
 async fn dispatched_bridge_disconnect_is_outcome_unknown_and_not_replayed() {
     let registry = ShellClientRegistry::default();
     register_bridge_runner(&registry).await;

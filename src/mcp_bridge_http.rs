@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 const BRIDGE_ID_PREFIX: &str = "wc_mcpb_";
 const MAX_DISCOVERY_RUNNERS: usize = 16;
 const MAX_HOSTED_PROVIDERS: usize = 64;
@@ -27,6 +28,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const BRIDGE_CALL_TIMEOUT: Duration = Duration::from_secs(125);
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JsonRpcRequest {
     #[serde(default)]
     jsonrpc: Option<String>,
@@ -47,6 +49,78 @@ struct ToolCallParams {
 
 fn empty_object() -> Value {
     json!({})
+}
+
+fn validate_initialize_params(params: &Value) -> Result<(), &'static str> {
+    let Some(params) = params.as_object() else {
+        return Err("initialize params must be an object");
+    };
+    if params.get("protocolVersion").and_then(Value::as_str) != Some(MCP_PROTOCOL_VERSION) {
+        return Err("unsupported MCP protocol version");
+    }
+    if !params.get("capabilities").is_some_and(Value::is_object) {
+        return Err("initialize requires object capabilities");
+    }
+    let Some(client_info) = params.get("clientInfo").and_then(Value::as_object) else {
+        return Err("initialize requires object clientInfo");
+    };
+    for field in ["name", "version"] {
+        if !client_info
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 128
+                    && !value.chars().any(char::is_control)
+            })
+        {
+            return Err("initialize clientInfo requires bounded name and version");
+        }
+    }
+    Ok(())
+}
+
+fn validate_protocol_header(req: &Request, method: &str) -> Result<(), &'static str> {
+    let version = match req.headers().get(MCP_PROTOCOL_VERSION_HEADER) {
+        Some(value) => Some(
+            value
+                .to_str()
+                .map_err(|_| "invalid MCP-Protocol-Version")?
+                .trim(),
+        ),
+        None => None,
+    };
+    match (method, version) {
+        ("initialize", None) => Ok(()),
+        (_, Some(version)) if version == MCP_PROTOCOL_VERSION => Ok(()),
+        (_, Some(_)) => Err("unsupported MCP-Protocol-Version"),
+        (_, None) => Err("MCP-Protocol-Version is required after initialize"),
+    }
+}
+
+fn downstream_execution_authorized(depot: &Depot) -> bool {
+    depot
+        .obtain::<Arc<crate::tool_runtime::ToolRuntime>>()
+        .ok()
+        .is_some_and(|runtime| runtime.permission_evaluator.config().auto_authorize())
+}
+
+fn render_execution_authority_denied(res: &mut Response, id: Option<Value>, operation: &str) {
+    render_rpc(
+        res,
+        StatusCode::FORBIDDEN,
+        rpc_error(
+            id,
+            -32022,
+            format!(
+                "MCP bridge {operation} is not authorized by the current execution authority mode"
+            ),
+            Some(json!({
+                "dispatchState": "not_started",
+                "retryable": false
+            })),
+        ),
+    );
 }
 
 #[derive(Clone)]
@@ -121,31 +195,17 @@ pub async fn bridge_info(req: &mut Request, depot: &mut Depot, res: &mut Respons
         return;
     };
     let auth = depot.obtain::<AuthContext>().ok().cloned();
-    let target = match resolve_target(&registry, auth.as_ref(), &bridge_id).await {
-        Ok(Some(target)) => target,
+    match resolve_target(&registry, auth.as_ref(), &bridge_id).await {
+        Ok(Some(_)) => {
+            // Streamable HTTP GET is the SSE-listening operation. V1 does not
+            // implement SSE, so an existing exact endpoint must return 405.
+            res.status_code(StatusCode::METHOD_NOT_ALLOWED);
+        }
         Ok(None) => {
             render_http_error(res, StatusCode::NOT_FOUND, "MCP bridge resource not found");
-            return;
         }
-        Err(error) => {
-            render_http_error(res, StatusCode::SERVICE_UNAVAILABLE, error);
-            return;
-        }
-    };
-    res.render(Json(json!({
-        "name": target.provider.name,
-        "version": env!("CARGO_PKG_VERSION"),
-        "protocol": "mcp",
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "transport": "streamable-http-jsonrpc",
-        "endpoint": format!("/mcp/bridge/{}", target.bridge_id),
-        "methods": ["initialize", "notifications/initialized", "ping", "tools/list", "tools/call"],
-        "available": target.provider.available,
-        "auth": {
-            "type": "bearer",
-            "scope": crate::auth::SCOPE_MCP_BRIDGE
-        }
-    })));
+        Err(error) => render_http_error(res, StatusCode::SERVICE_UNAVAILABLE, error),
+    }
 }
 
 #[handler]
@@ -164,8 +224,27 @@ pub async fn bridge_post(req: &mut Request, depot: &mut Depot, res: &mut Respons
         );
         return;
     };
-    let request: JsonRpcRequest = match req.parse_json().await {
-        Ok(request) => request,
+    let bytes = match req
+        .payload_with_max_size(MCP_BRIDGE_MAX_MESSAGE_BYTES)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            render_rpc(
+                res,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                rpc_error(
+                    None,
+                    -32600,
+                    "MCP bridge request exceeds the bounded message limit",
+                    None,
+                ),
+            );
+            return;
+        }
+    };
+    let raw: Value = match serde_json::from_slice(bytes) {
+        Ok(raw) => raw,
         Err(_) => {
             render_rpc(
                 res,
@@ -175,31 +254,35 @@ pub async fn bridge_post(req: &mut Request, depot: &mut Depot, res: &mut Respons
             return;
         }
     };
-    if serde_json::to_vec(&json!({
-        "jsonrpc": &request.jsonrpc,
-        "method": &request.method,
-        "params": &request.params,
-        "id": &request.id
-    }))
-    .map_or(true, |encoded| encoded.len() > MCP_BRIDGE_MAX_MESSAGE_BYTES)
-    {
-        render_rpc(
-            res,
-            StatusCode::BAD_REQUEST,
-            rpc_error(
-                request.id,
-                -32600,
-                "MCP bridge request exceeds the bounded message limit",
-                None,
-            ),
-        );
-        return;
-    }
+    let request: JsonRpcRequest = match serde_json::from_value(raw) {
+        Ok(request) => request,
+        Err(_) => {
+            render_rpc(
+                res,
+                StatusCode::BAD_REQUEST,
+                rpc_error(None, -32600, "Invalid JSON-RPC envelope", None),
+            );
+            return;
+        }
+    };
     if request.jsonrpc.as_deref() != Some("2.0") {
         render_rpc(
             res,
             StatusCode::BAD_REQUEST,
             rpc_error(request.id, -32600, "jsonrpc must be '2.0'", None),
+        );
+        return;
+    }
+    if let Err(message) = validate_protocol_header(req, &request.method) {
+        render_rpc(
+            res,
+            StatusCode::BAD_REQUEST,
+            rpc_error(
+                request.id.clone(),
+                -32600,
+                message,
+                Some(json!({"supportedProtocolVersion": MCP_PROTOCOL_VERSION})),
+            ),
         );
         return;
     }
@@ -294,17 +377,12 @@ pub async fn bridge_post(req: &mut Request, depot: &mut Depot, res: &mut Respons
     let id = request.id.clone();
     let response = match request.method.as_str() {
         "initialize" => {
-            if request
-                .params
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                != Some(MCP_PROTOCOL_VERSION)
-            {
+            if let Err(message) = validate_initialize_params(&request.params) {
                 rpc_error(
                     id,
                     -32602,
-                    format!("Unsupported MCP protocol version; expected {MCP_PROTOCOL_VERSION}"),
-                    None,
+                    message,
+                    Some(json!({"supportedProtocolVersion": MCP_PROTOCOL_VERSION})),
                 )
             } else {
                 rpc_result(
@@ -347,6 +425,10 @@ pub async fn bridge_post(req: &mut Request, depot: &mut Depot, res: &mut Respons
                         None,
                     ),
                 );
+                return;
+            }
+            if !downstream_execution_authorized(depot) {
+                render_execution_authority_denied(res, id, "tools/list");
                 return;
             }
             let operation = McpBridgeRequest::ToolsList {
@@ -392,16 +474,25 @@ pub async fn bridge_post(req: &mut Request, depot: &mut Depot, res: &mut Respons
                     None,
                 )
             } else {
+                if !downstream_execution_authorized(depot) {
+                    render_execution_authority_denied(res, id, "tools/call");
+                    return;
+                }
                 match invoke_exact(&registry, auth.as_ref(), &target, operation).await {
-                    Ok(McpBridgeResponsePayload::ToolResult { result }) => rpc_result(
-                        id,
-                        serde_json::to_value(result).unwrap_or_else(|_| {
-                            json!({
-                                "content": [{"type": "text", "text": "Bridge result serialization failed"}],
-                                "isError": true
-                            })
-                        }),
-                    ),
+                    Ok(McpBridgeResponsePayload::ToolResult { result }) => {
+                        match serde_json::to_value(result) {
+                            Ok(result) => rpc_result(id, result),
+                            Err(_) => rpc_error(
+                                id,
+                                -32603,
+                                "Failed to encode completed MCP tool result",
+                                Some(json!({
+                                    "dispatchState": "completed",
+                                    "retryable": false
+                                })),
+                            ),
+                        }
+                    }
                     Ok(_) => rpc_error(
                         id,
                         -32603,

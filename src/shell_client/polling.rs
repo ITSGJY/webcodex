@@ -92,6 +92,59 @@ impl ShellClientRegistry {
             let Some(request_id) = request_id else {
                 return Ok(None);
             };
+            let stale_bridge_error =
+                inner.pending_by_id.get(&request_id).and_then(|pending| {
+                    match (
+                        pending.request.mcp_bridge.is_some(),
+                        pending.expected_mcp_bridge_agent_instance_id.as_deref(),
+                    ) {
+                        (true, Some(expected_instance)) => inner
+                            .clients
+                            .get(&body.client_id)
+                            .filter(|client| client.agent_instance_id == expected_instance)
+                            .is_none()
+                            .then_some(
+                                "stale_mcp_bridge: target Runner changed before dispatch"
+                                    .to_string(),
+                            ),
+                        (true, None) | (false, Some(_)) => Some(
+                            "stale_mcp_bridge: pending exact-Runner fence is incomplete"
+                                .to_string(),
+                        ),
+                        (false, None) => None,
+                    }
+                });
+            if let Some(error) = stale_bridge_error {
+                let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
+                    continue;
+                };
+                if let Some(waiter) = pending.waiter.take() {
+                    let response = ShellRunResponse {
+                        success: false,
+                        request_id: request_id.clone(),
+                        client_id: body.client_id.clone(),
+                        cwd: pending.request.cwd.clone(),
+                        command_preview: request_preview(&pending.request),
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        duration_ms: None,
+                        error: Some(error.clone()),
+                        request_dispatched: Some(false),
+                        command_execution_state: Some(ShellCommandExecutionState::NotStarted),
+                    };
+                    let _ = waiter.send(response);
+                }
+                if let Some(waiter) = inner.mcp_bridge_waiters.remove(&request_id) {
+                    let _ = waiter.send(McpBridgeResponse::error(
+                        McpBridgeDispatchState::NotStarted,
+                        "stale_runner",
+                        "Exact Runner changed before bridge dispatch; request was not started",
+                    ));
+                }
+                inner.persistent_waiters.remove(&request_id);
+                continue;
+            }
             let stale_project_error = inner.pending_by_id.get(&request_id).and_then(|pending| {
                 match (
                     pending.expected_project_id.as_deref(),

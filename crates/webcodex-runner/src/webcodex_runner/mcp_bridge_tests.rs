@@ -163,6 +163,7 @@ fn initialization_failure_is_not_misreported_as_tool_dispatch() {
     for (scenario, code) in [
         ("init_crash", "provider_eof"),
         ("init_timeout", "provider_timeout"),
+        ("init_missing_tools", "provider_initialize_invalid"),
     ] {
         let fixture = Fixture::new(scenario, 1);
         let provider = fixture.provider();

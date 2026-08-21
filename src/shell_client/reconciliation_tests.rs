@@ -1133,6 +1133,7 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_client_owner: None,
                 expected_project_id: None,
                 expected_project_cwd: None,
+                expected_mcp_bridge_agent_instance_id: None,
                 dispatched: true,
             },
         );
@@ -1148,6 +1149,7 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 expected_client_owner: None,
                 expected_project_id: None,
                 expected_project_cwd: None,
+                expected_mcp_bridge_agent_instance_id: None,
                 dispatched: false,
             },
         );

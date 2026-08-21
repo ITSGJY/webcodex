@@ -68,9 +68,13 @@ argv, environment values, or stderr.
 
 V1 is stateless JSON Streamable HTTP using MCP protocol version `2025-06-18`.
 It supports `initialize`, `notifications/initialized`, `ping`, `tools/list`,
-and `tools/call`. It deliberately does not provide resources, prompts,
-sampling, elicitation, roots, completion, subscriptions, server-to-client
-callbacks, MCP Apps, SSE compatibility, or arbitrary JSON-RPC tunneling.
+and `tools/call`. A valid `initialize` includes `protocolVersion`, object
+`capabilities`, and bounded `clientInfo` name/version. Subsequent POSTs must
+carry `MCP-Protocol-Version: 2025-06-18`. Because V1 does not implement SSE, a
+GET to the exact `/mcp/bridge/<bridge_id>` MCP endpoint returns HTTP 405. V1
+deliberately does not provide resources, prompts, sampling, elicitation, roots,
+completion, subscriptions, server-to-client callbacks, MCP Apps, SSE
+compatibility, or arbitrary JSON-RPC tunneling.
 Downstream provider content is text-only in V1; image/binary content and
 excessive or malformed descriptors, schemas, arguments, messages, and results
 are rejected at bounded validation gates.
@@ -82,8 +86,11 @@ shared-key OAuth bridging, open-anonymous access, project-share credentials,
 and Runner transport tokens do not carry this scope. Scope possession is only
 the route gate: WebCodex also rechecks the principal's existing Runner
 owner/shared-key/project identity binding and the exact live Runner/provider
-identity when dispatching every `tools/call`. `tools/list` is discovery UX, not
-authoritative permission for a later call.
+identity when dispatching provider operations. `tools/list` and `tools/call`
+are additionally subject to the global execution-authority mode because both
+can cause local provider code to run; restricted/invalid authority fails closed
+before provider dispatch. `tools/list` remains discovery UX, not authoritative
+permission for a later call.
 
 Every third-party `tools/call` is treated as potentially effectful. WebCodex
 never automatically retries it after Runner dispatch. If the local provider
