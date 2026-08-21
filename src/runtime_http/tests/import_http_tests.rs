@@ -477,6 +477,7 @@ async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path()
         is_bootstrap: true,
         token_kind: None,
         allowed_client_id: None,
+        oauth_resource: None,
         shared_key_hash: None,
         project_grant_id: None,
     };
@@ -550,6 +551,7 @@ async fn runtime_conversation_import_rejects_non_mcp_transport() {
         is_bootstrap: true,
         token_kind: None,
         allowed_client_id: None,
+        oauth_resource: None,
         shared_key_hash: None,
         project_grant_id: None,
     };

@@ -237,7 +237,7 @@ impl TokenVerifier for OAuth2Verifier {
             }
         };
 
-        let ctx = match at_record.subject_kind.as_str() {
+        let mut ctx = match at_record.subject_kind.as_str() {
             "managed_user" => {
                 let user_id = at_record
                     .user_id
@@ -335,6 +335,7 @@ impl TokenVerifier for OAuth2Verifier {
             }
             _ => return Err("unsupported OAuth2 subject".to_string()),
         };
+        ctx.oauth_resource = at_record.resource.clone();
 
         // All checks passed — update last_used_at.
         if let Err(e) = db.update_oauth_access_token_last_used(&at_record.id, now) {

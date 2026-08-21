@@ -25,6 +25,7 @@ pub(in crate::tool_runtime::tests) fn auth_context(
             Some("user".to_string())
         },
         allowed_client_id: None,
+        oauth_resource: None,
         shared_key_hash: None,
         project_grant_id: None,
     }
@@ -49,6 +50,7 @@ pub(in crate::tool_runtime::tests) fn shared_key_auth_context(
         is_bootstrap: false,
         token_kind: Some("shared-key".to_string()),
         allowed_client_id: None,
+        oauth_resource: None,
         shared_key_hash: Some(hash.to_string()),
         project_grant_id: None,
     }
@@ -68,6 +70,7 @@ pub(in crate::tool_runtime::tests) fn oauth_bridge_auth_context(
         is_bootstrap: false,
         token_kind: Some("oauth2_shared_key".to_string()),
         allowed_client_id: Some("oauth-client".to_string()),
+        oauth_resource: None,
         shared_key_hash: Some(hash.to_string()),
         project_grant_id: None,
     }
@@ -91,6 +94,7 @@ pub(in crate::tool_runtime::tests) fn managed_oauth_auth_context(
         is_bootstrap: false,
         token_kind: Some("oauth2".to_string()),
         allowed_client_id: Some("oauth-client".to_string()),
+        oauth_resource: None,
         shared_key_hash: shared_key_hash.map(str::to_string),
         project_grant_id: None,
     }
@@ -113,6 +117,7 @@ pub(in crate::tool_runtime::tests) fn open_auth_context() -> crate::auth::AuthCo
         is_bootstrap: false,
         token_kind: Some("open".to_string()),
         allowed_client_id: None,
+        oauth_resource: None,
         shared_key_hash: None,
         project_grant_id: None,
     }

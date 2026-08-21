@@ -40,6 +40,9 @@ pub struct AuthContext {
     pub is_bootstrap: bool,
     pub token_kind: Option<String>,
     pub allowed_client_id: Option<String>,
+    /// RFC 8707 audience bound to a WebCodex-issued OAuth access token.
+    /// Non-OAuth credentials leave this unset.
+    pub oauth_resource: Option<String>,
     /// SHA-256 of a quick-start shared key or OAuth bridge subject key.
     /// Plaintext shared keys are never retained.
     pub shared_key_hash: Option<String>,
@@ -59,6 +62,7 @@ impl AuthContext {
             is_bootstrap: false,
             token_kind: None,
             allowed_client_id: None,
+            oauth_resource: None,
             shared_key_hash: None,
             project_grant_id: None,
         }

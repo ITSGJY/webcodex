@@ -37,21 +37,29 @@ struct TokenRequest {
 /// Resolve the RFC 8707 resource indicator for a token grant while retaining
 /// compatibility with pre-resource clients. When the authorization grant is
 /// already resource-bound, a token request may only repeat the same target.
-fn resolve_token_resource(
+async fn resolve_token_resource(
     config: &crate::Config,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
     requested: Option<&str>,
     authorized: Option<&str>,
 ) -> Result<Option<String>, ()> {
-    let Some(requested) = requested else {
-        return Ok(authorized.map(str::to_string));
-    };
-    let normalized = validate_authorize_resource(Some(requested), config).map_err(|_| ())?;
-    if let Some(authorized) = authorized {
-        if normalized.as_deref() != Some(authorized) {
-            return Err(());
+    let resolved = match requested {
+        Some(requested) => {
+            let normalized =
+                validate_authorize_resource(Some(requested), config).map_err(|_| ())?;
+            if let Some(authorized) = authorized {
+                if normalized.as_deref() != Some(authorized) {
+                    return Err(());
+                }
+            }
+            normalized
         }
-    }
-    Ok(normalized)
+        None => authorized.map(str::to_string),
+    };
+    super::validate_current_hosted_bridge_resource(config, registry, resolved.as_deref())
+        .await
+        .map_err(|_| ())?;
+    Ok(resolved)
 }
 
 #[handler]
@@ -230,6 +238,10 @@ pub(crate) async fn oauth_token(req: &mut Request, depot: &mut Depot, res: &mut 
         );
         return;
     };
+    let registry = depot
+        .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+        .ok()
+        .cloned();
 
     // --- Client authentication (before any token operations) ---
     let secret_ok = match db.verify_oauth_client_secret(client_id, client_secret) {
@@ -276,10 +288,20 @@ pub(crate) async fn oauth_token(req: &mut Request, depot: &mut Depot, res: &mut 
     // --- Dispatch by grant_type ---
     match grant_type {
         "authorization_code" => {
-            handle_authorization_code_grant(&config, &db, &client, &form, now, res).await;
+            handle_authorization_code_grant(
+                &config,
+                &db,
+                registry.as_ref(),
+                &client,
+                &form,
+                now,
+                res,
+            )
+            .await;
         }
         "refresh_token" => {
-            handle_refresh_token_grant(&config, &db, &client, &form, now, res).await;
+            handle_refresh_token_grant(&config, &db, registry.as_ref(), &client, &form, now, res)
+                .await;
         }
         _ => {
             oauth_error(
@@ -295,6 +317,7 @@ pub(crate) async fn oauth_token(req: &mut Request, depot: &mut Depot, res: &mut 
 async fn handle_authorization_code_grant(
     config: &crate::Config,
     db: &crate::Database,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
     client: &crate::models::OAuthClientRecord,
     form: &TokenRequest,
     now: i64,
@@ -464,9 +487,12 @@ async fn handle_authorization_code_grant(
 
     let token_resource = match resolve_token_resource(
         config,
+        registry,
         form.resource.as_deref(),
         code_record.resource.as_deref(),
-    ) {
+    )
+    .await
+    {
         Ok(resource) => resource,
         Err(()) => {
             let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
@@ -564,6 +590,7 @@ async fn handle_authorization_code_grant(
 async fn handle_refresh_token_grant(
     config: &crate::Config,
     db: &crate::Database,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
     client: &crate::models::OAuthClientRecord,
     form: &TokenRequest,
     now: i64,
@@ -688,9 +715,12 @@ async fn handle_refresh_token_grant(
 
     let token_resource = match resolve_token_resource(
         config,
+        registry,
         form.resource.as_deref(),
         old_rt_metadata.resource.as_deref(),
-    ) {
+    )
+    .await
+    {
         Ok(resource) => resource,
         Err(()) => {
             oauth_error(

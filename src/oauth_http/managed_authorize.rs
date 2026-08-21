@@ -279,61 +279,6 @@ fn redirect_error_for_missing_authorize_param(error: &OAuthAuthorizeError) -> &'
     }
 }
 
-fn normalize_oauth_resource_indicator(resource: &str) -> Result<String, OAuthAuthorizeError> {
-    let resource = resource.trim();
-    if resource.is_empty() {
-        return Err(OAuthAuthorizeError::UnsupportedResource);
-    }
-
-    let parsed = url::Url::parse(resource).map_err(|_| OAuthAuthorizeError::UnsupportedResource)?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(OAuthAuthorizeError::UnsupportedResource);
-    }
-    if parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(OAuthAuthorizeError::UnsupportedResource);
-    }
-
-    let mut normalized = format!(
-        "{}://{}",
-        parsed.scheme(),
-        parsed
-            .host_str()
-            .ok_or(OAuthAuthorizeError::UnsupportedResource)?
-    );
-    if let Some(port) = parsed.port() {
-        normalized.push(':');
-        normalized.push_str(&port.to_string());
-    }
-
-    let mut path = parsed.path().to_string();
-    if path == "/" {
-        path.clear();
-    } else {
-        while path.ends_with('/') {
-            path.pop();
-        }
-    }
-    normalized.push_str(&path);
-    Ok(normalized)
-}
-
-fn allowed_oauth_resource_indicators(config: &crate::Config) -> Vec<String> {
-    let Some(base) = config.oauth2.issuer.as_deref() else {
-        return Vec::new();
-    };
-    let Ok(base) = normalize_oauth_resource_indicator(base) else {
-        return Vec::new();
-    };
-
-    let mcp = format!("{}/mcp", base);
-    vec![base, mcp]
-}
-
 pub(super) fn validate_authorize_resource(
     resource: Option<&str>,
     config: &crate::Config,
@@ -341,15 +286,9 @@ pub(super) fn validate_authorize_resource(
     let Some(resource) = resource else {
         return Ok(None);
     };
-    let normalized = normalize_oauth_resource_indicator(resource)?;
-    if allowed_oauth_resource_indicators(config)
-        .iter()
-        .any(|allowed| allowed == &normalized)
-    {
-        Ok(Some(normalized))
-    } else {
-        Err(OAuthAuthorizeError::UnsupportedResource)
-    }
+    crate::oauth_resource::validate_oauth_resource(config, resource)
+        .map(Some)
+        .ok_or(OAuthAuthorizeError::UnsupportedResource)
 }
 
 /// Cookie name carrying the opaque authorize session id.
@@ -545,7 +484,6 @@ pub(crate) async fn oauth_authorize_login(
         res.render(Json(serde_json::json!({"error": "no session store"})));
         return;
     };
-
     let pairs = match parse_form_body(req).await {
         Some(p) => p,
         None => {
@@ -668,6 +606,10 @@ pub(crate) async fn oauth_authorize_consent(
         res.render(Json(serde_json::json!({"error": "no session store"})));
         return;
     };
+    let registry = depot
+        .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+        .ok()
+        .cloned();
 
     // A valid first-party authorize session is mandatory. Hidden form fields
     // are NOT trusted for identity.
@@ -708,11 +650,13 @@ pub(crate) async fn oauth_authorize_consent(
 
     // Reconstruct the authorize query from the submitted hidden fields and
     // revalidate client / redirect_uri / scope / PKCE from scratch.
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    for (k, v) in pairs.iter().filter(|(k, _)| k != "decision") {
-        serializer.append_pair(k, v);
-    }
-    let query = serializer.finish();
+    let query = {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in pairs.iter().filter(|(k, _)| k != "decision") {
+            serializer.append_pair(k, v);
+        }
+        serializer.finish()
+    };
 
     // Always need client + redirect to issue a safe redirect (even for deny).
     let parsed = match parse_authorize_query(&query) {
@@ -804,6 +748,23 @@ pub(crate) async fn oauth_authorize_consent(
             return;
         }
     };
+    if super::validate_current_hosted_bridge_resource(
+        &config,
+        registry.as_ref(),
+        resource.as_deref(),
+    )
+    .await
+    .is_err()
+    {
+        redirect_with_oauth_error(
+            res,
+            &config,
+            &parsed.redirect_uri,
+            "invalid_target",
+            parsed.state.as_deref(),
+        );
+        return;
+    }
 
     // Issue the authorization code bound to the session's user.
     let now = chrono::Utc::now().timestamp();
@@ -910,6 +871,10 @@ pub(crate) async fn oauth_authorize(req: &mut Request, depot: &mut Depot, res: &
         );
         return;
     };
+    let registry = depot
+        .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+        .ok()
+        .cloned();
 
     let query = req.uri().query().unwrap_or("").to_string();
 
@@ -924,14 +889,12 @@ pub(crate) async fn oauth_authorize(req: &mut Request, depot: &mut Depot, res: &
                 );
                 return;
             }
-            let Some(validated) = validate_bridge_authorize_request(res, &config, &db, &query)
+            let Some(validated) =
+                validate_bridge_authorize_request(res, &config, &db, registry.as_ref(), &query)
+                    .await
             else {
                 return;
             };
-            let registry = depot
-                .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
-                .ok()
-                .cloned();
             render_bridge_authorize_form(res, &validated, &query, None, registry.as_deref(), &[])
                 .await;
             return;
@@ -951,8 +914,14 @@ pub(crate) async fn oauth_authorize(req: &mut Request, depot: &mut Depot, res: &
     match crate::auth::configured_project_share_subject(&config) {
         Ok(Some(_)) => {
             let Some(validated) = super::project_share::validate_project_share_authorize_request(
-                res, &config, &db, &query,
-            ) else {
+                res,
+                &config,
+                &db,
+                registry.as_ref(),
+                &query,
+            )
+            .await
+            else {
                 return;
             };
             super::project_share::render_project_share_authorize_form(
@@ -979,7 +948,15 @@ pub(crate) async fn oauth_authorize(req: &mut Request, depot: &mut Depot, res: &
         match crate::auth::authenticate(&config, Some(&db), &token).await {
             Ok(Some(ctx)) if is_authorize_identity_allowed(&ctx) && ctx.user_id.is_some() => {
                 let user_id = ctx.user_id.clone().unwrap();
-                authorize_issue_with_context(res, &config, &db, &user_id, &query).await;
+                authorize_issue_with_context(
+                    res,
+                    &config,
+                    &db,
+                    registry.as_ref(),
+                    &user_id,
+                    &query,
+                )
+                .await;
                 return;
             }
             Ok(Some(_)) => {
@@ -1008,7 +985,7 @@ pub(crate) async fn oauth_authorize(req: &mut Request, depot: &mut Depot, res: &
     // Path 2: browser first-party session cookie.
     if let Some(session_cookie) = authorize_session_id_from_request(req) {
         if session_store.get_session(&session_cookie).is_some() {
-            authorize_render_consent(res, &config, &db, &query);
+            authorize_render_consent(res, &config, &db, registry.as_ref(), &query).await;
             return;
         }
     }
@@ -1032,6 +1009,7 @@ async fn authorize_issue_with_context(
     res: &mut Response,
     config: &crate::Config,
     db: &crate::Database,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
     user_id: &str,
     query: &str,
 ) {
@@ -1247,6 +1225,19 @@ async fn authorize_issue_with_context(
             return;
         }
     };
+    if super::validate_current_hosted_bridge_resource(config, registry, resource.as_deref())
+        .await
+        .is_err()
+    {
+        redirect_with_oauth_error(
+            res,
+            config,
+            &redirect_uri,
+            "invalid_target",
+            parsed.state.as_deref(),
+        );
+        return;
+    }
 
     let now = chrono::Utc::now().timestamp();
     let plaintext_code = generate_oauth_authorization_code();
@@ -1298,10 +1289,11 @@ async fn authorize_issue_with_context(
 /// the user picks Allow/Deny. Unknown client / redirect mismatch produce a
 /// direct 400. Invalid scope produces a direct error page so the user is not
 /// shown a misleading consent prompt.
-fn authorize_render_consent(
+async fn authorize_render_consent(
     res: &mut Response,
     config: &crate::Config,
     db: &crate::Database,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
     query: &str,
 ) {
     let parsed = match parse_authorize_query(query) {
@@ -1366,6 +1358,19 @@ fn authorize_render_consent(
             return;
         }
     };
+    if super::validate_current_hosted_bridge_resource(config, registry, resource.as_deref())
+        .await
+        .is_err()
+    {
+        redirect_with_oauth_error(
+            res,
+            config,
+            &parsed.redirect_uri,
+            "invalid_target",
+            parsed.state.as_deref(),
+        );
+        return;
+    }
 
     let html = authorize_consent_html(
         &client.name,

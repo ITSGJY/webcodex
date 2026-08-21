@@ -180,8 +180,13 @@ pub(crate) fn oauth_route_scope_policy_for_path_method(
     let path = normalize_route_path(path);
 
     match (method.as_str(), path.as_str()) {
-        (_, "/.well-known/oauth-protected-resource")
-        | (_, "/.well-known/oauth-authorization-server")
+        (_, path)
+            if path == "/.well-known/oauth-protected-resource"
+                || path.starts_with("/.well-known/oauth-protected-resource/") =>
+        {
+            OAuthRouteScopePolicy::Public
+        }
+        (_, "/.well-known/oauth-authorization-server")
         | (_, "/oauth/token")
         | (_, "/oauth/revoke")
         | ("POST", "/oauth/authorize/login")
@@ -489,6 +494,10 @@ mod tests {
     fn oauth_route_policy_public_endpoints() {
         for (method, path) in [
             ("GET", "/.well-known/oauth-protected-resource"),
+            (
+                "GET",
+                "/.well-known/oauth-protected-resource/mcp/bridge/wc_mcpb_opaque",
+            ),
             ("GET", "/.well-known/oauth-authorization-server"),
             ("POST", "/oauth/token"),
             ("POST", "/oauth/revoke"),

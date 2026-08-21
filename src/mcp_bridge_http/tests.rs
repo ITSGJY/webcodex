@@ -50,13 +50,13 @@ fn test_router_with_runtime(
         )
 }
 
-async fn register_runner(registry: &ShellClientRegistry) {
+async fn register_runner_with_owner(registry: &ShellClientRegistry, owner: Option<&str>) {
     registry
         .register(ShellClientRegisterRequest {
             client_id: "bridge-http-runner".to_string(),
             agent_instance_id: "bridge-http-instance".to_string(),
             display_name: None,
-            owner: None,
+            owner: owner.map(str::to_string),
             hostname: None,
             capabilities: Some(ShellClientCapabilities {
                 mcp_bridge: true,
@@ -75,9 +75,30 @@ async fn register_runner(registry: &ShellClientRegistry) {
         .unwrap();
 }
 
+async fn register_runner(registry: &ShellClientRegistry) {
+    register_runner_with_owner(registry, None).await;
+}
+
 fn spawn_fake_runner(
     registry: Arc<ShellClientRegistry>,
     calls: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_fake_runner_with_providers(
+        registry,
+        calls,
+        vec![McpBridgeProvider {
+            provider_id: "local-test".to_string(),
+            provider_instance_id: "provider-instance".to_string(),
+            name: "Local test provider".to_string(),
+            available: true,
+        }],
+    )
+}
+
+fn spawn_fake_runner_with_providers(
+    registry: Arc<ShellClientRegistry>,
+    calls: Arc<AtomicUsize>,
+    providers: Vec<McpBridgeProvider>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -96,12 +117,7 @@ fn spawn_fake_runner(
             let response = match request.mcp_bridge.unwrap() {
                 McpBridgeRequest::Discover => {
                     McpBridgeResponse::success(McpBridgeResponsePayload::Providers {
-                        providers: vec![McpBridgeProvider {
-                            provider_id: "local-test".to_string(),
-                            provider_instance_id: "provider-instance".to_string(),
-                            name: "Local test provider".to_string(),
-                            available: true,
-                        }],
+                        providers: providers.clone(),
                     })
                 }
                 McpBridgeRequest::ToolsList { .. } => {
@@ -374,6 +390,7 @@ fn seed_oauth_token(
     client: &crate::models::OAuthClientRecord,
     user: &crate::models::UserRecord,
     scopes: &str,
+    resource: Option<&str>,
 ) -> String {
     let token = crate::auth::generate_oauth_access_token();
     let now = chrono::Utc::now().timestamp();
@@ -385,13 +402,36 @@ fn seed_oauth_token(
         subject_id: user.id.clone(),
         user_id: Some(user.id.clone()),
         scopes: scopes.to_string(),
-        resource: None,
+        resource: resource.map(str::to_string),
         shared_key_hash: None,
         created_at: now,
         expires_at: now + 3600,
         revoked_at: None,
         last_used_at: None,
     })
+    .unwrap();
+    token
+}
+
+fn seed_pat(db: &crate::Database, user: &crate::models::UserRecord, scopes: &str) -> String {
+    let token = crate::auth::generate_api_token();
+    let now = chrono::Utc::now().timestamp();
+    db.insert_api_key(
+        &crate::models::ApiKeyRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            user_id: user.id.clone(),
+            name: "hosted-bridge-test".to_string(),
+            key_prefix: crate::auth::token_prefix(&token),
+            created_at: now,
+            last_used_at: None,
+            revoked_at: None,
+            scopes: scopes.to_string(),
+            expires_at: None,
+            kind: crate::models::TOKEN_KIND_USER.to_string(),
+            allowed_client_id: None,
+        },
+        &crate::auth::hash_token(&token),
+    )
     .unwrap();
     token
 }
@@ -404,7 +444,7 @@ async fn hosted_bridge_requires_auth_and_the_fixed_bridge_scope() {
     let registry = Arc::new(ShellClientRegistry::default());
     let user = seed_user(&db, "alice");
     let client = seed_oauth_client(&db, &user);
-    let runtime_only = seed_oauth_token(&db, &client, &user, crate::auth::SCOPE_RUNTIME_READ);
+    let runtime_only = seed_oauth_token(&db, &client, &user, crate::auth::SCOPE_RUNTIME_READ, None);
     let service = Service::new(test_router(config, db, registry));
 
     let unauthenticated = TestClient::get("http://localhost/mcp/bridge")
@@ -423,4 +463,135 @@ async fn hosted_bridge_requires_auth_and_the_fixed_bridge_scope() {
         insufficient.status_code.unwrap_or(StatusCode::OK),
         StatusCode::FORBIDDEN
     );
+}
+
+#[tokio::test]
+async fn hosted_bridge_oauth_audience_is_exact_without_affecting_first_party_credentials() {
+    let _auth = crate::auth::AuthEnvGuard::auth_required();
+    let mut config = test_config_oauth2(Some("bootstrap-secret"));
+    Arc::get_mut(&mut config).unwrap().oauth2.issuer =
+        Some("https://codex.example.com".to_string());
+    let (_temp, db) = test_db();
+    let registry = Arc::new(ShellClientRegistry::default());
+    register_runner_with_owner(&registry, Some("alice")).await;
+    let providers = vec![
+        McpBridgeProvider {
+            provider_id: "provider-a".to_string(),
+            provider_instance_id: "instance-a".to_string(),
+            name: "Provider A".to_string(),
+            available: true,
+        },
+        McpBridgeProvider {
+            provider_id: "provider-b".to_string(),
+            provider_instance_id: "instance-b".to_string(),
+            name: "Provider B".to_string(),
+            available: true,
+        },
+    ];
+    let bridge_a = opaque_bridge_id("bridge-http-runner", "bridge-http-instance", &providers[0]);
+    let bridge_b = opaque_bridge_id("bridge-http-runner", "bridge-http-instance", &providers[1]);
+    let endpoint_a = format!("/mcp/bridge/{bridge_a}");
+    let endpoint_b = format!("/mcp/bridge/{bridge_b}");
+    let resource_a = format!("https://codex.example.com{endpoint_a}");
+    let resource_mcp = "https://codex.example.com/mcp";
+    let user = seed_user(&db, "alice");
+    let client = seed_oauth_client(&db, &user);
+    let pat = seed_pat(&db, &user, crate::auth::SCOPE_MCP_BRIDGE);
+    let token_a = seed_oauth_token(
+        &db,
+        &client,
+        &user,
+        crate::auth::SCOPE_MCP_BRIDGE,
+        Some(&resource_a),
+    );
+    let mcp_token = seed_oauth_token(
+        &db,
+        &client,
+        &user,
+        &format!(
+            "{} {}",
+            crate::auth::SCOPE_RUNTIME_READ,
+            crate::auth::SCOPE_MCP_BRIDGE
+        ),
+        Some(resource_mcp),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = spawn_fake_runner_with_providers(Arc::clone(&registry), calls, providers);
+    let service = Service::new(test_router(config, db, registry));
+
+    let matching = TestClient::get(format!("http://localhost{endpoint_a}"))
+        .bearer_auth(&token_a)
+        .send(&service)
+        .await;
+    assert_eq!(matching.status_code, Some(StatusCode::METHOD_NOT_ALLOWED));
+
+    let bridge_b_rejected = TestClient::get(format!("http://localhost{endpoint_b}"))
+        .bearer_auth(&token_a)
+        .send(&service)
+        .await;
+    assert_eq!(
+        bridge_b_rejected.status_code,
+        Some(StatusCode::UNAUTHORIZED)
+    );
+    let bridge_b_challenge = bridge_b_rejected
+        .headers
+        .get("www-authenticate")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(bridge_b_challenge.contains("error=\"invalid_token\""));
+    assert!(bridge_b_challenge.contains(&format!(
+        "https://codex.example.com/.well-known/oauth-protected-resource/mcp/bridge/{bridge_b}"
+    )));
+
+    let generic_mcp_rejected = TestClient::get(format!("http://localhost{endpoint_a}"))
+        .bearer_auth(&mcp_token)
+        .send(&service)
+        .await;
+    assert_eq!(
+        generic_mcp_rejected.status_code,
+        Some(StatusCode::UNAUTHORIZED)
+    );
+
+    let ordinary_mcp = TestClient::get("http://localhost/mcp")
+        .bearer_auth(&mcp_token)
+        .send(&service)
+        .await;
+    assert_eq!(
+        ordinary_mcp.status_code,
+        Some(StatusCode::OK),
+        "ordinary /mcp audience behavior must remain regression-compatible"
+    );
+
+    let unauthenticated = TestClient::get(format!("http://localhost{endpoint_a}"))
+        .send(&service)
+        .await;
+    assert_eq!(unauthenticated.status_code, Some(StatusCode::UNAUTHORIZED));
+    let challenge = unauthenticated
+        .headers
+        .get("www-authenticate")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(challenge.contains(&format!(
+        "https://codex.example.com/.well-known/oauth-protected-resource/mcp/bridge/{bridge_a}"
+    )));
+
+    let bootstrap = TestClient::get(format!("http://localhost{endpoint_a}"))
+        .bearer_auth("bootstrap-secret")
+        .send(&service)
+        .await;
+    assert_eq!(
+        bootstrap.status_code,
+        Some(StatusCode::METHOD_NOT_ALLOWED),
+        "first-party bootstrap credentials must not be subjected to OAuth audience binding"
+    );
+    let pat = TestClient::get(format!("http://localhost{endpoint_a}"))
+        .bearer_auth(pat)
+        .send(&service)
+        .await;
+    assert_eq!(
+        pat.status_code,
+        Some(StatusCode::METHOD_NOT_ALLOWED),
+        "first-party PAT credentials must not be subjected to OAuth audience binding"
+    );
+    runner.abort();
 }

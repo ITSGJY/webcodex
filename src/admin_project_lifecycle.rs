@@ -786,6 +786,7 @@ mod tests {
             is_bootstrap: false,
             token_kind: Some("user".to_string()),
             allowed_client_id: None,
+            oauth_resource: None,
             shared_key_hash: None,
             project_grant_id: None,
         }

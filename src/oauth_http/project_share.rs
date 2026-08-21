@@ -40,10 +40,11 @@ pub(super) struct ProjectShareAuthorizeValidated {
     resource: Option<String>,
 }
 
-pub(super) fn validate_project_share_authorize_request(
+pub(super) async fn validate_project_share_authorize_request(
     res: &mut Response,
     config: &crate::Config,
     db: &crate::Database,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
     query: &str,
 ) -> Option<ProjectShareAuthorizeValidated> {
     let parsed = match parse_authorize_query(query) {
@@ -175,6 +176,19 @@ pub(super) fn validate_project_share_authorize_request(
             return None;
         }
     };
+    if super::validate_current_hosted_bridge_resource(config, registry, resource.as_deref())
+        .await
+        .is_err()
+    {
+        redirect_with_oauth_error(
+            res,
+            config,
+            &parsed.redirect_uri,
+            "invalid_target",
+            parsed.state.as_deref(),
+        );
+        return None;
+    }
 
     Some(ProjectShareAuthorizeValidated {
         parsed,
@@ -323,12 +337,20 @@ pub(crate) async fn oauth_authorize_project(
             return;
         }
     };
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    for (key, value) in pairs.iter().filter(|(key, _)| key != "project_credential") {
-        serializer.append_pair(key, value);
-    }
-    let query = serializer.finish();
-    let Some(validated) = validate_project_share_authorize_request(res, &config, &db, &query)
+    let query = {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in pairs.iter().filter(|(key, _)| key != "project_credential") {
+            serializer.append_pair(key, value);
+        }
+        serializer.finish()
+    };
+    let registry = depot
+        .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+        .ok()
+        .cloned();
+    let Some(validated) =
+        validate_project_share_authorize_request(res, &config, &db, registry.as_ref(), &query)
+            .await
     else {
         return;
     };

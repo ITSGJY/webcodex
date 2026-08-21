@@ -4,7 +4,7 @@
 //! discovery is a separate authenticated JSON endpoint at `/mcp/bridge`; each
 //! opaque provider resource lives at `/mcp/bridge/{bridge_id}`.
 
-use crate::auth::AuthContext;
+use crate::auth::{AuthContext, AuthKind};
 use crate::mcp_bridge::{
     validate_json_value, validate_request, McpBridgeDispatchState, McpBridgeProvider,
     McpBridgeRequest, McpBridgeResponse, McpBridgeResponsePayload, MCP_BRIDGE_MAX_MESSAGE_BYTES,
@@ -535,15 +535,20 @@ fn valid_rpc_id(id: Option<&Value>) -> bool {
 
 fn bridge_id_param(req: &Request) -> Option<String> {
     let value = req.param::<String>("bridge_id")?;
-    let suffix = value.strip_prefix(BRIDGE_ID_PREFIX)?;
-    (suffix.len() == 64
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    .then_some(value)
+    is_valid_bridge_id(&value).then_some(value)
 }
 
-fn opaque_bridge_id(
+pub(crate) fn is_valid_bridge_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(BRIDGE_ID_PREFIX) else {
+        return false;
+    };
+    suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn opaque_bridge_id(
     client_id: &str,
     agent_instance_id: &str,
     provider: &McpBridgeProvider,
@@ -634,6 +639,25 @@ async fn resolve_target(
         .await?
         .into_iter()
         .find(|target| target.bridge_id == bridge_id))
+}
+
+/// Resolve an opaque hosted bridge as internal resource-server state. This is
+/// used by public RFC 9728 metadata and OAuth grant validation, where there is
+/// not yet a bearer-token `AuthContext`. The opaque id is still checked
+/// against fresh Runner/provider discovery, so a restarted Runner or provider
+/// cannot inherit an older audience.
+pub(crate) async fn hosted_bridge_is_current(
+    registry: &Arc<ShellClientRegistry>,
+    bridge_id: &str,
+) -> Result<bool, &'static str> {
+    if !is_valid_bridge_id(bridge_id) {
+        return Ok(false);
+    }
+    let mut internal = AuthContext::new(AuthKind::Bootstrap);
+    internal.is_bootstrap = true;
+    resolve_target(registry, Some(&internal), bridge_id)
+        .await
+        .map(|target| target.is_some())
 }
 
 async fn invoke_exact(

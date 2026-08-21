@@ -633,6 +633,74 @@ async fn oauth_authorize_accepts_self_resource_mcp_endpoint() {
 }
 
 #[tokio::test]
+async fn exact_hosted_bridge_resource_survives_authorize_and_token_exchange() {
+    let config = test_config(oauth2_enabled_with_issuer("https://example.test"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let user_token = seed_user_token(&db, &user);
+    let (client, secret) = seed_client_with_redirects_scopes_and_secret(
+        &db,
+        &user,
+        "https://example.com/callback",
+        crate::auth::SCOPE_MCP_BRIDGE,
+    );
+    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let (_provider_instance, runner) =
+        start_test_hosted_bridge(&registry, "provider-instance-a").await;
+    let resource = test_hosted_bridge_resource(&config, "provider-instance-a");
+    let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let code_challenge = pkce_s256_challenge(code_verifier);
+    let service = Service::new(build_router_with_session_and_registry(
+        config,
+        db.clone(),
+        Arc::new(AuthorizeSessionStore::new()),
+        registry,
+    ));
+    let url = authorize_url(&[
+        ("response_type", "code"),
+        ("client_id", &client.client_id),
+        ("redirect_uri", "https://example.com/callback"),
+        ("scope", crate::auth::SCOPE_MCP_BRIDGE),
+        ("state", "state-1"),
+        ("code_challenge", &code_challenge),
+        ("code_challenge_method", "S256"),
+        ("resource", &resource),
+    ]);
+
+    let (_resp, _location, _parsed, code) =
+        authorize_success(&service, &db, &url, &user_token).await;
+    assert_eq!(
+        auth_code_by_plaintext(&db, &code).resource.as_deref(),
+        Some(resource.as_str())
+    );
+
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "https://example.com/callback"),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+        ("code_verifier", code_verifier),
+        ("resource", &resource),
+    ]);
+    let mut response = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    let body: serde_json::Value = response.take_json().await.unwrap();
+    assert_eq!(
+        access_token_resource_by_plaintext(&db, body["access_token"].as_str().unwrap()).as_deref(),
+        Some(resource.as_str())
+    );
+    assert_eq!(
+        refresh_token_resource_by_plaintext(&db, body["refresh_token"].as_str().unwrap())
+            .as_deref(),
+        Some(resource.as_str())
+    );
+    runner.abort();
+}
+
+#[tokio::test]
 async fn oauth_authorize_rejects_external_resource() {
     let config = test_config(oauth2_enabled_with_issuer("https://example.test"));
     let (_tmp, db) = test_db();

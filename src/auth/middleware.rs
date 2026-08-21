@@ -38,17 +38,68 @@ pub(crate) fn allow_query_token_for_path(path: &str) -> bool {
 }
 
 /// Build a `WWW-Authenticate: Bearer` challenge value that includes the
-/// protected resource metadata URL when OAuth2 is enabled. Returns `None`
-/// when OAuth2 is not configured or has no issuer.
-fn oauth2_bearer_challenge(config: &Config) -> Option<String> {
+/// RFC 9728 metadata URL for an exact hosted bridge when applicable. Other
+/// surfaces retain the existing root metadata URL.
+fn oauth2_bearer_challenge(
+    config: &Config,
+    request_path: &str,
+    invalid_token: bool,
+) -> Option<String> {
     if !config.oauth2.enabled {
         return None;
     }
     let issuer = config.oauth2.issuer.as_deref()?;
-    Some(format!(
-        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
-        issuer.trim_end_matches('/')
-    ))
+    let metadata =
+        crate::oauth_resource::hosted_bridge_resource_for_request_path(config, request_path)
+            .and_then(|resource| {
+                crate::oauth_resource::protected_resource_metadata_uri(&resource.uri)
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/.well-known/oauth-protected-resource",
+                    issuer.trim_end_matches('/')
+                )
+            });
+    let error = if invalid_token {
+        ", error=\"invalid_token\""
+    } else {
+        ""
+    };
+    Some(format!("Bearer resource_metadata=\"{metadata}\"{error}"))
+}
+
+fn oauth_hosted_bridge_audience_matches(
+    config: &Config,
+    ctx: &AuthContext,
+    request_path: &str,
+) -> bool {
+    if !ctx.is_oauth_token() {
+        return true;
+    }
+    if crate::oauth_resource::hosted_bridge_id_for_request_path(request_path).is_none() {
+        return true;
+    }
+    crate::oauth_resource::hosted_bridge_resource_for_request_path(config, request_path)
+        .is_some_and(|resource| ctx.oauth_resource.as_deref() == Some(resource.uri.as_str()))
+}
+
+fn render_oauth_invalid_audience(
+    config: &Config,
+    request_path: &str,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    res.status_code(StatusCode::UNAUTHORIZED);
+    if let Some(challenge) = oauth2_bearer_challenge(config, request_path, true) {
+        if let Ok(value) = salvo::http::HeaderValue::from_str(&challenge) {
+            res.headers_mut().insert("www-authenticate", value);
+        }
+    }
+    res.render(Json(serde_json::json!({
+        "error": "invalid_token",
+        "error_description": "access token audience does not match this MCP bridge resource",
+    })));
+    ctrl.skip_rest();
 }
 
 pub(crate) fn oauth_insufficient_scope_body(description: impl Into<String>) -> serde_json::Value {
@@ -346,7 +397,7 @@ impl Handler for AuthMiddleware {
                     return;
                 }
                 res.status_code(StatusCode::UNAUTHORIZED);
-                if let Some(challenge) = oauth2_bearer_challenge(&config) {
+                if let Some(challenge) = oauth2_bearer_challenge(&config, req.uri().path(), false) {
                     if let Ok(val) = salvo::http::HeaderValue::from_str(&challenge) {
                         res.headers_mut().insert("www-authenticate", val);
                     }
@@ -403,6 +454,10 @@ impl Handler for AuthMiddleware {
         // Run the verifier chain (PatVerifier → OAuth2Verifier).
         match authenticate(&config, db.as_ref(), &token).await {
             Ok(Some(ctx)) => {
+                if !oauth_hosted_bridge_audience_matches(&config, &ctx, req.uri().path()) {
+                    render_oauth_invalid_audience(&config, req.uri().path(), res, ctrl);
+                    return;
+                }
                 // Enforce token-kind surface restrictions (agent tokens,
                 // account credentials) before the handler runs.
                 if let Err((status, msg)) = enforce_request_surface(
@@ -458,7 +513,7 @@ impl Handler for AuthMiddleware {
                 }
                 // Unknown or managed-prefix-invalid token: reject.
                 res.status_code(StatusCode::UNAUTHORIZED);
-                if let Some(challenge) = oauth2_bearer_challenge(&config) {
+                if let Some(challenge) = oauth2_bearer_challenge(&config, req.uri().path(), false) {
                     if let Ok(val) = salvo::http::HeaderValue::from_str(&challenge) {
                         res.headers_mut().insert("www-authenticate", val);
                     }
@@ -475,7 +530,9 @@ impl Handler for AuthMiddleware {
                 };
                 res.status_code(status);
                 if status == StatusCode::UNAUTHORIZED {
-                    if let Some(challenge) = oauth2_bearer_challenge(&config) {
+                    if let Some(challenge) =
+                        oauth2_bearer_challenge(&config, req.uri().path(), false)
+                    {
                         if let Ok(val) = salvo::http::HeaderValue::from_str(&challenge) {
                             res.headers_mut().insert("www-authenticate", val);
                         }

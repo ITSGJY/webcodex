@@ -356,6 +356,53 @@ async fn oauth_token_exchange_rejects_mismatched_rfc8707_resource_parameter() {
 }
 
 #[tokio::test]
+async fn oauth_token_exchange_rejects_stale_hosted_bridge_resource() {
+    let config = test_config(oauth2_enabled_no_pkce_with_issuer("https://example.test"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_client(&db, &user, "Test App");
+    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let (provider_instance, runner) =
+        start_test_hosted_bridge(&registry, "provider-instance-old").await;
+    let stale_resource = test_hosted_bridge_resource(&config, "provider-instance-old");
+    let (_, code) = seed_auth_code_with_resource(
+        &db,
+        &client,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+        None,
+        None,
+        Some(&stale_resource),
+    );
+    *provider_instance.lock().unwrap() = "provider-instance-new".to_string();
+    let service = Service::new(build_router_with_session_and_registry(
+        config,
+        db.clone(),
+        Arc::new(AuthorizeSessionStore::new()),
+        registry,
+    ));
+    let before = oauth_token_counts(&db);
+    let body = form_body(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", "https://example.com/callback"),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+        ("resource", &stale_resource),
+    ]);
+    let mut response = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+
+    assert_eq!(response.status_code, Some(StatusCode::BAD_REQUEST));
+    let body: serde_json::Value = response.take_json().await.unwrap();
+    assert_eq!(body["error"], "invalid_target");
+    assert_eq!(oauth_token_counts(&db), before);
+    runner.abort();
+}
+
+#[tokio::test]
 async fn oauth_token_exchange_inherits_bridge_shared_key_hash_from_code() {
     let config = test_config(oauth2_enabled_no_pkce());
     let (_tmp, db) = test_db();
@@ -1603,6 +1650,48 @@ async fn oauth_refresh_token_inherits_resource() {
         refresh_token_resource_by_plaintext(&db, refresh_token).as_deref(),
         Some("https://example.test/mcp")
     );
+}
+
+#[tokio::test]
+async fn oauth_refresh_rotation_preserves_exact_hosted_bridge_audience() {
+    let config = test_config(oauth2_enabled_no_pkce_with_issuer("https://example.test"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let (client, secret) = seed_client(&db, &user, "Test App");
+    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let (_provider_instance, runner) =
+        start_test_hosted_bridge(&registry, "provider-instance-refresh").await;
+    let resource = test_hosted_bridge_resource(&config, "provider-instance-refresh");
+    let (_old_rt, old_rt_plaintext) =
+        seed_refresh_token_with_resource(&db, &client, &user, "runtime:read", Some(&resource));
+    let service = Service::new(build_router_with_session_and_registry(
+        config,
+        db.clone(),
+        Arc::new(AuthorizeSessionStore::new()),
+        registry,
+    ));
+    let body = form_body(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &old_rt_plaintext),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+    ]);
+    let mut response = post_form("http://localhost/oauth/token", body)
+        .send(&service)
+        .await;
+
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    let body: serde_json::Value = response.take_json().await.unwrap();
+    assert_eq!(
+        access_token_resource_by_plaintext(&db, body["access_token"].as_str().unwrap()).as_deref(),
+        Some(resource.as_str())
+    );
+    assert_eq!(
+        refresh_token_resource_by_plaintext(&db, body["refresh_token"].as_str().unwrap())
+            .as_deref(),
+        Some(resource.as_str())
+    );
+    runner.abort();
 }
 
 #[tokio::test]

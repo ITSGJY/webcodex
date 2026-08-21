@@ -67,6 +67,42 @@ async fn oauth_protected_resource_metadata_fields() {
 }
 
 #[tokio::test]
+async fn exact_hosted_bridge_metadata_uses_rfc9728_path_and_fails_closed_when_stale() {
+    let config = test_config(oauth2_enabled_with_issuer("https://codex.example.com/base"));
+    let (_tmp, db) = test_db();
+    let registry = Arc::new(crate::ShellClientRegistry::default());
+    let (provider_instance, runner) =
+        start_test_hosted_bridge(&registry, "provider-instance-metadata").await;
+    let resource = test_hosted_bridge_resource(&config, "provider-instance-metadata");
+    let metadata_uri = crate::oauth_resource::protected_resource_metadata_uri(&resource).unwrap();
+    assert!(metadata_uri.contains("/.well-known/oauth-protected-resource/base/mcp/bridge/wc_mcpb_"));
+    let service = Service::new(build_router_with_session_and_registry(
+        config,
+        db,
+        Arc::new(AuthorizeSessionStore::new()),
+        registry,
+    ));
+
+    let mut response = TestClient::get(metadata_uri.clone()).send(&service).await;
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    let body: serde_json::Value = response.take_json().await.unwrap();
+    assert_eq!(body["resource"], resource);
+    assert_eq!(
+        body["authorization_servers"][0],
+        "https://codex.example.com/base"
+    );
+    assert!(
+        body.get("scopes_supported").is_none(),
+        "exact metadata must not expand any OAuth scope ceiling"
+    );
+
+    *provider_instance.lock().unwrap() = "provider-instance-restarted".to_string();
+    let response = TestClient::get(metadata_uri).send(&service).await;
+    assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+    runner.abort();
+}
+
+#[tokio::test]
 async fn oauth_protected_resource_metadata_disabled_returns_404() {
     let config = test_config(oauth2_disabled());
     let (_tmp, db) = test_db();

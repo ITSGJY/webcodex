@@ -29,6 +29,7 @@ fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::Auth
             Some("user".to_string())
         },
         allowed_client_id: None,
+        oauth_resource: None,
         shared_key_hash: None,
         project_grant_id: None,
     }
@@ -51,6 +52,7 @@ fn agent_auth_context(
         is_bootstrap: false,
         token_kind: Some("agent".to_string()),
         allowed_client_id: Some(allowed_client_id.to_string()),
+        oauth_resource: None,
         shared_key_hash: None,
         project_grant_id: None,
     }
@@ -71,6 +73,7 @@ fn oauth_bridge_auth_context(hash: &str, scopes: Vec<&str>) -> crate::auth::Auth
         is_bootstrap: false,
         token_kind: Some("oauth2_shared_key".to_string()),
         allowed_client_id: Some("oauth-client".to_string()),
+        oauth_resource: None,
         shared_key_hash: Some(hash.to_string()),
         project_grant_id: None,
     }

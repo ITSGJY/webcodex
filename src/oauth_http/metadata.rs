@@ -38,6 +38,83 @@ pub(crate) async fn oauth_metadata(depot: &mut Depot, res: &mut Response) {
     res.render(Json(metadata));
 }
 
+/// Return RFC 9728 metadata for one exact hosted MCP bridge resource.
+///
+/// For `https://host/mcp/bridge/{id}`, RFC 9728 inserts the well-known suffix
+/// before the resource path, yielding
+/// `https://host/.well-known/oauth-protected-resource/mcp/bridge/{id}`.
+/// Metadata is emitted only while that opaque Runner/provider identity still
+/// resolves; stale identities are never mapped to a replacement.
+#[handler]
+pub(crate) async fn oauth_hosted_bridge_metadata(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let Some(config) = crate::auth::get_config(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(serde_json::json!({"error": "no config"})));
+        return;
+    };
+    if !config.oauth2.enabled {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(serde_json::json!({"error": "OAuth2 is not enabled"})));
+        return;
+    }
+
+    let Some(resource) =
+        crate::oauth_resource::hosted_bridge_resource_for_metadata_path(&config, req.uri().path())
+    else {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(
+            serde_json::json!({"error": "OAuth protected resource not found"}),
+        ));
+        return;
+    };
+    let Some(registry) = depot
+        .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
+        .ok()
+        .cloned()
+    else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(Json(
+            serde_json::json!({"error": "MCP bridge registry unavailable"}),
+        ));
+        return;
+    };
+    match crate::mcp_bridge_http::hosted_bridge_is_current(&registry, &resource.bridge_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(
+                serde_json::json!({"error": "OAuth protected resource not found"}),
+            ));
+            return;
+        }
+        Err(_) => {
+            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            res.render(Json(
+                serde_json::json!({"error": "MCP bridge discovery unavailable"}),
+            ));
+            return;
+        }
+    }
+
+    let Some(issuer) = config.oauth2.issuer.as_deref() else {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(
+            serde_json::json!({"error": "OAuth protected resource not found"}),
+        ));
+        return;
+    };
+    res.render(Json(serde_json::json!({
+        "resource": resource.uri,
+        "authorization_servers": [issuer],
+        "bearer_methods_supported": ["header"],
+        "resource_name": "WebCodex MCP Bridge",
+    })));
+}
+
 /// Return OAuth Authorization Server Metadata (RFC 8414).
 ///
 /// This is a **public** endpoint — no authentication required. It advertises

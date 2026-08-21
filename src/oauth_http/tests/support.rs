@@ -1,4 +1,125 @@
 use super::*;
+use crate::mcp_bridge::{
+    McpBridgeProvider, McpBridgeRequest, McpBridgeResponse, McpBridgeResponsePayload,
+};
+use crate::shell_protocol::{
+    ShellAgentPollRequest, ShellAgentResultPayload, ShellAgentResultRequest,
+    ShellClientCapabilities, ShellClientRegisterRequest,
+};
+
+pub(super) const TEST_BRIDGE_CLIENT_ID: &str = "oauth-bridge-runner";
+pub(super) const TEST_BRIDGE_AGENT_INSTANCE_ID: &str = "oauth-bridge-agent-instance";
+pub(super) const TEST_BRIDGE_PROVIDER_ID: &str = "oauth-test-provider";
+
+pub(super) fn test_hosted_bridge_id(provider_instance_id: &str) -> String {
+    crate::mcp_bridge_http::opaque_bridge_id(
+        TEST_BRIDGE_CLIENT_ID,
+        TEST_BRIDGE_AGENT_INSTANCE_ID,
+        &McpBridgeProvider {
+            provider_id: TEST_BRIDGE_PROVIDER_ID.to_string(),
+            provider_instance_id: provider_instance_id.to_string(),
+            name: "OAuth test provider".to_string(),
+            available: true,
+        },
+    )
+}
+
+pub(super) fn test_hosted_bridge_resource(
+    config: &crate::Config,
+    provider_instance_id: &str,
+) -> String {
+    crate::oauth_resource::canonical_hosted_bridge_resource(
+        config,
+        &test_hosted_bridge_id(provider_instance_id),
+    )
+    .unwrap()
+}
+
+pub(super) async fn start_test_hosted_bridge(
+    registry: &Arc<crate::ShellClientRegistry>,
+    provider_instance_id: &str,
+) -> (Arc<std::sync::Mutex<String>>, tokio::task::JoinHandle<()>) {
+    registry
+        .register(ShellClientRegisterRequest {
+            client_id: TEST_BRIDGE_CLIENT_ID.to_string(),
+            agent_instance_id: TEST_BRIDGE_AGENT_INSTANCE_ID.to_string(),
+            display_name: None,
+            owner: None,
+            hostname: None,
+            capabilities: Some(ShellClientCapabilities {
+                mcp_bridge: true,
+                ..Default::default()
+            }),
+            host_context: None,
+            projects: None,
+            agent_protocol_version: Some("polling-v1".to_string()),
+            policy: None,
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+        })
+        .await
+        .unwrap();
+    let provider_instance_id = Arc::new(std::sync::Mutex::new(provider_instance_id.to_string()));
+    let runner_provider_instance_id = Arc::clone(&provider_instance_id);
+    let runner_registry = Arc::clone(registry);
+    let runner = tokio::spawn(async move {
+        loop {
+            let request = match runner_registry
+                .poll(ShellAgentPollRequest {
+                    client_id: TEST_BRIDGE_CLIENT_ID.to_string(),
+                    agent_instance_id: TEST_BRIDGE_AGENT_INSTANCE_ID.to_string(),
+                    projects: None,
+                })
+                .await
+            {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    continue;
+                }
+                Err(_) => return,
+            };
+            let response = match request.mcp_bridge {
+                Some(McpBridgeRequest::Discover) => {
+                    let provider_instance_id = runner_provider_instance_id.lock().unwrap().clone();
+                    McpBridgeResponse::success(McpBridgeResponsePayload::Providers {
+                        providers: vec![McpBridgeProvider {
+                            provider_id: TEST_BRIDGE_PROVIDER_ID.to_string(),
+                            provider_instance_id,
+                            name: "OAuth test provider".to_string(),
+                            available: true,
+                        }],
+                    })
+                }
+                _ => McpBridgeResponse::error(
+                    crate::mcp_bridge::McpBridgeDispatchState::NotStarted,
+                    "unsupported_test_operation",
+                    "OAuth bridge fixture only supports discovery",
+                ),
+            };
+            runner_registry
+                .complete(ShellAgentResultPayload {
+                    result: ShellAgentResultRequest {
+                        client_id: TEST_BRIDGE_CLIENT_ID.to_string(),
+                        agent_instance_id: TEST_BRIDGE_AGENT_INSTANCE_ID.to_string(),
+                        request_id: request.request_id,
+                        exit_code: None,
+                        stdout: None,
+                        stderr: None,
+                        duration_ms: None,
+                        error: None,
+                    },
+                    command_execution_state: None,
+                    mcp_bridge: Some(response),
+                })
+                .await
+                .unwrap();
+        }
+    });
+    (provider_instance_id, runner)
+}
 
 pub(super) fn test_config(oauth2: OAuth2Config) -> Arc<crate::Config> {
     Arc::new(crate::Config {
@@ -154,6 +275,15 @@ pub(super) fn seed_client_with_redirects_and_scopes(
     redirect_uris: &str,
     allowed_scopes: &str,
 ) -> OAuthClientRecord {
+    seed_client_with_redirects_scopes_and_secret(db, user, redirect_uris, allowed_scopes).0
+}
+
+pub(super) fn seed_client_with_redirects_scopes_and_secret(
+    db: &crate::Database,
+    user: &UserRecord,
+    redirect_uris: &str,
+    allowed_scopes: &str,
+) -> (OAuthClientRecord, String) {
     let now = chrono::Utc::now().timestamp();
     let plaintext_secret = crate::auth::generate_oauth_client_secret();
     let secret_hash = hash_token(&plaintext_secret);
@@ -171,7 +301,7 @@ pub(super) fn seed_client_with_redirects_and_scopes(
         revoked_at: None,
     };
     db.insert_oauth_client(&record).unwrap();
-    record
+    (record, plaintext_secret)
 }
 
 pub(super) fn seed_shared_key_bridge_client(
@@ -770,7 +900,11 @@ pub(super) fn build_router_with_session_and_registry(
                 .hoop(crate::AuthMiddleware)
                 .post(test_agent_register_handler),
         )
-        .push(Router::with_path(".well-known/oauth-protected-resource").get(oauth_metadata))
+        .push(
+            Router::with_path(".well-known/oauth-protected-resource")
+                .get(oauth_metadata)
+                .push(Router::with_path("{**resource_path}").get(oauth_hosted_bridge_metadata)),
+        )
         .push(
             Router::with_path(".well-known/oauth-authorization-server")
                 .get(oauth_authorization_server_metadata),

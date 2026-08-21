@@ -60,7 +60,9 @@ use managed_authorize::{
 pub(crate) use managed_authorize::{
     oauth_authorize, oauth_authorize_consent, oauth_authorize_login, AuthorizeSessionStore,
 };
-pub(crate) use metadata::{oauth_authorization_server_metadata, oauth_metadata};
+pub(crate) use metadata::{
+    oauth_authorization_server_metadata, oauth_hosted_bridge_metadata, oauth_metadata,
+};
 pub(crate) use project_share::oauth_authorize_project;
 #[cfg(test)]
 pub(crate) use project_share::{
@@ -84,6 +86,24 @@ pub(crate) use token::verify_pkce_s256;
 
 /// Maximum request body size for the token endpoint (16 KiB).
 const MAX_OAUTH_TOKEN_FORM_BYTES: usize = 16 * 1024;
+
+async fn validate_current_hosted_bridge_resource(
+    config: &crate::Config,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
+    resource: Option<&str>,
+) -> Result<(), OAuthAuthorizeError> {
+    let Some(resource) = resource else {
+        return Ok(());
+    };
+    let Some(resource) = crate::oauth_resource::hosted_bridge_resource(config, resource) else {
+        return Ok(());
+    };
+    let registry = registry.ok_or(OAuthAuthorizeError::UnsupportedResource)?;
+    match crate::mcp_bridge_http::hosted_bridge_is_current(registry, &resource.bridge_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(OAuthAuthorizeError::UnsupportedResource),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests

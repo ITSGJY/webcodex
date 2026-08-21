@@ -92,6 +92,19 @@ can cause local provider code to run; restricted/invalid authority fails closed
 before provider dispatch. `tools/list` remains discovery UX, not authoritative
 permission for a later call.
 
+For OAuth clients, the canonical resource is the complete provider-specific
+URL, for example
+`https://your-domain.example/mcp/bridge/<bridge_id>`. Its RFC 9728 protected
+resource metadata is published at
+`https://your-domain.example/.well-known/oauth-protected-resource/mcp/bridge/<bridge_id>`;
+the metadata `resource` value is that same complete canonical URL. WebCodex
+binds the exact value through the authorization code, access token, and refresh
+token, and refresh rotation preserves it. A token for one bridge, or for the
+ordinary `/mcp` resource, cannot be used at another exact bridge endpoint.
+Metadata lookup, authorization, token exchange/refresh, and request dispatch
+all re-resolve the opaque identity and fail closed after a Runner or provider
+restart; an old OAuth audience is never redirected to the replacement.
+
 Every third-party `tools/call` is treated as potentially effectful. WebCodex
 never automatically retries it after Runner dispatch. If the local provider
 may have received the call but its result is lost, the JSON-RPC error data

@@ -31,6 +31,7 @@ mod mcp_bridge_http;
 mod model_surface;
 mod models;
 mod oauth_http;
+mod oauth_resource;
 mod openapi;
 mod pairing_http;
 mod project_entry;
@@ -456,7 +457,11 @@ only for local/trusted-network demos."
         )
         .push(
             Router::with_path(".well-known/oauth-protected-resource")
-                .get(oauth_http::oauth_metadata),
+                .get(oauth_http::oauth_metadata)
+                .push(
+                    Router::with_path("{**resource_path}")
+                        .get(oauth_http::oauth_hosted_bridge_metadata),
+                ),
         )
         .push(
             Router::with_path(".well-known/oauth-authorization-server")

@@ -14,6 +14,7 @@ fn managed_oauth_auth_context(
         is_bootstrap: false,
         token_kind: Some("oauth2".to_string()),
         allowed_client_id: Some("oauth-client".to_string()),
+        oauth_resource: None,
         shared_key_hash: shared_key_hash.map(str::to_string),
         project_grant_id: None,
     }

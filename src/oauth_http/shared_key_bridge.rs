@@ -334,10 +334,11 @@ pub(super) fn is_shared_key_bridge_query(query: &str) -> Result<bool, OAuthAutho
     }
 }
 
-pub(super) fn validate_bridge_authorize_request(
+pub(super) async fn validate_bridge_authorize_request(
     res: &mut Response,
     config: &crate::Config,
     db: &crate::Database,
+    registry: Option<&std::sync::Arc<crate::ShellClientRegistry>>,
     query: &str,
 ) -> Option<BridgeAuthorizeValidated> {
     let parsed = match parse_authorize_query(query) {
@@ -481,6 +482,19 @@ pub(super) fn validate_bridge_authorize_request(
             return None;
         }
     };
+    if super::validate_current_hosted_bridge_resource(config, registry, resource.as_deref())
+        .await
+        .is_err()
+    {
+        redirect_with_oauth_error(
+            res,
+            config,
+            &parsed.redirect_uri,
+            "invalid_target",
+            parsed.state.as_deref(),
+        );
+        return None;
+    }
 
     Some(BridgeAuthorizeValidated {
         parsed,
@@ -928,14 +942,16 @@ pub(crate) async fn oauth_authorize_bridge(
         }
     }
 
-    let Some(validated) = validate_bridge_authorize_request(res, &config, &db, &query) else {
-        return;
-    };
-
     let registry = depot
         .obtain::<std::sync::Arc<crate::ShellClientRegistry>>()
         .ok()
         .cloned();
+    let Some(validated) =
+        validate_bridge_authorize_request(res, &config, &db, registry.as_ref(), &query).await
+    else {
+        return;
+    };
+
     let submitted = form_field(&pairs, "shared_key").unwrap_or("");
     let shared_key_hash = match bridge_shared_key_hash(submitted) {
         Ok(hash) => hash,
