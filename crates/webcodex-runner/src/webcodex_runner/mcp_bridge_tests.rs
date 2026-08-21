@@ -277,6 +277,27 @@ fn timeout_and_invalid_untrusted_outputs_are_bounded() {
 }
 
 #[test]
+fn correlated_invalid_result_does_not_retire_provider_instance() {
+    let fixture = Fixture::new("bad_result", 2);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+
+    let response = fixture.call(&provider);
+    assert_eq!(response.dispatch_state, McpBridgeDispatchState::Completed);
+    assert_eq!(
+        response.error.as_ref().unwrap().code,
+        "unsupported_provider_content"
+    );
+
+    // The response was correlated, so the stdio session is still synchronized.
+    // A V1 result-format rejection must not turn the configured provider into a
+    // permanently stale instance or force a hidden respawn.
+    assert!(fixture.list(&provider).error.is_none());
+    assert_eq!(fixture.marker_count("start"), 1);
+    assert_eq!(fixture.marker_count("initialize"), 1);
+}
+
+#[test]
 fn provider_timeout_override_and_default_fallback_are_enforced() {
     let inherited = Fixture::new("slow", 2);
     let inherited_provider = inherited.provider();

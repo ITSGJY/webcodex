@@ -82,7 +82,11 @@ impl ProviderFailure {
         Self {
             code,
             dispatch_state: McpBridgeDispatchState::Completed,
-            fatal: true,
+            // A correlated JSON-RPC response proves this request-response
+            // exchange completed. Result-level V1 incompatibility must not
+            // poison the whole provider instance; only transport/protocol
+            // failures that lose correlation retire the session.
+            fatal: false,
         }
     }
 
