@@ -89,7 +89,11 @@ fn validate_protocol_header(req: &Request, method: &str) -> Result<(), &'static 
         None => None,
     };
     match (method, version) {
-        ("initialize", None) => Ok(()),
+        // ChatGPT's MCP host currently sends the post-initialize acknowledgement
+        // without the HTTP protocol-version header. This exact notification has
+        // no dispatch authority and no response body, so tolerate only that
+        // missing header while keeping every request/call strict.
+        ("initialize", None) | ("notifications/initialized", None) => Ok(()),
         (_, Some(version)) if version == MCP_PROTOCOL_VERSION => Ok(()),
         (_, Some(_)) => Err("unsupported MCP-Protocol-Version"),
         (_, None) => Err("MCP-Protocol-Version is required after initialize"),

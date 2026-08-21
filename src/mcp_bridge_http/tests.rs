@@ -286,6 +286,36 @@ async fn hosted_bridge_runs_initialize_list_and_repeated_calls_without_changing_
     );
     assert!(initialized["result"]["capabilities"]["tools"].is_object());
 
+    let initialized_notification = TestClient::post(format!("http://localhost{endpoint}"))
+        .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .send(&service)
+        .await;
+    assert_eq!(
+        initialized_notification
+            .status_code
+            .unwrap_or(StatusCode::OK),
+        StatusCode::ACCEPTED,
+        "the exact initialized notification tolerates ChatGPT omitting the protocol header"
+    );
+
+    let mut wrong_notification_version = TestClient::post(format!("http://localhost{endpoint}"))
+        .add_header(MCP_PROTOCOL_VERSION_HEADER, "2024-11-05", true)
+        .json(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .send(&service)
+        .await;
+    assert_eq!(
+        wrong_notification_version
+            .status_code
+            .unwrap_or(StatusCode::OK),
+        StatusCode::BAD_REQUEST,
+        "an explicitly unsupported notification protocol version must still fail closed"
+    );
+    let wrong_notification_version = wrong_notification_version
+        .take_json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(wrong_notification_version["error"]["code"], -32600);
+
     let mut missing_version = TestClient::post(format!("http://localhost{endpoint}"))
         .json(&json!({"jsonrpc":"2.0","id":20,"method":"ping","params":{}}))
         .send(&service)
