@@ -47,6 +47,23 @@ fn main() -> io::Result<()> {
             "notifications/initialized" => append(marker, "initialized\n")?,
             "tools/list" => {
                 append(marker, "list\n")?;
+                if scenario == "notifications" {
+                    send(
+                        &mut writer,
+                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                    )?;
+                }
+                if scenario == "notification_flood" {
+                    for progress in 0..40 {
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":"flood","progress":{progress}}}}}"#
+                            ),
+                        )?;
+                    }
+                    continue;
+                }
                 if scenario == "oversized_message" {
                     send(
                         &mut writer,
@@ -88,6 +105,12 @@ fn main() -> io::Result<()> {
                         r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","description":"{description}","inputSchema":{{"type":"object","properties":{{"value":{{"type":"string"}}}}}}}}]}}}}"#
                     ),
                 )?;
+                if scenario == "notifications" {
+                    send(
+                        &mut writer,
+                        r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"queued"}}"#,
+                    )?;
+                }
                 if scenario == "duplicate_id" {
                     send(
                         &mut writer,
@@ -102,6 +125,22 @@ fn main() -> io::Result<()> {
                 append(marker, "call\n")?;
                 match scenario {
                     "crash" => return Ok(()),
+                    "notifications" => {
+                        send(
+                            &mut writer,
+                            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"call","progress":1}}"#,
+                        )?;
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"call-{calls}"}}],"structuredContent":{{"call":{calls}}},"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "callback" => send(
+                        &mut writer,
+                        r#"{"jsonrpc":"2.0","id":9000,"method":"sampling/createMessage","params":{}}"#,
+                    )?,
                     "timeout" => {
                         thread::sleep(Duration::from_secs(3));
                     }

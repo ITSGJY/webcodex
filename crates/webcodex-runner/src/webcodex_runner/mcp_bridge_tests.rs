@@ -152,6 +152,75 @@ fn persistent_provider_initializes_once_and_serves_repeated_calls() {
 }
 
 #[test]
+fn provider_notifications_are_consumed_without_retiring_the_session() {
+    let fixture = Fixture::new("notifications", 2);
+    let provider = fixture.provider();
+
+    let listed = fixture.list(&provider);
+    assert!(listed.error.is_none(), "{:?}", listed.error);
+    // Let the post-response logging notification reach the bounded reader queue
+    // so the next operation exercises the pre-dispatch drain path as well.
+    std::thread::sleep(Duration::from_millis(25));
+
+    let called = fixture.call(&provider);
+    let Some(McpBridgeResponsePayload::ToolResult { result }) = called.payload else {
+        panic!("call payload missing: {:?}", called.error);
+    };
+    assert_eq!(
+        result.content,
+        vec![McpBridgeContent::Text {
+            text: "call-1".to_string()
+        }]
+    );
+    assert!(fixture.list(&provider).error.is_none());
+    assert_eq!(fixture.marker_count("start"), 1);
+    assert_eq!(fixture.marker_count("initialize"), 1);
+}
+
+#[test]
+fn provider_callback_after_dispatch_remains_unsupported_and_unknown() {
+    let fixture = Fixture::new("callback", 2);
+    let provider = fixture.provider();
+    assert!(fixture.list(&provider).error.is_none());
+
+    let response = fixture.call(&provider);
+    assert_eq!(
+        response.dispatch_state,
+        McpBridgeDispatchState::OutcomeUnknown
+    );
+    assert_eq!(
+        response.error.as_ref().unwrap().code,
+        "provider_callbacks_unsupported"
+    );
+    assert_eq!(
+        fixture.call(&provider).error.as_ref().unwrap().code,
+        "stale_provider"
+    );
+    assert_eq!(fixture.marker_count("start"), 1);
+}
+
+#[test]
+fn provider_notification_flood_is_bounded_and_retires_after_dispatch() {
+    let fixture = Fixture::new("notification_flood", 2);
+    let provider = fixture.provider();
+
+    let response = fixture.list(&provider);
+    assert_eq!(
+        response.dispatch_state,
+        McpBridgeDispatchState::OutcomeUnknown
+    );
+    assert_eq!(
+        response.error.as_ref().unwrap().code,
+        "provider_notification_flood"
+    );
+    assert_eq!(
+        fixture.list(&provider).error.as_ref().unwrap().code,
+        "stale_provider"
+    );
+    assert_eq!(fixture.marker_count("start"), 1);
+}
+
+#[test]
 fn crash_is_outcome_unknown_and_never_restarted_or_replayed() {
     let fixture = Fixture::new("crash", 2);
     let provider = fixture.provider();

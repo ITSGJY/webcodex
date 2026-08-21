@@ -22,6 +22,7 @@ use webcodex_process::ManagedChild;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const PROVIDER_AVAILABLE: u8 = 0;
 const PROVIDER_FAILED: u8 = 1;
+const MCP_BRIDGE_MAX_IGNORED_NOTIFICATIONS: usize = 32;
 
 pub(crate) struct McpBridgeManager {
     providers: BTreeMap<String, ProviderEntry>,
@@ -482,39 +483,52 @@ impl ProviderConnection {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, ProviderFailure> {
-        match self.incoming.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) | Ok(ReaderEvent::Eof) => {
-                return Err(ProviderFailure::before_send("provider_eof"))
-            }
-            Ok(ReaderEvent::Message(Ok(message))) => {
-                if message.get("method").is_some() {
+        let mut ignored_notifications = 0usize;
+        loop {
+            match self.incoming.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) | Ok(ReaderEvent::Eof) => {
+                    return Err(ProviderFailure::before_send("provider_eof"));
+                }
+                Ok(ReaderEvent::Message(Ok(message))) => {
+                    if is_provider_notification(&message) {
+                        ignored_notifications += 1;
+                        if ignored_notifications > MCP_BRIDGE_MAX_IGNORED_NOTIFICATIONS {
+                            return Err(ProviderFailure::before_send(
+                                "provider_notification_flood",
+                            ));
+                        }
+                        continue;
+                    }
+                    if message.get("method").is_some() {
+                        return Err(ProviderFailure::before_send(
+                            "provider_callbacks_unsupported",
+                        ));
+                    }
+                    let response_id = message
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(u64::MAX);
                     return Err(ProviderFailure::before_send(
-                        "provider_callbacks_unsupported",
+                        if response_id < self.next_id {
+                            "provider_duplicate_response_id"
+                        } else {
+                            "provider_unknown_response_id"
+                        },
                     ));
                 }
-                let response_id = message
-                    .get("id")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(u64::MAX);
-                return Err(ProviderFailure::before_send(
-                    if response_id < self.next_id {
-                        "provider_duplicate_response_id"
-                    } else {
-                        "provider_unknown_response_id"
-                    },
-                ));
-            }
-            Ok(ReaderEvent::Message(Err(ReaderFault::Malformed))) => {
-                return Err(ProviderFailure::before_send("provider_malformed_json"))
-            }
-            Ok(ReaderEvent::Message(Err(ReaderFault::TooLarge))) => {
-                return Err(ProviderFailure::before_send("provider_message_too_large"))
-            }
-            Ok(ReaderEvent::Message(Err(ReaderFault::Io))) => {
-                return Err(ProviderFailure::before_send("provider_stdout_failed"))
+                Ok(ReaderEvent::Message(Err(ReaderFault::Malformed))) => {
+                    return Err(ProviderFailure::before_send("provider_malformed_json"));
+                }
+                Ok(ReaderEvent::Message(Err(ReaderFault::TooLarge))) => {
+                    return Err(ProviderFailure::before_send("provider_message_too_large"));
+                }
+                Ok(ReaderEvent::Message(Err(ReaderFault::Io))) => {
+                    return Err(ProviderFailure::before_send("provider_stdout_failed"));
+                }
             }
         }
+
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let message = json!({
@@ -534,25 +548,45 @@ impl ProviderConnection {
             .and_then(|_| self.stdin.flush())
             .map_err(|_| ProviderFailure::after_send("provider_stdin_failed"))?;
 
-        let response = match self.incoming.recv_timeout(timeout) {
-            Ok(ReaderEvent::Message(Ok(response))) => response,
-            Ok(ReaderEvent::Message(Err(ReaderFault::Malformed))) => {
-                return Err(ProviderFailure::after_send("provider_malformed_json"))
+        let deadline = Instant::now() + timeout;
+        let mut ignored_notifications = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ProviderFailure::after_send("provider_timeout"));
             }
-            Ok(ReaderEvent::Message(Err(ReaderFault::TooLarge))) => {
-                return Err(ProviderFailure::after_send("provider_message_too_large"))
+            let response = match self.incoming.recv_timeout(remaining) {
+                Ok(ReaderEvent::Message(Ok(response))) => response,
+                Ok(ReaderEvent::Message(Err(ReaderFault::Malformed))) => {
+                    return Err(ProviderFailure::after_send("provider_malformed_json"));
+                }
+                Ok(ReaderEvent::Message(Err(ReaderFault::TooLarge))) => {
+                    return Err(ProviderFailure::after_send("provider_message_too_large"));
+                }
+                Ok(ReaderEvent::Message(Err(ReaderFault::Io))) => {
+                    return Err(ProviderFailure::after_send("provider_stdout_failed"));
+                }
+                Ok(ReaderEvent::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderFailure::after_send("provider_eof"));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(ProviderFailure::after_send("provider_timeout"));
+                }
+            };
+            if is_provider_notification(&response) {
+                ignored_notifications += 1;
+                if ignored_notifications > MCP_BRIDGE_MAX_IGNORED_NOTIFICATIONS {
+                    return Err(ProviderFailure::after_send("provider_notification_flood"));
+                }
+                continue;
             }
-            Ok(ReaderEvent::Message(Err(ReaderFault::Io))) => {
-                return Err(ProviderFailure::after_send("provider_stdout_failed"))
+            if response.get("method").is_some() {
+                return Err(ProviderFailure::after_send(
+                    "provider_callbacks_unsupported",
+                ));
             }
-            Ok(ReaderEvent::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(ProviderFailure::after_send("provider_eof"))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err(ProviderFailure::after_send("provider_timeout"))
-            }
-        };
-        validate_rpc_response(response, id)
+            return validate_rpc_response(response, id);
+        }
     }
 
     fn send_notification(&mut self, method: &str, params: Value) -> Result<(), ProviderFailure> {
@@ -652,6 +686,29 @@ fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, Reade
         });
     }
     Ok(Some(line))
+}
+
+fn is_provider_notification(message: &Value) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || object.contains_key("id")
+        || object.contains_key("result")
+        || object.contains_key("error")
+    {
+        return false;
+    }
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    if method.is_empty() || method.len() > 256 || method.chars().any(char::is_control) {
+        return false;
+    }
+    match object.get("params") {
+        None => true,
+        Some(params) => params.is_object() || params.is_array(),
+    }
 }
 
 fn validate_rpc_response(response: Value, expected_id: u64) -> Result<Value, ProviderFailure> {
