@@ -1,4 +1,4 @@
-use super::{parse_json_body, render_result, require_runtime};
+use super::{parse_json_body, parse_optional_json_body, render_result, require_runtime};
 use crate::action_audit::ActionAudit;
 use crate::tool_runtime::ToolCall;
 use salvo::prelude::*;
@@ -62,17 +62,27 @@ pub async fn projects_list(req: &mut Request, depot: &mut Depot, res: &mut Respo
     let Some(runtime) = require_runtime(depot, res) else {
         return;
     };
-    // Body is optional; reject non-empty invalid JSON for consistency but
-    // tolerate an empty/missing body since this call takes no arguments.
-    let body: Value = match req.parse_json().await {
-        Ok(body) => body,
-        Err(_) => Value::Null,
+    // Body remains optional for compatibility. Non-empty malformed JSON must
+    // fail closed instead of silently widening a targeted request to the full
+    // caller-visible registry.
+    let Some(arguments) = parse_optional_json_body(req, res).await else {
+        return;
     };
-    let _ = body;
+    let call = match ToolCall::from_tool_name("list_projects", arguments) {
+        Ok(call) => call,
+        Err(error) => {
+            render_result(
+                res,
+                &audit,
+                "list_projects",
+                None,
+                crate::tool_runtime::ToolResult::err(error),
+            );
+            return;
+        }
+    };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
-    let result = runtime
-        .dispatch_with_auth(ToolCall::ListProjects, auth.as_ref())
-        .await;
+    let result = runtime.dispatch_with_auth(call, auth.as_ref()).await;
     render_result(res, &audit, "list_projects", None, result);
 }
 
