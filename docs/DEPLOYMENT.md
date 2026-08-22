@@ -4,8 +4,8 @@
 
 This guide covers self-hosting WebCodex in production: building and installing
 the binaries, bootstrapping the Server, enrolling Runner machines, connecting
-MCP/GPT clients, and running smoke checks. For the shortest local-only setup,
-see [Quick Start](QUICK_START.md).
+MCP/GPT clients, and running smoke checks. For the shortest first ChatGPT/MCP
+connection, see [Quick Start](QUICK_START.md).
 
 ## Components
 
@@ -24,9 +24,10 @@ The documented distribution path is the npm thin installer/wrapper:
 npm install -g @yyjeqhc/webcodex
 ```
 
-Supported package platforms are Linux x64, Linux arm64, macOS arm64, and
-Windows x64. Windows x64 supports the CLI + Runner workflow against a remote
-Linux Server; a long-running Windows Server is not supported. The npm wrapper
+Supported package platforms are Linux x64, Linux arm64, macOS arm64, Windows
+x64, and Windows arm64. Windows x64/arm64 support the CLI + Runner workflow
+against a remote Linux Server; a long-running Windows Server is not supported.
+The npm wrapper
 requires Node.js 18 or newer. Starting with v0.3.5, the native Linux x64
 artifact targets glibc 2.17 or newer.
 
@@ -389,10 +390,14 @@ Recommended production smoke sequence:
 
 ### Runtime console
 
-The Server serves a read-only browser console at `/console` showing the shared
-project-readiness projection (Project, Connection, Agent/coding readiness,
-findings, next action). It does not expose the Agent registry or transport
-details and is not a full admin UI.
+The Server serves a host-local browser console at `/console`. It shows project
+readiness, the work queue, Workflow Session activity, visible Runners, and recent
+mutating activity. For Connector tasks, the same host-local human can send task
+guidance, decide pending approvals, cancel work, and Accept or Reject a stable
+result. These actions use the same authority boundaries as the CLI; the online
+model still cannot accept its own work. The console also shows non-secret client
+connection targets, with ChatGPT Developer Mode MCP custom apps as the primary
+ChatGPT path. Credentials are deliberately never returned by the console API.
 
 ### Runtime job API trust model
 
