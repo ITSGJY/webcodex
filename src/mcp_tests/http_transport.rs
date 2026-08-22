@@ -238,12 +238,50 @@ async fn http_mcp_tools_list_success() {
         assert!(tool["name"].is_string());
         assert!(tool["description"].is_string());
         assert!(tool["inputSchema"].is_object());
-        assert!(
-            tool["outputSchema"].is_object(),
-            "default HTTP tools/list must include outputSchema for {}",
-            tool["name"]
-        );
+        if tool["name"] == crate::mcp_gateway::MCP_TOOL_NAME {
+            assert!(
+                tool.get("outputSchema").is_none(),
+                "mcp_tool must not claim a fixed schema for provider-defined structuredContent"
+            );
+        } else {
+            assert!(
+                tool["outputSchema"].is_object(),
+                "default HTTP tools/list must include outputSchema for {}",
+                tool["name"]
+            );
+        }
     }
+}
+
+#[tokio::test]
+async fn http_mcp_accepts_chatgpt_2025_11_25_protocol_header() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .add_header(
+            MCP_PROTOCOL_VERSION_HEADER,
+            MCP_CHATGPT_PROTOCOL_VERSION,
+            true,
+        )
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 199,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MCP_CHATGPT_PROTOCOL_VERSION
+                }
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&response), StatusCode::OK);
+    let body: Value = response.take_json().await.unwrap();
+    assert!(body["result"]["tools"].is_array());
+    assert!(body["result"].get("resultType").is_none());
 }
 
 #[tokio::test]

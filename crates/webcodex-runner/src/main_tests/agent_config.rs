@@ -20,6 +20,8 @@ client_id = "oe"
         auto_transport_plan(&cfg),
         vec![TRANSPORT_WEBSOCKET, TRANSPORT_POLLING]
     );
+    assert_eq!(cfg.mcp_gateway.request_timeout_secs, 30);
+    assert!(cfg.mcp_gateway.providers.is_empty());
 }
 
 #[test]
@@ -759,4 +761,155 @@ fn phase_e2_polling_dispatch_and_job_execution_concurrency_defaults_are_independ
     assert_eq!(POLLING_DISPATCH_MAX_IN_FLIGHT, 2);
     assert_eq!(DEFAULT_MAX_CONCURRENT_JOBS, 4);
     assert_ne!(POLLING_DISPATCH_MAX_IN_FLIGHT, DEFAULT_MAX_CONCURRENT_JOBS);
+}
+
+fn mcp_test_toml_path(path: &std::path::Path) -> String {
+    serde_json::to_string(path.to_string_lossy().as_ref()).unwrap()
+}
+
+#[test]
+fn agent_config_accepts_static_literal_mcp_gateway_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    let executable = mcp_test_toml_path(&std::env::current_exe().unwrap());
+    let cwd_value = tmp.path().to_string_lossy().into_owned();
+    let cwd = serde_json::to_string(&cwd_value).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+server_url = "http://127.0.0.1:8000"
+token = "t"
+client_id = "oe"
+
+[mcp]
+request_timeout_secs = 7
+
+[[mcp.providers]]
+id = "local-tools"
+name = "Local tools"
+executable = {executable}
+args = ["--stdio", "$HOME", "$(id)"]
+cwd = {cwd}
+env_from_env = {{ GITHUB_TOKEN = "GITHUB_TOKEN", HOME = "HOME" }}
+timeout_secs = 5
+"#
+        ),
+    )
+    .unwrap();
+
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.mcp_gateway.request_timeout_secs, 7);
+    assert_eq!(config.mcp_gateway.providers.len(), 1);
+    assert_eq!(config.mcp_gateway.providers[0].timeout_secs, Some(5));
+    assert_eq!(
+        config.mcp_gateway.providers[0].args,
+        ["--stdio", "$HOME", "$(id)"]
+    );
+    assert_eq!(
+        config.mcp_gateway.providers[0].cwd.as_deref(),
+        Some(cwd_value.as_str())
+    );
+    assert_eq!(
+        config.mcp_gateway.providers[0]
+            .env_from_env
+            .get("GITHUB_TOKEN")
+            .map(String::as_str),
+        Some("GITHUB_TOKEN")
+    );
+}
+
+#[test]
+fn agent_config_mcp_gateway_provider_timeout_defaults_to_gateway_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("agent.toml");
+    let executable = mcp_test_toml_path(&std::env::current_exe().unwrap());
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+server_url = "http://127.0.0.1:8000"
+token = "t"
+client_id = "oe"
+
+[mcp]
+request_timeout_secs = 11
+
+[[mcp.providers]]
+id = "inherits"
+name = "Inherits"
+executable = {executable}
+"#
+        ),
+    )
+    .unwrap();
+
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.mcp_gateway.request_timeout_secs, 11);
+    assert_eq!(config.mcp_gateway.providers[0].timeout_secs, None);
+}
+
+#[test]
+fn agent_config_rejects_unsafe_or_ambiguous_mcp_gateway_identity() {
+    let executable = mcp_test_toml_path(&std::env::current_exe().unwrap());
+    for (providers, expected) in [
+        (
+            r#"
+[[mcp.providers]]
+id = "local"
+name = "Local"
+executable = "relative-mcp"
+"#
+            .to_string(),
+            "executable must be an absolute path",
+        ),
+        (
+            format!(
+                r#"
+[[mcp.providers]]
+id = "bad-timeout"
+name = "Bad timeout"
+executable = {executable}
+timeout_secs = 121
+"#
+            ),
+            "timeout_secs must be between 1 and 120",
+        ),
+        (
+            format!(
+                r#"
+[[mcp.providers]]
+id = "duplicate"
+name = "First"
+executable = {executable}
+
+[[mcp.providers]]
+id = "duplicate"
+name = "Second"
+executable = {executable}
+"#
+            ),
+            "provider ids must be unique",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+server_url = "http://127.0.0.1:8000"
+token = "t"
+client_id = "oe"
+
+[mcp]
+request_timeout_secs = 30
+{providers}
+"#
+            ),
+        )
+        .unwrap();
+        let error = load_config(&path).unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
 }

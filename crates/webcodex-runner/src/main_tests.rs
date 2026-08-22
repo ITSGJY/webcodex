@@ -6,29 +6,29 @@ use crate::webcodex_runner::{
     handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
     handle_resolve_or_register_project,
 };
-static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// RAII restore for environment variables mutated by tests: restores the
 /// previous value (or absence) on drop, even when the test panics, so a
 /// failure cannot leak env state into later tests.
-struct EnvGuard {
+pub(crate) struct EnvGuard {
     restored: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
 impl EnvGuard {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         EnvGuard {
             restored: Vec::new(),
         }
     }
 
-    fn set(mut self, name: &'static str, value: &str) -> Self {
+    pub(crate) fn set(mut self, name: &'static str, value: &str) -> Self {
         self.capture(name);
         std::env::set_var(name, value);
         self
     }
 
-    fn remove(mut self, name: &'static str) -> Self {
+    pub(crate) fn remove(mut self, name: &'static str) -> Self {
         self.capture(name);
         std::env::remove_var(name);
         self
@@ -83,6 +83,7 @@ fn test_config(projects_dir: PathBuf) -> AgentConfig {
         websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
         quic: None,
         tool_providers: Default::default(),
+        mcp_gateway: Default::default(),
     }
 }
 
@@ -447,6 +448,7 @@ fn shell_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
         lsp: None,
         sandbox: None,
         job_context: Some(test_job_context(cwd, Vec::new())),
+        mcp_gateway: None,
         persistent_shell: None,
     }
 }
@@ -540,6 +542,7 @@ fn json_file_op_request(
         lsp: None,
         sandbox: None,
         job_context: None,
+        mcp_gateway: None,
         persistent_shell: None,
     }
 }
@@ -1232,6 +1235,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         lsp: None,
         sandbox: None,
         job_context: Some(test_job_context(tmp.path(), Vec::new())),
+        mcp_gateway: None,
         persistent_shell: None,
     };
     let mut rejected_request = request.clone();
@@ -1331,6 +1335,7 @@ fn project_request(kind: &str, payload: serde_json::Value) -> ShellAgentShellReq
         lsp: None,
         sandbox: None,
         job_context: None,
+        mcp_gateway: None,
         persistent_shell: None,
     }
 }

@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn mcp_gateway_register_request_projects_bounded_provider_inventory_without_local_launch_details() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    cfg.mcp_gateway.providers = vec![webcodex_runner::config::McpGatewayProviderConfig {
+        id: "local-tools".to_string(),
+        name: "Local tools".to_string(),
+        executable: "/private/operator/bin/local-tools-mcp".to_string(),
+        args: vec!["--secret-profile".to_string()],
+        cwd: Some("/private/operator/provider-workdir".to_string()),
+        env_from_env: std::collections::BTreeMap::from([(
+            "GITHUB_TOKEN".to_string(),
+            "OPERATOR_GITHUB_TOKEN".to_string(),
+        )]),
+        timeout_secs: Some(5),
+    }];
+
+    let body = build_register_request(
+        &cfg,
+        Vec::new(),
+        AGENT_PROTOCOL_VERSION_POLLING_V1,
+        "runner-instance",
+        0,
+    );
+    let providers = body
+        .policy
+        .as_ref()
+        .and_then(|policy| policy.mcp_gateway_providers.as_ref())
+        .expect("MCP provider inventory");
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].provider_id, "local-tools");
+    assert_eq!(providers[0].name, "Local tools");
+    assert!(!providers[0].provider_instance_id.is_empty());
+    let serialized = serde_json::to_string(providers).unwrap();
+    assert!(!serialized.contains("/private/operator/bin"));
+    assert!(!serialized.contains("--secret-profile"));
+    assert!(!serialized.contains("/private/operator/provider-workdir"));
+    assert!(!serialized.contains("GITHUB_TOKEN"));
+    assert!(!serialized.contains("OPERATOR_GITHUB_TOKEN"));
+    assert!(!serialized.contains("timeout_secs"));
+}
+
+#[test]
 fn computer_register_request_announces_platform_capability_and_protocol_version() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = test_config(tmp.path().join("config/projects.d"));

@@ -1,4 +1,5 @@
 use super::external_tools::ExternalToolRouter;
+use super::mcp_gateway::McpGatewayManager;
 use super::shutdown::lock_unpoison;
 use crate::agent_init::{
     effective_allowed_roots, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_TIMEOUT_SECS,
@@ -71,6 +72,55 @@ pub(crate) struct AgentConfig {
     pub(crate) ssh: SshConfig,
     #[serde(default)]
     pub(crate) tool_providers: ToolProvidersConfig,
+    /// Static Runner-owned stdio MCP providers exposed through WebCodex's
+    /// built-in MCP gateway. The public config section is `[mcp]`.
+    #[serde(default, rename = "mcp")]
+    pub(crate) mcp_gateway: McpGatewayConfig,
+}
+
+const MCP_GATEWAY_MAX_ENV_MAPPINGS: usize = 64;
+const MCP_GATEWAY_MAX_ENV_NAME_BYTES: usize = 256;
+pub(crate) const MCP_GATEWAY_MAX_CWD_BYTES: usize = 4_096;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct McpGatewayConfig {
+    #[serde(default = "default_mcp_gateway_request_timeout_secs")]
+    pub(crate) request_timeout_secs: u64,
+    #[serde(default)]
+    pub(crate) providers: Vec<McpGatewayProviderConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct McpGatewayProviderConfig {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) executable: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    /// Optional host-local working directory used exactly as `Command::current_dir`.
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    /// Explicit provider-env-key -> Runner-process-env-key mapping. Values are
+    /// resolved only immediately before first spawn and are never advertised.
+    #[serde(default)]
+    pub(crate) env_from_env: BTreeMap<String, String>,
+    /// Optional per-provider request deadline. When absent, inherit
+    /// `mcp.request_timeout_secs`.
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u64>,
+}
+
+fn default_mcp_gateway_request_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for McpGatewayConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: default_mcp_gateway_request_timeout_secs(),
+            providers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -334,6 +384,7 @@ impl HotAgentConfig {
 
 pub(crate) struct ReloadableAgentConfig {
     startup: AgentConfig,
+    mcp_gateway: Arc<McpGatewayManager>,
     /// Config file path used by `reload()`. Config reload is a Unix feature
     /// (Windows marks reload as unsupported and never stores the path), but
     /// the reload logic is exercised by cross-platform tests.
@@ -356,6 +407,7 @@ impl ReloadableAgentConfig {
         let current = Arc::new(HotAgentConfig::new(1, &startup, status));
         let external_routers = vec![Arc::downgrade(&current.external_tools)];
         Self {
+            mcp_gateway: Arc::new(McpGatewayManager::new(&startup.mcp_gateway)),
             startup,
             #[cfg(any(unix, test))]
             path,
@@ -375,10 +427,15 @@ impl ReloadableAgentConfig {
 
     pub(crate) fn begin_shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        self.mcp_gateway.shutdown();
     }
 
     pub(crate) fn shutdown_flag(&self) -> &AtomicBool {
         &self.stopping
+    }
+
+    pub(crate) fn mcp_gateway(&self) -> &McpGatewayManager {
+        &self.mcp_gateway
     }
 
     /// Startup-owned managed temporary-project root. Like `projects_dir`, a
@@ -491,6 +548,7 @@ pub(crate) fn restart_required_fields(
         hostname,
         host_context,
         max_concurrent_jobs,
+        mcp_gateway,
         owner,
         poll_interval_ms,
         projects_dir,
@@ -958,7 +1016,263 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
             return Err("tool_providers.claude_code.timeout_secs must be > 0".to_string());
         }
     }
+    validate_mcp_gateway_config(&cfg.mcp_gateway)?;
     Ok(cfg)
+}
+
+fn validate_mcp_gateway_env_name(value: &str) -> Result<(), ()> {
+    if value.is_empty()
+        || value.len() > MCP_GATEWAY_MAX_ENV_NAME_BYTES
+        || !value.is_ascii()
+        || value.contains('\0')
+        || value.contains('=')
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> {
+    use crate::mcp_gateway::{
+        validate_provider_id, validate_provider_name, MCP_GATEWAY_MAX_PROVIDERS,
+    };
+    use std::collections::HashSet;
+
+    if !(1..=120).contains(&config.request_timeout_secs) {
+        return Err("mcp.request_timeout_secs must be between 1 and 120".to_string());
+    }
+    if config.providers.len() > MCP_GATEWAY_MAX_PROVIDERS {
+        return Err(format!(
+            "mcp.providers may contain at most {MCP_GATEWAY_MAX_PROVIDERS} entries"
+        ));
+    }
+    let mut ids = HashSet::new();
+    for provider in &config.providers {
+        validate_provider_id(&provider.id)
+            .map_err(|error| format!("mcp provider id is invalid: {error}"))?;
+        validate_provider_name(&provider.name)
+            .map_err(|error| format!("mcp provider name is invalid: {error}"))?;
+        if provider
+            .timeout_secs
+            .is_some_and(|timeout| !(1..=120).contains(&timeout))
+        {
+            return Err(format!(
+                "mcp provider '{}' timeout_secs must be between 1 and 120",
+                provider.id
+            ));
+        }
+        if !ids.insert(provider.id.as_str()) {
+            return Err("mcp provider ids must be unique".to_string());
+        }
+        if provider.executable.is_empty()
+            || provider.executable.len() > 1_024
+            || provider.executable.contains('\0')
+            || !Path::new(&provider.executable).is_absolute()
+        {
+            return Err(format!(
+                "mcp provider '{}' executable must be an absolute path of at most 1024 bytes",
+                provider.id
+            ));
+        }
+        if provider.args.len() > 64 {
+            return Err(format!(
+                "mcp provider '{}' args may contain at most 64 entries",
+                provider.id
+            ));
+        }
+        let mut total = 0usize;
+        for argument in &provider.args {
+            if argument.len() > 4_096 || argument.contains('\0') {
+                return Err(format!(
+                    "mcp provider '{}' contains an invalid argument",
+                    provider.id
+                ));
+            }
+            total = total.saturating_add(argument.len()).saturating_add(1);
+        }
+        if total > 16 * 1024 {
+            return Err(format!(
+                "mcp provider '{}' args exceed 16384 bytes",
+                provider.id
+            ));
+        }
+        if let Some(cwd) = provider.cwd.as_deref() {
+            if cwd.is_empty()
+                || cwd.len() > MCP_GATEWAY_MAX_CWD_BYTES
+                || cwd.contains('\0')
+                || !Path::new(cwd).is_absolute()
+            {
+                return Err(format!(
+                    "mcp provider '{}' cwd must be an absolute path of at most {MCP_GATEWAY_MAX_CWD_BYTES} bytes",
+                    provider.id
+                ));
+            }
+        }
+        if provider.env_from_env.len() > MCP_GATEWAY_MAX_ENV_MAPPINGS {
+            return Err(format!(
+                "mcp provider '{}' env_from_env may contain at most {MCP_GATEWAY_MAX_ENV_MAPPINGS} entries",
+                provider.id
+            ));
+        }
+        let mut destinations: Vec<&str> = Vec::with_capacity(provider.env_from_env.len());
+        for (destination, source) in &provider.env_from_env {
+            if validate_mcp_gateway_env_name(destination).is_err()
+                || validate_mcp_gateway_env_name(source).is_err()
+            {
+                return Err(format!(
+                    "mcp provider '{}' env_from_env contains an invalid environment variable name",
+                    provider.id
+                ));
+            }
+            if super::shell::is_sensitive_env_key(destination)
+                || super::shell::is_sensitive_env_key(source)
+            {
+                return Err(format!(
+                    "mcp provider '{}' env_from_env may not map WebCodex-sensitive environment variables",
+                    provider.id
+                ));
+            }
+            if destinations
+                .iter()
+                .any(|existing| super::shell::env_keys_equal(*existing, destination))
+            {
+                return Err(format!(
+                    "mcp provider '{}' env_from_env contains conflicting destination names for this platform",
+                    provider.id
+                ));
+            }
+            destinations.push(destination);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mcp_gateway_config_tests {
+    use super::*;
+
+    fn provider() -> McpGatewayProviderConfig {
+        McpGatewayProviderConfig {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            executable: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env_from_env: BTreeMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    fn validate(provider: McpGatewayProviderConfig) -> Result<(), String> {
+        validate_mcp_gateway_config(&McpGatewayConfig {
+            request_timeout_secs: 30,
+            providers: vec![provider],
+        })
+    }
+
+    #[test]
+    fn mcp_gateway_execution_context_accepts_explicit_cwd_and_env_mapping() {
+        let mut provider = provider();
+        provider.cwd = Some(
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        provider.env_from_env = BTreeMap::from([
+            ("GITHUB_TOKEN".to_string(), "GITHUB_TOKEN".to_string()),
+            ("HOME".to_string(), "HOME".to_string()),
+        ]);
+        validate(provider).unwrap();
+    }
+
+    #[test]
+    fn mcp_gateway_execution_context_rejects_invalid_cwd_and_env_bounds() {
+        let mut relative = provider();
+        relative.cwd = Some("relative/provider-cwd".to_string());
+        assert!(validate(relative)
+            .unwrap_err()
+            .contains("cwd must be an absolute path"));
+
+        let mut nul_cwd = provider();
+        let mut invalid_cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        invalid_cwd.push('\0');
+        nul_cwd.cwd = Some(invalid_cwd);
+        assert!(validate(nul_cwd)
+            .unwrap_err()
+            .contains("cwd must be an absolute path"));
+
+        for (destination, source) in [
+            ("", "SOURCE"),
+            ("BAD=NAME", "SOURCE"),
+            ("DEST", "BAD=SOURCE"),
+            ("DEST", "BAD\0SOURCE"),
+            ("DÉST", "SOURCE"),
+            ("DEST", "SOURCÉ"),
+        ] {
+            let mut invalid = provider();
+            invalid
+                .env_from_env
+                .insert(destination.to_string(), source.to_string());
+            assert!(validate(invalid)
+                .unwrap_err()
+                .contains("invalid environment variable name"));
+        }
+
+        let mut long_name = provider();
+        long_name.env_from_env.insert(
+            "D".repeat(MCP_GATEWAY_MAX_ENV_NAME_BYTES + 1),
+            "SOURCE".to_string(),
+        );
+        assert!(validate(long_name)
+            .unwrap_err()
+            .contains("invalid environment variable name"));
+
+        let mut too_many = provider();
+        too_many.env_from_env = (0..=MCP_GATEWAY_MAX_ENV_MAPPINGS)
+            .map(|index| (format!("DEST_{index}"), format!("SOURCE_{index}")))
+            .collect();
+        assert!(validate(too_many)
+            .unwrap_err()
+            .contains("env_from_env may contain at most"));
+    }
+
+    #[test]
+    fn mcp_gateway_execution_context_rejects_sensitive_and_platform_duplicate_names() {
+        for (destination, source) in [
+            ("WEBCODEX_TOKEN", "SOURCE"),
+            ("DEST", "WEBCODEX_AGENT_TOKEN"),
+            ("WEBCODEX_USER_TOKEN", "SOURCE"),
+            ("DEST", "AUTHORIZATION"),
+        ] {
+            let mut sensitive = provider();
+            sensitive
+                .env_from_env
+                .insert(destination.to_string(), source.to_string());
+            assert!(validate(sensitive)
+                .unwrap_err()
+                .contains("WebCodex-sensitive"));
+        }
+
+        let mut case_pair = provider();
+        case_pair.env_from_env = BTreeMap::from([
+            ("PATH".to_string(), "SOURCE_A".to_string()),
+            ("Path".to_string(), "SOURCE_B".to_string()),
+        ]);
+        if cfg!(windows) {
+            assert!(validate(case_pair)
+                .unwrap_err()
+                .contains("conflicting destination names"));
+        } else {
+            validate(case_pair).unwrap();
+        }
+    }
 }
 
 pub(crate) fn hostname() -> Option<String> {
