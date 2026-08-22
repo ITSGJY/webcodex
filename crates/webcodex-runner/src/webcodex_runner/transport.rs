@@ -19,11 +19,15 @@ use crate::shell_protocol::{
     ShellAgentJobUpdateResponse, ShellAgentPersistentShellResultRequest,
     ShellAgentPersistentShellResultResponse, ShellAgentProjectSummary, ShellAgentResultPayload,
     ShellAgentResultRequest, ShellAgentResultResponse, ShellJobInventory,
-    AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+    ShellProjectInventoryPage, ShellProjectInventoryStatus, AGENT_PROTOCOL_VERSION_QUIC_V1,
+    AGENT_PROTOCOL_VERSION_QUIC_V2, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+    AGENT_PROTOCOL_VERSION_WEBSOCKET_V2, PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES,
+    PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
 };
 use crate::{
-    build_register_request_with_provider_status, dispatch_request, handle_one_poll, register,
-    AgentHttpError, AgentHttpErrorKind, CommandResult, JobManager, PollingDispatchSupervisor,
+    build_register_request_with_provider_status, dispatch_request, handle_one_poll, is_project_op,
+    legacy_inline_project_inventory, project_registration_bootstrap, register, AgentHttpError,
+    AgentHttpErrorKind, CommandResult, JobManager, PollingDispatchSupervisor,
     PollingRecoveryAction, RegisterRecoveryAction,
 };
 use reqwest::blocking::Client;
@@ -31,7 +35,7 @@ use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -45,6 +49,16 @@ const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const WS_PROXY_CONNECT_HEADER_MAX_BYTES: usize = 16 * 1024;
 /// Bounded reconnect backoff after a transport disconnect or transient error.
 const RECONNECT_BACKOFF_STEPS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+/// Retry only transient Server-side project-inventory staging pressure on an
+/// otherwise healthy streaming connection. Permanent/malformed inventory
+/// failures never enter this backoff.
+const PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
     Duration::from_secs(5),
@@ -1390,6 +1404,190 @@ fn polling_idle_delay(backoff: &mut PollingIdleBackoff, ran_request: bool) -> Op
     }
 }
 
+static NEXT_PROJECT_INVENTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_project_inventory_sequence() -> u64 {
+    NEXT_PROJECT_INVENTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone)]
+struct PendingProjectInventoryPage {
+    page: ShellProjectInventoryPage,
+    next_cursor: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectInventorySync {
+    generation: String,
+    snapshot_sequence: u64,
+    projects: Vec<ShellAgentProjectSummary>,
+    cursor: usize,
+    page_index: u32,
+    pending: Option<PendingProjectInventoryPage>,
+}
+
+impl ProjectInventorySync {
+    fn new(projects: Vec<ShellAgentProjectSummary>) -> Self {
+        Self {
+            generation: uuid::Uuid::new_v4().simple().to_string(),
+            snapshot_sequence: next_project_inventory_sequence(),
+            projects,
+            cursor: 0,
+            page_index: 0,
+            pending: None,
+        }
+    }
+
+    fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    fn total_reported(&self) -> usize {
+        self.projects.len()
+    }
+
+    fn current_page(&mut self) -> Result<Option<ShellProjectInventoryPage>, &'static str> {
+        if let Some(pending) = &self.pending {
+            return Ok(Some(pending.page.clone()));
+        }
+        if self.cursor >= self.projects.len() && !(self.projects.is_empty() && self.page_index == 0)
+        {
+            return Ok(None);
+        }
+        if self.projects.is_empty() {
+            let page = ShellProjectInventoryPage {
+                generation: self.generation.clone(),
+                snapshot_sequence: self.snapshot_sequence,
+                page_index: 0,
+                total_reported: 0,
+                complete: true,
+                projects: Vec::new(),
+            };
+            self.pending = Some(PendingProjectInventoryPage {
+                page: page.clone(),
+                next_cursor: 0,
+            });
+            return Ok(Some(page));
+        }
+
+        let mut summaries = Vec::new();
+        for project in self.projects[self.cursor..].iter() {
+            if summaries.len() == PROJECT_INVENTORY_PAGE_MAX_SUMMARIES {
+                break;
+            }
+            summaries.push(project.clone());
+            let next_cursor = self.cursor + summaries.len();
+            let candidate = ShellProjectInventoryPage {
+                generation: self.generation.clone(),
+                snapshot_sequence: self.snapshot_sequence,
+                page_index: self.page_index,
+                total_reported: self.projects.len(),
+                complete: next_cursor == self.projects.len(),
+                projects: summaries.clone(),
+            };
+            let bytes = serde_json::to_vec(&candidate)
+                .map_err(|_| "project_inventory_serialization_failed")?;
+            if bytes.len() > PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES {
+                summaries.pop();
+                if summaries.is_empty() {
+                    return Err("project_inventory_summary_too_large");
+                }
+                break;
+            }
+        }
+        if summaries.is_empty() {
+            return Err("project_inventory_empty_page");
+        }
+        let next_cursor = self.cursor + summaries.len();
+        let page = ShellProjectInventoryPage {
+            generation: self.generation.clone(),
+            snapshot_sequence: self.snapshot_sequence,
+            page_index: self.page_index,
+            total_reported: self.projects.len(),
+            complete: next_cursor == self.projects.len(),
+            projects: summaries,
+        };
+        if serde_json::to_vec(&page)
+            .map_err(|_| "project_inventory_serialization_failed")?
+            .len()
+            > PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES
+        {
+            return Err("project_inventory_page_too_large");
+        }
+        self.pending = Some(PendingProjectInventoryPage {
+            page: page.clone(),
+            next_cursor,
+        });
+        Ok(Some(page))
+    }
+
+    fn acknowledge(&mut self, status: &ShellProjectInventoryStatus) -> Result<bool, String> {
+        // Explicit Server failure status owns error classification before any
+        // local pending-state or success-ack correlation. In particular,
+        // staging-capacity rejection can legitimately carry the previous
+        // authoritative generation because page 0 was not admitted.
+        if status.sync_state == "degraded" || status.sync_state == "failed" {
+            return Err(status
+                .last_error_code
+                .clone()
+                .unwrap_or_else(|| "project_inventory_sync_degraded".to_string()));
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(self.cursor >= self.projects.len());
+        };
+        // Successful in-progress/complete acknowledgements remain strictly
+        // fenced by generation, total, and exact cursor progress below.
+        if status.generation.as_deref() != Some(self.generation()) {
+            return Err("project_inventory_ack_generation_mismatch".to_string());
+        }
+        if status.total_reported != Some(self.projects.len()) {
+            return Err("project_inventory_ack_total_mismatch".to_string());
+        }
+        if status.total_synced != pending.next_cursor {
+            return Err("project_inventory_ack_progress_mismatch".to_string());
+        }
+        let final_page = pending.page.complete;
+        let valid_ack = (final_page && status.sync_state == "complete")
+            || (!final_page && status.sync_state == "in_progress");
+        if !valid_ack {
+            return Err("project_inventory_ack_state_mismatch".to_string());
+        }
+        self.cursor = pending.next_cursor;
+        self.page_index = self.page_index.saturating_add(1);
+        self.pending = None;
+        Ok(final_page)
+    }
+}
+
+fn log_project_inventory_upgrade_required(transport: &str, projects: usize) {
+    eprintln!(
+        "webcodex-runner project inventory sync unavailable transport={} projects={} reason_code=project_inventory_protocol_upgrade_required; runner remains online; upgrade Server to route this inventory",
+        transport, projects
+    );
+}
+
+fn log_project_inventory_degraded(transport: &str, projects: usize, reason_code: &str) {
+    eprintln!(
+        "webcodex-runner project inventory sync degraded transport={} projects={} reason_code={}; runner remains online",
+        transport, projects, reason_code
+    );
+}
+
+fn paged_sync_after_registration(
+    transport: &str,
+    projects: Vec<ShellAgentProjectSummary>,
+    status: Option<&ShellProjectInventoryStatus>,
+) -> Option<ProjectInventorySync> {
+    if legacy_inline_project_inventory(&projects).is_some() {
+        return None;
+    }
+    if status.is_none() {
+        log_project_inventory_upgrade_required(transport, projects.len());
+        return None;
+    }
+    Some(ProjectInventorySync::new(projects))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PollingProjectRefresh {
     last_sent_at: Instant,
@@ -1850,6 +2048,8 @@ fn run_polling_agent_with_shutdown(
     let mut session_refreshed_during_recovery = false;
     let mut recovery_backoff = RetryBackoff::new(&POLLING_RECOVERY_BACKOFF_STEPS);
     let mut lease_conflict_started: Option<Instant> = None;
+    let mut project_inventory_supported = false;
+    let mut project_inventory_sync: Option<ProjectInventorySync> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return complete_polling_after_shutdown(
@@ -1890,12 +2090,18 @@ fn run_polling_agent_with_shutdown(
                 jobs.prepared_profiles.len(),
                 &jobs,
             ) {
-                Ok((projects_count, registered_jobs)) => {
+                Ok((projects_count, registered_jobs, registered_projects, inventory_status)) => {
                     registered = true;
                     lease_conflict_started = None;
                     recovery_backoff.reset();
                     idle_backoff.reset();
                     project_refresh.mark_sent(Instant::now());
+                    project_inventory_supported = inventory_status.is_some();
+                    project_inventory_sync = paged_sync_after_registration(
+                        TRANSPORT_POLLING,
+                        registered_projects,
+                        inventory_status.as_ref(),
+                    );
                     let sink = AgentSink::Http(HttpSendConfig {
                         client: client.clone(),
                         server_url: cfg.server_url.clone(),
@@ -1997,14 +2203,51 @@ fn run_polling_agent_with_shutdown(
                 &mut project_cache,
             );
         }
-        let poll_projects = polling_projects_for_poll(
-            &project_refresh,
-            &mut project_cache,
-            &cfg,
-            shutdown.as_ref(),
-            Instant::now(),
-        );
-        let sent_project_refresh = poll_projects.is_some();
+        let refresh_projects = if project_inventory_sync.is_none() {
+            polling_projects_for_poll(
+                &project_refresh,
+                &mut project_cache,
+                &cfg,
+                shutdown.as_ref(),
+                Instant::now(),
+            )
+        } else {
+            None
+        };
+        let mut poll_projects = None;
+        let mut sent_inline_project_refresh = false;
+        if let Some(projects) = refresh_projects {
+            if let Some(inline) = legacy_inline_project_inventory(&projects) {
+                poll_projects = Some(inline);
+                sent_inline_project_refresh = true;
+            } else if project_inventory_supported {
+                project_inventory_sync = Some(ProjectInventorySync::new(projects));
+            } else {
+                log_project_inventory_upgrade_required(TRANSPORT_POLLING, projects.len());
+                project_refresh.mark_sent(Instant::now());
+            }
+        }
+
+        let mut project_inventory_page = None;
+        let mut inventory_page_build_failed = false;
+        if let Some(sync) = project_inventory_sync.as_mut() {
+            match sync.current_page() {
+                Ok(page) => project_inventory_page = page,
+                Err(reason_code) => {
+                    log_project_inventory_degraded(
+                        TRANSPORT_POLLING,
+                        sync.total_reported(),
+                        reason_code,
+                    );
+                    inventory_page_build_failed = true;
+                }
+            }
+        }
+        if inventory_page_build_failed {
+            project_inventory_sync = None;
+            project_refresh.mark_sent(Instant::now());
+        }
+        let sent_inventory_page = project_inventory_page.is_some();
         let mut poll_result = handle_one_poll(
             &client,
             &cfg,
@@ -2013,6 +2256,7 @@ fn run_polling_agent_with_shutdown(
             &runtime.persistent_shells,
             &mut project_cache,
             poll_projects,
+            project_inventory_page,
             agent_instance_id,
             &runtime.lsp,
             &shutdown,
@@ -2026,9 +2270,44 @@ fn run_polling_agent_with_shutdown(
             poll_result = Err(error);
         }
         match poll_result {
-            Ok(ran_request) => {
-                if sent_project_refresh {
+            Ok((ran_request, inventory_status)) => {
+                if sent_inline_project_refresh {
                     project_refresh.mark_sent(Instant::now());
+                }
+                if sent_inventory_page {
+                    match inventory_status {
+                        Some(status) => {
+                            if let Some(sync) = project_inventory_sync.as_mut() {
+                                match sync.acknowledge(&status) {
+                                    Ok(done) => {
+                                        if done {
+                                            project_inventory_sync = None;
+                                            project_refresh.mark_sent(Instant::now());
+                                        }
+                                    }
+                                    Err(reason_code) => {
+                                        log_project_inventory_degraded(
+                                            TRANSPORT_POLLING,
+                                            sync.total_reported(),
+                                            &reason_code,
+                                        );
+                                        project_inventory_sync = None;
+                                        project_refresh.mark_sent(Instant::now());
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            project_inventory_supported = false;
+                            if let Some(sync) = project_inventory_sync.take() {
+                                log_project_inventory_upgrade_required(
+                                    TRANSPORT_POLLING,
+                                    sync.total_reported(),
+                                );
+                            }
+                            project_refresh.mark_sent(Instant::now());
+                        }
+                    }
                 }
                 recovery_backoff.reset();
                 lease_conflict_started = None;
@@ -2042,6 +2321,12 @@ fn run_polling_agent_with_shutdown(
                     session_refreshed_during_recovery = false;
                 }
                 if once {
+                    // `--once` still completes a negotiated multi-page startup
+                    // inventory. Exiting after page 0 would make once-mode a
+                    // cardinality-dependent partial-sync path.
+                    if project_inventory_sync.is_some() {
+                        continue;
+                    }
                     while jobs.has_work() {
                         if sleep_or_shutdown(
                             Duration::from_millis(cfg.poll_interval_ms),
@@ -2255,9 +2540,13 @@ impl RegisteredStream {
     }
 }
 
-fn registered_ack(ack: AgentEnvelope) -> Result<(), String> {
+fn registered_ack(ack: AgentEnvelope) -> Result<Option<ShellProjectInventoryStatus>, String> {
     match ack {
-        AgentEnvelope::Registered { success: true, .. } => Ok(()),
+        AgentEnvelope::Registered {
+            success: true,
+            client,
+            ..
+        } => Ok(client.and_then(|client| client.project_inventory)),
         AgentEnvelope::Registered { error, .. } => Err(format!(
             "register rejected by server: {}",
             error.unwrap_or_else(|| "no server error message".to_string())
@@ -2270,16 +2559,252 @@ fn registered_ack(ack: AgentEnvelope) -> Result<(), String> {
     }
 }
 
+fn try_queue_project_inventory_page(
+    transport: StreamTransport,
+    sync: &mut Option<ProjectInventorySync>,
+    out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+) {
+    let next = sync
+        .as_mut()
+        .map(|state| (state.total_reported(), state.current_page()));
+    match next {
+        Some((_, Ok(Some(page)))) => {
+            let _ = out_tx.try_send(AgentEnvelope::ProjectInventoryPage { page });
+        }
+        Some((_, Ok(None))) => {
+            *sync = None;
+        }
+        Some((projects, Err(reason_code))) => {
+            log_project_inventory_degraded(transport.name(), projects, reason_code);
+            *sync = None;
+        }
+        None => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectInventoryStatusAction {
+    None,
+    IgnoreDelayedAck,
+    RetryExactAfter(Duration),
+    FreshResnapshot,
+}
+
+fn project_inventory_status_requests_fresh_resnapshot(
+    status: &ShellProjectInventoryStatus,
+) -> bool {
+    matches!(
+        status.last_error_code.as_deref(),
+        Some(
+            "project_inventory_stale_generation" | "project_inventory_missing_or_stale_generation"
+        )
+    )
+}
+
+fn project_inventory_status_is_delayed_success_ack(
+    state: &ProjectInventorySync,
+    status: &ShellProjectInventoryStatus,
+) -> bool {
+    if status.last_error_code.is_some()
+        || !matches!(status.sync_state.as_str(), "in_progress" | "complete")
+    {
+        return false;
+    }
+    if status.generation.as_deref() != Some(state.generation()) {
+        return true;
+    }
+    state.pending.as_ref().is_some_and(|pending| {
+        status.total_reported == Some(state.total_reported())
+            && status.total_synced < pending.next_cursor
+    })
+}
+
+fn handle_project_inventory_status(
+    transport: StreamTransport,
+    status: ShellProjectInventoryStatus,
+    sync: &mut Option<ProjectInventorySync>,
+    out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    retry_backoff: &mut RetryBackoff,
+) -> ProjectInventoryStatusAction {
+    // Stale-generation statuses can retain the last authoritative sync state
+    // and generation while carrying the actual recovery reason only in
+    // `last_error_code`. Those explicit reasons invalidate the current logical
+    // snapshot before ordinary success-ack correlation is attempted.
+    if project_inventory_status_requests_fresh_resnapshot(&status) {
+        if let Some(state) = sync.as_ref() {
+            log_project_inventory_degraded(
+                transport.name(),
+                state.total_reported(),
+                status
+                    .last_error_code
+                    .as_deref()
+                    .unwrap_or("project_inventory_stale_generation"),
+            );
+        }
+        *sync = None;
+        retry_backoff.reset();
+        return ProjectInventoryStatusAction::FreshResnapshot;
+    }
+
+    let Some(state) = sync.as_mut() else {
+        retry_backoff.reset();
+        return ProjectInventoryStatusAction::None;
+    };
+    if project_inventory_status_is_delayed_success_ack(state, &status) {
+        tracing::debug!(
+            transport = transport.name(),
+            current_generation = state.generation(),
+            ack_generation = status.generation.as_deref(),
+            ack_total_synced = status.total_synced,
+            "ignoring delayed project inventory success acknowledgement"
+        );
+        return ProjectInventoryStatusAction::IgnoreDelayedAck;
+    }
+    let projects = state.total_reported();
+    match state.acknowledge(&status) {
+        Ok(true) => {
+            *sync = None;
+            retry_backoff.reset();
+            ProjectInventoryStatusAction::None
+        }
+        Ok(false) => {
+            retry_backoff.reset();
+            try_queue_project_inventory_page(transport, sync, out_tx);
+            ProjectInventoryStatusAction::None
+        }
+        Err(reason_code) if reason_code == "project_inventory_staging_capacity" => {
+            let delay = retry_backoff.next_delay();
+            log_project_inventory_degraded(transport.name(), projects, &reason_code);
+            eprintln!(
+                "webcodex-runner project inventory retry scheduled transport={} reason_code={} delay={}",
+                transport.name(),
+                reason_code,
+                format_delay(delay)
+            );
+            // Keep the exact pending page/generation/snapshot_sequence. The
+            // Server rejected page 0 before advancing its high-water fence, so
+            // replaying this exact page after bounded delay is safe.
+            ProjectInventoryStatusAction::RetryExactAfter(delay)
+        }
+        Err(reason_code) => {
+            log_project_inventory_degraded(transport.name(), projects, &reason_code);
+            *sync = None;
+            retry_backoff.reset();
+            ProjectInventoryStatusAction::None
+        }
+    }
+}
+
+struct StreamingProjectInventoryCoordinator {
+    supported: bool,
+    sync: Option<ProjectInventorySync>,
+    project_cache: AgentProjectCache,
+    retry_backoff: RetryBackoff,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl StreamingProjectInventoryCoordinator {
+    fn new(sync: Option<ProjectInventorySync>) -> Self {
+        Self {
+            supported: sync.is_some(),
+            sync,
+            project_cache: AgentProjectCache::default(),
+            retry_backoff: RetryBackoff::new(&PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS),
+            retry_at: None,
+        }
+    }
+
+    fn retry_at(&self) -> Option<tokio::time::Instant> {
+        self.retry_at
+    }
+
+    fn queue_pending(
+        &mut self,
+        transport: StreamTransport,
+        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    ) {
+        try_queue_project_inventory_page(transport, &mut self.sync, out_tx);
+    }
+
+    fn retry_pending_now(
+        &mut self,
+        transport: StreamTransport,
+        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    ) {
+        self.retry_at = None;
+        self.queue_pending(transport, out_tx);
+    }
+
+    fn refresh_from_current_projects(
+        &mut self,
+        transport: StreamTransport,
+        cfg: &AgentConfig,
+        runtime: &AgentRuntimeState,
+        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+        reason_code: &str,
+    ) {
+        if !self.supported {
+            return;
+        }
+        self.project_cache.invalidate();
+        let projects = runtime.project_summaries(&mut self.project_cache, cfg);
+        let projects_count = projects.len();
+        self.sync = Some(ProjectInventorySync::new(projects));
+        self.retry_backoff.reset();
+        self.retry_at = None;
+        eprintln!(
+            "webcodex-runner project inventory resnapshot transport={} projects={} reason_code={}",
+            transport.name(),
+            projects_count,
+            reason_code
+        );
+        self.queue_pending(transport, out_tx);
+    }
+
+    fn handle_status(
+        &mut self,
+        transport: StreamTransport,
+        status: ShellProjectInventoryStatus,
+        cfg: &AgentConfig,
+        runtime: &AgentRuntimeState,
+        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    ) {
+        match handle_project_inventory_status(
+            transport,
+            status,
+            &mut self.sync,
+            out_tx,
+            &mut self.retry_backoff,
+        ) {
+            ProjectInventoryStatusAction::None => self.retry_at = None,
+            ProjectInventoryStatusAction::IgnoreDelayedAck => {}
+            ProjectInventoryStatusAction::RetryExactAfter(delay) => {
+                self.retry_at = Some(tokio::time::Instant::now() + delay);
+            }
+            ProjectInventoryStatusAction::FreshResnapshot => self.refresh_from_current_projects(
+                transport,
+                cfg,
+                runtime,
+                out_tx,
+                "project_inventory_server_invalidated_snapshot",
+            ),
+        }
+    }
+}
+
 fn handle_stream_envelope(
     transport: StreamTransport,
     envelope: AgentEnvelope,
     cfg: &AgentConfig,
     sink: &AgentSink,
     out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    project_inventory: &mut StreamingProjectInventoryCoordinator,
+    project_inventory_refresh_tx: &tokio::sync::mpsc::Sender<()>,
     runtime: &AgentRuntimeState,
 ) -> Option<String> {
     match envelope {
         AgentEnvelope::Request { request } => {
+            let project_op = is_project_op(&request.kind);
             let sink = sink.clone();
             let config = Arc::clone(&runtime.config);
             let hot = config.snapshot();
@@ -2291,9 +2816,10 @@ fn handle_stream_envelope(
             };
             let lsp = runtime.lsp.clone();
             let dispatch_guard = runtime.dispatches.enter();
+            let project_inventory_refresh_tx = project_inventory_refresh_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let _dispatch_guard = dispatch_guard;
-                let _ = dispatch_request(
+                let dispatch_result = dispatch_request(
                     &sink,
                     &hot,
                     &config,
@@ -2303,6 +2829,13 @@ fn handle_stream_envelope(
                     &lsp,
                     request,
                 );
+                if project_op && dispatch_result.is_ok() {
+                    // Capacity one deliberately coalesces multiple project
+                    // mutations. A queued dirty signal already guarantees a
+                    // fresh full observation; never block request completion on
+                    // inventory synchronization.
+                    let _ = project_inventory_refresh_tx.try_send(());
+                }
             });
             None
         }
@@ -2311,6 +2844,10 @@ fn handle_stream_envelope(
             None
         }
         AgentEnvelope::Pong { .. } => None,
+        AgentEnvelope::ProjectInventoryStatus { status } => {
+            project_inventory.handle_status(transport, status, cfg, runtime, out_tx);
+            None
+        }
         AgentEnvelope::Registered { .. } if transport == StreamTransport::Quic => None,
         AgentEnvelope::Error { code, message } => {
             Some(format!("server error {}: {}", code, message))
@@ -2333,6 +2870,7 @@ async fn serve_registered_stream<F>(
     registered_jobs: &ShellJobInventory,
     out_tx: tokio::sync::mpsc::Sender<AgentEnvelope>,
     mut stream: RegisteredStream,
+    project_inventory_sync: Option<ProjectInventorySync>,
     runtime: &AgentRuntimeState,
     shutdown: F,
 ) -> Result<AgentSessionExit, String>
@@ -2356,12 +2894,32 @@ where
     jobs.replay_snapshots_since(registered_jobs);
     let mut ping_interval = tokio::time::interval(transport.ping_interval());
     ping_interval.tick().await;
+    let mut project_inventory = StreamingProjectInventoryCoordinator::new(project_inventory_sync);
+    let (project_inventory_refresh_tx, mut project_inventory_refresh_rx) =
+        tokio::sync::mpsc::channel::<()>(1);
     let mut shutdown = Box::pin(shutdown);
     let mut shutdown_requested = false;
     let mut session_error = None;
 
     loop {
+        let project_inventory_retry_at = project_inventory.retry_at();
+        let project_inventory_retry_deadline =
+            project_inventory_retry_at.unwrap_or_else(tokio::time::Instant::now);
         tokio::select! {
+            _ = tokio::time::sleep_until(project_inventory_retry_deadline), if project_inventory_retry_at.is_some() => {
+                project_inventory.retry_pending_now(transport, &out_tx);
+            }
+            refresh = project_inventory_refresh_rx.recv() => {
+                if refresh.is_some() {
+                    project_inventory.refresh_from_current_projects(
+                        transport,
+                        cfg,
+                        runtime,
+                        &out_tx,
+                        "project_inventory_local_project_mutation",
+                    );
+                }
+            }
             _ = &mut shutdown => {
                 runtime.request_shutdown_signal();
                 shutdown_requested = true;
@@ -2370,9 +2928,16 @@ where
             read = stream.receive() => {
                 match read {
                     Ok(StreamRead::Envelope(envelope)) => {
-                        if let Some(error) =
-                            handle_stream_envelope(transport, envelope, cfg, &sink, &out_tx, runtime)
-                        {
+                        if let Some(error) = handle_stream_envelope(
+                            transport,
+                            envelope,
+                            cfg,
+                            &sink,
+                            &out_tx,
+                            &mut project_inventory,
+                            &project_inventory_refresh_tx,
+                            runtime,
+                        ) {
                             session_error = Some(error);
                             break;
                         }
@@ -2390,6 +2955,15 @@ where
                     "webcodex-runner stream keepalive ping"
                 );
                 send_provider_metadata(&out_tx, &runtime.config, None);
+                // An acknowledgement can be dropped if the Server's outbound
+                // channel is saturated. Re-sending the exact pending page is
+                // idempotent and gives the sync a bounded periodic recovery path.
+                // When the Server explicitly reported staging pressure, the
+                // dedicated backoff timer owns retry timing so keepalive cannot
+                // collapse that bounded delay into an eager resend.
+                if project_inventory.retry_at().is_none() {
+                    project_inventory.queue_pending(transport, &out_tx);
+                }
                 let _ = out_tx.try_send(AgentEnvelope::Ping {
                     ts: chrono::Utc::now().timestamp(),
                 });
@@ -2644,15 +3218,21 @@ async fn quic_session(
     // it exactly like the websocket/polling paths. It is never logged.
     let projects_count = enabled_projects_count(&projects);
     let registered_jobs = runtime.jobs.inventory();
+    let bootstrap = project_registration_bootstrap(&cfg.client_id, &projects, &registered_jobs);
+    let protocol_version = if bootstrap.paged_inventory {
+        AGENT_PROTOCOL_VERSION_QUIC_V2
+    } else {
+        AGENT_PROTOCOL_VERSION_QUIC_V1
+    };
     let (register_payload, provider, provider_revision) =
         build_register_request_with_provider_status(
             cfg,
             &runtime.config,
-            projects,
-            AGENT_PROTOCOL_VERSION_QUIC_V1,
+            bootstrap.projects,
+            protocol_version,
             agent_instance_id,
             0,
-            registered_jobs.clone(),
+            bootstrap.job_inventory,
         );
     let reg_env = AgentEnvelope::Register {
         payload: register_payload,
@@ -2681,7 +3261,9 @@ async fn quic_session(
     let ack = ack_result
         .map_err(|_| "quic register ack timed out".to_string())?
         .map_err(|e| format!("failed to read quic register ack: {}", e))?;
-    registered_ack(ack)?;
+    let inventory_status = registered_ack(ack)?;
+    let mut project_inventory_sync =
+        paged_sync_after_registration(TRANSPORT_QUIC, projects, inventory_status.as_ref());
     provider.mark_status_reported(provider_revision);
     eprintln!(
         "{}",
@@ -2733,6 +3315,7 @@ async fn quic_session(
     // Outgoing envelopes share one writer so future QUIC multistream work can
     // change the transport adapter without duplicating the session lifecycle.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+    try_queue_project_inventory_page(StreamTransport::Quic, &mut project_inventory_sync, &out_tx);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
             if write_quic_frame(&mut send, &env).await.is_err() {
@@ -2753,6 +3336,7 @@ async fn quic_session(
             connection: conn,
             endpoint: client_endpoint,
         },
+        project_inventory_sync,
         runtime,
         runtime.wait_for_shutdown(),
     )
@@ -3223,15 +3807,21 @@ where
     // `prepared_cache_count` is reported as 0 here.
     let projects_count = enabled_projects_count(&projects);
     let registered_jobs = runtime.jobs.inventory();
+    let bootstrap = project_registration_bootstrap(&cfg.client_id, &projects, &registered_jobs);
+    let protocol_version = if bootstrap.paged_inventory {
+        AGENT_PROTOCOL_VERSION_WEBSOCKET_V2
+    } else {
+        AGENT_PROTOCOL_VERSION_WEBSOCKET_V1
+    };
     let (register_payload, provider, provider_revision) =
         build_register_request_with_provider_status(
             cfg,
             &runtime.config,
-            projects,
-            AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+            bootstrap.projects,
+            protocol_version,
             agent_instance_id,
             0,
-            registered_jobs.clone(),
+            bootstrap.job_inventory,
         );
     let reg_env = AgentEnvelope::Register {
         payload: register_payload,
@@ -3265,7 +3855,9 @@ where
         .map_err(|_| "register ack was not text".to_string())?;
     let ack = AgentEnvelope::from_slice(ack_text.as_bytes())
         .map_err(|e| format!("register ack is not a valid envelope: {}", e))?;
-    registered_ack(ack)?;
+    let inventory_status = registered_ack(ack)?;
+    let mut project_inventory_sync =
+        paged_sync_after_registration(TRANSPORT_WEBSOCKET, projects, inventory_status.as_ref());
     provider.mark_status_reported(provider_revision);
     eprintln!(
         "{}",
@@ -3275,6 +3867,11 @@ where
     // Split socket into writer (drains outgoing envelopes) and reader.
     let (mut sink, stream) = ws_stream.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+    try_queue_project_inventory_page(
+        StreamTransport::WebSocket,
+        &mut project_inventory_sync,
+        &out_tx,
+    );
     let writer_task = tokio::spawn(async move {
         let mut graceful_close = false;
         while let Some(env) = out_rx.recv().await {
@@ -3309,6 +3906,7 @@ where
             reader: stream,
             writer: writer_task,
         },
+        project_inventory_sync,
         runtime,
         shutdown,
     )
