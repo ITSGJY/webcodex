@@ -26,7 +26,8 @@ use super::project_instructions::{ProjectInstructionFile, ProjectInstructionsSna
 use super::project_resolution::ResolvedProject;
 use super::runtime_info::compact_runtime_status;
 use super::session_context::{
-    session_project_mismatch_warning, SessionProjectMismatch, SESSION_PROJECT_MISMATCH_KIND,
+    session_project_mismatch_warning, workflow_session_authority_fingerprint,
+    SessionProjectMismatch, SESSION_PROJECT_MISMATCH_KIND,
 };
 use super::sessions::tool_failure_summary_from_events;
 use super::sessions::{self, SessionTransport, TOOL_CALL_RECORDING_SESSION_ID_FIELD};
@@ -677,7 +678,11 @@ impl ToolRuntime {
                 "message": "repository structure overview was unavailable during startup",
             }));
         }
-        let continuity_key = if bind_current {
+        // Explicit resume may need the exact historical durable binding as a
+        // legacy authority-upgrade proof even when the caller does not want to
+        // bind this request as current. Building the key does not itself create
+        // or refresh any binding; `bind_current` remains the sole mutation gate.
+        let continuity_key = if bind_current || resume_requested {
             match current_session_key(
                 auth,
                 transport,
@@ -687,18 +692,20 @@ impl ToolRuntime {
             ) {
                 Ok(key) => Some(key),
                 Err(message) => {
-                    warnings.push(if resume_requested {
-                        json!({
-                            "kind": "current_binding_unavailable",
-                            "reason_code": "stable_window_identity_unavailable",
-                            "message": "explicit Workflow Session resume continued without a current binding because stable chat-window identity was unavailable",
-                        })
-                    } else {
-                        json!({
-                            "kind": "current_binding_unavailable",
-                            "message": message,
-                        })
-                    });
+                    if bind_current {
+                        warnings.push(if resume_requested {
+                            json!({
+                                "kind": "current_binding_unavailable",
+                                "reason_code": "stable_window_identity_unavailable",
+                                "message": "explicit Workflow Session resume continued without a current binding because stable chat-window identity was unavailable",
+                            })
+                        } else {
+                            json!({
+                                "kind": "current_binding_unavailable",
+                                "message": message,
+                            })
+                        });
+                    }
                     None
                 }
             }
@@ -744,10 +751,30 @@ impl ToolRuntime {
         let binding_available = bind_current && continuity_key.is_some();
         let write_scope_verified =
             auth.is_none_or(|auth| auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE));
+        let authority_fingerprint = match auth {
+            None => None,
+            Some(auth) => match workflow_session_authority_fingerprint(Some(auth)) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(_) => {
+                    return attach_project_resolution(
+                        ToolResult::err_with_output(
+                            "authenticated caller has no canonical Workflow Session authority identity",
+                            json!({
+                                "error_kind": "session_authority_identity_unavailable",
+                                "failure_kind": "session_authority_denied",
+                                "state_changed": false,
+                            }),
+                        ),
+                        &project_resolution,
+                    );
+                }
+            },
+        };
         let session_outcome = match self.sessions.ensure_coding_session(
             sessions::CodingSessionRequest {
                 key: continuity_key.clone(),
                 project: resolved.resolved_id.clone(),
+                authority_fingerprint,
                 resume_session_id: resume_session_id.clone(),
                 instruction: title.clone(),
                 mode,
@@ -830,6 +857,39 @@ impl ToolRuntime {
                             "session_project": session_project,
                             "request_project": request_project,
                             "resume_requested": true,
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
+                );
+            }
+            Err(sessions::CodingSessionError::ResumeAuthorityMismatch { session_id }) => {
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        "session_authority_denied",
+                        json!({
+                            "error_kind": "session_authority_denied",
+                            "failure_kind": "session_authority_denied",
+                            "session_id": session_id,
+                            "resume_requested": true,
+                            "state_changed": false,
+                        }),
+                    ),
+                    &project_resolution,
+                );
+            }
+            Err(sessions::CodingSessionError::LegacySessionAuthorityUnverifiable {
+                session_id,
+            }) => {
+                return attach_project_resolution(
+                    ToolResult::err_with_output(
+                        "legacy_session_authority_unverifiable",
+                        json!({
+                            "error_kind": "legacy_session_authority_unverifiable",
+                            "failure_kind": "session_authority_denied",
+                            "reason_code": "legacy_session_authority_unverifiable",
+                            "session_id": session_id,
+                            "resume_requested": resume_requested,
                             "state_changed": false,
                         }),
                     ),
@@ -1268,6 +1328,12 @@ impl ToolRuntime {
         let include_handoff = include_handoff.unwrap_or(true);
         let include_validation_summary = include_validation_summary.unwrap_or(true);
 
+        if let Err(result) = self
+            .authorize_session_target(&session_id, "finish_coding_task", auth)
+            .await
+        {
+            return result;
+        }
         let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
             Ok(resolved) => resolved,
             Err(err) => return err.into_tool_result(),
@@ -1587,12 +1653,20 @@ impl ToolRuntime {
                         risk: 0,
                         todo: 0,
                         question: 0,
+                        answer: 0,
                         decision: 0,
+                        open_guidance: 0,
+                        open_questions: 0,
+                        open_risks: 0,
+                        open_todos: 0,
                     },
                     open_guidance: Vec::new(),
                     open_questions: Vec::new(),
                     open_risks: Vec::new(),
                     open_todos: Vec::new(),
+                    high_priority_open_todos: Vec::new(),
+                    recent_answers: Vec::new(),
+                    recent_completions: Vec::new(),
                     recent_progress: Vec::new(),
                     recent_decisions: Vec::new(),
                 },

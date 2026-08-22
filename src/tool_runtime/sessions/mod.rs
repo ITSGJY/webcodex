@@ -19,6 +19,8 @@ mod store;
 mod util;
 
 #[cfg(test)]
+mod collaboration_tests;
+#[cfg(test)]
 mod tests;
 
 // Re-exports keep `crate::tool_runtime::sessions::{...}` stable for callers.
@@ -32,18 +34,24 @@ pub(crate) use events::{
     ExplorationToolKind, EXPLORATION_TOOL_NAMES,
 };
 pub(crate) use model::{
-    CodingSessionError, CodingSessionRequest, CurrentSessionKey, ListSessionMessagesFilter,
-    PostSessionMessageInput, SessionCloseError, SessionCreateOptions, SessionDiscussionCounts,
-    SessionDiscussionSummary, SessionEvent, SessionExecutionContext,
+    CodingSessionError, CodingSessionRequest, CompleteSessionMessageInput, CurrentSessionKey,
+    ListSessionMessagesFilter, PostSessionMessageInput, SessionCloseError, SessionCreateOptions,
+    SessionDiscussionCounts, SessionDiscussionSummary, SessionEvent, SessionExecutionContext,
     SessionExecutionContextUpdateError, SessionGuardDenial, SessionGuards, SessionLifecycle,
     SessionLifecycleDenial, SessionMessage, SessionMessageError, SessionMessageKind,
     SessionMessagePriority, SessionMessageStatus, SessionSummary, SessionTransport,
     ToolCallRecorderMetadata, DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_SESSIONS,
-    MAX_CODING_INSTRUCTION_CHARS, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
+    MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_COMPLETION_KEY_CHARS,
+    TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
 };
 pub(crate) use store::SessionStore;
 pub(crate) use util::redact_and_bound_instruction;
+
+/// Synthetic authority marker used only by the cfg(test) SessionStore convenience
+/// constructors. Real runtime creation paths never write or accept this marker.
+#[cfg(test)]
+pub(crate) const TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT: &str =
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
 // Test-only surface: keep the runtime re-export list narrow while still
 // allowing crate-level tests to reach these constants without pub-ing `model`.

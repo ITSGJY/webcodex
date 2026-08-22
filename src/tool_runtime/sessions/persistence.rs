@@ -21,7 +21,7 @@ use super::model::{
     MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS, MAX_MESSAGE_CHARS,
     MAX_MESSAGE_RESOLUTION_CHARS, MESSAGE_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
-use super::query::validate_message_tags;
+use super::query::{is_valid_completion_id, validate_message_tags};
 use super::util::{
     bound_chars, bound_event_error_summary, bound_summary_string, redact_and_bound_instruction,
 };
@@ -58,6 +58,7 @@ impl PersistedSessionRecord {
         Self {
             session_id: record.session_id.clone(),
             project: record.project.clone(),
+            owner_authority_fingerprint: record.owner_authority_fingerprint.clone(),
             title: record.title.clone(),
             mode: record.mode,
             guards: record.guards,
@@ -74,6 +75,7 @@ impl PersistedSessionRecord {
     pub(super) fn still_matches_record(&self, record: &SessionRecord) -> bool {
         self.session_id == record.session_id
             && self.project == record.project
+            && self.owner_authority_fingerprint == record.owner_authority_fingerprint
             && self.title == record.title
             && self.mode == record.mode
             && self.guards == record.guards
@@ -131,6 +133,8 @@ impl PersistedSessionRecord {
         // count persisted.
         let retained_events = events.len() as u64;
         let project = self.project.map(|value| bound_summary_string(value.trim()));
+        let owner_authority_fingerprint =
+            sanitize_owner_authority_fingerprint(self.owner_authority_fingerprint);
         let execution_context = if project.is_some() {
             self.execution_context.sanitized_for_restore()
         } else {
@@ -139,6 +143,7 @@ impl PersistedSessionRecord {
         Some(SessionRecord {
             session_id,
             project,
+            owner_authority_fingerprint,
             title: self.title.map(|value| bound_summary_string(value.trim())),
             mode: self.mode,
             guards: SessionGuards::effective(self.mode, self.guards),
@@ -152,6 +157,27 @@ impl PersistedSessionRecord {
             messages,
             project_instructions: None,
         })
+    }
+}
+
+// Preserve the distinction between a genuinely absent legacy field and a
+// present-but-malformed value without retaining attacker-controlled material.
+// The marker is internal ledger state, is never a valid canonical fingerprint,
+// and therefore remains permanently fail-closed across subsequent rewrites.
+const INVALID_OWNER_AUTHORITY_FINGERPRINT_MARKER: &str =
+    "invalid_persisted_workflow_session_authority_fingerprint";
+
+fn sanitize_owner_authority_fingerprint(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() == 64
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Some(normalized)
+    } else {
+        Some(INVALID_OWNER_AUTHORITY_FINGERPRINT_MARKER.to_string())
     }
 }
 
@@ -176,6 +202,9 @@ pub(super) fn cold_session_from_persisted(
     Ok(ColdSessionRecord {
         session_id: persisted.session_id.clone(),
         project: persisted.project.clone(),
+        owner_authority_fingerprint: sanitize_owner_authority_fingerprint(
+            persisted.owner_authority_fingerprint.clone(),
+        ),
         mode: persisted.mode,
         guards: persisted.guards,
         lifecycle: persisted.lifecycle,
@@ -507,6 +536,24 @@ pub(super) fn sanitize_persisted_message(
             Some(reply_to)
         } else {
             None
+        }
+    });
+    message.author_session_id = message.author_session_id.and_then(|author_session_id| {
+        let author_session_id = author_session_id.trim().to_string();
+        is_valid_session_id(&author_session_id).then_some(author_session_id)
+    });
+    message.resolved_by_message_id = message.resolved_by_message_id.and_then(|message_id| {
+        let message_id = message_id.trim().to_string();
+        message_id
+            .starts_with(MESSAGE_ID_PREFIX)
+            .then_some(message_id)
+    });
+    message.completion_id = message.completion_id.and_then(|completion_id| {
+        let completion_id = completion_id.trim().to_ascii_lowercase();
+        if is_valid_completion_id(&completion_id) {
+            Some(completion_id)
+        } else {
+            Some("invalid".to_string())
         }
     });
     message.resolution = message

@@ -38,6 +38,8 @@ pub(crate) const MAX_MESSAGE_CHARS: usize = 8000;
 pub(crate) const MAX_MESSAGE_TAGS: usize = 16;
 pub(crate) const MAX_MESSAGE_TAG_CHARS: usize = 64;
 pub(crate) const MAX_MESSAGE_RESOLUTION_CHARS: usize = 8000;
+pub(crate) const MAX_MESSAGE_COMPLETION_KEY_CHARS: usize = 128;
+pub(crate) const MESSAGE_COMPLETION_FINGERPRINT_HEX_CHARS: usize = 64;
 pub(super) const MAX_MESSAGE_SUMMARY_CHARS: usize = 240;
 pub(super) const SUMMARY_MESSAGE_GROUP_LIMIT: usize = 5;
 pub(crate) const TOOL_EXPECTATION_RESULT_NONE: &str = "none";
@@ -290,6 +292,12 @@ pub(crate) struct SessionLifecycleDenial {
 pub(super) struct SessionRecord {
     pub(super) session_id: String,
     pub(super) project: Option<String>,
+    /// Domain-separated SHA-256 of the canonical creation-time authority group.
+    /// The historical field name is retained for ledger compatibility; the raw
+    /// authority identity is never stored. Restore may use a private noncanonical
+    /// marker for a malformed persisted value so it remains distinguishable from
+    /// a genuinely absent legacy field and permanently fails authorization.
+    pub(super) owner_authority_fingerprint: Option<String>,
     pub(super) title: Option<String>,
     pub(super) mode: SessionMode,
     pub(super) guards: SessionGuards,
@@ -323,6 +331,7 @@ pub(super) enum StoredSession {
 pub(super) struct ColdSessionRecord {
     pub(super) session_id: String,
     pub(super) project: Option<String>,
+    pub(super) owner_authority_fingerprint: Option<String>,
     pub(super) mode: SessionMode,
     pub(super) guards: SessionGuards,
     pub(super) lifecycle: SessionLifecycle,
@@ -343,6 +352,13 @@ impl StoredSession {
         match self {
             Self::Hot(record) => record.project.as_deref(),
             Self::Cold(record) => record.project.as_deref(),
+        }
+    }
+
+    pub(super) fn owner_authority_fingerprint(&self) -> Option<&str> {
+        match self {
+            Self::Hot(record) => record.owner_authority_fingerprint.as_deref(),
+            Self::Cold(record) => record.owner_authority_fingerprint.as_deref(),
         }
     }
 
@@ -388,6 +404,7 @@ impl StoredSession {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionCreateOptions {
     pub(crate) project: Option<String>,
+    pub(crate) owner_authority_fingerprint: Option<String>,
     pub(crate) title: Option<String>,
     pub(crate) mode: SessionMode,
     pub(crate) guards: SessionGuards,
@@ -404,6 +421,7 @@ impl SessionCreateOptions {
     ) -> Self {
         Self {
             project,
+            owner_authority_fingerprint: None,
             title,
             mode,
             guards,
@@ -417,6 +435,14 @@ impl SessionCreateOptions {
         project_instructions: Option<ProjectInstructionsSnapshot>,
     ) -> Self {
         self.project_instructions = project_instructions;
+        self
+    }
+
+    pub(crate) fn with_owner_authority_fingerprint(
+        mut self,
+        owner_authority_fingerprint: Option<String>,
+    ) -> Self {
+        self.owner_authority_fingerprint = owner_authority_fingerprint;
         self
     }
 
@@ -439,6 +465,9 @@ impl SessionCreateOptions {
 pub(crate) struct CodingSessionRequest {
     pub(crate) key: Option<CurrentSessionKey>,
     pub(crate) project: String,
+    /// Canonical creation-time authority fence for authenticated callers.
+    /// `None` is reserved for the trusted local/dev path.
+    pub(crate) authority_fingerprint: Option<String>,
     pub(crate) resume_session_id: Option<String>,
     pub(crate) instruction: Option<String>,
     pub(crate) mode: SessionMode,
@@ -483,6 +512,12 @@ pub(crate) enum CodingSessionError {
         session_id: String,
         session_project: Option<String>,
         request_project: String,
+    },
+    ResumeAuthorityMismatch {
+        session_id: String,
+    },
+    LegacySessionAuthorityUnverifiable {
+        session_id: String,
     },
     ResumeNewSessionConflict,
     WriteScopeRequired,
@@ -606,6 +641,11 @@ pub(super) struct DurableCurrentBinding {
 pub(super) struct PersistedSessionRecord {
     pub(super) session_id: String,
     pub(super) project: Option<String>,
+    /// Additive v1 field. c3a09275 used it only for project-less ownership;
+    /// current writers store the canonical authority-group fingerprint for every
+    /// authenticated Session. The historical name keeps ledger compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) owner_authority_fingerprint: Option<String>,
     pub(super) title: Option<String>,
     pub(super) mode: SessionMode,
     pub(super) guards: SessionGuards,
@@ -901,8 +941,14 @@ pub(crate) struct SessionMessage {
     pub(crate) message: String,
     pub(crate) tags: Vec<String>,
     pub(crate) reply_to: Option<String>,
+    #[serde(default)]
+    pub(crate) author_session_id: Option<String>,
     pub(crate) resolved_at: Option<i64>,
     pub(crate) resolution: Option<String>,
+    #[serde(default)]
+    pub(crate) resolved_by_message_id: Option<String>,
+    #[serde(default)]
+    pub(crate) completion_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -915,10 +961,30 @@ pub(crate) struct PostSessionMessageInput {
     pub(crate) priority: SessionMessagePriority,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
+pub(crate) struct CompleteSessionMessageInput {
+    pub(crate) session_id: String,
+    pub(crate) message_id: String,
+    pub(crate) answer: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) priority: SessionMessagePriority,
+    pub(crate) completion_id: String,
+    pub(crate) author_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CompleteSessionMessageOutcome {
+    pub(crate) todo: SessionMessage,
+    pub(crate) answer: SessionMessage,
+    pub(crate) replayed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ListSessionMessagesFilter {
     pub(crate) kind: Option<SessionMessageKind>,
     pub(crate) status: Option<SessionMessageStatus>,
+    pub(crate) message_id: Option<String>,
+    pub(crate) reply_to: Option<String>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -950,7 +1016,20 @@ pub(crate) struct SessionDiscussionCounts {
     pub(crate) risk: usize,
     pub(crate) todo: usize,
     pub(crate) question: usize,
+    pub(crate) answer: usize,
     pub(crate) decision: usize,
+    pub(crate) open_guidance: usize,
+    pub(crate) open_questions: usize,
+    pub(crate) open_risks: usize,
+    pub(crate) open_todos: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SessionMessageCompletionSummary {
+    pub(crate) todo_message_id: String,
+    pub(crate) answer_message_id: String,
+    pub(crate) author_session_id: Option<String>,
+    pub(crate) completed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -960,6 +1039,9 @@ pub(crate) struct SessionDiscussionSummary {
     pub(crate) open_questions: Vec<SessionMessage>,
     pub(crate) open_risks: Vec<SessionMessage>,
     pub(crate) open_todos: Vec<SessionMessage>,
+    pub(crate) high_priority_open_todos: Vec<SessionMessage>,
+    pub(crate) recent_answers: Vec<SessionMessage>,
+    pub(crate) recent_completions: Vec<SessionMessageCompletionSummary>,
     pub(crate) recent_progress: Vec<SessionMessage>,
     pub(crate) recent_decisions: Vec<SessionMessage>,
 }
@@ -984,6 +1066,14 @@ pub(crate) struct SessionInboxHint {
 pub(crate) enum SessionMessageError {
     UnknownSession,
     UnknownMessage,
+    NotTodo,
+    IdempotencyConflict,
+    AlreadyCompleted {
+        answer_message_id: Option<String>,
+        completion_id: Option<String>,
+    },
+    InvalidCompletionState,
+    PersistenceUncertain,
     /// Message-board mutation denied because the workflow session is closed
     /// (or archived). Query tools remain available.
     SessionClosed {

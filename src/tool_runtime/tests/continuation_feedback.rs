@@ -1561,6 +1561,8 @@ fn resolved_guidance_is_not_counted_as_open() {
             sessions::ListSessionMessagesFilter {
                 kind: Some(sessions::SessionMessageKind::Guidance),
                 status: None,
+                message_id: None,
+                reply_to: None,
                 limit: None,
             },
         )
@@ -2354,6 +2356,7 @@ fn add_instruction(runtime: &ToolRuntime, session_id: &str, instruction: &str, m
         .ensure_coding_session(sessions::CodingSessionRequest {
             key: None,
             project: "test-project".to_string(),
+            authority_fingerprint: None,
             resume_session_id: Some(session_id.to_string()),
             instruction: Some(instruction.to_string()),
             mode,
@@ -2475,6 +2478,7 @@ fn add_instruction_for(
         .ensure_coding_session(sessions::CodingSessionRequest {
             key: None,
             project: project.to_string(),
+            authority_fingerprint: None,
             resume_session_id: Some(session_id.to_string()),
             instruction: Some(instruction.to_string()),
             mode,
@@ -2607,12 +2611,20 @@ fn empty_discussion() -> sessions::SessionDiscussionSummary {
             risk: 0,
             todo: 0,
             question: 0,
+            answer: 0,
             decision: 0,
+            open_guidance: 0,
+            open_questions: 0,
+            open_risks: 0,
+            open_todos: 0,
         },
         open_guidance: Vec::new(),
         open_questions: Vec::new(),
         open_risks: Vec::new(),
         open_todos: Vec::new(),
+        high_priority_open_todos: Vec::new(),
+        recent_answers: Vec::new(),
+        recent_completions: Vec::new(),
         recent_progress: Vec::new(),
         recent_decisions: Vec::new(),
     }

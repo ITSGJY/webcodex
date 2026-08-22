@@ -26,7 +26,8 @@ use super::events::{
 };
 use super::model::{
     CodingSessionError, CodingSessionOutcome, CodingSessionRequest, ColdSessionRecord,
-    CurrentSessionKey, DurableCurrentBinding, PersistedCurrentBinding, PersistedCurrentBindings,
+    CompleteSessionMessageInput, CompleteSessionMessageOutcome, CurrentSessionKey,
+    DurableCurrentBinding, PersistedCurrentBinding, PersistedCurrentBindings,
     PersistedSessionLedger, PersistedSessionRecord, PersistedSessionSnapshot,
     PersistentShellEventEvidence, PostSessionMessageInput, SessionCloseError, SessionCloseOutcome,
     SessionCounts, SessionCreateOptions, SessionEvent, SessionExecutionContext,
@@ -44,7 +45,8 @@ use super::persistence::{
     write_ledger_atomic,
 };
 use super::query::{
-    build_messages_summary, validate_message_tags, validate_message_text, validate_resolution_text,
+    build_messages_summary, is_valid_completion_id, validate_message_tags, validate_message_text,
+    validate_resolution_text,
 };
 use super::util::{
     bound_event_error_summary, bound_summary_string, now_ts, redact_and_bound_instruction,
@@ -127,7 +129,7 @@ impl LedgerWriterGuard {
         }))
     }
 
-    fn mark_dirty(&self) {
+    fn mark_dirty(&self) -> u64 {
         let mut state = self
             .shared
             .state
@@ -135,31 +137,38 @@ impl LedgerWriterGuard {
             .expect("session ledger writer state poisoned");
         state.dirty = true;
         state.dirty_generation = state.dirty_generation.saturating_add(1);
+        let generation = state.dirty_generation;
         self.shared.cvar.notify_one();
+        generation
     }
 
-    /// Block until every dirty mark observed so far has been written (or the
-    /// writer has shut down). Used by tests that re-open the ledger file and
-    /// by Drop for a best-effort durable shutdown.
-    ///
-    /// Must also wait out an in-flight write: the writer clears `dirty` before
-    /// serializing, so a flush that only checked `dirty` could return while
-    /// the file was still being written.
-    #[cfg(test)]
-    fn flush(&self) {
+    /// Block until the exact generation requested by the caller has been
+    /// written. Later concurrent dirty marks do not extend this fence.
+    fn flush_through(&self, generation: u64) {
         let mut state = self
             .shared
             .state
             .lock()
             .expect("session ledger writer state poisoned");
-        while !state.shutdown && (state.dirty || state.writes_completed < state.dirty_generation) {
-            // Spurious wakeups are fine; re-check the condition.
+        while state.writes_completed < generation {
             state = self
                 .shared
                 .cvar
                 .wait(state)
                 .expect("session ledger writer state poisoned");
         }
+    }
+
+    /// Test/closeout barrier for every dirty mark observed at call time.
+    #[cfg(test)]
+    fn flush(&self) {
+        let generation = self
+            .shared
+            .state
+            .lock()
+            .expect("session ledger writer state poisoned")
+            .dirty_generation;
+        self.flush_through(generation);
     }
 }
 
@@ -433,6 +442,19 @@ impl SessionStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn insert_process_local_binding_only_for_test(
+        &self,
+        key: CurrentSessionKey,
+        session_id: &str,
+    ) {
+        self.inner
+            .lock()
+            .expect("session store mutex poisoned")
+            .current_sessions
+            .insert(key, session_id.to_string());
+    }
+
+    #[cfg(test)]
     pub(crate) fn hot_payload_entry_count_for_test(&self, session_id: &str) -> Option<usize> {
         self.inner
             .lock()
@@ -491,6 +513,15 @@ impl SessionStore {
         mut opts: SessionCreateOptions,
     ) -> Result<SessionSummary, String> {
         opts.execution_context = opts.execution_context.validated()?;
+        #[cfg(test)]
+        if opts.project.is_some() && opts.owner_authority_fingerprint.is_none() {
+            // cfg(test)-only callers often build a synthetic project Session
+            // directly, without an AuthContext. Mark those fixtures explicitly;
+            // real runtime creation supplies a canonical fingerprint before this
+            // point, so production missing-fingerprint records still fail closed.
+            opts.owner_authority_fingerprint =
+                Some(super::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string());
+        }
         if opts.project.is_none() && !opts.execution_context.is_empty() {
             return Err(
                 "execution_context requires a Workflow Session bound to a registered project"
@@ -500,9 +531,11 @@ impl SessionStore {
         let session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let now = now_ts();
         let guards = SessionGuards::effective(opts.mode, opts.guards);
+        let owner_authority_fingerprint = opts.owner_authority_fingerprint;
         let record = SessionRecord {
             session_id: session_id.clone(),
             project: opts.project,
+            owner_authority_fingerprint,
             title: opts.title,
             mode: opts.mode,
             guards,
@@ -595,6 +628,49 @@ impl SessionStore {
                 None
             };
 
+            let legacy_authority_upgrade = if let (Some(session_id), Some(authority_fingerprint)) = (
+                reusable_session_id.as_deref(),
+                request.authority_fingerprint.as_deref(),
+            ) {
+                let stored_fingerprint = inner
+                    .sessions
+                    .get(session_id)
+                    .and_then(StoredSession::owner_authority_fingerprint);
+                #[cfg(test)]
+                let synthetic_test_fixture = stored_fingerprint
+                    == Some(super::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT);
+                #[cfg(not(test))]
+                let synthetic_test_fixture = false;
+                if synthetic_test_fixture {
+                    false
+                } else if let Some(stored_fingerprint) = stored_fingerprint {
+                    if stored_fingerprint != authority_fingerprint {
+                        return Err(CodingSessionError::ResumeAuthorityMismatch {
+                            session_id: session_id.to_string(),
+                        });
+                    }
+                    false
+                } else {
+                    let Some(key) = request.key.as_ref() else {
+                        return Err(CodingSessionError::LegacySessionAuthorityUnverifiable {
+                            session_id: session_id.to_string(),
+                        });
+                    };
+                    if !inner.legacy_project_session_authority_upgrade_proof(
+                        session_id,
+                        key,
+                        &request.project,
+                    ) {
+                        return Err(CodingSessionError::LegacySessionAuthorityUnverifiable {
+                            session_id: session_id.to_string(),
+                        });
+                    }
+                    true
+                }
+            } else {
+                false
+            };
+
             if let Some(session_id) = reusable_session_id {
                 let (previous_mode, previous_guards, previous_execution_context) = {
                     let record = inner
@@ -670,6 +746,12 @@ impl SessionStore {
                         .get_mut(&session_id)
                         .and_then(StoredSession::hot_mut)
                         .expect("active reusable session must stay hot before commit");
+                    if legacy_authority_upgrade {
+                        // The exact durable binding proof and every other fallible
+                        // continuation check completed above. Commit the canonical
+                        // fence with the same Session mutation/persistence generation.
+                        record.owner_authority_fingerprint = request.authority_fingerprint.clone();
+                    }
                     record.mode = request.mode;
                     record.guards = next_guards;
                     record.execution_context = next_execution_context;
@@ -738,6 +820,7 @@ impl SessionStore {
                 let record = SessionRecord {
                     session_id: new_session_id.clone(),
                     project: Some(request.project.clone()),
+                    owner_authority_fingerprint: request.authority_fingerprint.clone(),
                     // The first accepted instruction remains the root title.
                     // Follow-up instructions never overwrite it.
                     title: instruction,
@@ -934,6 +1017,14 @@ impl SessionStore {
     pub(crate) fn session_project(&self, session_id: &str) -> Option<Option<String>> {
         let inner = self.inner.lock().expect("session store mutex poisoned");
         inner.session_project(session_id)
+    }
+
+    pub(crate) fn session_target_authority(
+        &self,
+        session_id: &str,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        inner.session_target_authority(session_id)
     }
 
     /// Return inherited defaults only for an active Session whose registered
@@ -1642,12 +1733,35 @@ impl SessionStore {
     pub(super) fn persist_after_mutation(&self) {
         if let Some(writer) = &self.writer {
             // Fire-and-forget: the dedicated writer thread serializes and
-            // writes. Callers that need durability before reading the file
-            // must call `flush_persistence`.
-            writer.mark_dirty();
+            // writes. Narrow restart-safe operations use
+            // `persist_after_mutation_durable` instead.
+            let _ = writer.mark_dirty();
             return;
         }
         self.persist_after_mutation_with(write_ledger_atomic);
+    }
+
+    /// Persist this exact mutation generation before returning success. Used
+    /// only by low-frequency operations whose success response promises
+    /// restart-safe idempotency; ordinary Session events remain asynchronous.
+    pub(super) fn persist_after_mutation_durable(&self) -> Result<(), ()> {
+        if let Some(writer) = &self.writer {
+            let generation = writer.mark_dirty();
+            writer.flush_through(generation);
+        } else {
+            self.persist_after_mutation_with(write_ledger_atomic);
+        }
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        if inner
+            .persistence
+            .as_ref()
+            .and_then(|persistence| persistence.last_persist_error.as_ref())
+            .is_some()
+        {
+            Err(())
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn persist_after_mutation_with(
@@ -1703,6 +1817,7 @@ fn lifecycle_blocks_tool(tool_name: &str) -> bool {
         tool_name,
         "post_session_message"
             | "resolve_session_message"
+            | "complete_session_message"
             | "update_session_context"
             | "workspace_checkpoint_create"
             | "workspace_checkpoint_restore"
@@ -2154,6 +2269,27 @@ impl SessionStoreInner {
         process_local_removed || durable_removed
     }
 
+    fn legacy_project_session_authority_upgrade_proof(
+        &self,
+        session_id: &str,
+        key: &CurrentSessionKey,
+        expected_project: &str,
+    ) -> bool {
+        if key.resolved_project != expected_project {
+            return false;
+        }
+        let legacy_session_matches = self.sessions.get(session_id).is_some_and(|record| {
+            record.lifecycle().allows_mutation()
+                && record.project() == Some(expected_project)
+                && record.owner_authority_fingerprint().is_none()
+        });
+        legacy_session_matches
+            && self
+                .durable_current_bindings
+                .get(&key.durable_binding_key())
+                .is_some_and(|binding| binding.session_id == session_id)
+    }
+
     fn reusable_current_session_id(
         &self,
         key: &CurrentSessionKey,
@@ -2244,8 +2380,11 @@ impl SessionStoreInner {
             message,
             tags,
             reply_to: input.reply_to,
+            author_session_id: None,
             resolved_at: None,
             resolution: None,
+            resolved_by_message_id: None,
+            completion_id: None,
         };
         record.updated_at = now;
         record.messages.push_back(Arc::new(message.clone()));
@@ -2297,6 +2436,143 @@ impl SessionStoreInner {
         Ok(message.clone())
     }
 
+    pub(super) fn complete_message(
+        &mut self,
+        input: CompleteSessionMessageInput,
+    ) -> Result<CompleteSessionMessageOutcome, SessionMessageError> {
+        self.touch(&input.session_id);
+        let Some(stored) = self.sessions.get_mut(&input.session_id) else {
+            return Err(SessionMessageError::UnknownSession);
+        };
+        let lifecycle = stored.lifecycle();
+        if !lifecycle.allows_mutation() {
+            return Err(SessionMessageError::SessionClosed { lifecycle });
+        }
+        if !is_valid_completion_id(&input.completion_id) {
+            return Err(SessionMessageError::InvalidInput(
+                "completion identity is invalid".to_string(),
+            ));
+        }
+        if input
+            .author_session_id
+            .as_deref()
+            .is_some_and(|author_session_id| !super::events::is_valid_session_id(author_session_id))
+        {
+            return Err(SessionMessageError::InvalidInput(
+                "author session identity is invalid".to_string(),
+            ));
+        }
+        let answer_text = validate_message_text(input.answer)?;
+        let tags = validate_message_tags(input.tags)?;
+        let record = stored
+            .hot_mut()
+            .expect("active session message mutation must stay hot");
+        let Some(todo_index) = record
+            .messages
+            .iter()
+            .position(|message| message.message_id == input.message_id)
+        else {
+            return Err(SessionMessageError::UnknownMessage);
+        };
+        if record.messages[todo_index].kind != super::model::SessionMessageKind::Todo {
+            return Err(SessionMessageError::NotTodo);
+        }
+
+        let todo_snapshot = record.messages[todo_index].as_ref().clone();
+        if todo_snapshot.status == SessionMessageStatus::Resolved {
+            match (
+                todo_snapshot.completion_id.as_deref(),
+                todo_snapshot.resolved_by_message_id.as_deref(),
+            ) {
+                (None, None) => {
+                    return Err(SessionMessageError::AlreadyCompleted {
+                        answer_message_id: None,
+                        completion_id: None,
+                    });
+                }
+                (Some(completion_id), Some(answer_message_id)) => {
+                    let Some(answer) = record.messages.iter().find(|message| {
+                        message.message_id == answer_message_id
+                            && message.kind == super::model::SessionMessageKind::Answer
+                            && message.reply_to.as_deref() == Some(input.message_id.as_str())
+                    }) else {
+                        return Err(SessionMessageError::InvalidCompletionState);
+                    };
+                    if completion_id != input.completion_id {
+                        return Err(SessionMessageError::AlreadyCompleted {
+                            answer_message_id: Some(answer.message_id.clone()),
+                            completion_id: Some(completion_id.to_string()),
+                        });
+                    }
+                    if answer.message != answer_text
+                        || answer.tags != tags
+                        || answer.priority != input.priority
+                    {
+                        return Err(SessionMessageError::IdempotencyConflict);
+                    }
+                    return Ok(CompleteSessionMessageOutcome {
+                        todo: todo_snapshot,
+                        answer: answer.as_ref().clone(),
+                        replayed: true,
+                    });
+                }
+                _ => return Err(SessionMessageError::InvalidCompletionState),
+            }
+        }
+        if todo_snapshot.completion_id.is_some() || todo_snapshot.resolved_by_message_id.is_some() {
+            return Err(SessionMessageError::InvalidCompletionState);
+        }
+
+        let now = now_ts();
+        let answer = SessionMessage {
+            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            session_id: input.session_id.clone(),
+            created_at: now,
+            kind: super::model::SessionMessageKind::Answer,
+            status: SessionMessageStatus::Open,
+            priority: input.priority,
+            message: answer_text,
+            tags,
+            reply_to: Some(input.message_id.clone()),
+            author_session_id: input.author_session_id,
+            resolved_at: None,
+            resolution: None,
+            resolved_by_message_id: None,
+            completion_id: None,
+        };
+        {
+            let todo = Arc::make_mut(&mut record.messages[todo_index]);
+            todo.status = SessionMessageStatus::Resolved;
+            todo.resolved_at = Some(now);
+            todo.resolved_by_message_id = Some(answer.message_id.clone());
+            todo.completion_id = Some(input.completion_id);
+        }
+        record.messages.push_back(Arc::new(answer.clone()));
+        while record.messages.len() > DEFAULT_MAX_MESSAGES_PER_SESSION {
+            let protected_answer_id = answer.message_id.as_str();
+            let protected_todo_id = input.message_id.as_str();
+            let Some(remove_index) = record.messages.iter().position(|message| {
+                message.message_id != protected_todo_id && message.message_id != protected_answer_id
+            }) else {
+                return Err(SessionMessageError::InvalidCompletionState);
+            };
+            record.messages.remove(remove_index);
+        }
+        record.updated_at = now;
+        let todo = record
+            .messages
+            .iter()
+            .find(|message| message.message_id == input.message_id)
+            .expect("completed todo retained")
+            .as_ref()
+            .clone();
+        Ok(CompleteSessionMessageOutcome {
+            todo,
+            answer,
+            replayed: false,
+        })
+    }
+
     // --- reads / housekeeping ---
 
     pub(super) fn contains_session(&self, session_id: &str) -> bool {
@@ -2307,6 +2583,18 @@ impl SessionStoreInner {
         self.sessions
             .get(session_id)
             .map(|record| record.project().map(str::to_string))
+    }
+
+    pub(super) fn session_target_authority(
+        &self,
+        session_id: &str,
+    ) -> Option<(Option<String>, Option<String>)> {
+        self.sessions.get(session_id).map(|record| {
+            (
+                record.project().map(str::to_string),
+                record.owner_authority_fingerprint().map(str::to_string),
+            )
+        })
     }
 
     pub(super) fn guard_state(&self, session_id: &str) -> Option<(SessionMode, SessionGuards)> {
