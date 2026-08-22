@@ -271,8 +271,12 @@ the audit ledger.
 
 ### Full-runtime coding continuity
 
-`start_coding_task` is the ordinary start-or-continue aggregate on the full
-operator surface. With a stable transport window, its default behavior is:
+`start_coding_task` is the advanced/direct start-or-continue aggregate retained
+for full-runtime compatibility. It is not an ordinary model-discovered MCP or
+GPT Actions bootstrap: model-facing discovery and generic Action flattened fields
+use `work_on_project` as the canonical coding entry. The advanced schema remains
+available only to explicit direct/API compatibility callers. With a stable
+transport window, `start_coding_task`'s default behavior is:
 
 - no valid binding creates and binds one active Workflow Session;
 - an exact repository binding reuses that Session and appends the accepted

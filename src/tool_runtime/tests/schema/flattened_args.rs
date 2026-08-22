@@ -1,6 +1,12 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+fn flattened_compatibility_specs() -> Vec<ToolSpec> {
+    let mut specs = registered_tool_specs();
+    specs.push(crate::tool_runtime::start_coding_task_compatibility_spec());
+    specs
+}
+
 #[test]
 fn accepted_flattened_arg_preferred_order_is_unique_and_declared() {
     use crate::tool_runtime::registry::ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER;
@@ -11,7 +17,7 @@ fn accepted_flattened_arg_preferred_order_is_unique_and_declared() {
     }
 
     let mut schema_fields = BTreeSet::new();
-    for spec in registered_tool_specs() {
+    for spec in flattened_compatibility_specs() {
         let Some(properties) = spec.input_schema["properties"].as_object() else {
             continue;
         };
@@ -58,9 +64,9 @@ fn accepted_flattened_args_appends_recorder_field_once() {
 }
 
 #[test]
-fn model_facing_flattened_args_exclude_testing_and_debug_metadata() {
+fn call_runtime_tool_flattened_args_exclude_testing_and_debug_metadata() {
     let mut accepted_fields = BTreeSet::new();
-    for spec in registered_tool_specs() {
+    for spec in flattened_compatibility_specs() {
         accepted_fields
             .extend(crate::tool_runtime::registry::accepted_flattened_args_for_spec(&spec));
     }
@@ -85,7 +91,7 @@ fn model_facing_flattened_args_exclude_testing_and_debug_metadata() {
     ] {
         assert!(
             !accepted_fields.contains(field),
-            "model-facing flattened args must not advertise non-business metadata field {field}"
+            "runtime flattened compatibility args must not advertise non-business metadata field {field}"
         );
     }
 }
@@ -113,10 +119,22 @@ fn accepted_flattened_args_cover_each_tool_spec_input_property() {
             );
             assert!(
                 tool_call_properties.contains_key(field),
-                "{} input_schema.properties.{field} must appear in ToolCallRequest.properties",
+                "model-visible {} input_schema.properties.{field} must appear in ToolCallRequest.properties",
                 spec.name
             );
         }
+    }
+
+    let hidden = crate::tool_runtime::start_coding_task_compatibility_spec();
+    let hidden_properties = hidden.input_schema["properties"].as_object().unwrap();
+    let hidden_accepted = crate::tool_runtime::registry::accepted_flattened_args_for_spec(&hidden)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for field in hidden_properties.keys() {
+        assert!(
+            hidden_accepted.contains(field),
+            "hidden compatibility input {field} must remain accepted by its direct runtime contract"
+        );
     }
 }
 
@@ -230,6 +248,27 @@ fn openapi_generic_call_runtime_tool_schema_remains_strict_model_visible_surface
             "ToolCallRequest.tool enum, if added, must match model-visible ToolDefinition names exactly"
         );
     }
+    assert!(!tool_description.contains("start_coding_task"));
+    assert!(!tool_call["description"]
+        .as_str()
+        .unwrap()
+        .contains("start_coding_task"));
+    for field in [
+        "temporary_project_name",
+        "mode",
+        "deny_write_tools",
+        "deny_shell_tools",
+        "detail",
+        "resume_session_id",
+        "bind_current",
+        "new_session",
+    ] {
+        assert!(
+            !properties.contains_key(field),
+            "hidden start-only field {field} must not enter model-facing ToolCallRequest"
+        );
+    }
+    assert!(properties.contains_key("execution_context"));
 }
 
 fn accepted_flattened_action_fields() -> BTreeSet<String> {
