@@ -31,6 +31,12 @@ pub const CODING_AGENT_TIMEOUT_MIN_SECS: u64 = 1;
 pub const CODING_AGENT_TIMEOUT_MAX_SECS: u64 = 3600;
 pub const CODING_AGENT_OBSERVE_WAIT_MAX_SECS: u64 = 60;
 
+pub const CODING_AGENT_STOP_REASON_END_TURN: &str = "end_turn";
+pub const CODING_AGENT_STOP_REASON_CANCELLED: &str = "cancelled";
+pub const CODING_AGENT_STOP_REASON_MAX_TOKENS: &str = "max_tokens";
+pub const CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS: &str = "max_turn_requests";
+pub const CODING_AGENT_STOP_REASON_REFUSAL: &str = "refusal";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodingAgentProvider {
@@ -476,6 +482,15 @@ pub fn validate_response_for_request(
     if run.run_id != request.run_id() {
         return Err("CodingAgentRun response run_id does not match request".to_string());
     }
+    validate_coding_agent_run_snapshot(run)?;
+    Ok(())
+}
+
+/// Validate the bounded identity and semantic state matrix of one Runner-owned
+/// CodingAgentRun snapshot. This is the canonical Server/Runner reconciliation
+/// contract: structurally decodable snapshots that contradict the closed ACP v1
+/// terminal truth fail closed before they can become retry/recovery authority.
+pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Result<(), String> {
     validate_run_id(&run.run_id)?;
     validate_intent_fingerprint(&run.intent_fingerprint)?;
     validate_authority_fingerprint(&run.authority_fingerprint)?;
@@ -484,8 +499,9 @@ pub fn validate_response_for_request(
     if run.runtime_project_id.trim().is_empty()
         || run.runtime_project_id.len() > CODING_AGENT_MAX_PROJECT_ID_BYTES
     {
-        return Err("CodingAgentRun response project id is invalid".to_string());
+        return Err("CodingAgentRun snapshot project id is invalid".to_string());
     }
+
     if let Some(terminal) = run.terminal.as_ref() {
         if terminal
             .stop_reason
@@ -500,13 +516,123 @@ pub fn validate_response_for_request(
                 .as_ref()
                 .is_some_and(|value| value.len() > CODING_AGENT_MAX_ERROR_MESSAGE_BYTES)
         {
-            return Err("CodingAgentRun response terminal metadata is too large".to_string());
+            return Err("CodingAgentRun snapshot terminal metadata is too large".to_string());
+        }
+        if let Some(error_code) = terminal.error_code.as_deref() {
+            validate_low_cardinality_kind(
+                error_code,
+                "CodingAgentRun terminal error code",
+                CODING_AGENT_MAX_TERMINAL_METADATA_BYTES,
+            )?;
         }
     }
-    if run.state.terminal() != run.terminal.is_some() {
-        return Err("CodingAgentRun response terminal metadata is inconsistent".to_string());
+
+    match run.state {
+        CodingAgentRunState::Starting => {
+            if run.execution_state != CodingAgentExecutionState::NotStarted
+                || run.terminal.is_some()
+            {
+                return Err(
+                    "starting CodingAgentRun snapshot is semantically inconsistent".to_string(),
+                );
+            }
+        }
+        CodingAgentRunState::Running => {
+            if !matches!(
+                run.execution_state,
+                CodingAgentExecutionState::OutcomeUnknown | CodingAgentExecutionState::Started
+            ) || run.terminal.is_some()
+            {
+                return Err(
+                    "running CodingAgentRun snapshot is semantically inconsistent".to_string(),
+                );
+            }
+        }
+        CodingAgentRunState::WaitingPermission => {
+            if run.execution_state != CodingAgentExecutionState::Started || run.terminal.is_some() {
+                return Err(
+                    "waiting_permission CodingAgentRun snapshot is semantically inconsistent"
+                        .to_string(),
+                );
+            }
+        }
+        CodingAgentRunState::Completed => {
+            let terminal = terminal_for_state(run, CodingAgentExecutionState::Completed)?;
+            if terminal.stop_reason.as_deref() != Some(CODING_AGENT_STOP_REASON_END_TURN)
+                || terminal.error_code.is_some()
+            {
+                return Err("completed CodingAgentRun snapshot lacks end_turn truth".to_string());
+            }
+        }
+        CodingAgentRunState::Cancelled => {
+            let terminal = terminal_for_state(run, CodingAgentExecutionState::Completed)?;
+            if terminal.stop_reason.as_deref() != Some(CODING_AGENT_STOP_REASON_CANCELLED)
+                || terminal.error_code.is_some()
+            {
+                return Err("cancelled CodingAgentRun snapshot lacks cancelled truth".to_string());
+            }
+        }
+        CodingAgentRunState::Failed => {
+            let terminal = run.terminal.as_ref().ok_or_else(|| {
+                "failed CodingAgentRun snapshot lacks terminal metadata".to_string()
+            })?;
+            match terminal.stop_reason.as_deref() {
+                Some(
+                    reason @ (CODING_AGENT_STOP_REASON_MAX_TOKENS
+                    | CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS
+                    | CODING_AGENT_STOP_REASON_REFUSAL),
+                ) => {
+                    if run.execution_state != CodingAgentExecutionState::Completed
+                        || terminal.error_code.as_deref() != Some(reason)
+                    {
+                        return Err(
+                            "failed CodingAgentRun ACP terminal truth is inconsistent".to_string()
+                        );
+                    }
+                }
+                None => {
+                    if !matches!(
+                        run.execution_state,
+                        CodingAgentExecutionState::NotStarted
+                            | CodingAgentExecutionState::Completed
+                    ) || terminal.error_code.is_none()
+                    {
+                        return Err(
+                            "failed CodingAgentRun internal terminal truth is inconsistent"
+                                .to_string(),
+                        );
+                    }
+                }
+                Some(_) => {
+                    return Err(
+                        "CodingAgentRun snapshot has unknown or contradictory stop_reason"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        CodingAgentRunState::Lost => {
+            let terminal = terminal_for_state(run, CodingAgentExecutionState::OutcomeUnknown)?;
+            if terminal.stop_reason.is_some() || terminal.error_code.is_none() {
+                return Err(
+                    "lost CodingAgentRun snapshot claims definite terminal truth".to_string(),
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn terminal_for_state(
+    run: &CodingAgentRunSnapshot,
+    execution_state: CodingAgentExecutionState,
+) -> Result<&CodingAgentTerminal, String> {
+    if run.execution_state != execution_state {
+        return Err("terminal CodingAgentRun execution_state is inconsistent".to_string());
+    }
+    run.terminal
+        .as_ref()
+        .ok_or_else(|| "terminal CodingAgentRun snapshot lacks terminal metadata".to_string())
 }
 
 fn validate_coding_agent_error(error: &CodingAgentError) -> Result<(), String> {
@@ -659,6 +785,202 @@ mod tests {
             wait_secs: 0,
         });
         assert!(validate_response_for_request(&observe_request, &response).is_err());
+    }
+
+    fn snapshot(
+        state: CodingAgentRunState,
+        execution_state: CodingAgentExecutionState,
+        stop_reason: Option<&str>,
+        error_code: Option<&str>,
+    ) -> CodingAgentRunSnapshot {
+        CodingAgentRunSnapshot {
+            run_id: "wc_agent_run_semantic_matrix".to_string(),
+            intent_fingerprint: "cafebabe".to_string(),
+            authority_fingerprint: "auth_0123456789abcdef".to_string(),
+            runtime_project_id: "agent:test:demo".to_string(),
+            provider_id: "codex".to_string(),
+            provider_instance_id: "provider_123".to_string(),
+            state,
+            execution_state,
+            observation_revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            terminal: stop_reason.or(error_code).map(|_| CodingAgentTerminal {
+                stop_reason: stop_reason.map(str::to_string),
+                error_code: error_code.map(str::to_string),
+                message: None,
+                completed_at: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn run_snapshot_semantic_matrix_is_closed_and_fail_closed() {
+        for valid in [
+            snapshot(
+                CodingAgentRunState::Starting,
+                CodingAgentExecutionState::NotStarted,
+                None,
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Running,
+                CodingAgentExecutionState::OutcomeUnknown,
+                None,
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Running,
+                CodingAgentExecutionState::Started,
+                None,
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::WaitingPermission,
+                CodingAgentExecutionState::Started,
+                None,
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Completed,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_END_TURN),
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Cancelled,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_CANCELLED),
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Failed,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_MAX_TOKENS),
+                Some(CODING_AGENT_STOP_REASON_MAX_TOKENS),
+            ),
+            snapshot(
+                CodingAgentRunState::Failed,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS),
+                Some(CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS),
+            ),
+            snapshot(
+                CodingAgentRunState::Failed,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_REFUSAL),
+                Some(CODING_AGENT_STOP_REASON_REFUSAL),
+            ),
+            snapshot(
+                CodingAgentRunState::Failed,
+                CodingAgentExecutionState::NotStarted,
+                None,
+                Some("setup_failed"),
+            ),
+            snapshot(
+                CodingAgentRunState::Failed,
+                CodingAgentExecutionState::Completed,
+                None,
+                Some("prompt_error"),
+            ),
+            snapshot(
+                CodingAgentRunState::Lost,
+                CodingAgentExecutionState::OutcomeUnknown,
+                None,
+                Some("coding_agent_transport_lost"),
+            ),
+        ] {
+            validate_coding_agent_run_snapshot(&valid).unwrap();
+        }
+
+        let invalid = [
+            snapshot(
+                CodingAgentRunState::Completed,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_REFUSAL),
+                Some(CODING_AGENT_STOP_REASON_REFUSAL),
+            ),
+            snapshot(
+                CodingAgentRunState::Failed,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_END_TURN),
+                Some(CODING_AGENT_STOP_REASON_END_TURN),
+            ),
+            snapshot(
+                CodingAgentRunState::Cancelled,
+                CodingAgentExecutionState::Completed,
+                Some(CODING_AGENT_STOP_REASON_MAX_TOKENS),
+                Some(CODING_AGENT_STOP_REASON_MAX_TOKENS),
+            ),
+            snapshot(
+                CodingAgentRunState::Lost,
+                CodingAgentExecutionState::OutcomeUnknown,
+                Some(CODING_AGENT_STOP_REASON_END_TURN),
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Running,
+                CodingAgentExecutionState::Completed,
+                None,
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::WaitingPermission,
+                CodingAgentExecutionState::OutcomeUnknown,
+                None,
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Failed,
+                CodingAgentExecutionState::Completed,
+                Some("future_stop_reason"),
+                Some("future_stop_reason"),
+            ),
+        ];
+        for invalid in invalid {
+            assert!(
+                validate_coding_agent_run_snapshot(&invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        let mut nonterminal_with_terminal = snapshot(
+            CodingAgentRunState::Running,
+            CodingAgentExecutionState::Started,
+            None,
+            None,
+        );
+        nonterminal_with_terminal.terminal = Some(CodingAgentTerminal {
+            stop_reason: None,
+            error_code: Some("impossible".to_string()),
+            message: None,
+            completed_at: 1,
+        });
+        assert!(validate_coding_agent_run_snapshot(&nonterminal_with_terminal).is_err());
+
+        let mut terminal_without_metadata = snapshot(
+            CodingAgentRunState::Completed,
+            CodingAgentExecutionState::Completed,
+            Some(CODING_AGENT_STOP_REASON_END_TURN),
+            None,
+        );
+        terminal_without_metadata.terminal = None;
+        assert!(validate_coding_agent_run_snapshot(&terminal_without_metadata).is_err());
+    }
+
+    #[test]
+    fn response_validation_reuses_snapshot_semantics() {
+        let request = test_request();
+        let mut contradictory = snapshot(
+            CodingAgentRunState::Completed,
+            CodingAgentExecutionState::Completed,
+            Some(CODING_AGENT_STOP_REASON_REFUSAL),
+            Some(CODING_AGENT_STOP_REASON_REFUSAL),
+        );
+        contradictory.run_id = request.run_id().to_string();
+        let response =
+            CodingAgentResponse::success(CodingAgentResponsePayload::Start { run: contradictory });
+        assert!(validate_response_for_request(&request, &response).is_err());
     }
 
     #[test]

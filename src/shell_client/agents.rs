@@ -27,11 +27,10 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use webcodex_core::coding_agent::{
-    validate_authority_fingerprint, validate_intent_fingerprint,
-    validate_provider_id as validate_coding_agent_provider_id,
+    validate_coding_agent_run_snapshot, validate_provider_id as validate_coding_agent_provider_id,
     validate_provider_instance_id as validate_coding_agent_provider_instance_id,
-    validate_run_id as validate_coding_agent_run_id, CodingAgentProvider, CodingAgentRunInventory,
-    CodingAgentRunSnapshot, CODING_AGENT_MAX_INVENTORY_RUNS, CODING_AGENT_MAX_PROVIDERS,
+    CodingAgentProvider, CodingAgentRunInventory, CodingAgentRunSnapshot,
+    CODING_AGENT_MAX_INVENTORY_RUNS, CODING_AGENT_MAX_PROVIDERS,
     CODING_AGENT_MAX_PROVIDER_NAME_BYTES,
 };
 
@@ -78,18 +77,8 @@ fn validate_coding_agent_registration(
             let expected_project_prefix = format!("agent:{client_id}:");
             let mut run_ids = HashSet::new();
             for run in &inventory.runs {
-                validate_coding_agent_run_id(&run.run_id)
-                    .map_err(|error| format!("invalid coding-agent Run id: {error}"))?;
-                validate_intent_fingerprint(&run.intent_fingerprint)
-                    .map_err(|error| format!("invalid coding-agent intent fingerprint: {error}"))?;
-                validate_authority_fingerprint(&run.authority_fingerprint).map_err(|error| {
-                    format!("invalid coding-agent authority fingerprint: {error}")
-                })?;
-                validate_coding_agent_provider_id(&run.provider_id)
-                    .map_err(|error| format!("invalid coding-agent Run provider id: {error}"))?;
-                validate_coding_agent_provider_instance_id(&run.provider_instance_id).map_err(
-                    |error| format!("invalid coding-agent Run provider instance: {error}"),
-                )?;
+                validate_coding_agent_run_snapshot(run)
+                    .map_err(|error| format!("invalid coding-agent Run snapshot: {error}"))?;
                 if !run_ids.insert(run.run_id.as_str()) {
                     return Err("duplicate coding-agent Run id in inventory".to_string());
                 }
@@ -98,9 +87,6 @@ fn validate_coding_agent_registration(
                         "coding-agent Run inventory references another Runner project namespace"
                             .to_string(),
                     );
-                }
-                if run.state.terminal() != run.terminal.is_some() {
-                    return Err("coding-agent Run terminal metadata is inconsistent".to_string());
                 }
                 if !run.state.terminal()
                     && !providers.iter().any(|provider| {

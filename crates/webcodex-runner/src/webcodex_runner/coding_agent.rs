@@ -1,5 +1,6 @@
 use super::config::{AcpAgentConfig, AcpConfig};
 use super::projects::load_agent_project_summaries_from_dir;
+use super::shell::canonicalize_existing;
 use agent_client_protocol_schema::v1::{
     NewSessionResponse, PromptResponse, RequestPermissionRequest, SessionConfigKind,
     SessionConfigOption, SessionConfigSelectOptions, SetSessionConfigOptionResponse, StopReason,
@@ -21,15 +22,19 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-#[cfg(test)]
+use webcodex_agent_config::paths::paths_equal;
+#[cfg(all(test, unix))]
 use webcodex_core::coding_agent::CodingAgentCancelRequest;
 use webcodex_core::coding_agent::{
-    validate_request, CodingAgentConfigValue, CodingAgentDispatchState, CodingAgentEvent,
-    CodingAgentEventKind, CodingAgentExecutionState, CodingAgentObserveResult, CodingAgentProvider,
-    CodingAgentRequest, CodingAgentResponse, CodingAgentResponsePayload, CodingAgentRunInventory,
-    CodingAgentRunSnapshot, CodingAgentRunState, CodingAgentTerminal, CodingAgentUsage,
+    validate_coding_agent_run_snapshot, validate_request, CodingAgentConfigValue,
+    CodingAgentDispatchState, CodingAgentEvent, CodingAgentEventKind, CodingAgentExecutionState,
+    CodingAgentObserveResult, CodingAgentProvider, CodingAgentRequest, CodingAgentResponse,
+    CodingAgentResponsePayload, CodingAgentRunInventory, CodingAgentRunSnapshot,
+    CodingAgentRunState, CodingAgentTerminal, CodingAgentUsage,
     CODING_AGENT_MAX_EVENTS_PER_RESPONSE, CODING_AGENT_MAX_INVENTORY_RUNS,
-    CODING_AGENT_MAX_RETAINED_EVENTS,
+    CODING_AGENT_MAX_RETAINED_EVENTS, CODING_AGENT_STOP_REASON_CANCELLED,
+    CODING_AGENT_STOP_REASON_END_TURN, CODING_AGENT_STOP_REASON_MAX_TOKENS,
+    CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS, CODING_AGENT_STOP_REASON_REFUSAL,
 };
 use webcodex_process::ManagedChild;
 #[cfg(windows)]
@@ -299,10 +304,10 @@ fn publish_state_file(_temp: &Path, _state_path: &Path) -> Result<(), String> {
     Err("ACP Run durable state is unsupported on this platform".to_string())
 }
 
-fn sync_parent(dir: &Path) -> Result<(), String> {
+fn sync_parent(_dir: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
-        File::open(dir)
+        File::open(_dir)
             .and_then(|file| file.sync_all())
             .map_err(|error| format!("failed to sync ACP Run state dir: {error}"))?;
     }
@@ -310,17 +315,13 @@ fn sync_parent(dir: &Path) -> Result<(), String> {
 }
 
 fn validate_durable_record(record: &DurableRunRecord) -> Result<(), String> {
-    if record.schema_version != STORE_SCHEMA_VERSION
-        || record.run_id.is_empty()
-        || record.intent_fingerprint.is_empty()
-        || record.runtime_project_id.is_empty()
-        || record.provider_id.is_empty()
-        || record.provider_instance_id.is_empty()
-    {
-        return Err("ACP Run durable record is invalid".to_string());
+    if record.schema_version != STORE_SCHEMA_VERSION {
+        return Err("ACP Run durable record schema is invalid".to_string());
     }
-    if record.dispatch_phase == DurableDispatchPhase::Terminal && !record.state.terminal() {
-        return Err("ACP Run terminal durable phase has nonterminal state".to_string());
+    validate_coding_agent_run_snapshot(&record.snapshot(0))
+        .map_err(|error| format!("ACP Run durable snapshot is invalid: {error}"))?;
+    if (record.dispatch_phase == DurableDispatchPhase::Terminal) != record.state.terminal() {
+        return Err("ACP Run durable phase/state terminal truth is inconsistent".to_string());
     }
     Ok(())
 }
@@ -1298,43 +1299,42 @@ impl CodingAgentManager {
                                 &request.run_id,
                                 &entry,
                                 CodingAgentRunState::Completed,
-                                "end_turn",
+                                CODING_AGENT_STOP_REASON_END_TURN,
                                 None,
                             ),
                             StopReason::Cancelled => self.finish_terminal(
                                 &request.run_id,
                                 &entry,
                                 CodingAgentRunState::Cancelled,
-                                "cancelled",
+                                CODING_AGENT_STOP_REASON_CANCELLED,
                                 None,
                             ),
                             StopReason::MaxTokens => self.finish_terminal(
                                 &request.run_id,
                                 &entry,
                                 CodingAgentRunState::Failed,
-                                "max_tokens",
+                                CODING_AGENT_STOP_REASON_MAX_TOKENS,
                                 Some("ACP turn reached max tokens"),
                             ),
                             StopReason::MaxTurnRequests => self.finish_terminal(
                                 &request.run_id,
                                 &entry,
                                 CodingAgentRunState::Failed,
-                                "max_turn_requests",
+                                CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS,
                                 Some("ACP turn reached max requests"),
                             ),
                             StopReason::Refusal => self.finish_terminal(
                                 &request.run_id,
                                 &entry,
                                 CodingAgentRunState::Failed,
-                                "refusal",
+                                CODING_AGENT_STOP_REASON_REFUSAL,
                                 Some("ACP agent refused the turn"),
                             ),
-                            _ => self.finish_terminal(
+                            _ => self.finish_failed(
                                 &request.run_id,
                                 &entry,
-                                CodingAgentRunState::Failed,
-                                "unknown",
-                                Some("unknown ACP stop reason"),
+                                "unknown_stop_reason",
+                                "unknown ACP stop reason".to_string(),
                             ),
                         }
                         cleanup_child(&mut child, stdin);
@@ -1440,7 +1440,7 @@ impl CodingAgentManager {
 
     fn setup_failure(&self, run_id: &str, entry: &Arc<RunEntry>, code: &str, message: &str) {
         let terminal = CodingAgentTerminal {
-            stop_reason: Some(code.to_string()),
+            stop_reason: None,
             error_code: Some(code.to_string()),
             message: Some(bounded_text(message)),
             completed_at: now(),
@@ -1464,13 +1464,28 @@ impl CodingAgentManager {
     }
 
     fn finish_failed(&self, run_id: &str, entry: &Arc<RunEntry>, code: &str, message: String) {
-        self.finish_terminal(
+        let terminal = CodingAgentTerminal {
+            stop_reason: None,
+            error_code: Some(code.to_string()),
+            message: Some(bounded_text(&message)),
+            completed_at: now(),
+        };
+        let _ = self.persist_phase(
             run_id,
             entry,
+            DurableDispatchPhase::Terminal,
             CodingAgentRunState::Failed,
-            code,
-            Some(&message),
+            CodingAgentExecutionState::Completed,
+            Some(terminal.clone()),
         );
+        entry.push_event(CodingAgentEvent {
+            sequence: 0,
+            kind: CodingAgentEventKind::Terminal,
+            text: terminal.message.clone(),
+            label: terminal.error_code.clone(),
+            status: Some("failed".to_string()),
+            usage: None,
+        });
     }
 
     fn finish_terminal(
@@ -1677,13 +1692,25 @@ fn project_binding_matches(
     runtime_project_id: &str,
     root: &str,
 ) -> bool {
+    let Ok(requested_root) = canonicalize_existing(Path::new(root)) else {
+        return false;
+    };
+    if !requested_root.is_dir() {
+        return false;
+    }
     load_agent_project_summaries_from_dir(projects_dir)
         .into_iter()
         .any(|project| {
-            format!("agent:{client_id}:{}", project.id) == runtime_project_id
-                && Path::new(&project.path) == Path::new(root)
-                && project.allow_patch
-                && !project.disabled
+            if format!("agent:{client_id}:{}", project.id) != runtime_project_id
+                || !project.allow_patch
+                || project.disabled
+            {
+                return false;
+            }
+            canonicalize_existing(Path::new(&project.path))
+                .ok()
+                .filter(|registered_root| registered_root.is_dir())
+                .is_some_and(|registered_root| paths_equal(&registered_root, &requested_root))
         })
 }
 
@@ -2564,18 +2591,24 @@ for line in sys.stdin:
     fn project_binding_requires_current_writable_registration() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("repo");
+        let other = temp.path().join("other");
         fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&other).unwrap();
         let projects = temp.path().join("projects");
         fs::create_dir_all(&projects).unwrap();
         let config_path = projects.join("p.toml");
-        fs::write(
-            &config_path,
-            format!(
-                "id = \"demo\"\npath = {:?}\nallow_patch = false\n",
-                root.to_string_lossy()
-            ),
-        )
-        .unwrap();
+        let write_registration = |allow_patch: bool, disabled: bool, path: &Path| {
+            fs::write(
+                &config_path,
+                format!(
+                    "id = \"demo\"\npath = {:?}\nallow_patch = {allow_patch}\ndisabled = {disabled}\n",
+                    path.to_string_lossy()
+                ),
+            )
+            .unwrap();
+        };
+
+        write_registration(false, false, &root);
         assert!(!project_binding_matches(
             &projects,
             "test",
@@ -2583,19 +2616,130 @@ for line in sys.stdin:
             root.to_string_lossy().as_ref()
         ));
 
+        write_registration(true, true, &root);
+        assert!(!project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            root.to_string_lossy().as_ref()
+        ));
+
+        write_registration(true, false, &root);
+        assert!(project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            root.to_string_lossy().as_ref()
+        ));
+        assert!(!project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:wrong",
+            root.to_string_lossy().as_ref()
+        ));
+        assert!(!project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            other.to_string_lossy().as_ref()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_binding_accepts_canonical_alias_and_rejects_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let alias = temp.path().join("repo-alias");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        symlink(&first, &alias).unwrap();
+        let projects = temp.path().join("projects");
+        fs::create_dir_all(&projects).unwrap();
         fs::write(
-            &config_path,
+            projects.join("p.toml"),
             format!(
                 "id = \"demo\"\npath = {:?}\nallow_patch = true\n",
-                root.to_string_lossy()
+                alias.to_string_lossy()
             ),
+        )
+        .unwrap();
+        let canonical_first = canonicalize_existing(&first).unwrap();
+        assert!(project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            canonical_first.to_string_lossy().as_ref()
+        ));
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+        assert!(!project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            canonical_first.to_string_lossy().as_ref()
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn project_binding_accepts_var_private_var_alias() {
+        assert_eq!(
+            canonicalize_existing(Path::new("/var")).unwrap(),
+            canonicalize_existing(Path::new("/private/var")).unwrap()
+        );
+        let temp = TempDir::new().unwrap();
+        let projects = temp.path().join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(
+            projects.join("p.toml"),
+            "id = \"demo\"\npath = \"/private/var\"\nallow_patch = true\n",
         )
         .unwrap();
         assert!(project_binding_matches(
             &projects,
             "test",
             "agent:test:demo",
-            root.to_string_lossy().as_ref()
+            "/var"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_binding_accepts_windows_case_and_verbatim_disk_identity() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("RepoCase");
+        fs::create_dir_all(&root).unwrap();
+        let canonical = canonicalize_existing(&root).unwrap();
+        let canonical_text = canonical.to_string_lossy().to_string();
+        let plain = canonical_text
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical_text)
+            .to_string();
+        let case_variant = plain.to_ascii_uppercase();
+        let verbatim = format!(r"\\?\{plain}");
+        let projects = temp.path().join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(
+            projects.join("p.toml"),
+            format!("id = \"demo\"\npath = {:?}\nallow_patch = true\n", plain),
+        )
+        .unwrap();
+        assert!(project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            &case_variant
+        ));
+        assert!(project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            &verbatim
         ));
     }
 

@@ -324,6 +324,91 @@ async fn coding_agent_run_lookup_is_exact_when_bound_and_ambiguous_when_unbound(
 }
 
 #[tokio::test]
+async fn coding_agent_registration_rejects_semantically_contradictory_snapshot() {
+    let registry = ShellClientRegistry::default();
+    let register =
+        |run: webcodex_core::coding_agent::CodingAgentRunSnapshot| ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: Some(vec![webcodex_core::coding_agent::CodingAgentProvider {
+                provider_id: "codex".to_string(),
+                provider_instance_id: "provider_test".to_string(),
+                name: "Codex".to_string(),
+            }]),
+            coding_agent_inventory: Some(webcodex_core::coding_agent::CodingAgentRunInventory {
+                runs: vec![run],
+            }),
+            client_id: "test".to_string(),
+            agent_instance_id: "inst_test".to_string(),
+            display_name: None,
+            owner: None,
+            hostname: None,
+            host_context: None,
+            capabilities: Some(ShellClientCapabilities {
+                coding_agent_runs: true,
+                ..Default::default()
+            }),
+            projects: None,
+            agent_protocol_version: None,
+            policy: None,
+        };
+    let base = webcodex_core::coding_agent::CodingAgentRunSnapshot {
+        run_id: "wc_agent_run_registration_semantic".to_string(),
+        intent_fingerprint: "fingerprint".to_string(),
+        authority_fingerprint: "auth_test".to_string(),
+        runtime_project_id: "agent:test:demo".to_string(),
+        provider_id: "codex".to_string(),
+        provider_instance_id: "provider_test".to_string(),
+        state: webcodex_core::coding_agent::CodingAgentRunState::Running,
+        execution_state: webcodex_core::coding_agent::CodingAgentExecutionState::Started,
+        observation_revision: 1,
+        created_at: 1,
+        updated_at: 1,
+        terminal: None,
+    };
+    registry.register(register(base.clone())).await.unwrap();
+
+    let mut completed_with_refusal = base.clone();
+    completed_with_refusal.run_id = "wc_agent_run_registration_bad1".to_string();
+    completed_with_refusal.state = webcodex_core::coding_agent::CodingAgentRunState::Completed;
+    completed_with_refusal.execution_state =
+        webcodex_core::coding_agent::CodingAgentExecutionState::Completed;
+    completed_with_refusal.terminal = Some(webcodex_core::coding_agent::CodingAgentTerminal {
+        stop_reason: Some("refusal".to_string()),
+        error_code: Some("refusal".to_string()),
+        message: None,
+        completed_at: 1,
+    });
+    let error = registry
+        .register(register(completed_with_refusal))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("invalid coding-agent Run snapshot"),
+        "{error}"
+    );
+
+    let mut unknown_stop = base;
+    unknown_stop.run_id = "wc_agent_run_registration_bad2".to_string();
+    unknown_stop.state = webcodex_core::coding_agent::CodingAgentRunState::Failed;
+    unknown_stop.execution_state =
+        webcodex_core::coding_agent::CodingAgentExecutionState::Completed;
+    unknown_stop.terminal = Some(webcodex_core::coding_agent::CodingAgentTerminal {
+        stop_reason: Some("future_stop_reason".to_string()),
+        error_code: Some("future_stop_reason".to_string()),
+        message: None,
+        completed_at: 1,
+    });
+    let error = registry.register(register(unknown_stop)).await.unwrap_err();
+    assert!(
+        error.contains("invalid coding-agent Run snapshot"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn client_supports_recognizes_all_protocol_capability_names() {
     let registry = ShellClientRegistry::default();
     registry
