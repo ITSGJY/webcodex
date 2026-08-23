@@ -392,9 +392,16 @@ impl RunEntry {
         after: Option<u64>,
         limit: usize,
         wait_secs: u64,
-    ) -> CodingAgentObserveResult {
+    ) -> Result<CodingAgentObserveResult, String> {
         let deadline = Instant::now() + Duration::from_secs(wait_secs);
         let mut state = self.state.lock().unwrap();
+        let latest_emitted_sequence = state.next_sequence.saturating_sub(1);
+        if after.is_some_and(|sequence| sequence > latest_emitted_sequence) {
+            return Err(format!(
+                "CodingAgentRun observation cursor {sequence} is ahead of latest emitted sequence {latest_emitted_sequence}",
+                sequence = after.unwrap_or_default()
+            ));
+        }
         loop {
             let cursor = after.unwrap_or_else(|| state.first_retained_sequence.saturating_sub(1));
             let changed =
@@ -428,14 +435,14 @@ impl RunEntry {
         if events.len() > CODING_AGENT_MAX_EVENTS_PER_RESPONSE {
             events.truncate(CODING_AGENT_MAX_EVENTS_PER_RESPONSE);
         }
-        CodingAgentObserveResult {
+        Ok(CodingAgentObserveResult {
             run: state.snapshot.clone(),
             events,
             first_retained_sequence: state.first_retained_sequence,
             next_sequence: last,
             has_more,
             history_lost,
-        }
+        })
     }
 }
 
@@ -575,15 +582,24 @@ impl CodingAgentManager {
             CodingAgentRequest::Observe(request) => {
                 let entry = self.runs.lock().unwrap().get(&request.run_id).cloned();
                 match entry {
-                    Some(entry) => {
-                        CodingAgentResponse::success(CodingAgentResponsePayload::Observe {
-                            observation: entry.observe(
-                                request.after_sequence,
-                                request.limit,
-                                request.wait_secs,
-                            ),
-                        })
-                    }
+                    Some(entry) => match entry.observe(
+                        request.after_sequence,
+                        request.limit,
+                        request.wait_secs,
+                    ) {
+                        Ok(observation) => {
+                            CodingAgentResponse::success(CodingAgentResponsePayload::Observe {
+                                observation,
+                            })
+                        }
+                        Err(error) => response_error(
+                            CodingAgentDispatchState::NotStarted,
+                            "invalid_coding_agent_observation_cursor",
+                            error,
+                            "invalid_input",
+                            "fix_input",
+                        ),
+                    },
                     None => response_error(
                         CodingAgentDispatchState::NotStarted,
                         "unknown_coding_agent_run",
@@ -1915,14 +1931,19 @@ fn event(
 
 fn bounded_text(value: &str) -> String {
     const MAX: usize = webcodex_core::coding_agent::CODING_AGENT_MAX_EVENT_TEXT_BYTES;
+    const SUFFIX: &str = "…";
     if value.len() <= MAX {
         return value.to_string();
     }
-    let mut end = MAX;
-    while !value.is_char_boundary(end) {
+    let mut end = MAX.saturating_sub(SUFFIX.len());
+    while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &value[..end])
+    let mut bounded = String::with_capacity(MAX);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(SUFFIX);
+    debug_assert!(bounded.len() <= MAX);
+    bounded
 }
 fn bounded_json_summary(value: &Value) -> String {
     let text = serde_json::to_string(value).unwrap_or_else(|_| "invalid_json".to_string());
@@ -2130,7 +2151,8 @@ for line in sys.stdin:
             .unwrap()
             .get(&run)
             .unwrap()
-            .observe(None, 64, 0);
+            .observe(None, 64, 0)
+            .expect("retained fake Run cursor must be valid");
         std::mem::forget(temp);
         (manager, run, observation)
     }
@@ -2255,7 +2277,8 @@ for line in sys.stdin:
             .unwrap()
             .get(run)
             .unwrap()
-            .observe(None, 64, 0);
+            .observe(None, 64, 0)
+            .expect("retained fake Run cursor must be valid");
         for kind in [
             CodingAgentEventKind::AgentMessage,
             CodingAgentEventKind::Reasoning,
@@ -2424,6 +2447,34 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn bounded_text_never_exceeds_utf8_byte_budget() {
+        let max = webcodex_core::coding_agent::CODING_AGENT_MAX_EVENT_TEXT_BYTES;
+        let cases = [
+            "a".repeat(max),
+            "a".repeat(max + 1),
+            "é".repeat(max / "é".len() + 2),
+            "€".repeat(max / "€".len() + 2),
+            "🦀".repeat(max / "🦀".len() + 2),
+            "z".repeat(max * 4),
+        ];
+        for input in cases {
+            let output = bounded_text(&input);
+            assert!(output.len() <= max, "{} > {max}", output.len());
+            assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+            if input.len() <= max {
+                assert_eq!(output, input);
+            } else {
+                assert!(output.ends_with('…'));
+            }
+        }
+
+        let json = json!({"body": "界".repeat(max * 2)});
+        let summary = bounded_json_summary(&json);
+        assert!(summary.len() <= max);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn event_ring_capacity_and_continuation_are_bounded() {
         let temp = TempDir::new().unwrap();
@@ -2442,14 +2493,38 @@ for line in sys.stdin:
             .is_none());
         wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
         let entry = manager.runs.lock().unwrap().get(run).unwrap().clone();
-        let first = entry.observe(Some(0), 32, 0);
+        let first = entry.observe(Some(0), 32, 0).unwrap();
+        assert!(first.run.state.terminal());
         assert!(first.history_lost);
         assert!(first.has_more);
         assert_eq!(first.events.len(), 32);
         assert!(first.first_retained_sequence > 1);
-        let second = entry.observe(Some(first.next_sequence), 32, 0);
+        let second = entry.observe(Some(first.next_sequence), 32, 0).unwrap();
+        assert!(second.run.state.terminal());
         assert!(!second.events.is_empty());
         assert!(second.events.first().unwrap().sequence > first.events.last().unwrap().sequence);
+
+        let latest = entry.state.lock().unwrap().next_sequence.saturating_sub(1);
+        let error = entry
+            .observe(Some(latest.saturating_add(1)), 32, 0)
+            .unwrap_err();
+        assert!(
+            error.contains("ahead of latest emitted sequence"),
+            "{error}"
+        );
+        let response = manager.handle(
+            CodingAgentRequest::Observe(webcodex_core::coding_agent::CodingAgentObserveRequest {
+                run_id: run.to_string(),
+                after_sequence: Some(latest.saturating_add(1)),
+                limit: 32,
+                wait_secs: 0,
+            }),
+            &projects,
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code.as_str()),
+            Some("invalid_coding_agent_observation_cursor")
+        );
     }
 
     #[test]
@@ -3169,7 +3244,8 @@ for line in sys.stdin:
             .unwrap()
             .get(run)
             .unwrap()
-            .observe(None, 64, 0);
+            .observe(None, 64, 0)
+            .expect("retained real Run cursor must be valid");
         assert_eq!(
             terminal.state,
             CodingAgentRunState::Completed,

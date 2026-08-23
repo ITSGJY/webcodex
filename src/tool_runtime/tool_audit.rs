@@ -2073,9 +2073,9 @@ mod computer_privacy_tests {
             "state": "running",
             "execution_state": "started",
             "events": [
-                {"sequence": 1, "kind": "agentmessage", "text": MESSAGE, "label": null, "status": null},
-                {"sequence": 2, "kind": "reasoning", "text": REASONING, "label": null, "status": null},
-                {"sequence": 3, "kind": "toolactivity", "text": null, "label": TOOL_LABEL, "status": "running"}
+                {"sequence": 1, "kind": "agent_message", "text": MESSAGE, "label": null, "status": null, "usage": null},
+                {"sequence": 2, "kind": "reasoning", "text": REASONING, "label": null, "status": null, "usage": null},
+                {"sequence": 3, "kind": "tool_activity", "text": null, "label": TOOL_LABEL, "status": "running", "usage": null}
             ],
             "observation_token": TOKEN,
             "has_more": false,

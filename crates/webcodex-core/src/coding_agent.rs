@@ -113,6 +113,25 @@ pub enum CodingAgentEventKind {
     Terminal,
 }
 
+impl CodingAgentEventKind {
+    /// Canonical model-facing and wire vocabulary. Keep this exhaustive match
+    /// aligned with the serde snake_case representation instead of relying on
+    /// Debug formatting, which does not preserve word boundaries.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::AgentMessage => "agent_message",
+            Self::Reasoning => "reasoning",
+            Self::Plan => "plan",
+            Self::ToolActivity => "tool_activity",
+            Self::FileChange => "file_change",
+            Self::TerminalActivity => "terminal_activity",
+            Self::Usage => "usage",
+            Self::PermissionRequest => "permission_request",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodingAgentUsage {
@@ -720,6 +739,28 @@ mod tests {
             config: BTreeMap::new(),
             timeout_secs: 60,
         })
+    }
+
+    #[test]
+    fn event_kind_model_vocabulary_is_exact_snake_case() {
+        let cases = [
+            (CodingAgentEventKind::AgentMessage, "agent_message"),
+            (CodingAgentEventKind::Reasoning, "reasoning"),
+            (CodingAgentEventKind::Plan, "plan"),
+            (CodingAgentEventKind::ToolActivity, "tool_activity"),
+            (CodingAgentEventKind::FileChange, "file_change"),
+            (CodingAgentEventKind::TerminalActivity, "terminal_activity"),
+            (CodingAgentEventKind::Usage, "usage"),
+            (
+                CodingAgentEventKind::PermissionRequest,
+                "permission_request",
+            ),
+            (CodingAgentEventKind::Terminal, "terminal"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+            assert_eq!(serde_json::to_value(&kind).unwrap(), expected);
+        }
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use super::{RecoveryKind, ToolResult, ToolRuntime};
 use crate::auth::{AuthContext, AuthKind};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -21,7 +23,13 @@ const IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
 const START_RESPONSE_WAIT_SECS: u64 = 32;
 const CONTROL_RESPONSE_WAIT_SECS: u64 = 65;
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
-const PUBLIC_TOKEN_PREFIX: &str = "wcar1";
+const PUBLIC_TOKEN_PREFIX: &str = "wcar2_";
+const PUBLIC_TOKEN_MAX_BYTES: usize = 192;
+const PUBLIC_TOKEN_EPOCH_BYTES: usize = 32;
+const PUBLIC_TOKEN_SEQUENCE_BYTES: usize = 8;
+const PUBLIC_TOKEN_TAG_BYTES: usize = 16;
+const PUBLIC_TOKEN_PAYLOAD_BYTES: usize =
+    PUBLIC_TOKEN_EPOCH_BYTES + PUBLIC_TOKEN_SEQUENCE_BYTES + PUBLIC_TOKEN_TAG_BYTES;
 const SERVER_TERMINAL_RETENTION_SECS: i64 = 15 * 60;
 const SERVER_MAX_TERMINAL_RUNS: usize = CODING_AGENT_MAX_INVENTORY_RUNS;
 
@@ -1005,44 +1013,124 @@ enum TokenError {
     StaleEpoch,
 }
 
-fn run_token_hash(run_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"webcodex-coding-agent-token-run-v1\0");
-    hasher.update(run_id.as_bytes());
-    format!("{:x}", hasher.finalize())[..16].to_string()
+fn observation_token_mac_key() -> &'static [u8; 32] {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"webcodex.coding-agent.observation.mac-key.v2\0");
+        hasher.update(Uuid::new_v4().as_bytes());
+        hasher.update(Uuid::new_v4().as_bytes());
+        hasher.finalize().into()
+    })
+}
+
+fn observation_token_hmac(domain: &[u8], epoch: &str, run_id: &str, extra: &[u8]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let key = observation_token_mac_key();
+    let mut ipad = [0x36u8; BLOCK_BYTES];
+    let mut opad = [0x5cu8; BLOCK_BYTES];
+    for (index, byte) in key.iter().enumerate() {
+        ipad[index] ^= byte;
+        opad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(domain);
+    inner.update((epoch.len() as u64).to_be_bytes());
+    inner.update(epoch.as_bytes());
+    inner.update((run_id.len() as u64).to_be_bytes());
+    inner.update(run_id.as_bytes());
+    inner.update((extra.len() as u64).to_be_bytes());
+    inner.update(extra);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer.finalize().into()
 }
 
 fn observation_token(epoch: &str, run_id: &str, sequence: u64) -> String {
-    format!(
-        "{PUBLIC_TOKEN_PREFIX}:{epoch}:{}:{sequence}",
-        run_token_hash(run_id)
-    )
+    debug_assert_eq!(epoch.len(), PUBLIC_TOKEN_EPOCH_BYTES);
+    let mask = observation_token_hmac(
+        b"webcodex.coding-agent.observation.sequence-mask.v2\0",
+        epoch,
+        run_id,
+        &[],
+    );
+    let sequence = sequence.to_be_bytes();
+    let mut masked_sequence = [0_u8; PUBLIC_TOKEN_SEQUENCE_BYTES];
+    for (index, byte) in sequence.iter().enumerate() {
+        masked_sequence[index] = byte ^ mask[index];
+    }
+    let tag = observation_token_hmac(
+        b"webcodex.coding-agent.observation.tag.v2\0",
+        epoch,
+        run_id,
+        &masked_sequence,
+    );
+    let mut payload = Vec::with_capacity(PUBLIC_TOKEN_PAYLOAD_BYTES);
+    payload.extend_from_slice(epoch.as_bytes());
+    payload.extend_from_slice(&masked_sequence);
+    payload.extend_from_slice(&tag[..PUBLIC_TOKEN_TAG_BYTES]);
+    let token = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(payload));
+    debug_assert!(token.len() <= PUBLIC_TOKEN_MAX_BYTES);
+    token
 }
 
 fn parse_observation_token(epoch: &str, run_id: &str, token: &str) -> Result<u64, TokenError> {
-    if token.len() > 192 {
+    if token.len() > PUBLIC_TOKEN_MAX_BYTES {
         return Err(TokenError::Invalid);
     }
-    let mut parts = token.split(':');
-    if parts.next() != Some(PUBLIC_TOKEN_PREFIX) {
+    let encoded = token
+        .strip_prefix(PUBLIC_TOKEN_PREFIX)
+        .ok_or(TokenError::Invalid)?;
+    if encoded.is_empty() || !encoded.is_ascii() {
         return Err(TokenError::Invalid);
     }
-    let Some(token_epoch) = parts.next() else {
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| TokenError::Invalid)?;
+    if payload.len() != PUBLIC_TOKEN_PAYLOAD_BYTES {
         return Err(TokenError::Invalid);
-    };
-    let Some(run_hash) = parts.next() else {
+    }
+    let token_epoch = std::str::from_utf8(&payload[..PUBLIC_TOKEN_EPOCH_BYTES])
+        .map_err(|_| TokenError::Invalid)?;
+    if token_epoch.len() != PUBLIC_TOKEN_EPOCH_BYTES
+        || !token_epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err(TokenError::Invalid);
-    };
-    let Some(sequence) = parts.next() else {
-        return Err(TokenError::Invalid);
-    };
-    if parts.next().is_some() || run_hash != run_token_hash(run_id) {
+    }
+    let masked_start = PUBLIC_TOKEN_EPOCH_BYTES;
+    let masked_end = masked_start + PUBLIC_TOKEN_SEQUENCE_BYTES;
+    let masked_sequence: [u8; PUBLIC_TOKEN_SEQUENCE_BYTES] = payload[masked_start..masked_end]
+        .try_into()
+        .map_err(|_| TokenError::Invalid)?;
+    let expected_tag = observation_token_hmac(
+        b"webcodex.coding-agent.observation.tag.v2\0",
+        token_epoch,
+        run_id,
+        &masked_sequence,
+    );
+    if !crate::config::constant_time_eq(
+        &payload[masked_end..],
+        &expected_tag[..PUBLIC_TOKEN_TAG_BYTES],
+    ) {
         return Err(TokenError::Invalid);
     }
     if token_epoch != epoch {
         return Err(TokenError::StaleEpoch);
     }
-    sequence.parse().map_err(|_| TokenError::Invalid)
+    let mask = observation_token_hmac(
+        b"webcodex.coding-agent.observation.sequence-mask.v2\0",
+        token_epoch,
+        run_id,
+        &[],
+    );
+    let mut sequence = [0_u8; PUBLIC_TOKEN_SEQUENCE_BYTES];
+    for (index, byte) in masked_sequence.iter().enumerate() {
+        sequence[index] = byte ^ mask[index];
+    }
+    Ok(u64::from_be_bytes(sequence))
 }
 
 fn start_projection(run: &CodingAgentRunSnapshot, token: String) -> Value {
@@ -1096,7 +1184,7 @@ fn observe_projection(observation: CodingAgentObserveResult, epoch: &str, reset:
 fn event_projection(event: &CodingAgentEvent) -> Value {
     json!({
         "sequence": event.sequence,
-        "kind": format!("{:?}", event.kind).to_ascii_lowercase(),
+        "kind": event.kind.as_str(),
         "text": event.text,
         "label": event.label,
         "status": event.status,
@@ -1403,19 +1491,52 @@ mod tests {
     }
 
     #[test]
-    fn identities_are_domain_separated_and_tokens_are_run_bound() {
+    fn identities_are_domain_separated_and_tokens_are_run_bound_and_tamper_evident() {
         let principal = "oauth2:shared-key:abc";
         let run = deterministic_run_id(principal, "same-key");
+        let epoch = "11111111111111111111111111111111";
+        let stale_epoch = "22222222222222222222222222222222";
         assert!(run.starts_with("wc_agent_run_"));
         assert_ne!(authority_fingerprint(principal), run);
-        let token = observation_token("epoch", &run, 7);
-        assert_eq!(parse_observation_token("epoch", &run, &token), Ok(7));
+
+        let token = observation_token(epoch, &run, 7);
+        assert!(token.starts_with(PUBLIC_TOKEN_PREFIX));
+        assert!(token.len() <= PUBLIC_TOKEN_MAX_BYTES);
+        assert!(!token.contains(&run));
+        assert_eq!(parse_observation_token(epoch, &run, &token), Ok(7));
+        let continuation = observation_token(epoch, &run, 9);
+        assert_eq!(parse_observation_token(epoch, &run, &continuation), Ok(9));
         assert_eq!(
-            parse_observation_token("other", &run, &token),
+            parse_observation_token(stale_epoch, &run, &token),
             Err(TokenError::StaleEpoch)
         );
         assert_eq!(
-            parse_observation_token("epoch", "wc_agent_run_other", &token),
+            parse_observation_token(epoch, "wc_agent_run_other", &token),
+            Err(TokenError::Invalid)
+        );
+
+        let encoded = token.strip_prefix(PUBLIC_TOKEN_PREFIX).unwrap();
+        let mut payload = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        payload[PUBLIC_TOKEN_EPOCH_BYTES] ^= 1;
+        let forged_sequence = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(&payload));
+        assert_eq!(
+            parse_observation_token(epoch, &run, &forged_sequence),
+            Err(TokenError::Invalid)
+        );
+
+        let mut payload = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        payload[0] = b'2';
+        let forged_epoch = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(&payload));
+        assert_eq!(
+            parse_observation_token(epoch, &run, &forged_epoch),
+            Err(TokenError::Invalid)
+        );
+
+        let mut payload = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        *payload.last_mut().unwrap() ^= 1;
+        let tampered = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(&payload));
+        assert_eq!(
+            parse_observation_token(epoch, &run, &tampered),
             Err(TokenError::Invalid)
         );
     }
