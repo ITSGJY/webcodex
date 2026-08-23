@@ -1159,6 +1159,28 @@ impl ShellClientRegistry {
         Self::client_view_locked(&inner, client_id)
     }
 
+    pub(crate) async fn coding_agent_run_for_client_for_auth(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        client_id: &str,
+        run_id: &str,
+    ) -> Option<(ShellClientView, CodingAgentRunSnapshot)> {
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
+        let client = inner.clients.get(client_id)?;
+        if !shell_client_visible_to_auth(auth, client) {
+            return None;
+        }
+        let run = client
+            .coding_agent_inventory
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .cloned()?;
+        let view = Self::client_view_locked(&inner, client_id)?;
+        Some((view, run))
+    }
+
     pub(crate) async fn coding_agent_run_for_auth(
         &self,
         auth: Option<&crate::auth::AuthContext>,
@@ -1169,6 +1191,7 @@ impl ShellClientRegistry {
         self.prune_expired_shared_key_clients_locked(&mut inner, now);
         let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
         ids.sort();
+        let mut matched = None;
         for client_id in ids {
             let Some(client) = inner.clients.get(&client_id) else {
                 continue;
@@ -1176,18 +1199,25 @@ impl ShellClientRegistry {
             if !shell_client_visible_to_auth(auth, client) {
                 continue;
             }
-            if let Some(run) = client
+            let Some(run) = client
                 .coding_agent_inventory
                 .runs
                 .iter()
                 .find(|run| run.run_id == run_id)
                 .cloned()
-            {
-                let view = Self::client_view_locked(&inner, &client_id)?;
-                return Some((view, run));
+            else {
+                continue;
+            };
+            if matched.is_some() {
+                // A Server restart has no process-local binding to disambiguate
+                // duplicate run ids. Fail closed instead of choosing a Runner by
+                // registry iteration order and silently retargeting provenance.
+                return None;
             }
+            let view = Self::client_view_locked(&inner, &client_id)?;
+            matched = Some((view, run));
         }
-        None
+        matched
     }
 
     pub(crate) async fn assert_client_access(

@@ -20,6 +20,10 @@ pub const CODING_AGENT_MAX_CONFIG_OPTIONS: usize = 32;
 pub const CODING_AGENT_MAX_CONFIG_KEY_BYTES: usize = 128;
 pub const CODING_AGENT_MAX_CONFIG_VALUE_BYTES: usize = 4096;
 pub const CODING_AGENT_MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
+pub const CODING_AGENT_MAX_ERROR_KIND_BYTES: usize = 64;
+pub const CODING_AGENT_MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
+pub const CODING_AGENT_MAX_EVENT_METADATA_BYTES: usize = 1024;
+pub const CODING_AGENT_MAX_TERMINAL_METADATA_BYTES: usize = 1024;
 pub const CODING_AGENT_MAX_EVENTS_PER_RESPONSE: usize = 64;
 pub const CODING_AGENT_MAX_RETAINED_EVENTS: usize = 256;
 pub const CODING_AGENT_MAX_INVENTORY_RUNS: usize = 128;
@@ -412,6 +416,11 @@ pub fn validate_response_for_request(
         );
     }
     let Some(payload) = response.payload.as_ref() else {
+        let error = response
+            .error
+            .as_ref()
+            .expect("response payload/error exclusivity checked above");
+        validate_coding_agent_error(error)?;
         return Ok(());
     };
     let run = match (request, payload) {
@@ -431,6 +440,24 @@ pub fn validate_response_for_request(
                     return Err(
                         "CodingAgentRun response event bounds/order are invalid".to_string()
                     );
+                }
+                if event
+                    .label
+                    .as_ref()
+                    .is_some_and(|value| value.len() > CODING_AGENT_MAX_EVENT_METADATA_BYTES)
+                    || event
+                        .status
+                        .as_ref()
+                        .is_some_and(|value| value.len() > CODING_AGENT_MAX_EVENT_METADATA_BYTES)
+                    || event.usage.as_ref().is_some_and(|usage| {
+                        usage.cost_amount.as_ref().is_some_and(|value| {
+                            value.len() > CODING_AGENT_MAX_EVENT_METADATA_BYTES
+                        }) || usage.cost_currency.as_ref().is_some_and(|value| {
+                            value.len() > CODING_AGENT_MAX_EVENT_METADATA_BYTES
+                        })
+                    })
+                {
+                    return Err("CodingAgentRun response event metadata is too large".to_string());
                 }
                 previous = Some(event.sequence);
             }
@@ -459,8 +486,70 @@ pub fn validate_response_for_request(
     {
         return Err("CodingAgentRun response project id is invalid".to_string());
     }
+    if let Some(terminal) = run.terminal.as_ref() {
+        if terminal
+            .stop_reason
+            .as_ref()
+            .is_some_and(|value| value.len() > CODING_AGENT_MAX_TERMINAL_METADATA_BYTES)
+            || terminal
+                .error_code
+                .as_ref()
+                .is_some_and(|value| value.len() > CODING_AGENT_MAX_TERMINAL_METADATA_BYTES)
+            || terminal
+                .message
+                .as_ref()
+                .is_some_and(|value| value.len() > CODING_AGENT_MAX_ERROR_MESSAGE_BYTES)
+        {
+            return Err("CodingAgentRun response terminal metadata is too large".to_string());
+        }
+    }
     if run.state.terminal() != run.terminal.is_some() {
         return Err("CodingAgentRun response terminal metadata is inconsistent".to_string());
+    }
+    Ok(())
+}
+
+fn validate_coding_agent_error(error: &CodingAgentError) -> Result<(), String> {
+    validate_low_cardinality_kind(
+        &error.code,
+        "CodingAgentRun error code",
+        CODING_AGENT_MAX_ERROR_KIND_BYTES,
+    )?;
+    if error.message.len() > CODING_AGENT_MAX_ERROR_MESSAGE_BYTES {
+        return Err("CodingAgentRun error message is too large".to_string());
+    }
+    if let Some(failure_kind) = error.failure_kind.as_deref() {
+        validate_low_cardinality_kind(
+            failure_kind,
+            "CodingAgentRun failure kind",
+            CODING_AGENT_MAX_ERROR_KIND_BYTES,
+        )?;
+    }
+    if let Some(recovery_kind) = error.recovery_kind.as_deref() {
+        if !matches!(
+            recovery_kind,
+            "fix_input"
+                | "retry_same"
+                | "reobserve"
+                | "reconcile"
+                | "wait"
+                | "user_action"
+                | "none"
+        ) {
+            return Err("CodingAgentRun recovery kind is invalid".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_low_cardinality_kind(value: &str, field: &str, max_bytes: usize) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(format!("{field} is invalid"));
     }
     Ok(())
 }
@@ -491,6 +580,86 @@ fn validate_identifier(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_request() -> CodingAgentRequest {
+        CodingAgentRequest::Start(CodingAgentStartRequest {
+            run_id: "wc_agent_run_0123456789abcdef".to_string(),
+            intent_fingerprint: "cafebabe".to_string(),
+            authority_fingerprint: "auth_0123456789abcdef".to_string(),
+            runtime_project_id: "agent:test:demo".to_string(),
+            project_root: "/tmp/demo".to_string(),
+            provider_id: "codex".to_string(),
+            provider_instance_id: "provider_123".to_string(),
+            instruction: "inspect the repository".to_string(),
+            config: BTreeMap::new(),
+            timeout_secs: 60,
+        })
+    }
+
+    #[test]
+    fn response_validation_closes_error_and_model_facing_string_bounds() {
+        let request = test_request();
+        let valid_error = CodingAgentResponse::error(
+            CodingAgentDispatchState::NotStarted,
+            "coding_agent_unavailable",
+            "provider unavailable",
+            Some("unavailable"),
+            Some("reobserve"),
+        );
+        validate_response_for_request(&request, &valid_error).unwrap();
+
+        let mut invalid = valid_error.clone();
+        invalid.error.as_mut().unwrap().code = "PRIVATE arbitrary / path".to_string();
+        assert!(validate_response_for_request(&request, &invalid).is_err());
+
+        let mut invalid = valid_error.clone();
+        invalid.error.as_mut().unwrap().recovery_kind = Some("blind_retry".to_string());
+        assert!(validate_response_for_request(&request, &invalid).is_err());
+
+        let mut invalid = valid_error;
+        invalid.error.as_mut().unwrap().message =
+            "x".repeat(CODING_AGENT_MAX_ERROR_MESSAGE_BYTES + 1);
+        assert!(validate_response_for_request(&request, &invalid).is_err());
+
+        let run = CodingAgentRunSnapshot {
+            run_id: request.run_id().to_string(),
+            intent_fingerprint: "cafebabe".to_string(),
+            authority_fingerprint: "auth_0123456789abcdef".to_string(),
+            runtime_project_id: "agent:test:demo".to_string(),
+            provider_id: "codex".to_string(),
+            provider_instance_id: "provider_123".to_string(),
+            state: CodingAgentRunState::Running,
+            execution_state: CodingAgentExecutionState::Started,
+            observation_revision: 1,
+            created_at: 1,
+            updated_at: 1,
+            terminal: None,
+        };
+        let response = CodingAgentResponse::success(CodingAgentResponsePayload::Observe {
+            observation: CodingAgentObserveResult {
+                run,
+                events: vec![CodingAgentEvent {
+                    sequence: 1,
+                    kind: CodingAgentEventKind::ToolActivity,
+                    text: None,
+                    label: None,
+                    status: Some("x".repeat(CODING_AGENT_MAX_EVENT_METADATA_BYTES + 1)),
+                    usage: None,
+                }],
+                first_retained_sequence: 1,
+                next_sequence: 1,
+                has_more: false,
+                history_lost: false,
+            },
+        });
+        let observe_request = CodingAgentRequest::Observe(CodingAgentObserveRequest {
+            run_id: request.run_id().to_string(),
+            after_sequence: None,
+            limit: 8,
+            wait_secs: 0,
+        });
+        assert!(validate_response_for_request(&observe_request, &response).is_err());
+    }
 
     #[test]
     fn request_round_trip_is_closed_and_bounded() {

@@ -256,6 +256,74 @@ async fn client_supports_reflects_registered_capabilities() {
 }
 
 #[tokio::test]
+async fn coding_agent_run_lookup_is_exact_when_bound_and_ambiguous_when_unbound() {
+    let registry = ShellClientRegistry::default();
+    let run_id = "wc_agent_run_duplicate_123";
+    for client_id in ["a", "b"] {
+        let provider_instance_id = format!("provider_{client_id}");
+        registry
+            .register(ShellClientRegisterRequest {
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: Some(vec![
+                    webcodex_core::coding_agent::CodingAgentProvider {
+                        provider_id: "codex".to_string(),
+                        provider_instance_id: provider_instance_id.clone(),
+                        name: "Codex".to_string(),
+                    },
+                ]),
+                coding_agent_inventory: Some(
+                    webcodex_core::coding_agent::CodingAgentRunInventory {
+                        runs: vec![webcodex_core::coding_agent::CodingAgentRunSnapshot {
+                            run_id: run_id.to_string(),
+                            intent_fingerprint: "fingerprint".to_string(),
+                            authority_fingerprint: "auth_test".to_string(),
+                            runtime_project_id: format!("agent:{client_id}:demo"),
+                            provider_id: "codex".to_string(),
+                            provider_instance_id,
+                            state: webcodex_core::coding_agent::CodingAgentRunState::Running,
+                            execution_state:
+                                webcodex_core::coding_agent::CodingAgentExecutionState::Started,
+                            observation_revision: 1,
+                            created_at: 1,
+                            updated_at: 1,
+                            terminal: None,
+                        }],
+                    },
+                ),
+                client_id: client_id.to_string(),
+                agent_instance_id: format!("inst_{client_id}"),
+                display_name: None,
+                owner: None,
+                hostname: None,
+                host_context: None,
+                capabilities: Some(ShellClientCapabilities {
+                    coding_agent_runs: true,
+                    ..Default::default()
+                }),
+                projects: None,
+                agent_protocol_version: None,
+                policy: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    assert!(registry
+        .coding_agent_run_for_auth(None, run_id)
+        .await
+        .is_none());
+    let (client, run) = registry
+        .coding_agent_run_for_client_for_auth(None, "b", run_id)
+        .await
+        .expect("exact bound client lookup");
+    assert_eq!(client.client_id, "b");
+    assert_eq!(run.runtime_project_id, "agent:b:demo");
+}
+
+#[tokio::test]
 async fn client_supports_recognizes_all_protocol_capability_names() {
     let registry = ShellClientRegistry::default();
     registry
@@ -267,8 +335,14 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 active_complete: true,
                 jobs: Vec::new(),
             }),
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
+            coding_agent_providers: Some(vec![webcodex_core::coding_agent::CodingAgentProvider {
+                provider_id: "codex".to_string(),
+                provider_instance_id: "provider_all".to_string(),
+                name: "Codex".to_string(),
+            }]),
+            coding_agent_inventory: Some(
+                webcodex_core::coding_agent::CodingAgentRunInventory::default(),
+            ),
             client_id: "all".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,
@@ -319,7 +393,7 @@ async fn client_supports_recognizes_all_protocol_capability_names() {
                 computer_window_activate: true,
                 computer_text_input: true,
                 job_state_reconciliation: true,
-                coding_agent_runs: false,
+                coding_agent_runs: true,
             }),
             projects: None,
             agent_protocol_version: None,

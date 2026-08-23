@@ -881,18 +881,26 @@ mod tests {
                 );
             }
         }
-        let allowed = oauth(&["coding_agent:run"]);
-        for tool in [
-            "coding_agent_start",
-            "coding_agent_observe",
-            "coding_agent_cancel",
-        ] {
+        let run_only = oauth(&["coding_agent:run"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&run_only), "coding_agent_start"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_PROJECT_WRITE),
+                description: "missing required scope: project:write".to_string(),
+            })
+        );
+        for tool in ["coding_agent_observe", "coding_agent_cancel"] {
             assert_eq!(
-                check_runtime_tool_scope(Some(&allowed), tool),
+                check_runtime_tool_scope(Some(&run_only), tool),
                 Ok(()),
                 "{tool}"
             );
         }
+        let start_allowed = oauth(&["coding_agent:run", "project:write"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&start_allowed), "coding_agent_start"),
+            Ok(())
+        );
     }
 
     #[test]

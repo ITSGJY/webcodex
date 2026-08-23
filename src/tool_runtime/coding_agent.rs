@@ -64,6 +64,15 @@ fn prune_server_runs_locked(runs: &mut HashMap<String, ServerRunBinding>, now: i
     }
 }
 
+fn run_matches_binding_identity(binding: &ServerRunBinding, run: &CodingAgentRunSnapshot) -> bool {
+    run.run_id == binding.snapshot.run_id
+        && run.authority_fingerprint == binding.authority_fingerprint
+        && run.intent_fingerprint == binding.snapshot.intent_fingerprint
+        && run.runtime_project_id == binding.runtime_project_id
+        && run.provider_id == binding.provider_id
+        && run.provider_instance_id == binding.provider_instance_id
+}
+
 impl Default for CodingAgentServerState {
     fn default() -> Self {
         Self {
@@ -195,6 +204,9 @@ impl ToolRuntime {
             Ok(resolved) => resolved,
             Err(error) => return error.into_tool_result(),
         };
+        if !resolved.config.allow_patch {
+            return coding_agent_project_not_writable_result(&run_id);
+        }
         let client_id = match resolved.config.agent_client_id() {
             Ok(value) => value.to_string(),
             Err(error) => {
@@ -348,6 +360,8 @@ impl ToolRuntime {
                 if run.authority_fingerprint != authority_fingerprint
                     || run.intent_fingerprint != intent_fingerprint
                     || run.runtime_project_id != resolved.resolved_id
+                    || run.provider_id != provider_id
+                    || run.provider_instance_id != provider.provider_instance_id
                 {
                     return coding_agent_error(
                         "invalid_runner_response",
@@ -521,10 +535,10 @@ impl ToolRuntime {
             };
         match response.payload {
             Some(CodingAgentResponsePayload::Observe { mut observation }) => {
-                if observation.run.authority_fingerprint != authority {
+                if !run_matches_binding_identity(&binding, &observation.run) {
                     return coding_agent_error(
                         "invalid_runner_response",
-                        "Runner CodingAgentRun authority fingerprint mismatch",
+                        "Runner returned mismatched CodingAgentRun identity",
                         "outcome_unknown",
                         RecoveryKind::Reconcile,
                         Some(&run_id),
@@ -538,7 +552,16 @@ impl ToolRuntime {
                     .get_client_view_for_auth(&binding.client_id, auth)
                     .await
                 {
-                    Some(client) => client,
+                    Some(client) if client.agent_instance_id == binding.agent_instance_id => client,
+                    Some(_) => {
+                        return coding_agent_error(
+                            "invalid_runner_response",
+                            "owning Runner instance changed while observation was in flight",
+                            "outcome_unknown",
+                            RecoveryKind::Reconcile,
+                            Some(&run_id),
+                        )
+                    }
                     None => {
                         return coding_agent_error(
                             "coding_agent_runner_unavailable",
@@ -641,10 +664,10 @@ impl ToolRuntime {
             };
         match response.payload {
             Some(CodingAgentResponsePayload::Cancel { run }) => {
-                if run.authority_fingerprint != authority {
+                if !run_matches_binding_identity(&binding, &run) {
                     return coding_agent_error(
                         "invalid_runner_response",
-                        "Runner CodingAgentRun authority fingerprint mismatch",
+                        "Runner returned mismatched CodingAgentRun identity",
                         "outcome_unknown",
                         RecoveryKind::Reconcile,
                         Some(&run_id),
@@ -655,6 +678,15 @@ impl ToolRuntime {
                     .get_client_view_for_auth(&binding.client_id, auth)
                     .await
                 {
+                    if client.agent_instance_id != binding.agent_instance_id {
+                        return coding_agent_error(
+                            "invalid_runner_response",
+                            "owning Runner instance changed while cancellation was in flight",
+                            "outcome_unknown",
+                            RecoveryKind::Reconcile,
+                            Some(&run_id),
+                        );
+                    }
                     self.coding_agent_runs
                         .bind(&client, run.clone(), None)
                         .await;
@@ -725,62 +757,98 @@ impl ToolRuntime {
         authority: &str,
         auth: Option<&AuthContext>,
     ) -> Option<ServerRunBinding> {
-        // A live Runner inventory is authoritative over the Server's process-local
-        // projection. This is what lets a Server restart (or a Runner restart that
-        // recovered a durable record as `lost`) rebaseline without redispatching.
-        if let Some((client, run)) = self
-            .shell_clients
-            .coding_agent_run_for_auth(auth, run_id)
-            .await
-        {
-            if run.authority_fingerprint != authority {
+        let existing = self.coding_agent_runs.get(run_id).await;
+        if let Some(mut binding) = existing {
+            if binding.authority_fingerprint != authority {
                 return None;
             }
-            self.coding_agent_runs.bind(&client, run, None).await;
-            return self.coding_agent_runs.get(run_id).await;
-        }
+            // Once the Server has a binding, only the exact bound client may
+            // refresh it. Another visible Runner advertising the same run_id is
+            // not evidence about this Run and must not force a false retarget/lost.
+            if let Some((client, run)) = self
+                .shell_clients
+                .coding_agent_run_for_client_for_auth(auth, &binding.client_id, run_id)
+                .await
+            {
+                if run.authority_fingerprint != authority {
+                    return None;
+                }
+                let identity_changed = !run_matches_binding_identity(&binding, &run);
+                let runner_replaced_while_active =
+                    client.agent_instance_id != binding.agent_instance_id && !run.state.terminal();
+                if identity_changed || runner_replaced_while_active {
+                    mark_server_binding_lost(
+                        &mut binding,
+                        if identity_changed {
+                            "coding_agent_identity_changed_uncertain"
+                        } else {
+                            "runner_replaced_uncertain"
+                        },
+                    );
+                    self.coding_agent_runs
+                        .runs
+                        .lock()
+                        .await
+                        .insert(run_id.to_string(), binding.clone());
+                    return Some(binding);
+                }
+                self.coding_agent_runs.bind(&client, run, None).await;
+                return self.coding_agent_runs.get(run_id).await;
+            }
 
-        let mut binding = self.coding_agent_runs.get(run_id).await?;
-        if binding.authority_fingerprint != authority {
-            return None;
-        }
-        if binding.snapshot.state.terminal() {
+            if binding.snapshot.state.terminal() {
+                return Some(binding);
+            }
+
+            // A temporary disconnect of the same Runner is not proof of loss: keep
+            // the active projection so callers get wait/reobserve semantics. A live
+            // replacement instance, however, is a positive fence crossing. If that
+            // replacement does not advertise the durable Run, the old prompt may have
+            // executed and P1 must close it `lost` rather than retrying blindly.
+            if let Some(current) = self
+                .shell_clients
+                .get_client_view_for_auth(&binding.client_id, auth)
+                .await
+            {
+                let instance_replaced = current.agent_instance_id != binding.agent_instance_id;
+                let provider_replaced = !instance_replaced
+                    && current
+                        .coding_agent_providers
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .all(|provider| {
+                            provider.provider_instance_id != binding.provider_instance_id
+                        });
+                if instance_replaced || provider_replaced {
+                    let code = if instance_replaced {
+                        "runner_replaced_uncertain"
+                    } else {
+                        "provider_replaced_uncertain"
+                    };
+                    mark_server_binding_lost(&mut binding, code);
+                    self.coding_agent_runs
+                        .runs
+                        .lock()
+                        .await
+                        .insert(run_id.to_string(), binding.clone());
+                }
+            }
             return Some(binding);
         }
 
-        // A temporary disconnect of the same Runner is not proof of loss: keep
-        // the active projection so callers get wait/reobserve semantics. A live
-        // replacement instance, however, is a positive fence crossing. If that
-        // replacement does not advertise the durable Run, the old prompt may have
-        // executed and P1 must close it `lost` rather than retrying blindly.
-        if let Some(current) = self
+        // After a Server restart there is no process-local binding. Recover only
+        // from a unique visible Runner inventory match; the registry fails closed
+        // on duplicate run ids instead of choosing by iteration order.
+        let (client, run) = self
             .shell_clients
-            .get_client_view_for_auth(&binding.client_id, auth)
-            .await
-        {
-            let instance_replaced = current.agent_instance_id != binding.agent_instance_id;
-            let provider_replaced = !instance_replaced
-                && current
-                    .coding_agent_providers
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .all(|provider| provider.provider_instance_id != binding.provider_instance_id);
-            if instance_replaced || provider_replaced {
-                let code = if instance_replaced {
-                    "runner_replaced_uncertain"
-                } else {
-                    "provider_replaced_uncertain"
-                };
-                mark_server_binding_lost(&mut binding, code);
-                self.coding_agent_runs
-                    .runs
-                    .lock()
-                    .await
-                    .insert(run_id.to_string(), binding.clone());
-            }
+            .coding_agent_run_for_auth(auth, run_id)
+            .await?;
+        if run.authority_fingerprint != authority {
+            return None;
         }
-        Some(binding)
+        self.coding_agent_runs.bind(&client, run, None).await;
+        self.coding_agent_runs.get(run_id).await
     }
 
     async fn current_agent_instance(
@@ -1076,14 +1144,24 @@ fn run_recovery_kind(run: &CodingAgentRunSnapshot) -> &'static str {
         CodingAgentRunState::Starting | CodingAgentRunState::Running => "reobserve",
         CodingAgentRunState::WaitingPermission => "wait",
         CodingAgentRunState::Lost => "reconcile",
-        CodingAgentRunState::Completed | CodingAgentRunState::Cancelled => "none",
-        CodingAgentRunState::Failed
-            if run.execution_state == CodingAgentExecutionState::NotStarted =>
-        {
-            "retry_same"
-        }
-        CodingAgentRunState::Failed => "none",
+        CodingAgentRunState::Completed
+        | CodingAgentRunState::Failed
+        | CodingAgentRunState::Cancelled => "none",
     }
+}
+
+fn coding_agent_project_not_writable_result(run_id: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        "coding_agent_start requires a Project with allow_patch=true",
+        json!({
+            "error_kind": "coding_agent_project_not_writable",
+            "failure_kind": "policy_rejected",
+            "run_id": run_id,
+            "state_changed": false,
+            "execution_state": "not_started",
+        }),
+    )
+    .with_recovery(RecoveryKind::UserAction, None)
 }
 
 fn coding_agent_error(
@@ -1221,6 +1299,61 @@ mod tests {
                 .filter(|binding| binding.snapshot.state.terminal())
                 .count(),
             SERVER_MAX_TERMINAL_RUNS
+        );
+    }
+
+    #[test]
+    fn non_writable_project_is_a_hard_prestart_denial() {
+        let result = coding_agent_project_not_writable_result("wc_agent_run_readonly");
+        assert!(!result.success);
+        assert_eq!(result.output["failure_kind"], "policy_rejected");
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert_eq!(result.output["state_changed"], false);
+        assert_eq!(result.output["recovery_kind"], "user_action");
+        assert!(crate::tool_runtime::permissions::is_hard_denied_output(
+            &result.output,
+            result.error.as_deref()
+        ));
+    }
+
+    #[test]
+    fn bound_run_identity_rejects_provider_project_and_intent_retarget() {
+        let binding = test_server_binding(
+            "wc_agent_run_identity_fence".to_string(),
+            CodingAgentRunState::Running,
+            1,
+        );
+        assert!(run_matches_binding_identity(&binding, &binding.snapshot));
+
+        let mut retargeted = binding.snapshot.clone();
+        retargeted.provider_id = "other-provider".to_string();
+        assert!(!run_matches_binding_identity(&binding, &retargeted));
+
+        let mut retargeted = binding.snapshot.clone();
+        retargeted.provider_instance_id = "other-instance".to_string();
+        assert!(!run_matches_binding_identity(&binding, &retargeted));
+
+        let mut retargeted = binding.snapshot.clone();
+        retargeted.runtime_project_id = "agent:test:other".to_string();
+        assert!(!run_matches_binding_identity(&binding, &retargeted));
+
+        let mut retargeted = binding.snapshot.clone();
+        retargeted.intent_fingerprint = "other-intent".to_string();
+        assert!(!run_matches_binding_identity(&binding, &retargeted));
+    }
+
+    #[test]
+    fn terminal_not_started_run_does_not_advertise_retry_same() {
+        let mut binding = test_server_binding(
+            "wc_agent_run_failed_not_started".to_string(),
+            CodingAgentRunState::Failed,
+            1,
+        );
+        binding.snapshot.execution_state = CodingAgentExecutionState::NotStarted;
+        assert_eq!(
+            run_recovery_kind(&binding.snapshot),
+            "none",
+            "a retained terminal Run cannot be redispatched by replaying the same idempotency key"
         );
     }
 

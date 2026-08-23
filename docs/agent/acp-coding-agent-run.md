@@ -431,9 +431,12 @@ For a non-empty caller `config` object P1 must perform this order:
 An invalid override is `not_started` with `recovery_kind=fix_input`; it must not
 partially begin the coding prompt.
 
-The initial P1 operator policy should be an explicit allowlist of option ids (and,
-where needed, values) rather than a generic policy language. Unknown newly
-advertised options remain non-overridable until the operator permits them.
+The initial P1 operator policy is an explicit allowlist of option ids rather than
+a generic policy language. Permitting one id delegates selection among that
+session's currently advertised legal values; unknown newly advertised option ids
+remain non-overridable. If a future provider exposes materially different
+authority levels as values of one option, add an explicit value ceiling for that
+concrete need rather than pretending P1 already has per-value policy.
 
 ### Fields remote callers never control
 
@@ -599,7 +602,7 @@ multiplying states. Reuse the existing concepts `not_started`, `started`,
 | `running` | Prompt request was dispatched; agent may have accepted it. | No blind prompt retry. | `reobserve`; after transport failure use `reconcile`. |
 | `waiting_permission` | Prompt is active and a real ACP permission callback is pending. | No prompt retry and no automatic allow. | `wait`; P1 fail-closes the permission deadline. |
 | `completed` | Correlated terminal prompt result proves normal terminal completion. | No retry of the same Run. | `none`. |
-| `failed` | Deterministic terminal failure is known, or setup failed before prompt dispatch. | A new initiation is allowed only when failure metadata proves `not_started`; otherwise caller must not infer retry safety. | Usually `fix_input`, `retry_same`, or `none` based on the concrete failure. |
+| `failed` | Deterministic terminal failure is known, or setup failed before prompt dispatch. | The retained Run itself is terminal and same-key replay only returns it. A new initiation with a new idempotency key is safe only when `execution_state=not_started`; otherwise caller must not infer retry safety. | `none` for the retained terminal Run. Pre-admission tool-call failures may separately use `fix_input` or exact `retry_same`. |
 | `cancelled` | Cancellation reached a correlated terminal cancelled result, or the Run was cancelled while prompt was provably not started. | Do not resend the cancelled prompt as a retry. | `none`. |
 | `lost` | No terminal prompt result is available and exact continuation cannot currently be proved. Prompt may have run. | Never blind retry. | `reconcile` / `reobserve`; create a new Run only after authoritative evidence establishes safety or the user intentionally requests new work. |
 
@@ -620,6 +623,11 @@ and wait for a bounded terminal result. A correlated cancelled result becomes
 `cancelled`; losing the process/transport before correlation becomes `lost`.
 Setup deadline failures before prompt dispatch become `failed` with
 `execution_state=not_started`.
+A retained terminal `failed/not_started` Run therefore never advertises
+`retry_same`: deterministic same-key replay is observation/idempotency only and
+cannot redispatch that terminal Run. After correcting the underlying setup issue,
+a caller may intentionally create a new initiation with a new idempotency key;
+that is distinct from replaying the old initiation.
 
 ## 10. Initiation and retry safety
 
@@ -833,6 +841,9 @@ For the P1 public vertical slice:
 
 - start requires `coding_agent:run` plus normal authorization for the exact
   writable Project;
+  Concretely, delegated start also requires `project:write` and the current
+  Runner registration must still have `allow_patch=true`; the Runner rechecks
+  that writable binding immediately before admitting/spawning the ACP run.
 - observe/cancel require the same Run visibility/ownership and exact Project
   boundary; knowing `run_id` is never sufficient;
 - Workflow Session provenance grants no additional authority;

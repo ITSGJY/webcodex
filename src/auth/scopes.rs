@@ -313,6 +313,9 @@ pub(crate) fn oauth_scope_policy_for_runtime_tool(tool_name: &str) -> OAuthToolS
     if tool_name == "run_detached_process" {
         return OAuthToolScopePolicy::RequireAll(&[SCOPE_JOB_RUN, SCOPE_JOB_DETACH]);
     }
+    if tool_name == "coding_agent_start" {
+        return OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE]);
+    }
     if tool_name == "computer_read_clipboard" {
         return OAuthToolScopePolicy::RequireAll(&[
             SCOPE_COMPUTER_READ,
@@ -982,7 +985,7 @@ mod tests {
             ("cargo_test", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             (
                 "coding_agent_start",
-                OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
+                OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE]),
             ),
             (
                 "coding_agent_observe",
@@ -1049,6 +1052,8 @@ mod tests {
             let metadata = lookup_tool_metadata(tool).unwrap();
             let expected = if tool == "run_detached_process" {
                 OAuthToolScopePolicy::RequireAll(&[SCOPE_JOB_RUN, SCOPE_JOB_DETACH])
+            } else if tool == "coding_agent_start" {
+                OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE])
             } else if tool == "computer_save_snapshot" {
                 OAuthToolScopePolicy::RequireAll(&[SCOPE_PROJECT_WRITE, SCOPE_COMPUTER_READ])
             } else if tool == "computer_read_clipboard" {

@@ -302,6 +302,7 @@ pub(crate) struct ToolDefinitionPolicy {
     pub(crate) captures_validation_output: bool,
     pub(crate) current_session_control: bool,
     pub(crate) creates_or_binds_session: bool,
+    pub(crate) current_session_fallback_disabled: bool,
     pub(crate) disabled_message: Option<&'static str>,
     pub(crate) extra_accepted_flattened_args: &'static [&'static str],
     pub(crate) git_like: bool,
@@ -317,6 +318,7 @@ impl ToolDefinitionPolicy {
         captures_validation_output: false,
         current_session_control: false,
         creates_or_binds_session: false,
+        current_session_fallback_disabled: false,
         disabled_message: None,
         extra_accepted_flattened_args: &[],
         git_like: false,
@@ -420,6 +422,11 @@ bool_policy_modifier!(current_session_control, current_session_control);
 bool_policy_modifier!(git_like, git_like);
 
 bool_policy_modifier!(creates_or_binds_session, creates_or_binds_session);
+
+bool_policy_modifier!(
+    disable_current_session_fallback,
+    current_session_fallback_disabled
+);
 
 const fn extra_accepted_flattened_args(
     definition: ToolDefinition,

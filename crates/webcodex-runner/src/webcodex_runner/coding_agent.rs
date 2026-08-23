@@ -658,7 +658,7 @@ impl CodingAgentManager {
             return response_error(
                 CodingAgentDispatchState::NotStarted,
                 "stale_coding_agent_project",
-                "registered Project root no longer matches start intent",
+                "registered writable Project binding no longer matches start intent",
                 "stale_state",
                 "reobserve",
             );
@@ -1682,6 +1682,8 @@ fn project_binding_matches(
         .any(|project| {
             format!("agent:{client_id}:{}", project.id) == runtime_project_id
                 && Path::new(&project.path) == Path::new(root)
+                && project.allow_patch
+                && !project.disabled
         })
 }
 
@@ -1779,16 +1781,11 @@ fn normalize_update(message: &Value) -> Option<CodingAgentEvent> {
                 .get("title")
                 .and_then(Value::as_str)
                 .map(bounded_text)
-                .or_else(|| {
-                    update
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
+                .or_else(|| update.get("kind").and_then(Value::as_str).map(bounded_text));
             let status = update
                 .get("status")
                 .and_then(Value::as_str)
-                .map(str::to_string);
+                .map(bounded_text);
             let event_kind = match update.get("kind").and_then(Value::as_str) {
                 Some("edit") | Some("delete") | Some("move") => CodingAgentEventKind::FileChange,
                 Some("execute") => CodingAgentEventKind::TerminalActivity,
@@ -2561,6 +2558,45 @@ for line in sys.stdin:
             restored.execution_state,
             CodingAgentExecutionState::OutcomeUnknown
         );
+    }
+
+    #[test]
+    fn project_binding_requires_current_writable_registration() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let projects = temp.path().join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        let config_path = projects.join("p.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "id = \"demo\"\npath = {:?}\nallow_patch = false\n",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        assert!(!project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            root.to_string_lossy().as_ref()
+        ));
+
+        fs::write(
+            &config_path,
+            format!(
+                "id = \"demo\"\npath = {:?}\nallow_patch = true\n",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        assert!(project_binding_matches(
+            &projects,
+            "test",
+            "agent:test:demo",
+            root.to_string_lossy().as_ref()
+        ));
     }
 
     #[test]

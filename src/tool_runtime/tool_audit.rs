@@ -61,11 +61,7 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose"]);
         }
         "coding_agent_start" => {
-            copy_keys(
-                obj,
-                &mut out,
-                &["provider_id", "timeout_secs", "recording_session_id"],
-            );
+            copy_keys(obj, &mut out, &["provider_id", "timeout_secs"]);
             out.insert(
                 "instruction_bytes".to_string(),
                 Value::from(
@@ -2056,6 +2052,8 @@ mod computer_privacy_tests {
         assert!(!request_serialized.contains(PROMPT));
         assert!(!request_serialized.contains(IDEMPOTENCY));
         assert!(!request_serialized.contains("agent\""));
+        assert!(request_summary.get("recording_session_id").is_none());
+        assert!(!request_serialized.contains("wc_sess_safe"));
 
         let observe_request = json!({
             "run_id": "wc_agent_run_safe",
@@ -2133,7 +2131,7 @@ impl ToolCall {
                 instruction,
                 config,
                 timeout_secs,
-                recording_session_id,
+                recording_session_id: _,
             } => serde_json::json!({
                 "project": project,
                 "provider_id": provider_id,
@@ -2141,7 +2139,6 @@ impl ToolCall {
                 "instruction_bytes": instruction.len(),
                 "config_count": config.as_ref().map(std::collections::BTreeMap::len).unwrap_or_default(),
                 "timeout_secs": timeout_secs,
-                "recording_session_id": recording_session_id,
             }),
             Self::CodingAgentObserve {
                 run_id,

@@ -73,6 +73,7 @@ impl ToolDefinition {
 
     pub(crate) fn allows_current_session_fallback(self) -> bool {
         self.metadata.requires_project
+            && !self.policy.current_session_fallback_disabled
             && !self.is_current_session_control()
             && !self.requires_explicit_business_session()
             && !self.creates_or_binds_session()

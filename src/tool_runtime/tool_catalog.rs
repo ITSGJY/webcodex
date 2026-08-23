@@ -4,6 +4,7 @@ use super::tool_definition::{ToolDiscoveryGroup, ToolManifestIntent, ToolRecomme
 
 pub(crate) const TOOL_DISCOVERY_GROUP_CHECKPOINT: &str = "checkpoint";
 pub(crate) const TOOL_DISCOVERY_GROUP_CLEANUP: &str = "cleanup";
+pub(crate) const TOOL_DISCOVERY_GROUP_CODING_AGENT: &str = "coding_agent";
 pub(crate) const TOOL_DISCOVERY_GROUP_EDIT: &str = "edit";
 pub(crate) const TOOL_DISCOVERY_GROUP_GIT: &str = "git";
 pub(crate) const TOOL_DISCOVERY_GROUP_INSPECT: &str = "inspect";
@@ -208,6 +209,14 @@ pub(crate) const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "list_agents",
             "runtime_status",
             "tool_manifest",
+        ],
+    },
+    ToolDiscoveryGroup {
+        name: TOOL_DISCOVERY_GROUP_CODING_AGENT,
+        tools: &[
+            "coding_agent_start",
+            "coding_agent_observe",
+            "coding_agent_cancel",
         ],
     },
     ToolDiscoveryGroup {

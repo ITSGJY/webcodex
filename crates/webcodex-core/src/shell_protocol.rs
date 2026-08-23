@@ -2830,6 +2830,7 @@ mod envelope_tests {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         }
     }
@@ -2891,6 +2892,7 @@ mod envelope_tests {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         }
     }
@@ -3452,6 +3454,7 @@ mod envelope_tests {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let env = AgentEnvelope::Request { request };
@@ -3944,6 +3947,7 @@ mod envelope_tests {
                 },
                 command_execution_state: Some(ShellCommandExecutionState::Completed),
                 mcp_gateway: None,
+                coding_agent: None,
             },
         };
         let json = result_env.to_json().unwrap();
