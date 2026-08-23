@@ -95,8 +95,10 @@ example `wc_agent_run_*`. It is the only agent-execution identity a model needs
 to retain after successful admission.
 
 A Run owns the bounded normalized event history, current state, exact Project,
-exact Runner instance, exact ACP provider instance/revision, initiation intent,
-optional Workflow Session provenance, and the Runner-private ACP session id.
+exact Runner instance, exact ACP provider instance, a bounded initiation-intent
+fingerprint, optional Workflow Session provenance, and the Runner-private ACP
+session id. Raw prompt/config input is execution data, not durable authority
+identity, and should be discarded once it is no longer needed for active dispatch.
 
 ### ACP session
 
@@ -273,6 +275,14 @@ capabilities, and validates the returned negotiated version and advertised
 capabilities before creating a session. Unsupported/malformed negotiation is a
 pre-prompt failure and must fail closed.
 
+P1 must advertise only ACP client capabilities that it actually implements.
+`session/request_permission` is a baseline client method, while client-side
+filesystem, terminal, and elicitation methods are optional capability-gated
+surfaces. P1 must not advertise `fs.readTextFile`, `fs.writeTextFile`, terminal,
+or elicitation support merely because the selected agent can use those concepts.
+An unexpected unsupported agent-to-client request must receive a bounded
+fail-closed protocol response rather than hanging the Run.
+
 ### Session creation
 
 For P1 the Runner supplies the exact registered Project root as the `session/new`
@@ -422,22 +432,33 @@ provider-reload framework for one consumer.
 Each advertised provider needs bounded sanitized identity such as:
 
 ```text
-provider_id
-provider_instance_id   # opaque, fresh for the Runner/provider process lifetime
-provider_revision      # bounded revision of the sanitized advertisement
+provider_id             # logical id selectable within the exact Project Runner
+provider_instance_id    # opaque internal fence for this startup-owned provider instance
 name
-available/configured capability facts only
+configured/routing capability facts only
 ```
 
-A new Runner process or provider replacement gets a new instance identity. Any
-Server request naming an old provider instance/revision fails before starting a
-Run. The Server must never receive executable path, argv, PID, environment
-values, credential material, stderr, local config contents, or raw ACP auth
-data.
+P1 configuration is startup/restart-owned and has no hot provider replacement,
+so a second `provider_revision` authority token has no demonstrated purpose.
+The exact Runner `agent_instance_id` plus opaque `provider_instance_id` are the
+replacement fence. A future hot-reload design can add a revision only if it
+creates a distinct live replacement boundary.
+
+Public callers select only the logical provider id after Project resolution. The
+Server captures the exact Runner/provider instance internally and revalidates it
+immediately before dispatch; ephemeral provider-instance identity is not a
+model input. A new Runner/provider instance makes an already-bound request stale
+before Run start. The Server must never receive executable path, argv, PID,
+environment values, credential material, stderr, local config contents, or raw
+ACP auth data.
 
 `env_from_env` is resolved only on the Runner immediately before spawn. The
-caller supplies neither source names nor values. P1 must preserve existing
-secret-redaction rules; it must not log resolved environment values.
+caller supplies neither source names nor values. The ACP child must follow the
+existing static-MCP provider boundary: clear the inherited process environment
+first, then inject only operator-declared `env_from_env` mappings. Missing mapped
+sources fail before child start. P1 must preserve existing secret-redaction
+rules; it must never silently inherit the Runner's complete environment or log
+resolved values.
 
 Admission capacity is an ACP-run plane, not Job concurrency. P1 should use a
 small bounded `max_concurrent_runs` and **reject before start when full** rather
@@ -489,9 +510,11 @@ P1 nevertheless must implement the callback. The minimum safe behavior is:
 - emit a bounded sanitized `permission_request` Run event;
 - enter `waiting_permission` while a bounded response deadline is active;
 - never choose an allow option automatically;
-- because P1 has no public permission-response tool, resolve the deadline
-  fail-closed by returning the protocol's cancelled/rejected outcome available
-  for that request;
+- if `coding_agent_cancel` cancels the prompt while a permission request is
+  outstanding, answer that request with ACP `Cancelled` as required by v1 and
+  then continue the cancel path;
+- if only the permission-response deadline expires, answer ACP `Cancelled`.
+  Do not synthesize an option selection or mutate the Agent's persistent policy;
 - then continue observing the same prompt until it reaches a terminal result or
   becomes lost.
 
@@ -528,6 +551,16 @@ multiplying states. Reuse the existing concepts `not_started`, `started`,
 | `cancelled` | Cancellation reached a correlated terminal cancelled result, or the Run was cancelled while prompt was provably not started. | Do not resend the cancelled prompt as a retry. | `none`. |
 | `lost` | No terminal prompt result is available and exact continuation cannot currently be proved. Prompt may have run. | Never blind retry. | `reconcile` / `reobserve`; create a new Run only after authoritative evidence establishes safety or the user intentionally requests new work. |
 
+ACP v1 terminal `stopReason` mapping is closed for P1: `end_turn` becomes
+`completed`; `cancelled` becomes `cancelled`; `max_tokens`,
+`max_turn_requests`, and `refusal` become deterministic `failed` outcomes. Those
+non-success stop reasons are correlated terminal responses, so they are not
+`lost`, but they also do not prove that the turn had no coding effects and do not
+create retry authority. An unknown stop reason is a fail-closed protocol failure,
+not normal completion. A correlated JSON-RPC error for the prompt is likewise a
+terminal `failed` outcome; loss of correlation/transport before any terminal
+response is what produces `lost`.
+
 `lost` is an uncertainty state, not proof that the coding process had no effect.
 
 A timeout is not a separate initial state. On a Run deadline, request cancellation
@@ -542,15 +575,54 @@ Setup deadline failures before prompt dispatch become `failed` with
 bounded caller-chosen `idempotency_key`, using the same semantic pattern as
 `run_detached_process` but a separate CodingAgentRun namespace.
 
-The key should be scoped to authenticated principal and initiation intent and
-resolve to one stable `run_id` while that Run is active or retained. Replaying
-the same key with the same normalized intent returns/observes that Run and
-cannot dispatch the prompt twice. Reusing it with a different Project, provider,
-prompt, or config intent fails with an idempotency conflict before dispatch.
+The idempotency identity is the stable authenticated principal plus the bounded
+caller key; the initiation intent is a separate conflict check. Following the
+existing detached-Job precedent, P1 should derive `run_id` deterministically
+from an ACP-specific domain separator, canonical stable principal identity, and
+the key. Do not randomly mint the Run id unless an equally strong durable
+admission mapping is committed before dispatch; P1 should not add that extra
+persistence concept.
 
-The initiation key is not the Run id, not authority, and should not be copied to
-the Runner as a credential. The Server can derive/mint the stable Run identity
-before dispatch and send the closed Run intent to the exact Runner.
+Before first dispatch, compute a bounded canonical `intent_fingerprint` for the
+execution-affecting start intent. Replaying the same derived `run_id` with the
+same fingerprint returns/observes that Run and cannot dispatch the prompt twice.
+A different Project, logical provider, prompt, config, timeout, or other
+execution-affecting intent under the same key is an idempotency conflict before
+dispatch. The Runner Run record/inventory carries the `run_id` and fingerprint
+needed for post-Server-restart reconciliation, not the caller's raw key or a
+retained raw prompt solely for idempotency checking.
+
+The initiation key is not authority and must not be copied to the Runner,
+persisted in ordinary evidence, or logged. Deterministic Run identity is what
+lets a retry after Server restart meet an already-running authoritative Run
+instead of creating a second execution.
+
+Deterministic identity alone is insufficient across a Runner restart because the
+new Runner must still know whether that logical Run may already have produced
+effects. P1 therefore needs a **minimal durable Runner-local Run record** (or an
+equally strong existing durable mechanism) for admitted CodingAgentRuns. This is
+not a durable transcript and not automatic ACP-session recovery. It stores only
+bounded authority/lifecycle facts such as `run_id`, `intent_fingerprint`, exact
+Project identity, logical provider identity, conservative dispatch phase, and
+terminal metadata.
+
+The dispatch phase must include a crash-safe conservative barrier persisted
+**before** writing `session/prompt`. Once that barrier is durable, a restart may
+only conclude that the prompt *may have been dispatched* until a correlated
+terminal result is durably recorded. A crash after the barrier but before the
+actual write therefore sacrifices retryability and recovers as `lost`; that is
+preferable to duplicate coding effects. Only a record proven to have remained
+strictly before this barrier may recover as `not_started`. A correlated terminal
+result may later replace the barrier with bounded terminal metadata. Raw prompt,
+config bodies, event transcript, idempotency key, credentials, and ACP messages
+must not be stored in this durable record.
+
+Consequently, a same-key initiation after either Server or Runner restart must
+first reconcile the deterministic `run_id` against the durable Run record and
+current Runner inventory. A matching `lost`, active, or retained-terminal record
+is observed/returned and never redispatched; a mismatched fingerprint conflicts.
+If the required durable record is unavailable or corrupt after a possibly
+started Run, fail closed rather than treating absence as proof of `not_started`.
 
 The most important uncertainty rule is:
 
@@ -621,10 +693,15 @@ The response must make retention explicit:
 - terminal state is returned even when there are no new textual events.
 
 Raw reasoning and tool payloads can contain sensitive or very large data. P1
-must define per-event bounds/redaction and retain only sanitized normalized
-evidence needed for model observation and audit. Environment values, auth data,
-absolute provider executable paths, raw credentials, and arbitrary stderr are
-never event content.
+must define per-event bounds/redaction. The bounded Runner observation ring may
+retain model-facing message/reasoning/tool summaries needed to observe the Run,
+but existing durable Action Audit, generic model-ergonomics telemetry, and
+Workflow Session lifecycle evidence must not automatically persist prompt text,
+agent-message/reasoning bodies, or raw ACP tool inputs/results. Durable surfaces
+should record bounded lifecycle/size/kind metadata unless a future explicit
+evidence feature defines otherwise. Environment values, auth data, absolute
+provider executable paths, raw credentials, and arbitrary stderr are never event
+content.
 
 ## 12. Cancel, timeout, restart, and replacement
 
@@ -641,8 +718,10 @@ A surviving Runner process can retain a Run and its event ring independently of
 the Server request that started/observed it. P1 should extend the established
 Runner reconciliation pattern with a bounded active/recent-terminal
 CodingAgentRun inventory. The same Runner `agent_instance_id`, exact `run_id`,
-Project, provider instance/revision, state, and observation revision are the
-recovery authority.
+Project, provider instance, `intent_fingerprint`, state, and observation revision
+are the recovery authority. The deterministic principal+idempotency-key Run id
+allows a retried initiation to correlate with that recovered inventory without
+sending the raw key to the Runner.
 
 A Server restart invalidates process-local waits/tokens as needed, but it must
 not imply that the Run should be restarted. Re-observation should return a
@@ -652,15 +731,20 @@ bounded reset/baseline and fresh token when the Run is still authoritative.
 
 A new Runner process has a new `agent_instance_id` and new ACP provider instance
 identity. P1 does not claim transparent active-Run recovery across that boundary.
-An active Run whose owning Runner/provider instance disappears becomes `lost`
-unless exact future recovery proves continuity.
+At startup it first loads the minimal durable Run records described above. A
+record strictly before the prompt-dispatch barrier may close as deterministic
+`not_started`; a record at/after that barrier without a durable correlated
+terminal result recovers as `lost`; a retained terminal record stays terminal
+although its in-memory event history may have been lost. The new Runner must not
+turn a missing in-memory Run into permission to redispatch a deterministic
+`run_id` whose durable record says effects were possible.
 
 Although current Codex ACP can load a durable session in a new adapter process,
 P1 should defer automatic cross-process Run recovery. `session/load` alone does
 not provide exact in-flight prompt reconciliation, and guessing would risk
 re-executing coding effects.
 
-A stale Server request carrying an old provider instance/revision must fail
+A stale Server request internally bound to an old provider instance must fail
 closed before spawning or retargeting any agent.
 
 ## 13. Authorization and scope recommendation
@@ -684,6 +768,14 @@ mcp:local
 Those scopes authorize different primitives. Giving an existing credential the
 ability to start an autonomous coding agent merely because it can edit a file,
 run a Job, or call a local MCP tool would silently broaden authority.
+
+Registering the new scope is not permission to add it to existing default scope
+ceilings. In particular, P1 must leave direct shared-key model scopes, the OAuth
+shared-key bridge defaults, open-anonymous scopes, Project-credential connector
+scopes, and already-issued legacy OAuth clients unchanged unless an explicit
+operator/consent path grants `coding_agent:run`. The first usable ACP flow needs
+such an explicit opt-in issuance path; it must not obtain usability by silently
+expanding existing credentials.
 
 For the P1 public vertical slice:
 
@@ -710,8 +802,8 @@ framework or a second provider.
 Add a narrow transport-neutral coding-agent protocol module (for example
 `crates/webcodex-core/src/coding_agent.rs`) with bounded typed values for:
 
-- sanitized ACP provider advertisement and instance/revision identity;
-- Run start intent/result;
+- sanitized ACP provider advertisement plus internal instance identity;
+- Run start intent/result plus bounded `intent_fingerprint`;
 - Run observe request/result and normalized events;
 - Run cancel request/result;
 - bounded active/recent-terminal Run inventory for same-Runner reconciliation.
@@ -727,16 +819,21 @@ Add a focused ACP module under `crates/webcodex-runner` that:
 
 - parses `[acp]` / `[[acp.agents]]` startup configuration;
 - validates ids, executable/argv bounds, explicit `env_from_env`, and concurrency;
-- creates process-ephemeral provider identity/revision;
+- creates an opaque startup-owned provider-instance identity;
 - spawns each admitted Run with `ManagedChild` and owns the whole process tree;
+- clears inherited environment and injects only configured `env_from_env` values;
 - uses project root as `session/new.cwd`;
-- performs `initialize`, `session/new`, validated explicit config overrides, then
-  one `session/prompt`;
+- performs `initialize` with only implemented client capabilities, `session/new`,
+  validated explicit config overrides, then one `session/prompt`;
 - handles `session/update`, `session/request_permission`, prompt response,
   `session/cancel`, protocol faults, and process exit;
 - retains a bounded normalized event ring and active/recent-terminal Run inventory;
-- rejects stale provider instance/revision and over-capacity starts before prompt
-  dispatch;
+- persists the minimal crash-safe Run admission/dispatch/terminal record before
+  crossing the prompt-dispatch barrier, without persisting prompt/transcript bodies;
+- rejects stale provider instance and over-capacity starts before prompt dispatch;
+- after terminal Run state, closes ACP stdin/transport and boundedly reaps or
+  terminates the owned `ManagedChild` process tree; terminal protocol state does
+  not by itself prove child cleanup;
 - drains/discards bounded diagnostic stderr without projecting secrets.
 
 Do not reuse `McpGatewayManager` itself: its callbacks are intentionally
@@ -748,11 +845,14 @@ secret-free advertisement, and dispatch certainty.
 
 Add a `CodingAgentRun` registry/runtime path separate from `jobs.rs`, with:
 
-- stable `wc_agent_run_*` identity derived/admitted before Runner dispatch;
-- detached-style idempotency conflict checking;
+- deterministic `wc_agent_run_*` identity derived from stable principal +
+  idempotency key before Runner dispatch;
+- bounded intent fingerprinting and detached-style idempotency conflict checking;
 - exact Project/Runner/provider binding;
 - lifecycle and recovery metadata using existing vocabulary;
 - same-Runner inventory reconciliation after Server restart;
+- reconciliation with the Runner's durable Run record so restart never turns a
+  possibly-dispatched prompt into a fresh admission;
 - bounded observation-token encoding and serialized-output enforcement;
 - optional Workflow Session recording/provenance only.
 
@@ -766,14 +866,18 @@ coding_agent_observe
 coding_agent_cancel
 ```
 
-`coding_agent_start` inputs should be limited to Project, provider id/instance
-observation, required idempotency key, prompt/instruction, optional explicit
-validated `config`, timeout, and optional Workflow Session provenance as
-appropriate. It must not accept executable/argv/env/cwd/transport/raw RPC.
+`coding_agent_start` inputs should be limited to Project, logical provider id,
+required idempotency key, prompt/instruction, optional explicit validated
+`config`, timeout, and optional Workflow Session provenance as appropriate. The
+Server resolves and fences the exact Runner/provider instance internally. The
+tool must not accept provider-instance tokens, executable/argv/env/cwd/transport,
+or raw RPC.
 
-Add the new `coding_agent:run` scope to the normal scope registry and OAuth
-issuance surfaces in the same P1 vertical slice, with explicit tests proving
-legacy `project:write`, Job, and MCP credentials do not inherit it.
+Add the new `coding_agent:run` scope to the normal scope registry and an
+explicit opt-in OAuth/operator issuance path in the same P1 vertical slice.
+Keep existing default/shared-key/Project-credential/open-anonymous ceilings
+unchanged, with explicit tests proving legacy `project:write`, Job, MCP, and
+shared-key credentials do not inherit it.
 
 ### Focused validation
 
@@ -785,13 +889,22 @@ coverage and one opt-in real Codex ACP smoke for compatibility. Cover at least:
 - permission request never auto-allows;
 - cancel -> correlated terminal cancellation;
 - provider crash before vs after prompt dispatch;
-- stale provider instance/revision;
-- idempotent start replay and intent conflict;
+- stale provider instance;
+- idempotent start replay, intent conflict, and post-Server-restart replay without
+  duplicate dispatch;
+- minimal client-capability advertisement and fail-closed unsupported callbacks;
 - event retention/history loss and token Run binding;
-- Server restart with same Runner inventory;
+- Server restart with same Runner inventory and intent fingerprint;
+- Runner restart at each dispatch boundary: before durable barrier, after barrier
+  before prompt write, after prompt write before terminal, and terminal-before-
+  projection, proving no duplicate prompt dispatch;
+- missing/corrupt durable record after possible dispatch fails closed;
 - Runner/provider replacement -> lost/fail closed;
 - project/scope/Workflow-Session authority boundaries;
-- environment redaction and bounded serialized output.
+- environment redaction and bounded serialized output;
+- cleared child environment plus explicit `env_from_env` injection;
+- terminal child-process cleanup;
+- durable audit/telemetry privacy for prompt, message, reasoning, and tool bodies.
 
 ## 15. Explicitly deferred
 
@@ -830,9 +943,17 @@ The P0 architecture baseline is therefore:
    not a transcript replay or raw ACP stream.
 9. After prompt dispatch, transport/process loss is outcome-unknown; no blind
    retry, including when `session/load` exists.
-10. Runner/provider instance fencing and same-Runner reconciliation follow the
-    established Job/MCP safety patterns without reusing those semantic objects.
-11. ACP execution receives a new `coding_agent:run` scope rather than inheriting
-    `project:write`, Job, or MCP authority.
-12. P1 is one exact Codex vertical slice with typed closed Server<->Runner
+10. Runner/provider instance fencing follows the established MCP pattern, while
+    the model selects only a logical provider id; ephemeral provider identity is
+    an internal dispatch fence.
+11. Restart-safe initiation uses deterministic principal+key Run identity plus a
+    separate intent fingerprint and a minimal durable Runner dispatch record.
+    After the conservative prompt-dispatch barrier, uncertainty recovers as
+    `lost`, never as permission to redispatch.
+12. ACP execution receives a new `coding_agent:run` scope rather than inheriting
+    `project:write`, Job, MCP, shared-key, or other existing default authority.
+13. P1 advertises only ACP client capabilities it actually implements, clears
+    the child environment before explicit `env_from_env` injection, and keeps
+    prompt/reasoning/tool bodies out of ordinary durable telemetry/audit.
+14. P1 is one exact Codex vertical slice with typed closed Server<->Runner
     protocol and three eventual model tools, not a generic agent framework.
