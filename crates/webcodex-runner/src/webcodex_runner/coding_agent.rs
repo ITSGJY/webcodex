@@ -446,8 +446,13 @@ pub(crate) struct CodingAgentManager {
     max_concurrent_runs: usize,
     permission_timeout: Duration,
     store: DurableRunStore,
+    admission: Mutex<()>,
     runs: Mutex<HashMap<String, Arc<RunEntry>>>,
     accepting: AtomicBool,
+    #[cfg(test)]
+    admission_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    initial_claim_writes: std::sync::atomic::AtomicUsize,
 }
 
 impl CodingAgentManager {
@@ -474,8 +479,13 @@ impl CodingAgentManager {
             store: DurableRunStore {
                 root: DurableRunStore::default_root(client_id, server_url)?,
             },
+            admission: Mutex::new(()),
             runs: Mutex::new(HashMap::new()),
             accepting: AtomicBool::new(true),
+            #[cfg(test)]
+            admission_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            initial_claim_writes: std::sync::atomic::AtomicUsize::new(0),
         });
         manager.recover()?;
         Ok(manager)
@@ -499,8 +509,13 @@ impl CodingAgentManager {
             max_concurrent_runs: config.max_concurrent_runs,
             permission_timeout: Duration::from_secs(config.permission_timeout_secs),
             store: DurableRunStore { root },
+            admission: Mutex::new(()),
             runs: Mutex::new(HashMap::new()),
             accepting: AtomicBool::new(true),
+            #[cfg(test)]
+            admission_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            initial_claim_writes: std::sync::atomic::AtomicUsize::new(0),
         });
         manager.recover()?;
         Ok(manager)
@@ -607,6 +622,18 @@ impl CodingAgentManager {
         request: webcodex_core::coding_agent::CodingAgentStartRequest,
         projects_dir: &Path,
     ) -> CodingAgentResponse {
+        #[cfg(test)]
+        {
+            let barrier = self.admission_test_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
+        }
+        // Admission is the authoritative process-local fence for both idempotent
+        // run identity and max_concurrent_runs. It intentionally ends once the
+        // durable BeforePromptBarrier claim and in-memory RunEntry both exist;
+        // provider execution is never serialized by this lock.
+        let admission = self.admission.lock().unwrap();
         if !self.accepting.load(Ordering::Acquire) {
             return response_error(
                 CodingAgentDispatchState::NotStarted,
@@ -741,6 +768,9 @@ impl CodingAgentManager {
             updated_at: timestamp,
             terminal: None,
         };
+        #[cfg(test)]
+        self.initial_claim_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Err(error) = self.store.write(&record) {
             // Admission has not launched the ACP turn yet. Remove any partial
             // directory/state residue so the documented retry_same response
@@ -759,6 +789,7 @@ impl CodingAgentManager {
             .lock()
             .unwrap()
             .insert(request.run_id.clone(), Arc::clone(&entry));
+        drop(admission);
         let run_id = request.run_id.clone();
         let thread_entry = Arc::clone(&entry);
         let thread_manager = Arc::clone(self);
@@ -2145,6 +2176,32 @@ for line in sys.stdin:
             .collect()
     }
 
+    #[cfg(unix)]
+    fn wait_for_received_method_count(temp: &TempDir, method: &str, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = received_methods(&wire_log(temp))
+                .iter()
+                .filter(|candidate| candidate.as_str() == method)
+                .count();
+            if count >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected} {method} calls; observed {count}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn successful_start_run_id(response: &CodingAgentResponse) -> Option<String> {
+        match response.payload.as_ref() {
+            Some(CodingAgentResponsePayload::Start { run }) => Some(run.run_id.clone()),
+            _ => None,
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn acp_v1_sequence_cwd_config_and_normalized_updates_are_exact() {
@@ -2393,6 +2450,148 @@ for line in sys.stdin:
         let second = entry.observe(Some(first.next_sequence), 32, 0);
         assert!(!second.events.is_empty());
         assert!(second.events.first().unwrap().sequence > first.events.last().unwrap().sequence);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_duplicate_start_admission_creates_exactly_one_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "wait_cancel");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_concurrentdup01";
+        let request = start_request(&manager, &root, run, BTreeMap::new());
+        *manager.admission_test_barrier.lock().unwrap() =
+            Some(Arc::new(std::sync::Barrier::new(2)));
+
+        let first_manager = Arc::clone(&manager);
+        let first_projects = projects.clone();
+        let first_request = request.clone();
+        let first = thread::spawn(move || first_manager.handle(first_request, &first_projects));
+        let second_manager = Arc::clone(&manager);
+        let second_projects = projects.clone();
+        let second = thread::spawn(move || second_manager.handle(request, &second_projects));
+
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        *manager.admission_test_barrier.lock().unwrap() = None;
+        assert!(first.error.is_none(), "{:?}", first.error);
+        assert!(second.error.is_none(), "{:?}", second.error);
+        assert_eq!(successful_start_run_id(&first).as_deref(), Some(run));
+        assert_eq!(successful_start_run_id(&second).as_deref(), Some(run));
+        assert_eq!(
+            manager
+                .initial_claim_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "duplicate concurrent admission must publish only one initial durable claim"
+        );
+        assert_eq!(manager.runs.lock().unwrap().len(), 1);
+        wait_for_received_method_count(&temp, "session/prompt", 1);
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
+                .count(),
+            1,
+            "duplicate concurrent admission dispatched more than one ACP prompt"
+        );
+
+        manager.handle(
+            CodingAgentRequest::Cancel(CodingAgentCancelRequest {
+                run_id: run.to_string(),
+            }),
+            &projects,
+        );
+        wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_capacity_admission_never_exceeds_configured_limit() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "wait_cancel");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        *manager.admission_test_barrier.lock().unwrap() =
+            Some(Arc::new(std::sync::Barrier::new(2)));
+        let first_request = start_request(
+            &manager,
+            &root,
+            "wc_agent_run_concurrentcap01",
+            BTreeMap::new(),
+        );
+        let second_request = start_request(
+            &manager,
+            &root,
+            "wc_agent_run_concurrentcap02",
+            BTreeMap::new(),
+        );
+
+        let first_manager = Arc::clone(&manager);
+        let first_projects = projects.clone();
+        let first = thread::spawn(move || first_manager.handle(first_request, &first_projects));
+        let second_manager = Arc::clone(&manager);
+        let second_projects = projects.clone();
+        let second = thread::spawn(move || second_manager.handle(second_request, &second_projects));
+
+        let responses = [first.join().unwrap(), second.join().unwrap()];
+        *manager.admission_test_barrier.lock().unwrap() = None;
+        let successes = responses
+            .iter()
+            .filter_map(successful_start_run_id)
+            .collect::<Vec<_>>();
+        let capacity_failures = responses
+            .iter()
+            .filter(|response| {
+                response.error.as_ref().map(|error| error.code.as_str())
+                    == Some("coding_agent_capacity_full")
+            })
+            .count();
+        assert_eq!(successes.len(), 1, "exactly one Run may acquire the slot");
+        assert_eq!(
+            capacity_failures, 1,
+            "the competing Run must fail capacity admission"
+        );
+        assert_eq!(
+            manager
+                .initial_claim_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "capacity admission must publish only the winning durable claim"
+        );
+        assert_eq!(
+            manager
+                .runs
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|entry| !entry.snapshot().state.terminal())
+                .count(),
+            1,
+            "active Run count exceeded max_concurrent_runs=1"
+        );
+        wait_for_received_method_count(&temp, "session/prompt", 1);
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|method| method.as_str() == "session/prompt")
+                .count(),
+            1
+        );
+
+        let winner = &successes[0];
+        manager.handle(
+            CodingAgentRequest::Cancel(CodingAgentCancelRequest {
+                run_id: winner.clone(),
+            }),
+            &projects,
+        );
+        wait_for_snapshot(&manager, winner, |snapshot| snapshot.state.terminal());
     }
 
     #[test]
