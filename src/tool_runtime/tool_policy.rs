@@ -2,14 +2,25 @@
 
 use super::metadata::{tool_metadata, ToolMetadata, ToolPathHint, ToolRisk};
 use super::tool_definition::{
-    tool_definitions, AgentCapability, ToolDefinition, PERMISSION_RISK_ARTIFACT_WRITE,
-    PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL,
-    PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
+    tool_definitions, AgentCapability, ToolDefinition, ToolEffectAnnotations,
+    PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH,
+    PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
 };
 
 impl ToolDefinition {
     pub(crate) fn metadata(self) -> ToolMetadata {
         self.metadata
+    }
+
+    pub(crate) fn effect_annotations(self) -> ToolEffectAnnotations {
+        self.policy
+            .effect_annotations
+            .unwrap_or(ToolEffectAnnotations {
+                read_only_hint: self.metadata.read_only,
+                destructive_hint: self.metadata.destructive,
+                idempotent_hint: self.metadata.read_only,
+                open_world_hint: self.metadata.shell_like,
+            })
     }
 
     pub(crate) fn session_risk_class(self) -> &'static str {
@@ -161,6 +172,18 @@ pub(crate) fn runtime_tool_metadata(name: &str) -> ToolMetadata {
     match definition_or_metadata_facade(name) {
         Ok(definition) => definition.metadata(),
         Err(metadata) => metadata,
+    }
+}
+
+pub(crate) fn runtime_tool_effect_annotations(name: &str) -> ToolEffectAnnotations {
+    match definition_or_metadata_facade(name) {
+        Ok(definition) => definition.effect_annotations(),
+        Err(metadata) => ToolEffectAnnotations {
+            read_only_hint: metadata.read_only,
+            destructive_hint: metadata.destructive,
+            idempotent_hint: metadata.read_only,
+            open_world_hint: metadata.shell_like,
+        },
     }
 }
 

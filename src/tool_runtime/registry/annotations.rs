@@ -1,17 +1,13 @@
 use serde_json::{json, Value};
 
-use super::super::tool_definition::runtime_tool_metadata;
+use super::super::tool_definition::runtime_tool_effect_annotations;
 
 pub(crate) fn tool_annotations(name: &str) -> Value {
-    let metadata = runtime_tool_metadata(name);
-    let read_only = metadata.read_only;
-    let destructive = metadata.destructive;
-    let open_world = metadata.shell_like;
-    let idempotent = metadata.read_only;
+    let effects = runtime_tool_effect_annotations(name);
     json!({
-        "readOnlyHint": read_only,
-        "destructiveHint": destructive,
-        "idempotentHint": idempotent,
-        "openWorldHint": open_world,
+        "readOnlyHint": effects.read_only_hint,
+        "destructiveHint": effects.destructive_hint,
+        "idempotentHint": effects.idempotent_hint,
+        "openWorldHint": effects.open_world_hint,
     })
 }

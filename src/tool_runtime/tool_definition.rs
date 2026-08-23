@@ -51,7 +51,7 @@ pub(crate) use super::tool_policy::{
     is_model_visible_tool_name, lookup_tool_definition, model_visible_tool_definitions,
     model_visible_tool_names_csv, runtime_tool_agent_capability,
     runtime_tool_allows_current_session_fallback, runtime_tool_captures_validation_output,
-    runtime_tool_category, runtime_tool_disabled_message,
+    runtime_tool_category, runtime_tool_disabled_message, runtime_tool_effect_annotations,
     runtime_tool_extra_accepted_flattened_args, runtime_tool_is_change_summary_like,
     runtime_tool_is_git_like, runtime_tool_is_read_like, runtime_tool_is_shell_like,
     runtime_tool_is_write_like, runtime_tool_metadata, runtime_tool_permission_risk,
@@ -297,6 +297,14 @@ pub(crate) const PERMISSION_RISK_VALIDATION: &str = "validation";
 pub(crate) const PERMISSION_RISK_WRITE: &str = "write";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolEffectAnnotations {
+    pub(crate) read_only_hint: bool,
+    pub(crate) destructive_hint: bool,
+    pub(crate) idempotent_hint: bool,
+    pub(crate) open_world_hint: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ToolDefinitionPolicy {
     pub(crate) change_summary_like: bool,
     pub(crate) captures_validation_output: bool,
@@ -306,6 +314,7 @@ pub(crate) struct ToolDefinitionPolicy {
     pub(crate) disabled_message: Option<&'static str>,
     pub(crate) extra_accepted_flattened_args: &'static [&'static str],
     pub(crate) git_like: bool,
+    pub(crate) effect_annotations: Option<ToolEffectAnnotations>,
     pub(crate) permission_risk: Option<&'static str>,
     pub(crate) requires_artifact_upload_path_binding: bool,
     pub(crate) requires_explicit_business_session: bool,
@@ -322,6 +331,7 @@ impl ToolDefinitionPolicy {
         disabled_message: None,
         extra_accepted_flattened_args: &[],
         git_like: false,
+        effect_annotations: None,
         permission_risk: None,
         requires_artifact_upload_path_binding: false,
         requires_explicit_business_session: false,
@@ -395,6 +405,19 @@ const fn model_spec(
             description,
             input_schema,
         }),
+        ..definition
+    }
+}
+
+const fn effect_annotations(
+    definition: ToolDefinition,
+    annotations: ToolEffectAnnotations,
+) -> ToolDefinition {
+    ToolDefinition {
+        policy: ToolDefinitionPolicy {
+            effect_annotations: Some(annotations),
+            ..definition.policy
+        },
         ..definition
     }
 }
