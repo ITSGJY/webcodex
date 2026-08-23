@@ -10,6 +10,9 @@ use crate::tool_runtime::kernel::{
     check_runtime_tool_scope, HostFileImportTrust, ToolCallContext, ToolCallErrorStatus,
     ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
+use crate::tool_runtime::model_ergonomics_telemetry::{
+    ModelErgonomicsRecord, ModelErgonomicsTimer,
+};
 use crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES;
 #[cfg(test)]
 use crate::tool_runtime::MAX_PROJECT_ARTIFACT_BYTES;
@@ -2266,11 +2269,20 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     } else {
         None
     };
-    let record_audit = |success: bool, status: StatusCode, error: Option<String>| {
+    let record_audit = |success: bool,
+                        status: StatusCode,
+                        error: Option<String>,
+                        model_ergonomics: Option<&ModelErgonomicsRecord>| {
         if let Some((audit, tool, project)) = audit.as_ref() {
+            let mut summary = json!({ "transport": "mcp" });
+            if let Some(telemetry) =
+                model_ergonomics.and_then(|record| serde_json::to_value(record).ok())
+            {
+                summary["model_ergonomics"] = telemetry;
+            }
             let mut event = ActionAuditRecord::new(tool.clone(), success, status)
                 .error(error)
-                .summary(json!({ "transport": "mcp" }));
+                .summary(summary);
             event.project = project.clone();
             audit.record(event);
         }
@@ -2291,6 +2303,16 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     // failure mode behind "MCP request never gets a reply"), converting a
     // silently dead HTTP request into an observable JSON-RPC error.
     let request_id = request.id.clone();
+    // The shared kernel timer is authoritative for completed runtime calls. Keep
+    // one outer emergency timer only so the MCP hard-timeout path does not erase
+    // an otherwise established runtime invocation from ergonomics telemetry.
+    let mut hard_timeout_model_ergonomics =
+        if runtime.model_surface() == ModelSurface::CanonicalConnector {
+            None
+        } else {
+            tool_name.as_deref().and_then(ModelErgonomicsTimer::start)
+        };
+    let mut model_ergonomics = None;
     let outcome = match tokio::time::timeout(
         MCP_DISPATCH_HARD_TIMEOUT,
         handle_mcp_request_with_lifecycle(
@@ -2302,6 +2324,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             host_file_import_trust,
             window.identity.as_ref(),
             Some(&mut guard),
+            Some(&mut model_ergonomics),
         ),
     )
     .await
@@ -2330,10 +2353,16 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                     Some(-32000),
                 );
             }
+            let timeout_model_ergonomics = hard_timeout_model_ergonomics.take().map(|timer| {
+                timer
+                    .finish()
+                    .record_for_pre_result_failure("dispatch_hard_timeout")
+            });
             record_audit(
                 false,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Some("mcp dispatch hard timeout".to_string()),
+                timeout_model_ergonomics.as_ref(),
             );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(500, estimated, Some(false), None, "dispatch_hard_timeout");
@@ -2396,6 +2425,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                         .as_str()
                         .map(str::to_string)
                 },
+                model_ergonomics.as_ref(),
             );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(200, estimated, Some(true), tool_success, "ok");
@@ -2403,7 +2433,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             guard.handler_returned(200, estimated, Some(true), tool_success, "ok");
         }
         McpOutcome::ArtifactExportStream { id, plan } => {
-            record_audit(true, StatusCode::OK, None);
+            record_audit(true, StatusCode::OK, None, None);
             guard.response_serialized(200, None, Some(true), None, "artifact_export_stream");
             res.status_code(StatusCode::OK);
             let _ = res.add_header("content-type", "application/json", true);
@@ -2450,6 +2480,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                 false,
                 StatusCode::BAD_REQUEST,
                 body["error"]["message"].as_str().map(str::to_string),
+                model_ergonomics.as_ref(),
             );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(400, estimated, Some(false), None, "bad_request");
@@ -2462,6 +2493,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                 false,
                 StatusCode::NOT_FOUND,
                 body["error"]["message"].as_str().map(str::to_string),
+                model_ergonomics.as_ref(),
             );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(404, estimated, Some(false), None, "not_found");
@@ -2480,6 +2512,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                     "insufficient scope: {}",
                     required_scope.unwrap_or("unknown")
                 )),
+                model_ergonomics.as_ref(),
             );
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(403, estimated, Some(false), None, "forbidden");
@@ -2525,6 +2558,7 @@ async fn handle_mcp_request(
         HostFileImportTrust::Untrusted,
         None,
         None,
+        None,
     )
     .await;
     match outcome {
@@ -2547,6 +2581,7 @@ async fn handle_mcp_request_with_lifecycle(
     host_file_import_trust: HostFileImportTrust,
     window: Option<&crate::client_window::ClientWindow>,
     mut lifecycle: Option<&mut ToolRequestLifecycle>,
+    mut model_ergonomics_out: Option<&mut Option<ModelErgonomicsRecord>>,
 ) -> McpOutcome {
     let stateless_2026 = protocol_era == McpProtocolEra::Stateless2026;
     let artifact_export_resource_read = stateless_2026
@@ -2888,6 +2923,11 @@ async fn handle_mcp_request_with_lifecycle(
                     ),
                 ));
             }
+            // From here on, the MCP boundary has established a model-visible runtime
+            // tool identity. A few MCP-only validations still happen before the
+            // shared ToolRuntime kernel; preserve those failed attempts in generic
+            // telemetry without creating a second record for normal kernel calls.
+            let mut pre_kernel_model_ergonomics = ModelErgonomicsTimer::start(&params.name);
             let artifact_export_caller = if params.name == "export_project_artifact" {
                 if !stateless_2026 || runtime.model_surface() != ModelSurface::FullOperatorRuntime {
                     return McpOutcome::BadRequest(rpc_error(
@@ -2899,11 +2939,21 @@ async fn handle_mcp_request_with_lifecycle(
                 match mcp_artifact_export_caller_binding(auth) {
                     Ok(caller) => Some(caller),
                     Err(error) => {
+                        if let (Some(slot), Some(timer)) = (
+                            model_ergonomics_out.as_deref_mut(),
+                            pre_kernel_model_ergonomics.take(),
+                        ) {
+                            *slot = Some(
+                                timer
+                                    .finish()
+                                    .record_for_pre_result_failure("invalid_arguments"),
+                            );
+                        }
                         return McpOutcome::BadRequest(rpc_error(
                             id,
                             -32602,
                             format!("export_project_artifact cannot bind this caller: {error}"),
-                        ))
+                        ));
                     }
                 }
             } else {
@@ -2994,6 +3044,16 @@ async fn handle_mcp_request_with_lifecycle(
                         lc.dispatch_failed("invalid_arguments");
                         lc.dispatch_finished(false, Some(false), "invalid_arguments");
                     }
+                    if let (Some(slot), Some(timer)) = (
+                        model_ergonomics_out.as_deref_mut(),
+                        pre_kernel_model_ergonomics.take(),
+                    ) {
+                        *slot = Some(
+                            timer
+                                .finish()
+                                .record_for_pre_result_failure("invalid_arguments"),
+                        );
+                    }
                     return McpOutcome::BadRequest(rpc_error(id, -32602, message));
                 }
             };
@@ -3015,6 +3075,7 @@ async fn handle_mcp_request_with_lifecycle(
                     },
                 )
                 .await;
+            let model_ergonomics_completion = outcome.model_ergonomics;
             let result = match outcome.error_status {
                 Some(ToolCallErrorStatus::InsufficientScope {
                     required_scope,
@@ -3024,12 +3085,25 @@ async fn handle_mcp_request_with_lifecycle(
                         lc.dispatch_failed("forbidden");
                         lc.dispatch_finished(false, Some(false), "forbidden");
                     }
+                    if let (Some(slot), Some(completion)) = (
+                        model_ergonomics_out.as_deref_mut(),
+                        model_ergonomics_completion.as_ref(),
+                    ) {
+                        *slot =
+                            Some(completion.record_for_pre_result_failure("insufficient_scope"));
+                    }
                     return scope_forbidden(auth, required_scope, description);
                 }
                 Some(ToolCallErrorStatus::InvalidArguments { message }) => {
                     if let Some(lc) = lifecycle.as_deref() {
                         lc.dispatch_failed("invalid_arguments");
                         lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                    }
+                    if let (Some(slot), Some(completion)) = (
+                        model_ergonomics_out.as_deref_mut(),
+                        model_ergonomics_completion.as_ref(),
+                    ) {
+                        *slot = Some(completion.record_for_pre_result_failure("invalid_arguments"));
                     }
                     return McpOutcome::BadRequest(rpc_error(id, -32602, message));
                 }
@@ -3065,14 +3139,22 @@ async fn handle_mcp_request_with_lifecycle(
                     snapshot_resource_caller,
                 )
             };
-            rpc_result(
+            let model_ergonomics = model_ergonomics_completion.as_ref().and_then(|completion| {
+                result
+                    .get("structuredContent")
+                    .and_then(|structured| completion.record_for_structured_content(structured))
+            });
+            if let Some(slot) = model_ergonomics_out.as_deref_mut() {
+                *slot = model_ergonomics;
+            }
+            return McpOutcome::Ok(rpc_result(
                 id,
                 if stateless_2026 {
                     mcp_stateless_result(result, false)
                 } else {
                     result
                 },
-            )
+            ));
         }
         "notifications/initialized" if !stateless_2026 => rpc_result(id, json!({})),
         _ => {
