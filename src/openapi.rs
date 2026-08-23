@@ -215,9 +215,14 @@ const LEGACY_FORBIDDEN_PATHS: &[&str] = &[
     "/openapi.json",
     // Browser console shells and their browser-only Runtime Console API are
     // intentionally NOT GPT Actions and must never appear in /openapi.json.
+    "/api/runtime-console/overview",
+    "/api/runtime-console/runner",
     "/api/runtime-console/projects",
     "/api/runtime-console/workflow-sessions",
     "/api/runtime-console/workflow-session",
+    "/api/runtime-console/workflow-session-messages",
+    "/api/runtime-console/workflow-session-observe",
+    "/api/runtime-console/workflow-session-post-message",
     "/runtime",
     "/runtime/app.js",
     "/runtime/styles.css",

@@ -26,39 +26,40 @@ statement is true for only one kind, name that kind explicitly.
 ## Project Connector continuity is not a third session type
 
 The ordinary project-bound product path uses existing durable Connector Tasks
-and task events. A lightweight SQLite map associates the hashed client-window
-identity, authenticated subject, exact Connector project, and canonical-root
-hash with one current durable task. It does not create another event ledger and
-must never be cross-wired to either session system below.
+and task events. Connector continuity is adapter-specific; it is never inferred
+merely because two requests come from the same credential, connection, project,
+or apparent chat.
 
-`task_start` resolves get-or-create/continue context without duplication:
+An adapter/protocol that explicitly supplies a stable `ClientWindow` may use a
+lightweight SQLite map from the domain-separated hashed window identity,
+authenticated subject, exact Connector project, and canonical-root hash to one
+current durable task. That mapping does not create another event ledger and must
+never be cross-wired to either session system below. On such a stateful adapter,
+`task_start` may continue the exact active mapping, repository switches remain
+isolated, write upgrades recheck project-write authority, and a terminal task
+advances only that exact mapping while preserving history.
 
-- no mapping creates a durable Connector Task;
-- an active exact mapping appends a `task_instruction` event to that task;
-- changing repository activates a separate mapping without closing the first;
-- returning to the repository restores its mapping;
-- a read-only-to-write transition rechecks project-write authority and upgrades
-  the same task's execution workspace;
-- a terminal task advances that repository mapping to a new task while keeping
-  old history.
+**Stateless MCP 2026 deliberately supplies no stable `ClientWindow`.** Every
+`task_start` therefore starts independent durable work; even a caller-supplied
+legacy `Mcp-Session-Id` must not create hidden continuity. Existing work is
+continued explicitly with its durable `task_id` through `task_resume` (and may be
+discovered with `task_list`). This stateless path never falls back to a user,
+credential, project identity, connection, or prior request.
 
-Raw window identifiers are neither tool arguments nor stored data. MCP uses the
-server-minted `Mcp-Session-Id` from initialize; hosted Actions use their
-conversation-scoped request header; other HTTP clients use a server-minted
-HttpOnly cookie and one cookie jar per logical window. Only a domain-separated
-SHA-256 key is stored. Every lookup is also scoped by authenticated subject,
-Connector project id, and canonical-root hash. The process-local
-current-project navigation map is intentionally separate from the durable
-per-repository task mapping.
+Legacy/stateful MCP and first-party/hosted HTTP adapters may have their own
+explicit window sources, such as the older server-minted MCP session header, a
+conversation-scoped request header, or a first-party HttpOnly window cookie.
+Those are adapter-local `ClientWindow` inputs, not a general property of HTTP or
+MCP and never proof of Workflow Session identity, model-context retention, or
+authority. Raw window values are not stored; only their domain-separated hash is
+used where that adapter contract permits window binding.
 
-Restart recovery has a strict boundary: task history and the durable exact
-mapping survive; current navigation does not. A retained MCP header or HTTP
-cookie can recover the exact repository. Missing identity never falls back to a
-user, credential, project name, or repository path. MCP rejects anonymous
-`task_start`; HTTP clients that discard cookies require explicit task recovery.
-When `task_resume` has a new stable window identity, it moves the lightweight
-binding to that window without copying history or sharing one active task
-between two windows.
+Restart recovery follows the same boundary: durable task history always
+survives; only adapters with an explicit stable window may restore an exact
+window/repository mapping automatically. Stateless callers recover explicitly by
+`task_id`. `task_resume` may rebind only when the current adapter actually
+supplies a new stable `ClientWindow`; otherwise the durable task resumes without
+manufacturing one.
 
 ---
 
@@ -98,6 +99,10 @@ handoff, and finish can reason about the same unit of work.
 | Current-session binding | In-memory exact-key cache plus a bounded durable projection in the same JSON ledger; isolated by client window, principal, transport, resolved project, and canonical repository-root hash |
 
 Stateless MCP 2026 does not have a reliable Workflow Session or ChatGPT-window transport identity. Its `tools/list` schema therefore projects `recording_session_id` as explicit wrapper metadata for runtime tools. A call may carry `recording_session_id=W` while the concrete tool body carries business `session_id=C`; the MCP adapter removes the recorder field before concrete parsing and the kernel independently authorizes `W` before it can record evidence or supply trusted collaboration provenance. This does not revive legacy `mcp-session-id`, grant target authority, or infer a recorder from credentials, project identity, or connection state.
+
+Stateless MCP 2026 also projects optional `ack_session_message_ids` wrapper metadata, bounded to eight opaque `wc_msg_*` ids. An ACK is request-scoped evidence that the current model context still remembers an unresolved message in the exact authorized recording Workflow Session. The adapter removes ACK metadata before concrete tool parsing; it never grants authority, resolves a message, or gates the concrete tool effect. In the first version only open high-priority Guidance can require ACK. Accepted ids suppress that Guidance body only in the current response; if a later request omits the id, the unresolved Guidance is eligible for bounded redelivery again. Historical ACK state is never used to infer current model-context retention.
+
+A required Guidance message may persist `first_ack_observed_at` for observability. Only the first accepted ACK advances message-observation revision; repeated echoes do not create revision churn. This field means only that the Server once observed an explicit ACK echo. It is not a delivery/read receipt and does not change `status=open`. `resolve_session_message` remains the durable processed-state transition; resolved messages no longer participate in hints or urgent redelivery.
 
 ### Message observation state
 
@@ -487,6 +492,7 @@ a `finish_coding_task` verdict.
   `insufficient_scope_identity`, `validation_not_requested`). Count deltas are
   signed integers (a decrease in passed tests yields a negative `passed_delta`);
   zero-test success never resolves a prior test failure.
+- **Async terminal validation evidence:** structured validation Job metadata carries the same opaque `validation_target_id` as the originating validation attempt. When an authorized validation-summary or Runtime Console Session read observes a retained terminal Job, WebCodex idempotently materializes one bounded `validation_job_terminal` event in that exact Workflow Session before projecting validation state. Idempotence does not depend on that event remaining in the 200-event Session FIFO: the version-1 ledger also persists a serde-defaulted exact Job-id marker set bounded to the Runner authoritative terminal inventory limit (64), and a new materialization evicts only markers absent from the current terminal-candidate snapshot. The marker check, marker insertion, and event append commit under one Session-store mutation, so concurrent reconcilers append at most once and restart restoration keeps the same suppression identity. Terminal reconciliation also serializes authoritative candidate-snapshot acquisition through marker/event materialization within one runtime: a later snapshot cannot commit first, so an older snapshot never gains eviction authority over a marker established from newer inventory. Synthetic evidence uses the authoritative Job `finished_at`; reconciliation never advances Session activity to the wall-clock read time. This is recovery/materialization only: it never re-runs validation, never treats acceptance/handoff as terminal success, and never exposes raw Job output. A later terminal success for the same structured target can therefore resolve an older retained failure even after the acceptance event is gone; the materialized terminal evidence then follows normal Session persistence/retention across Server restart.
 - **Opaque scope identity:** `comparison.scope_identity` is a domain-separated,
   opaque stable identity (`validation_scope:v1:<sha256>`) over the normalized
   *structured* scope. It never returns a raw command, absolute path, or test

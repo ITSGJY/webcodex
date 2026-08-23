@@ -16,6 +16,13 @@ pub(super) const EVENT_ID_PREFIX: &str = "evt_";
 pub(super) const CALL_ID_PREFIX: &str = "wc_call_";
 pub(crate) const DEFAULT_MAX_SESSIONS: usize = 100;
 pub(crate) const DEFAULT_MAX_EVENTS_PER_SESSION: usize = 200;
+/// Exact terminal-validation Job identities retained per Workflow Session. This
+/// matches the Runner's authoritative terminal Job inventory bound: while a
+/// terminal Job can still be a reconciliation candidate, one of these bounded
+/// identities can represent it without turning the Session ledger into an
+/// unbounded Job-id history.
+pub(super) const MAX_MATERIALIZED_VALIDATION_JOB_IDS: usize =
+    crate::shell_protocol::JOB_INVENTORY_MAX_TERMINAL_JOBS;
 /// Maximum project-relative exploration paths retained on one ledger event.
 /// This covers the largest currently supported structured search/LSP result
 /// while keeping every event independently bounded.
@@ -49,6 +56,10 @@ pub(crate) const TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE: &str = "unexpected_
 pub(crate) const TOOL_EXPECTATION_RESULT_MISMATCH: &str = "expectation_mismatch";
 pub(crate) const TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS: &str = "unexpected_success";
 pub(crate) const TOOL_CALL_RECORDING_SESSION_ID_FIELD: &str = "recording_session_id";
+pub(crate) const TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: &str = "ack_session_message_ids";
+pub(crate) const TOOL_CALL_ACK_SESSION_MESSAGE_IDS_INTERNAL_FIELD: &str =
+    "__webcodex_stateless_ack_session_message_ids";
+pub(crate) const MAX_TOOL_CALL_ACK_MESSAGE_IDS: usize = 8;
 pub(crate) const TOOL_EXPECTED_FAILURE_FIELD: &str = "expected_failure";
 pub(crate) const TOOL_EXPECTED_FAILURE_KIND_FIELD: &str = "expected_failure_kind";
 pub(crate) const TOOL_ASSERTION_NAME_FIELD: &str = "assertion_name";
@@ -314,6 +325,10 @@ pub(super) struct SessionRecord {
     /// than are retained now". The persisted counterpart carries the additive
     /// serde default; the in-memory record is always constructed explicitly.
     pub(super) events_observed: u64,
+    /// Bounded durable exact identities for terminal structured-validation Jobs
+    /// already synthesized into this Session. Independent of the retained event
+    /// deque so event FIFO eviction cannot resurrect an authoritative Job.
+    pub(super) materialized_validation_job_ids: VecDeque<String>,
     pub(super) messages: VecDeque<Arc<SessionMessage>>,
     /// Durable Session-local monotonic message-state revision. This is never
     /// exposed as a public cursor; callers receive an opaque Session-bound token.
@@ -680,6 +695,10 @@ pub(super) struct PersistedSessionRecord {
     /// persisted events" for legacy compatibility.
     #[serde(default)]
     pub(super) events_observed: u64,
+    /// Additive ledger-v1 field. Exact identities are sanitized and bounded on
+    /// restore; old ledgers deserialize to an empty set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) materialized_validation_job_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -749,6 +768,7 @@ pub(crate) struct ToolCallExpectation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolCallRecorderMetadata {
     pub(crate) expectation: ToolCallExpectation,
+    pub(crate) ack_session_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -957,6 +977,10 @@ pub(crate) struct SessionMessage {
     pub(crate) tags: Vec<String>,
     pub(crate) reply_to: Option<String>,
     #[serde(default)]
+    pub(crate) requires_ack: bool,
+    #[serde(default)]
+    pub(crate) first_ack_observed_at: Option<i64>,
+    #[serde(default)]
     pub(crate) author_session_id: Option<String>,
     pub(crate) resolved_at: Option<i64>,
     pub(crate) resolution: Option<String>,
@@ -974,6 +998,20 @@ pub(crate) struct PostSessionMessageInput {
     pub(crate) tags: Vec<String>,
     pub(crate) reply_to: Option<String>,
     pub(crate) priority: SessionMessagePriority,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionAckObservation {
+    pub(crate) accepted_ids: Vec<String>,
+    pub(crate) accepted_count: usize,
+    pub(crate) ignored_count: usize,
+    pub(crate) first_observed_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionAttentionSnapshot {
+    pub(crate) messages: Vec<SessionMessage>,
+    pub(crate) total_open_requires_ack: usize,
 }
 
 #[derive(Debug, Clone)]

@@ -1,19 +1,34 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import {
   initialRuntimeConsoleState,
   runtimeDeviceIds,
   runtimeProjectsForDevice,
+  filterAndSortRuntimeProjects,
   preferredRuntimeProjectSelection,
   beginRuntimeCredential,
+  refreshRuntimeOverview,
+  isCurrentRuntimeOverviewRequest,
   refreshRuntimeProjects,
   isCurrentRuntimeProjectsRequest,
+  refreshRuntimeRunner,
+  isCurrentRuntimeRunnerRequest,
   selectRuntimeProject,
   refreshRuntimeSessionList,
   isCurrentRuntimeSessionListRequest,
   selectRuntimeWorkflowSession,
   isCurrentRuntimeWorkflowSessionRequest,
   adoptRuntimeWorkflowSessionDetail,
+  runtimeCollaborationRequest,
+  isCurrentRuntimeCollaborationRequest,
+  adoptRuntimeCollaborationList,
+  adoptRuntimeCollaborationObservation,
+  setRuntimeCollaborationAvailable,
+  setRuntimeCollaborationPhase,
+  runtimeCollaborationNeedsRefreshRecovery,
+  mergeRuntimeCollaborationMessages,
+  runtimeCollaborationObservationAction,
 } from "../dist/runtime_console_state.js";
 
 test("runtime credential and project generations fence stale project responses", () => {
@@ -41,6 +56,27 @@ test("runtime credential and project generations fence stale project responses",
   assert.equal(state.workflow.snapshot, null);
 });
 
+test("server and Runner requests are fenced across credential and Runner changes", () => {
+  const state = initialRuntimeConsoleState();
+  beginRuntimeCredential(state);
+  const overviewA = refreshRuntimeOverview(state);
+  const listA = selectRuntimeProject(state, "runner-a", "agent:runner-a:p");
+  const runnerA = refreshRuntimeRunner(state);
+  assert.equal(isCurrentRuntimeOverviewRequest(state, overviewA), true);
+  assert.equal(isCurrentRuntimeRunnerRequest(state, runnerA), true);
+  assert.equal(isCurrentRuntimeSessionListRequest(state, listA), true);
+
+  selectRuntimeProject(state, "runner-b", "agent:runner-b:p");
+  const runnerB = refreshRuntimeRunner(state);
+  assert.equal(isCurrentRuntimeRunnerRequest(state, runnerA), false);
+  assert.equal(isCurrentRuntimeRunnerRequest(state, runnerB), true);
+  assert.equal(isCurrentRuntimeSessionListRequest(state, listA), false);
+
+  beginRuntimeCredential(state);
+  assert.equal(isCurrentRuntimeOverviewRequest(state, overviewA), false);
+  assert.equal(isCurrentRuntimeRunnerRequest(state, runnerB), false);
+});
+
 test("runtime device and project options use authoritative client ids with stable ordering", () => {
   const projects = [
     { id: "opaque-b", client_id: "device-b", name: "Beta" },
@@ -48,20 +84,10 @@ test("runtime device and project options use authoritative client ids with stabl
     { id: "opaque-a2", client_id: "device-a", name: "Alpha" },
     { id: "opaque-a1", client_id: "device-a", name: "Alpha" },
   ];
-
   assert.deepEqual(runtimeDeviceIds(projects), ["device-a", "device-b"]);
-  assert.deepEqual(
-    runtimeProjectsForDevice(projects, "device-a").map((project) => project.id),
-    ["opaque-a1", "opaque-a2", "agent:not-device-a:project"]
-  );
-  assert.deepEqual(
-    preferredRuntimeProjectSelection(projects, "device-b", "agent:not-device-a:project"),
-    { device: "device-a", project: "agent:not-device-a:project" }
-  );
-  assert.deepEqual(
-    preferredRuntimeProjectSelection(projects, "device-a", "missing-project"),
-    { device: "device-a", project: "opaque-a1" }
-  );
+  assert.deepEqual(runtimeProjectsForDevice(projects, "device-a").map((project) => project.id), ["opaque-a1", "opaque-a2", "agent:not-device-a:project"]);
+  assert.deepEqual(preferredRuntimeProjectSelection(projects, "device-b", "agent:not-device-a:project"), { device: "device-a", project: "agent:not-device-a:project" });
+  assert.deepEqual(preferredRuntimeProjectSelection(projects, "device-a", "missing-project"), { device: "device-a", project: "opaque-a1" });
 });
 
 test("runtime refresh preserves an authorized selected device and project", () => {
@@ -70,9 +96,28 @@ test("runtime refresh preserves an authorized selected device and project", () =
     { id: "project-1", client_id: "device-z", name: "First" },
     { id: "project-3", client_id: "device-a", name: "Other" },
   ];
+  assert.deepEqual(preferredRuntimeProjectSelection(projects, "device-z", "project-2"), { device: "device-z", project: "project-2" });
+});
+
+test("Project list filters and prioritizes running attention then recent activity", () => {
+  const projects = [
+    { id: "agent:r:idle", client_id: "runner", name: "Idle", sessions: { running_sessions: 0, attention: {}, latest_updated_at: 100 } },
+    { id: "agent:r:recent", client_id: "runner", name: "Recent", sessions: { running_sessions: 0, attention: {}, latest_updated_at: 400 } },
+    { id: "agent:r:attention", client_id: "runner", name: "Needs review", sessions: { running_sessions: 0, attention: { open_guidance: 1 }, latest_updated_at: 50 } },
+    { id: "agent:r:working", client_id: "runner", name: "Working", sessions: { running_sessions: 1, attention: {}, latest_updated_at: 10 } },
+    { id: "agent:other:x", client_id: "other", name: "Other" },
+  ];
   assert.deepEqual(
-    preferredRuntimeProjectSelection(projects, "device-z", "project-2"),
-    { device: "device-z", project: "project-2" }
+    filterAndSortRuntimeProjects(projects, "runner", "").map((project) => project.id),
+    ["agent:r:working", "agent:r:attention", "agent:r:recent", "agent:r:idle"]
+  );
+  assert.deepEqual(
+    filterAndSortRuntimeProjects(projects, "runner", "REVIEW").map((project) => project.id),
+    ["agent:r:attention"]
+  );
+  assert.deepEqual(
+    filterAndSortRuntimeProjects(projects, "runner", "agent:r:recent").map((project) => project.id),
+    ["agent:r:recent"]
   );
 });
 
@@ -88,11 +133,132 @@ test("runtime workflow detail identity includes project plus session id", () => 
   selectRuntimeProject(state, "device-b", "agent:b:project");
   assert.equal(state.workflow.snapshot, null);
   assert.equal(isCurrentRuntimeWorkflowSessionRequest(state, detailA), false);
-
   const detailB = selectRuntimeWorkflowSession(state, "wc_sess_same");
   assert.equal(detailB.project, "agent:b:project");
   assert.equal(isCurrentRuntimeWorkflowSessionRequest(state, detailB), true);
   assert.equal(adoptRuntimeWorkflowSessionDetail(state, detailA, { title: "late A" }), false);
   assert.equal(adoptRuntimeWorkflowSessionDetail(state, detailB, { title: "B" }), true);
   assert.equal(state.workflow.snapshot.title, "B");
+});
+
+test("session switch invalidates old collaboration responses", () => {
+  const state = initialRuntimeConsoleState();
+  beginRuntimeCredential(state);
+  selectRuntimeProject(state, "runner", "agent:runner:project");
+  selectRuntimeWorkflowSession(state, "wc_sess_a");
+  const requestA = runtimeCollaborationRequest(state);
+  assert.equal(isCurrentRuntimeCollaborationRequest(state, requestA), true);
+  selectRuntimeWorkflowSession(state, "wc_sess_b");
+  const requestB = runtimeCollaborationRequest(state);
+  assert.equal(isCurrentRuntimeCollaborationRequest(state, requestA), false);
+  assert.equal(isCurrentRuntimeCollaborationRequest(state, requestB), true);
+  assert.equal(adoptRuntimeCollaborationList(state, requestA, [{ message_id: "wc_msg_old" }]), false);
+});
+
+test("collaboration delta replaces message state by id and completion renders todo resolution plus answer", () => {
+  const state = initialRuntimeConsoleState();
+  beginRuntimeCredential(state);
+  selectRuntimeProject(state, "runner", "agent:runner:project");
+  selectRuntimeWorkflowSession(state, "wc_sess_a");
+  const request = runtimeCollaborationRequest(state);
+  adoptRuntimeCollaborationList(state, request, [
+    { message_id: "wc_msg_todo", kind: "todo", status: "open", created_at: 1, message: "do work" },
+  ]);
+  assert.equal(adoptRuntimeCollaborationObservation(state, request, {
+    observation_token: "opaque-1",
+    messages: [
+      { message_id: "wc_msg_todo", kind: "todo", status: "resolved", created_at: 1, message: "do work", resolved_by_message_id: "wc_msg_answer" },
+      { message_id: "wc_msg_answer", kind: "answer", status: "open", created_at: 2, message: "done", reply_to: "wc_msg_todo", author_session_id: "wc_sess_worker" },
+    ],
+  }), true);
+  assert.equal(state.collaboration.messages.length, 2);
+  assert.equal(state.collaboration.messages[0].status, "resolved");
+  assert.equal(state.collaboration.messages[1].reply_to, "wc_msg_todo");
+  assert.equal(state.collaboration.observationToken, "opaque-1");
+});
+
+test("history loss reloads and has_more drains without duplicate message ids", () => {
+  assert.equal(runtimeCollaborationObservationAction({ history_lost: true, has_more: true }), "reload");
+  assert.equal(runtimeCollaborationObservationAction({ history_lost: false, has_more: true }), "drain");
+  assert.equal(runtimeCollaborationObservationAction({ wait_outcome: "timeout" }), "wait");
+  const merged = mergeRuntimeCollaborationMessages(
+    [{ message_id: "a", created_at: 1, status: "open" }],
+    [{ message_id: "a", created_at: 1, status: "resolved" }, { message_id: "b", created_at: 2 }]
+  );
+  assert.deepEqual(merged.map((message) => message.message_id), ["a", "b"]);
+  assert.equal(merged[0].status, "resolved");
+});
+
+test("project-read-only degradation keeps project selection while collaboration is marked unavailable", () => {
+  const state = initialRuntimeConsoleState();
+  beginRuntimeCredential(state);
+  selectRuntimeProject(state, "runner", "agent:runner:project");
+  selectRuntimeWorkflowSession(state, "wc_sess_a");
+  const request = runtimeCollaborationRequest(state);
+  assert.equal(setRuntimeCollaborationAvailable(state, request, false), true);
+  assert.equal(state.selectedProject, "agent:runner:project");
+  assert.equal(state.workflow.selectedSessionId, "wc_sess_a");
+  assert.equal(state.collaboration.available, false);
+});
+
+test("manual Refresh recovery is required only after collaboration is paused", () => {
+  const state = initialRuntimeConsoleState();
+  beginRuntimeCredential(state);
+  selectRuntimeProject(state, "runner", "agent:runner:project");
+  selectRuntimeWorkflowSession(state, "wc_sess_a");
+  const requestA = runtimeCollaborationRequest(state);
+  assert.equal(setRuntimeCollaborationPhase(state, requestA, "live"), true);
+  assert.equal(runtimeCollaborationNeedsRefreshRecovery(state), false);
+  assert.equal(setRuntimeCollaborationPhase(state, requestA, "paused"), true);
+  assert.equal(runtimeCollaborationNeedsRefreshRecovery(state), true);
+  selectRuntimeWorkflowSession(state, "wc_sess_b");
+  assert.equal(state.collaboration.phase, "idle");
+  assert.equal(setRuntimeCollaborationPhase(state, requestA, "paused"), false);
+  assert.equal(runtimeCollaborationNeedsRefreshRecovery(state), false);
+});
+
+test("runtime collaboration rendering uses textContent and explicitly reloads on history loss", async () => {
+  const source = await readFile(new URL("../src/runtime.ts", import.meta.url), "utf8");
+  const html = await readFile(new URL("../src/runtime.html", import.meta.url), "utf8");
+  const css = await readFile(new URL("../src/runtime.css", import.meta.url), "utf8");
+  assert.equal(html.includes("runtime-project-" + "select"), false);
+  assert.match(html, /runtime-project-list/);
+  assert.match(html, /runtime-project-search/);
+  assert.match(html, /runtime-collaboration-form/);
+  assert.match(html, /runtime-message-requires-ack/);
+  assert.match(css, /-webkit-line-clamp:\s*4/);
+  assert.equal(source.includes("innerHTML"), false);
+  assert.match(source, /body\.textContent = String\(message\?\.message \|\| ""\)/);
+  assert.match(source, /action === "reload"[\s\S]*loadRetainedCollaboration/);
+  assert.match(source, /action === "drain"/);
+  assert.match(source, /abortCollaboration\(\)/);
+  assert.match(source, /workflow-session-post-message/);
+  assert.match(source, /kind\?\.value === "guidance"/);
+  assert.match(source, /priority\?\.value !== "high"/);
+  assert.match(source, /First ACK observed/);
+  assert.doesNotMatch(source, /Delivered|Read by model|Currently acknowledged/);
+  assert.match(source, /Refresh failed · showing previous data/);
+  assert.match(source, /runtimeCollaborationNeedsRefreshRecovery/);
+  const fetchProjectsStart = source.indexOf("async function fetchProjects");
+  const fetchProjectsEnd = source.indexOf("function effectiveProjects", fetchProjectsStart);
+  assert.doesNotMatch(source.slice(fetchProjectsStart, fetchProjectsEnd), /fetchOverview\(/);
+  const selectStart = source.indexOf("function selectSession");
+  const selectEnd = source.indexOf("async function fetchSessionDetail", selectStart);
+  assert.match(source.slice(selectStart, selectEnd), /setHumanJoinSendEnabled\(false\)[\s\S]*startCollaboration/);
+  const postStart = source.indexOf("async function postHumanCollaborationMessage");
+  const postEnd = source.indexOf("function setRefreshBusy", postStart);
+  const post = source.slice(postStart, postEnd);
+  assert.match(post, /if \(!isCurrentRuntimeCollaborationRequest\(state, request\)\) return;\s*if \(response\?\.status === 0\)[\s\S]*return;\s*\}[\s\S]*if \(send\) send\.disabled = false;/);
+  assert.match(post, /Send outcome unknown\. Refresh and review retained messages before retrying\./);
+  assert.match(post, /abortCollaboration\(\)[\s\S]*setRuntimeCollaborationPhase\(state, request, "paused"\)/);
+  const refreshStart = source.indexOf("async function refreshAll");
+  const refreshEnd = source.indexOf("function startAuto", refreshStart);
+  assert.equal((source.slice(refreshStart, refreshEnd).match(/fetchOverview\(/g) || []).length, 1);
+  const bootstrapStart = source.indexOf("async function loadRetainedCollaboration");
+  const bootstrapEnd = source.indexOf("async function startCollaboration", bootstrapStart);
+  const bootstrap = source.slice(bootstrapStart, bootstrapEnd);
+  const baselineAt = bootstrap.indexOf('api("workflow-session-observe"');
+  const retainedListAt = bootstrap.indexOf('api("workflow-session-messages"');
+  assert.ok(baselineAt >= 0 && retainedListAt > baselineAt, "live baseline must precede the retained snapshot to avoid a lost-update gap");
+  assert.match(bootstrap, /setRuntimeCollaborationPhase\(state, request, "live"\);[\s\S]*setHumanJoinSendEnabled\(true\)/);
 });

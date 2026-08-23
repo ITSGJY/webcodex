@@ -26,7 +26,10 @@ mod tests;
 // Re-exports keep `crate::tool_runtime::sessions::{...}` stable for callers.
 // Only symbols referenced outside this module are re-exported here; internal
 // helpers stay `pub(super)` / module-private.
-pub(crate) use console::{WorkflowSessionConsoleDetail, WorkflowSessionConsoleList};
+pub(crate) use console::{
+    aggregate_console_list, WorkflowSessionConsoleAggregate, WorkflowSessionConsoleDetail,
+    WorkflowSessionConsoleList,
+};
 pub(crate) use events::{
     exploration_tool_kind, is_valid_session_id, normalize_observed_project_path,
     strip_tool_call_expectation_metadata, tool_failure_summary_from_events,
@@ -42,7 +45,8 @@ pub(crate) use model::{
     SessionMessageObservationError, SessionMessagePriority, SessionMessageStatus, SessionSummary,
     SessionTransport, ToolCallRecorderMetadata, DEFAULT_MAX_EVENTS_PER_SESSION,
     DEFAULT_MAX_SESSIONS, MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_COMPLETION_KEY_CHARS,
-    MAX_MESSAGE_LIST_LIMIT, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    MAX_MESSAGE_LIST_LIMIT, MAX_TOOL_CALL_ACK_MESSAGE_IDS, TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_INTERNAL_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
 };
 pub(crate) use store::SessionStore;

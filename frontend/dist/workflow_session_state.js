@@ -140,6 +140,46 @@ export function workflowSessionOverviewPresentation(overview) {
         progressAt: progress && typeof progress.reported_at === "number" ? progress.reported_at : null,
     };
 }
+function hasPendingAttention(overview) {
+    const attention = overview && typeof overview === "object" ? overview.attention : null;
+    return ["open_guidance", "open_questions", "open_risks", "open_todos"]
+        .some((key) => overviewCount(attention && attention[key]) > 0);
+}
+function idleAgeLabel(ageSeconds) {
+    if (ageSeconds < 60)
+        return "<1m";
+    const minutes = Math.floor(ageSeconds / 60);
+    if (minutes < 60)
+        return minutes + "m";
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24)
+        return hours + "h";
+    return Math.floor(hours / 24) + "d";
+}
+export function workflowSessionLivenessPresentation(session, nowSeconds = Date.now() / 1000) {
+    const runningCall = !!session?.running_call;
+    const runningJobs = typeof session?.running_jobs === "number" ? Math.max(0, session.running_jobs) : 0;
+    const tooltip = "WebCodex activity only; host/model state is unknown.";
+    if (runningCall || runningJobs > 0) {
+        return { state: "working", label: "working", tooltip };
+    }
+    const updatedAt = typeof session?.updated_at === "number" ? session.updated_at : 0;
+    const ageSeconds = updatedAt > 0 ? Math.max(0, nowSeconds - updatedAt) : Number.POSITIVE_INFINITY;
+    if (ageSeconds <= 120) {
+        return { state: "recent", label: "recently active", tooltip };
+    }
+    if (hasPendingAttention(session?.overview)) {
+        return { state: "attention", label: "idle · pending attention", tooltip };
+    }
+    return {
+        state: "idle",
+        label: Number.isFinite(ageSeconds) ? "idle · " + idleAgeLabel(ageSeconds) : "idle",
+        tooltip,
+    };
+}
+export function workflowSessionIdleAttentionLabel(runningCall, overview) {
+    return workflowSessionLivenessPresentation({ running_call: runningCall, overview, updated_at: 0 }, 0).label;
+}
 export function initialWorkflowSessionState() {
     return {
         selectedSessionId: "",

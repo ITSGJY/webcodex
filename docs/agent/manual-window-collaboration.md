@@ -81,6 +81,12 @@ Retention is explicit. Each retained message carries internal latest-revision bo
 
 Message observation is **not** a delivery receipt, **not** proof of model-context retention, **not** a subscription/stream, and **not** an orchestrator wake-up. It never automatically wakes a model or spawns/routes work. Room/Discussion remains only a future additive direction; this Workflow Session primitive does not create Room, participant, presence, typing, scheduler, worker-pool, or routing state.
 
+## Runtime Collaboration Console
+
+The Server-hosted `/runtime` page presents the same authoritative runtime and Workflow Session state without creating a second Session store or collaboration truth. It keeps a bounded Server overview, a focused per-Runner machine view, one compact/searchable Project selector, compact Workflow Session activity, and retained collaboration messages. The narrow Human Join composer is the only collaboration mutation affordance: it posts bounded Session messages through the canonical kernel path described below. Existing Project and Workflow Session console reads retain their `project:read` boundary; Server-wide/Runner-wide facts and full collaboration message/observation/post routes require `runtime:read` and still re-authorize the exact target Session/project.
+
+The collaboration panel establishes an observation baseline before reading the retained snapshot, then uses bounded long-polls and merges deltas by `message_id`. `has_more` is drained before the next wait, while `history_lost` causes a retained-board reload and a new baseline rather than claiming complete history. Manual Refresh reports visible refreshing/success/failure state and preserves prior usable data; a healthy live collaboration loop is not restarted merely because Refresh was clicked, while a paused/failed loop performs a retained reload, new baseline, and bounded reconnect. Session liveness is derived only from WebCodex facts such as a running call, owned running Job, or recent retained activity; it never claims to know whether the host/model is processing, frozen, or present. All aggregate counts remain bounded/truncation-aware. Browser observation remains UI refresh only: it is not a model wake-up, subscription, participant-presence mechanism, scheduler, worker claim, or execution lease.
+
 ## Provenance is metadata, not authority
 
 A completed answer can identify the independent worker with `author_session_id`. That value is derived first from the trusted recording Session that owns the completion tool evidence, then from the trusted current-Session binding only when no recording Session exists. It is not a caller-authored claim. In stateless MCP 2026, `recording_session_id` is explicit wrapper provenance metadata, not a transport Session and not an authority grant; the legacy `mcp-session-id` header remains irrelevant.
@@ -118,6 +124,12 @@ Do not treat todo state, `reply_to`, `completion_key`, `author_session_id`, or `
 - authority to mutate another Project.
 
 When multiple workers operate on the same source, use normal Git/WebCodex Project isolation and revalidate current state before acting on collaboration messages.
+
+## Human join and acknowledgement ergonomics
+
+The hosted Runtime Console may post `note`, `guidance`, `question`, and `todo` messages into an exact authorized Workflow Session through the same `post_session_message` kernel path. This is a browser affordance, not a Participant entity, membership record, presence signal, or identity-spoofing surface. The browser route keeps the current collaboration metadata authority policy (`runtime:read`) and still applies the stored Session/project authority fence.
+
+High-priority Guidance may opt into `requires_ack`. A Stateless MCP 2026 caller can echo the visible message id in `ack_session_message_ids` on an otherwise ordinary recorded tool call. The original tool executes normally whether the ACK is present, missing, unknown, foreign, or stale. A valid ACK suppresses that Guidance body only for the same request/response. If the model later omits the ACK while the Guidance remains open, the Server may piggyback the bounded body again. The first observed ACK timestamp is observability only; it must never be described as delivered, read, or currently remembered. Durable completion still requires normal message resolution.
 
 ## Bounded payload guidance
 

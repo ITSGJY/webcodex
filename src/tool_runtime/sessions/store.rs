@@ -37,8 +37,8 @@ use super::model::{
     StoredSession, ToolCallRecorderMetadata, ToolCallStart, ToolEffectEventEvidence,
     CALL_ID_PREFIX, DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_MESSAGES_PER_SESSION,
     DEFAULT_MAX_SESSIONS, DEFAULT_SUMMARY_LIMIT, DURABLE_CURRENT_BINDINGS_PER_SESSION,
-    EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX,
-    SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
+    EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_MATERIALIZED_VALIDATION_JOB_IDS,
+    MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
 use super::persistence::{
     cold_session_from_persisted, load_persisted_ledger, materialize_cold_session,
@@ -554,6 +554,7 @@ impl SessionStore {
             messages: VecDeque::new(),
             events: VecDeque::new(),
             events_observed: 0,
+            materialized_validation_job_ids: VecDeque::new(),
             message_observation_revision: 0,
             message_observation_floor: 0,
             message_observation_revisions: Default::default(),
@@ -843,6 +844,7 @@ impl SessionStore {
                     messages: VecDeque::new(),
                     events: VecDeque::from([Arc::new(event)]),
                     events_observed: 1,
+                    materialized_validation_job_ids: VecDeque::new(),
                     message_observation_revision: 0,
                     message_observation_floor: 0,
                     message_observation_revisions: Default::default(),
@@ -1541,6 +1543,220 @@ impl SessionStore {
             execution_context_changed: None,
         });
         Some(event_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_validation_job_terminal(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        retained_terminal_job_ids: &[&str],
+        tool_name: &str,
+        project: Option<String>,
+        validation_target_id: &str,
+        job_status: &str,
+        exit_code: Option<i64>,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
+        duration_ms: Option<u64>,
+        validation_output_summary: Option<Value>,
+    ) -> bool {
+        let session_id = session_id.trim();
+        let job_id = job_id.trim();
+        let valid_target = validation_target_id
+            .strip_prefix("target:")
+            .is_some_and(|suffix| {
+                suffix.len() == 24 && suffix.as_bytes().iter().all(u8::is_ascii_hexdigit)
+            });
+        let Some(timestamp) = finished_at else {
+            // Reconciliation must never substitute wall-clock read time for
+            // authoritative execution activity.
+            return false;
+        };
+        if !is_valid_session_id(session_id)
+            || !super::super::helpers::is_safe_job_id(job_id)
+            || retained_terminal_job_ids.len() > MAX_MATERIALIZED_VALIDATION_JOB_IDS
+            || retained_terminal_job_ids.iter().any(|candidate| {
+                *candidate != candidate.trim() || !super::super::helpers::is_safe_job_id(candidate)
+            })
+            || !retained_terminal_job_ids
+                .iter()
+                .any(|candidate| *candidate == job_id)
+            || !matches!(
+                tool_name,
+                "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test"
+            )
+            || !valid_target
+            || !matches!(
+                job_status,
+                "completed" | "failed" | "timeout" | "timed_out" | "stopped" | "cancelled" | "lost"
+            )
+        {
+            return false;
+        }
+        let succeeded = job_status == "completed" && exit_code == Some(0);
+        let failure_kind = (!succeeded).then(|| match job_status {
+            "timeout" | "timed_out" => "timeout".to_string(),
+            "stopped" | "cancelled" => "cancelled".to_string(),
+            "lost" => "execution_lost".to_string(),
+            _ => "command_exit_nonzero".to_string(),
+        });
+        let classification = SessionToolClassification::for_tool(tool_name);
+        let event = SessionEvent {
+            event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            call_id: None,
+            session_id: session_id.to_string(),
+            kind: "validation_job_terminal".to_string(),
+            timestamp,
+            transport: "job_terminal".to_string(),
+            tool_name: tool_name.to_string(),
+            project: project.clone(),
+            resolved_project: project.clone(),
+            risk_class: classification.risk_class.to_string(),
+            read_like: classification.read_like,
+            write_like: classification.write_like,
+            shell_like: classification.shell_like,
+            git_like: classification.git_like,
+            change_summary_like: classification.change_summary_like,
+            diff_review_like: false,
+            started_at,
+            finished_at: Some(timestamp),
+            duration_ms,
+            status: Some(if succeeded { "succeeded" } else { "failed" }.to_string()),
+            exit_code,
+            failure_kind,
+            error_kind: None,
+            expected_failure: None,
+            expected_failure_kind: None,
+            assertion_name: None,
+            actual_failure_kind: None,
+            failure_expectation_result: None,
+            warning_kind: None,
+            session_project: None,
+            request_project: None,
+            allow_cross_project_session_required: None,
+            allow_cross_project_session: None,
+            error_message_summary: None,
+            changed_paths: Vec::new(),
+            observed_paths: Vec::new(),
+            job_id: Some(job_id.to_string()),
+            persistent_shell: None,
+            effect_evidence: None,
+            input_summary: Some(serde_json::json!({
+                "validation_target_id": validation_target_id,
+            })),
+            validation_output_summary,
+            permission: None,
+            instruction: None,
+            requested_mode: None,
+            previous_mode: None,
+            requested_guards: None,
+            previous_guards: None,
+            capability_changed: None,
+            context_refreshed: None,
+            execution_context: None,
+            previous_execution_context: None,
+            execution_context_changed: None,
+        };
+
+        let (cold, hot_closed, recorded) = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            let max_events = inner.max_events_per_session;
+            let Some(stored) = inner.sessions.get_mut(session_id) else {
+                return false;
+            };
+            match stored {
+                StoredSession::Hot(record) => {
+                    let recorded = Self::append_validation_job_terminal_to_record(
+                        record,
+                        job_id,
+                        retained_terminal_job_ids,
+                        project.as_deref(),
+                        &event,
+                        timestamp,
+                        max_events,
+                    );
+                    let hot_closed = recorded && !record.lifecycle.allows_mutation();
+                    (None, hot_closed, recorded)
+                }
+                StoredSession::Cold(record) => (Some(record.clone()), false, false),
+            }
+        };
+        let recorded = match cold {
+            Some(cold) => {
+                self.rewrite_cold_record(session_id, cold, false, |record, max_events| {
+                    Self::append_validation_job_terminal_to_record(
+                        record,
+                        job_id,
+                        retained_terminal_job_ids,
+                        project.as_deref(),
+                        &event,
+                        timestamp,
+                        max_events,
+                    )
+                })
+            }
+            None => recorded,
+        };
+        if !recorded {
+            return false;
+        }
+        if hot_closed {
+            self.coldify_closed_session(session_id);
+        }
+        self.persist_after_mutation();
+        true
+    }
+
+    fn append_validation_job_terminal_to_record(
+        record: &mut SessionRecord,
+        job_id: &str,
+        retained_terminal_job_ids: &[&str],
+        project: Option<&str>,
+        event: &SessionEvent,
+        timestamp: i64,
+        max_events: usize,
+    ) -> bool {
+        if record.project.as_deref() != project
+            || record
+                .materialized_validation_job_ids
+                .iter()
+                .any(|materialized| materialized == job_id)
+        {
+            return false;
+        }
+
+        // The Runner can retain at most 64 authoritative terminal Jobs. Keep an
+        // exact marker for every Job still present in this reconciliation snapshot;
+        // if stale markers fill the bound, discard one that the authoritative
+        // snapshot can no longer name before inserting the new identity.
+        while record.materialized_validation_job_ids.len() >= MAX_MATERIALIZED_VALIDATION_JOB_IDS {
+            let Some(stale_index) =
+                record
+                    .materialized_validation_job_ids
+                    .iter()
+                    .position(|materialized| {
+                        !retained_terminal_job_ids
+                            .iter()
+                            .any(|candidate| *candidate == materialized.as_str())
+                    })
+            else {
+                // A complete valid terminal snapshot cannot name more than the
+                // bound. Fail closed rather than evicting a still-retained Job.
+                return false;
+            };
+            record.materialized_validation_job_ids.remove(stale_index);
+        }
+        record
+            .materialized_validation_job_ids
+            .push_back(job_id.to_string());
+        record.updated_at = record.updated_at.max(timestamp);
+        record.events.push_back(Arc::new(event.clone()));
+        record.events_observed = record.events_observed.saturating_add(1);
+        while record.events.len() > max_events {
+            record.events.pop_front();
+        }
+        true
     }
 
     /// Sole entry for appending a session ledger event.
@@ -2359,6 +2575,7 @@ impl SessionStoreInner {
     pub(super) fn post_message(
         &mut self,
         input: PostSessionMessageInput,
+        requires_ack: bool,
     ) -> Result<(SessionMessage, bool), SessionMessageError> {
         self.touch(&input.session_id);
         let Some(stored) = self.sessions.get_mut(&input.session_id) else {
@@ -2371,6 +2588,14 @@ impl SessionStoreInner {
         let record = stored
             .hot_mut()
             .expect("active session message mutation must stay hot");
+        if requires_ack
+            && (input.kind != super::model::SessionMessageKind::Guidance
+                || input.priority != super::model::SessionMessagePriority::High)
+        {
+            return Err(SessionMessageError::InvalidInput(
+                "requires_ack is only valid for high-priority guidance".to_string(),
+            ));
+        }
         let message = validate_message_text(input.message)?;
         let tags = validate_message_tags(input.tags)?;
         if let Some(reply_to) = input.reply_to.as_deref() {
@@ -2393,6 +2618,8 @@ impl SessionStoreInner {
             message,
             tags,
             reply_to: input.reply_to,
+            requires_ack,
+            first_ack_observed_at: None,
             author_session_id: None,
             resolved_at: None,
             resolution: None,
@@ -2411,6 +2638,61 @@ impl SessionStoreInner {
             }
         }
         Ok((message, true))
+    }
+
+    pub(super) fn observe_message_acks(
+        &mut self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> super::model::SessionAckObservation {
+        let Some(stored) = self.sessions.get_mut(session_id) else {
+            return super::model::SessionAckObservation {
+                ignored_count: message_ids.len(),
+                ..Default::default()
+            };
+        };
+        let Some(record) = stored.hot_mut() else {
+            return super::model::SessionAckObservation {
+                ignored_count: message_ids.len(),
+                ..Default::default()
+            };
+        };
+        let mut outcome = super::model::SessionAckObservation::default();
+        let mut seen = std::collections::HashSet::new();
+        let now = now_ts();
+        for message_id in message_ids {
+            if !seen.insert(message_id.as_str()) {
+                continue;
+            }
+            let Some(index) = record.messages.iter().position(|message| {
+                message.message_id == *message_id
+                    && message.status == SessionMessageStatus::Open
+                    && message.kind == super::model::SessionMessageKind::Guidance
+                    && message.priority == super::model::SessionMessagePriority::High
+                    && message.requires_ack
+            }) else {
+                outcome.ignored_count += 1;
+                continue;
+            };
+            outcome.accepted_count += 1;
+            outcome.accepted_ids.push(message_id.clone());
+            if record.messages[index].first_ack_observed_at.is_none() {
+                let Ok(revision) = Self::next_message_observation_revision(record) else {
+                    outcome.accepted_ids.pop();
+                    outcome.accepted_count = outcome.accepted_count.saturating_sub(1);
+                    outcome.ignored_count += 1;
+                    continue;
+                };
+                let message = Arc::make_mut(&mut record.messages[index]);
+                message.first_ack_observed_at = Some(now);
+                record
+                    .message_observation_revisions
+                    .insert(message.message_id.clone(), revision);
+                record.updated_at = now;
+                outcome.first_observed_count += 1;
+            }
+        }
+        outcome
     }
 
     /// Resolve an open message. Already-resolved messages stay resolved
@@ -2576,6 +2858,8 @@ impl SessionStoreInner {
             message: answer_text,
             tags,
             reply_to: Some(input.message_id.clone()),
+            requires_ack: false,
+            first_ack_observed_at: None,
             author_session_id: input.author_session_id,
             resolved_at: None,
             resolution: None,
