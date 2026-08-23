@@ -5,7 +5,10 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -32,6 +35,9 @@ const PUBLIC_TOKEN_PAYLOAD_BYTES: usize =
     PUBLIC_TOKEN_EPOCH_BYTES + PUBLIC_TOKEN_SEQUENCE_BYTES + PUBLIC_TOKEN_TAG_BYTES;
 const SERVER_TERMINAL_RETENTION_SECS: i64 = 15 * 60;
 const SERVER_MAX_TERMINAL_RUNS: usize = CODING_AGENT_MAX_INVENTORY_RUNS;
+const OBSERVATION_MAC_KEY_DIR: &str = "private";
+const OBSERVATION_MAC_KEY_FILE: &str = "coding-agent-observation-mac-key-v2";
+const OBSERVATION_MAC_KEY_BYTES: usize = 32;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ServerRunBinding {
@@ -46,9 +52,9 @@ pub(crate) struct ServerRunBinding {
     snapshot: CodingAgentRunSnapshot,
 }
 
-#[derive(Debug)]
 pub(crate) struct CodingAgentServerState {
     epoch: String,
+    observation_mac_key: [u8; OBSERVATION_MAC_KEY_BYTES],
     runs: Mutex<HashMap<String, ServerRunBinding>>,
 }
 
@@ -83,14 +89,32 @@ fn run_matches_binding_identity(binding: &ServerRunBinding, run: &CodingAgentRun
 
 impl Default for CodingAgentServerState {
     fn default() -> Self {
-        Self {
-            epoch: Uuid::new_v4().simple().to_string(),
-            runs: Mutex::new(HashMap::new()),
-        }
+        Self::with_observation_mac_key(new_observation_mac_key())
     }
 }
 
 impl CodingAgentServerState {
+    fn with_observation_mac_key(observation_mac_key: [u8; OBSERVATION_MAC_KEY_BYTES]) -> Self {
+        Self {
+            epoch: Uuid::new_v4().simple().to_string(),
+            observation_mac_key,
+            runs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with_persistent_observation_mac_key(state_dir: &Path) -> Result<Self, String> {
+        Ok(Self::with_observation_mac_key(
+            load_or_create_observation_mac_key(state_dir)?,
+        ))
+    }
+
+    fn observation_token(&self, run_id: &str, sequence: u64) -> String {
+        observation_token(&self.observation_mac_key, &self.epoch, run_id, sequence)
+    }
+
+    fn parse_observation_token(&self, run_id: &str, token: &str) -> Result<u64, TokenError> {
+        parse_observation_token(&self.observation_mac_key, &self.epoch, run_id, token)
+    }
     async fn bind(
         &self,
         client: &crate::shell_protocol::ShellClientView,
@@ -168,6 +192,16 @@ impl CodingAgentServerState {
 }
 
 impl ToolRuntime {
+    pub(crate) fn with_persistent_coding_agent_observation_state(
+        mut self,
+        state_dir: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        self.coding_agent_runs = Arc::new(
+            CodingAgentServerState::with_persistent_observation_mac_key(state_dir.as_ref())?,
+        );
+        Ok(self)
+    }
+
     pub(crate) async fn coding_agent_start(
         &self,
         project: String,
@@ -306,7 +340,7 @@ impl ToolRuntime {
             self.record_coding_agent_lifecycle_if_needed(&run_id).await;
             return ToolResult::ok(start_projection(
                 &existing.snapshot,
-                observation_token(&self.coding_agent_runs.epoch, &run_id, 0),
+                self.coding_agent_runs.observation_token(&run_id, 0),
             ));
         }
 
@@ -385,7 +419,7 @@ impl ToolRuntime {
                 self.record_coding_agent_lifecycle_if_needed(&run_id).await;
                 ToolResult::ok(start_projection(
                     &run,
-                    observation_token(&self.coding_agent_runs.epoch, &run_id, 0),
+                    self.coding_agent_runs.observation_token(&run_id, 0),
                 ))
             }
             _ => response_to_tool_error(response, Some(&run_id)),
@@ -443,7 +477,10 @@ impl ToolRuntime {
         let (after_sequence, token_reset) = match after_observation_token.as_deref() {
             None => (None, false),
             Some(token) => {
-                match parse_observation_token(&self.coding_agent_runs.epoch, &run_id, token) {
+                match self
+                    .coding_agent_runs
+                    .parse_observation_token(&run_id, token)
+                {
                     Ok(sequence) => (Some(sequence), false),
                     Err(TokenError::StaleEpoch) => (None, true),
                     Err(TokenError::Invalid) => {
@@ -474,7 +511,7 @@ impl ToolRuntime {
                     has_more: false,
                     history_lost: true,
                 },
-                &self.coding_agent_runs.epoch,
+                self.coding_agent_runs.as_ref(),
                 token_reset,
             ));
         }
@@ -509,7 +546,7 @@ impl ToolRuntime {
                             has_more: false,
                             history_lost: true,
                         },
-                        &self.coding_agent_runs.epoch,
+                        self.coding_agent_runs.as_ref(),
                         true,
                     ));
                 }
@@ -586,7 +623,7 @@ impl ToolRuntime {
                 self.record_coding_agent_lifecycle_if_needed(&run_id).await;
                 ToolResult::ok(observe_projection(
                     observation,
-                    &self.coding_agent_runs.epoch,
+                    self.coding_agent_runs.as_ref(),
                     token_reset,
                 ))
             }
@@ -725,7 +762,7 @@ impl ToolRuntime {
             self.record_coding_agent_lifecycle_if_needed(run_id).await;
             return ToolResult::ok(start_projection(
                 &binding.snapshot,
-                observation_token(&self.coding_agent_runs.epoch, run_id, 0),
+                self.coding_agent_runs.observation_token(run_id, 0),
             ));
         }
         match dispatched {
@@ -1013,20 +1050,93 @@ enum TokenError {
     StaleEpoch,
 }
 
-fn observation_token_mac_key() -> &'static [u8; 32] {
-    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let mut hasher = Sha256::new();
-        hasher.update(b"webcodex.coding-agent.observation.mac-key.v2\0");
-        hasher.update(Uuid::new_v4().as_bytes());
-        hasher.update(Uuid::new_v4().as_bytes());
-        hasher.finalize().into()
-    })
+fn new_observation_mac_key() -> [u8; OBSERVATION_MAC_KEY_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"webcodex.coding-agent.observation.mac-key.v2\0");
+    hasher.update(Uuid::new_v4().as_bytes());
+    hasher.update(Uuid::new_v4().as_bytes());
+    hasher.finalize().into()
 }
 
-fn observation_token_hmac(domain: &[u8], epoch: &str, run_id: &str, extra: &[u8]) -> [u8; 32] {
+fn read_observation_mac_key(path: &Path) -> Result<[u8; OBSERVATION_MAC_KEY_BYTES], String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| format!("cannot read CodingAgent observation MAC key: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect CodingAgent observation MAC key: {error}"))?;
+    if !metadata.is_file() {
+        return Err("CodingAgent observation MAC key is not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("CodingAgent observation MAC key permissions are not private".to_string());
+        }
+    }
+    let mut bytes = Vec::with_capacity(OBSERVATION_MAC_KEY_BYTES);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read CodingAgent observation MAC key: {error}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| "CodingAgent observation MAC key has an invalid persisted length".to_string())
+}
+
+fn load_or_create_observation_mac_key(
+    state_dir: &Path,
+) -> Result<[u8; OBSERVATION_MAC_KEY_BYTES], String> {
+    let private_dir = state_dir.join(OBSERVATION_MAC_KEY_DIR);
+    fs::create_dir_all(&private_dir)
+        .map_err(|error| format!("cannot create CodingAgent private state directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!("cannot protect CodingAgent private state directory: {error}")
+        })?;
+    }
+    let path = private_dir.join(OBSERVATION_MAC_KEY_FILE);
+    match read_observation_mac_key(&path) {
+        Ok(key) => return Ok(key),
+        Err(_) if !path.exists() => {}
+        Err(error) => return Err(error),
+    }
+
+    let key = new_observation_mac_key();
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(&key).and_then(|_| file.sync_all()) {
+                let _ = fs::remove_file(&path);
+                return Err(format!(
+                    "cannot persist CodingAgent observation MAC key: {error}"
+                ));
+            }
+            Ok(key)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => read_observation_mac_key(&path),
+        Err(error) => Err(format!(
+            "cannot create CodingAgent observation MAC key: {error}"
+        )),
+    }
+}
+
+fn observation_token_hmac(
+    key: &[u8; OBSERVATION_MAC_KEY_BYTES],
+    domain: &[u8],
+    epoch: &str,
+    run_id: &str,
+    extra: &[u8],
+) -> [u8; 32] {
     const BLOCK_BYTES: usize = 64;
-    let key = observation_token_mac_key();
     let mut ipad = [0x36u8; BLOCK_BYTES];
     let mut opad = [0x5cu8; BLOCK_BYTES];
     for (index, byte) in key.iter().enumerate() {
@@ -1049,9 +1159,15 @@ fn observation_token_hmac(domain: &[u8], epoch: &str, run_id: &str, extra: &[u8]
     outer.finalize().into()
 }
 
-fn observation_token(epoch: &str, run_id: &str, sequence: u64) -> String {
+fn observation_token(
+    key: &[u8; OBSERVATION_MAC_KEY_BYTES],
+    epoch: &str,
+    run_id: &str,
+    sequence: u64,
+) -> String {
     debug_assert_eq!(epoch.len(), PUBLIC_TOKEN_EPOCH_BYTES);
     let mask = observation_token_hmac(
+        key,
         b"webcodex.coding-agent.observation.sequence-mask.v2\0",
         epoch,
         run_id,
@@ -1063,6 +1179,7 @@ fn observation_token(epoch: &str, run_id: &str, sequence: u64) -> String {
         masked_sequence[index] = byte ^ mask[index];
     }
     let tag = observation_token_hmac(
+        key,
         b"webcodex.coding-agent.observation.tag.v2\0",
         epoch,
         run_id,
@@ -1077,7 +1194,12 @@ fn observation_token(epoch: &str, run_id: &str, sequence: u64) -> String {
     token
 }
 
-fn parse_observation_token(epoch: &str, run_id: &str, token: &str) -> Result<u64, TokenError> {
+fn parse_observation_token(
+    key: &[u8; OBSERVATION_MAC_KEY_BYTES],
+    epoch: &str,
+    run_id: &str,
+    token: &str,
+) -> Result<u64, TokenError> {
     if token.len() > PUBLIC_TOKEN_MAX_BYTES {
         return Err(TokenError::Invalid);
     }
@@ -1106,6 +1228,7 @@ fn parse_observation_token(epoch: &str, run_id: &str, token: &str) -> Result<u64
         .try_into()
         .map_err(|_| TokenError::Invalid)?;
     let expected_tag = observation_token_hmac(
+        key,
         b"webcodex.coding-agent.observation.tag.v2\0",
         token_epoch,
         run_id,
@@ -1121,6 +1244,7 @@ fn parse_observation_token(epoch: &str, run_id: &str, token: &str) -> Result<u64
         return Err(TokenError::StaleEpoch);
     }
     let mask = observation_token_hmac(
+        key,
         b"webcodex.coding-agent.observation.sequence-mask.v2\0",
         token_epoch,
         run_id,
@@ -1157,9 +1281,13 @@ fn cancel_projection(run: &CodingAgentRunSnapshot) -> Value {
     })
 }
 
-fn observe_projection(observation: CodingAgentObserveResult, epoch: &str, reset: bool) -> Value {
+fn observe_projection(
+    observation: CodingAgentObserveResult,
+    token_state: &CodingAgentServerState,
+    reset: bool,
+) -> Value {
     let run = &observation.run;
-    let token = observation_token(epoch, &run.run_id, observation.next_sequence);
+    let token = token_state.observation_token(&run.run_id, observation.next_sequence);
     let events = observation
         .events
         .iter()
@@ -1499,19 +1627,23 @@ mod tests {
         assert!(run.starts_with("wc_agent_run_"));
         assert_ne!(authority_fingerprint(principal), run);
 
-        let token = observation_token(epoch, &run, 7);
+        let key = [0x5au8; OBSERVATION_MAC_KEY_BYTES];
+        let token = observation_token(&key, epoch, &run, 7);
         assert!(token.starts_with(PUBLIC_TOKEN_PREFIX));
         assert!(token.len() <= PUBLIC_TOKEN_MAX_BYTES);
         assert!(!token.contains(&run));
-        assert_eq!(parse_observation_token(epoch, &run, &token), Ok(7));
-        let continuation = observation_token(epoch, &run, 9);
-        assert_eq!(parse_observation_token(epoch, &run, &continuation), Ok(9));
+        assert_eq!(parse_observation_token(&key, epoch, &run, &token), Ok(7));
+        let continuation = observation_token(&key, epoch, &run, 9);
         assert_eq!(
-            parse_observation_token(stale_epoch, &run, &token),
+            parse_observation_token(&key, epoch, &run, &continuation),
+            Ok(9)
+        );
+        assert_eq!(
+            parse_observation_token(&key, stale_epoch, &run, &token),
             Err(TokenError::StaleEpoch)
         );
         assert_eq!(
-            parse_observation_token(epoch, "wc_agent_run_other", &token),
+            parse_observation_token(&key, epoch, "wc_agent_run_other", &token),
             Err(TokenError::Invalid)
         );
 
@@ -1520,7 +1652,7 @@ mod tests {
         payload[PUBLIC_TOKEN_EPOCH_BYTES] ^= 1;
         let forged_sequence = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(&payload));
         assert_eq!(
-            parse_observation_token(epoch, &run, &forged_sequence),
+            parse_observation_token(&key, epoch, &run, &forged_sequence),
             Err(TokenError::Invalid)
         );
 
@@ -1528,7 +1660,7 @@ mod tests {
         payload[0] = b'2';
         let forged_epoch = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(&payload));
         assert_eq!(
-            parse_observation_token(epoch, &run, &forged_epoch),
+            parse_observation_token(&key, epoch, &run, &forged_epoch),
             Err(TokenError::Invalid)
         );
 
@@ -1536,9 +1668,52 @@ mod tests {
         *payload.last_mut().unwrap() ^= 1;
         let tampered = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(&payload));
         assert_eq!(
-            parse_observation_token(epoch, &run, &tampered),
+            parse_observation_token(&key, epoch, &run, &tampered),
             Err(TokenError::Invalid)
         );
+    }
+
+    #[test]
+    fn persistent_observation_mac_key_preserves_stale_epoch_across_server_restart() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let run = "wc_agent_run_restart";
+        let first =
+            CodingAgentServerState::with_persistent_observation_mac_key(state_dir.path()).unwrap();
+        let first_epoch = first.epoch.clone();
+        let token = first.observation_token(run, 7);
+        drop(first);
+
+        let second =
+            CodingAgentServerState::with_persistent_observation_mac_key(state_dir.path()).unwrap();
+        assert_ne!(second.epoch, first_epoch);
+        assert_eq!(
+            second.parse_observation_token(run, &token),
+            Err(TokenError::StaleEpoch)
+        );
+
+        let encoded = token.strip_prefix(PUBLIC_TOKEN_PREFIX).unwrap();
+        let mut payload = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        *payload.last_mut().unwrap() ^= 1;
+        let tampered = format!("{PUBLIC_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(payload));
+        assert_eq!(
+            second.parse_observation_token(run, &tampered),
+            Err(TokenError::Invalid)
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private_dir = state_dir.path().join(OBSERVATION_MAC_KEY_DIR);
+            let key_path = private_dir.join(OBSERVATION_MAC_KEY_FILE);
+            assert_eq!(
+                fs::metadata(private_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(key_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
