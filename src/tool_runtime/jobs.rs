@@ -10,7 +10,7 @@ use super::local_jobs::{
     retain_inspect_job_until_terminal, LocalJobKiller, LocalJobLogSnapshot, LocalJobRecord,
     TerminateOutcome, ACTIVE_JOB_STATUSES, ACTIVE_LOCAL_STATUSES,
 };
-use super::tool_result::ToolResult;
+use super::tool_result::{RecoveryKind, RecoveryTool, ToolResult};
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::shell_client::{command_preview, ShellJobStartMetadata, COMMAND_PREVIEW_MAX_CHARS};
@@ -577,7 +577,7 @@ pub(crate) async fn local_job_log(
         .transpose()
     {
         Ok(token) => token,
-        Err(error) => return ToolResult::err(error),
+        Err(error) => return invalid_job_observation_result("invalid_observation_token", error),
     };
     let mut timeout_note = enforce_local_job_timeout(record, killer);
     let meta = record.read_json("metadata.json");
@@ -1025,6 +1025,39 @@ fn local_job_session_id(record: &LocalJobRecord) -> Option<String> {
         .map(str::to_string)
 }
 
+fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResult {
+    ToolResult::err_with_output(
+        message,
+        json!({
+            "error_kind": error_kind,
+            "failure_kind": "invalid_arguments",
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::FixInput, None)
+}
+
+fn unknown_job_observation_result(job_id: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        format!("unknown job: {}", job_id),
+        json!({
+            "error_kind": "unknown_job",
+            "failure_kind": "job_not_found",
+            "job_id": job_id,
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
+}
+
+fn agent_job_log_error_result(job_id: &str, error: String) -> ToolResult {
+    if error.starts_with("invalid after_observation_token:") {
+        invalid_job_observation_result("invalid_observation_token", error)
+    } else {
+        unknown_job_observation_result(job_id)
+    }
+}
+
 fn confirmation_required_result(project: &str, job_id: &str) -> ToolResult {
     ToolResult::err_with_output(
         "confirmation_required: stop_job requires confirm=true".to_string(),
@@ -1044,6 +1077,7 @@ fn confirmation_required_result(project: &str, job_id: &str) -> ToolResult {
             "command_started": false,
         }),
     )
+    .with_recovery(RecoveryKind::UserAction, None)
 }
 
 fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
@@ -1065,6 +1099,7 @@ fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
             "command_started": false,
         }),
     )
+    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
 }
 
 fn job_project_mismatch_result(
@@ -1094,6 +1129,7 @@ fn job_project_mismatch_result(
             "command_started": false,
         }),
     )
+    .with_recovery(RecoveryKind::FixInput, None)
 }
 
 fn job_stop_forbidden_result(
@@ -1125,6 +1161,7 @@ fn job_stop_forbidden_result(
             "command_started": false,
         }),
     )
+    .with_recovery(RecoveryKind::FixInput, None)
 }
 
 fn job_session_unknown_warning() -> Value {
@@ -1163,6 +1200,7 @@ fn job_recovering_stop_result(project: &str, job: &ShellJobInfo) -> ToolResult {
             "command_started": false,
         }),
     )
+    .with_recovery(RecoveryKind::Wait, None)
 }
 
 fn ownership_basis_for_stop(
@@ -1667,7 +1705,7 @@ impl ToolRuntime {
         let killer = self.job_killer.as_ref();
         if let Some(record) = self.local_jobs.lock().await.get(&job_id).cloned() {
             if !record.is_public() || !local_jobs_visible_to_auth(auth) {
-                return ToolResult::err(format!("unknown job: {}", job_id));
+                return unknown_job_observation_result(&job_id);
             }
             return local_job_status(&job_id, &record, killer, include_command_preview);
         }
@@ -1682,11 +1720,11 @@ impl ToolRuntime {
         {
             if let Some(record) = self.recover_local_job(&job_id).await {
                 if !local_jobs_visible_to_auth(auth) {
-                    return ToolResult::err(format!("unknown job: {}", job_id));
+                    return unknown_job_observation_result(&job_id);
                 }
                 return local_job_status(&job_id, &record, killer, include_command_preview);
             }
-            return ToolResult::err(format!("unknown job: {}", job_id));
+            return unknown_job_observation_result(&job_id);
         }
         match self.shell_clients.get_job_for_auth(auth, &job_id).await {
             Ok(job) => {
@@ -1768,7 +1806,7 @@ impl ToolRuntime {
                 }
                 ToolResult::ok(output)
             }
-            Err(_) => ToolResult::err(format!("unknown job: {}", job_id)),
+            Err(_) => unknown_job_observation_result(&job_id),
         }
     }
 
@@ -1808,7 +1846,7 @@ impl ToolRuntime {
         wait_secs: Option<u64>,
     ) -> ToolResult {
         if let Err(message) = Self::validate_job_log_wait(wait_secs) {
-            return ToolResult::err(message);
+            return invalid_job_observation_result("invalid_wait_secs", message);
         }
         let tail_lines = if offset.is_none() && tail_lines.is_none() {
             Some(super::helpers::DEFAULT_JOB_LOG_TAIL_LINES)
@@ -1818,7 +1856,7 @@ impl ToolRuntime {
         let killer = self.job_killer.as_ref();
         if let Some(record) = self.local_jobs.lock().await.get(&job_id).cloned() {
             if !record.is_public() || !local_jobs_visible_to_auth(auth) {
-                return ToolResult::err(format!("unknown job: {}", job_id));
+                return unknown_job_observation_result(&job_id);
             }
             return local_job_log(
                 &job_id,
@@ -1839,7 +1877,7 @@ impl ToolRuntime {
         {
             if let Some(record) = self.recover_local_job(&job_id).await {
                 if !local_jobs_visible_to_auth(auth) {
-                    return ToolResult::err(format!("unknown job: {}", job_id));
+                    return unknown_job_observation_result(&job_id);
                 }
                 return local_job_log(
                     &job_id,
@@ -1852,7 +1890,7 @@ impl ToolRuntime {
                 )
                 .await;
             }
-            return ToolResult::err(format!("unknown job: {}", job_id));
+            return unknown_job_observation_result(&job_id);
         }
         match self
             .shell_clients
@@ -1951,7 +1989,7 @@ impl ToolRuntime {
                     "validation": validation,
                 }))
             }
-            Err(_) => ToolResult::err(format!("unknown job: {}", job_id)),
+            Err(error) => agent_job_log_error_result(&job_id, error),
         }
     }
 
@@ -1982,10 +2020,10 @@ impl ToolRuntime {
             Some(value) => {
                 let value = value.trim();
                 if value.is_empty() || value.chars().count() > 512 {
-                    return ToolResult::err_with_output(
+                    return invalid_job_observation_result(
+                        "invalid_project_filter",
                         "invalid_project_filter: project must contain 1..=512 characters"
                             .to_string(),
-                        json!({"error_kind": "invalid_project_filter"}),
                     );
                 }
                 Some(value.to_string())
@@ -1996,10 +2034,10 @@ impl ToolRuntime {
             Some(value) => {
                 let value = value.trim();
                 if value.is_empty() || value.chars().count() > 128 {
-                    return ToolResult::err_with_output(
+                    return invalid_job_observation_result(
+                        "invalid_session_filter",
                         "invalid_session_filter: session_id must contain 1..=128 characters"
                             .to_string(),
-                        json!({"error_kind": "invalid_session_filter"}),
                     );
                 }
                 Some(value.to_string())
@@ -2457,7 +2495,12 @@ impl ToolRuntime {
 
 #[cfg(test)]
 mod recovery_projection_tests {
-    use super::{recovery_reason_text, validation_job_projection};
+    use super::{
+        confirmation_required_result, job_not_found_result, job_project_mismatch_result,
+        job_recovering_stop_result, job_stop_forbidden_result, recovery_reason_text,
+        validation_job_projection,
+    };
+    use crate::shell_protocol::ShellJobInfo;
     use serde_json::json;
 
     #[test]
@@ -2537,6 +2580,52 @@ mod recovery_projection_tests {
     #[test]
     fn recovery_reason_text_none_when_no_state_or_code() {
         assert_eq!(recovery_reason_text(None, None), None);
+    }
+
+    #[test]
+    fn job_control_failures_expose_bounded_recovery_without_changing_lifecycle_fields() {
+        let confirmation = confirmation_required_result("agent:special:demo", "job-1");
+        assert_eq!(confirmation.output["error_kind"], "confirmation_required");
+        assert_eq!(confirmation.output["failure_kind"], "confirmation_required");
+        assert_eq!(confirmation.output["command_started"], false);
+        assert_eq!(confirmation.output["recovery_kind"], "user_action");
+
+        let missing = job_not_found_result("agent:special:demo", "job-missing");
+        assert_eq!(missing.output["failure_kind"], "job_not_found");
+        assert_eq!(missing.output["recovery_kind"], "reobserve");
+        assert_eq!(missing.output["recovery_tool"], "list_jobs");
+
+        let mismatch =
+            job_project_mismatch_result("agent:special:demo", "agent:special:other", "job-2");
+        assert_eq!(mismatch.output["failure_kind"], "job_project_mismatch");
+        assert_eq!(mismatch.output["recovery_kind"], "fix_input");
+
+        let forbidden = job_stop_forbidden_result(
+            "agent:special:demo",
+            "job-3",
+            Some("wc_sess_request"),
+            Some("wc_sess_owner"),
+        );
+        assert_eq!(forbidden.output["failure_kind"], "job_stop_forbidden");
+        assert_eq!(forbidden.output["recovery_kind"], "fix_input");
+
+        let recovering: ShellJobInfo = serde_json::from_value(json!({
+            "job_id": "job-recovering",
+            "client_id": "special",
+            "command_preview": "",
+            "status": "recovering",
+            "created_at": 1,
+            "recovery_state": "recovering",
+            "recovery_reason_code": "runner_transport_disconnected"
+        }))
+        .unwrap();
+        let wait = job_recovering_stop_result("agent:special:demo", &recovering);
+        assert_eq!(wait.output["error_kind"], "runner_unavailable_recovering");
+        assert_eq!(wait.output["failure_kind"], "runner_unavailable_recovering");
+        assert_eq!(wait.output["command_started"], false);
+        assert_eq!(wait.output["stop_effect"], "runner_unavailable");
+        assert_eq!(wait.output["recovery_kind"], "wait");
+        assert!(wait.output.get("recovery_tool").is_none());
     }
 
     #[test]

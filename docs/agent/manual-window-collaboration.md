@@ -54,7 +54,7 @@ When a collaboration call has both a recording Session and a target Session, Web
 
 For uncertain responses, retry the same `session_id + message_id + completion_key` with the same answer metadata. WebCodex returns the original completion without creating another answer. Reusing the same key with different answer content/metadata fails with `idempotency_conflict`. A different completion after another completion already resolved the todo returns `already_completed` and bounded existing completion identity.
 
-A successful completion is fenced through the Session-ledger writer generation that contains that completion before success is returned. If durable persistence cannot be confirmed, the tool returns `completion_persistence_uncertain` with `failure_kind=outcome_unknown`; retry the same completion key and payload to reconcile the already-possible in-memory mutation instead of posting a second answer. Correlation and idempotency metadata survive restart/persistence restoration; old records without the new fields load with absent provenance. Malformed partial completion structures fail closed and never silently reopen a resolved todo.
+A successful completion is fenced through the Session-ledger writer generation that contains that completion before success is returned. If durable persistence cannot be confirmed, the tool returns `completion_persistence_uncertain` with `failure_kind=outcome_unknown`, `retry_same_completion=true`, and `recovery_kind=retry_same`; retry the exact same `session_id + message_id + completion_key + payload` to reconcile the already-possible in-memory mutation instead of posting a second answer. `retry_same` is an exact idempotent replay contract, not general retryability. Correlation and idempotency metadata survive restart/persistence restoration; old records without the new fields load with absent provenance. Malformed partial completion structures fail closed and never silently reopen a resolved todo.
 
 ## Exact assignment and reply lookup
 
@@ -125,3 +125,63 @@ Do not put bearer tokens, OAuth secrets, private keys, credentials, sensitive co
 This workflow does not add automatic worker spawning, scheduler/worker pool behavior, generic task queues, automatic claims, work leases, filesystem locks, branch locks, shared transcripts, hidden chain-of-thought transfer, cross-owner delegation, webhook/model callbacks, automatic Job-terminal continuation, or implicit authority inheritance.
 
 The human or coordinator still chooses workers and isolated worktrees/Projects. WebCodex supplies bounded durable collaboration state and deterministic completion correlation, not a multi-agent execution scheduler.
+
+## Future extensibility boundary
+
+The current message board is intentionally scoped to a Workflow Session because
+that is sufficient for short coordinator/worker handoffs. That storage choice
+does not make the Workflow Session the future long-lived conversation object.
+
+If real usage later needs a durable multi-participant chat or discussion space,
+introduce an additive Room/Discussion container with its own collaboration
+lifecycle. Independent Workflow Sessions may participate in that container, but
+they continue to own their own execution/evidence histories and may be created,
+closed, or replaced independently of the room.
+
+Room/Discussion state is durable application collaboration state, not model-context
+continuity or delivery proof. Membership, presence, a transport/window identity,
+or a referenced Workflow Session never proves that a model still retains or has
+ever read any room message. Models must explicitly observe the bounded messages
+or deltas they need; Room identity must not become a hidden current-session or
+context-retention fallback.
+
+Room/Discussion identifiers and participant claims are not bearer capabilities:
+every Room read or post still requires the authenticated caller to satisfy that
+container's own visibility/posting authorization.
+
+Keep the future layers separate:
+
+```text
+collaboration substrate
+  bounded messages / replies / provenance / observation
+            |
+            v
+optional orchestrator
+  wake-up / routing / worker spawning / scheduling
+            |
+            v
+Workflow Sessions / Jobs / Projects
+  authoritative execution and evidence
+```
+
+A message or room may reference a Workflow Session, Job, Artifact, checkpoint,
+commit, PR, or another collaboration object. Such references only locate the
+authoritative object; they never delegate authority, and consumers revalidate
+the referenced source before consequential use. Participant roles and presence
+are likewise collaboration metadata, not execution permissions.
+
+An optional orchestrator may decide when to wake, route, or spawn work, but it
+must not mint, inherit, or cache execution authority from Room membership,
+participant role, message authorship, or object references. Every consequential
+execution still goes through the normal explicit Project/Workflow Session target,
+caller authorization, guards, capability checks, and dispatch-time revalidation.
+Collaboration state may be scheduling input; it is not execution-effect truth or
+a lease over a Project, Session, Job, or worktree.
+
+Do not introduce Room membership, participant registries, presence, typing
+state, generic task leases, or automatic agent routing until a concrete product
+need exists. When a second real collaboration container does exist, shared
+message semantics may be extracted from the existing model rather than creating
+parallel `ChatMessage`, `WorkItem`, and `Todo` systems. Preserve historical
+`wc_sess_*` and Session-message semantics through additive fields/objects rather
+than reinterpretation migrations.
