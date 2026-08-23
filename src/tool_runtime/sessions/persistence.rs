@@ -1,5 +1,5 @@
 //! JSON session ledger load/save, sanitize-on-restore, and atomic writes.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -69,6 +69,9 @@ impl PersistedSessionRecord {
             events,
             messages,
             events_observed: record.events_observed,
+            message_observation_revision: record.message_observation_revision,
+            message_observation_floor: record.message_observation_floor,
+            message_observation_revisions: record.message_observation_revisions.clone(),
         }
     }
 
@@ -84,6 +87,9 @@ impl PersistedSessionRecord {
             && self.created_at == record.created_at
             && self.updated_at == record.updated_at
             && self.events_observed == record.events_observed
+            && self.message_observation_revision == record.message_observation_revision
+            && self.message_observation_floor == record.message_observation_floor
+            && self.message_observation_revisions == record.message_observation_revisions
             && self.events.len() == record.events.len()
             && self.messages.len() == record.messages.len()
             && self
@@ -115,7 +121,7 @@ impl PersistedSessionRecord {
             .into_iter()
             .rev()
             .collect();
-        let messages: VecDeque<Arc<SessionMessage>> = self
+        let mut messages: VecDeque<Arc<SessionMessage>> = self
             .messages
             .into_iter()
             .map(|message| Arc::try_unwrap(message).unwrap_or_else(|message| (*message).clone()))
@@ -127,6 +133,97 @@ impl PersistedSessionRecord {
             .into_iter()
             .rev()
             .collect();
+        // Canonical writers mint one unique message_id per retained message. A
+        // duplicate persisted id is structurally ambiguous for message mutation
+        // and for revision-only pagination. Do not guess which conflicting body
+        // is authoritative: discard every retained message carrying that id.
+        let mut seen_message_ids = HashSet::new();
+        let mut duplicate_message_ids = HashSet::new();
+        for message in &messages {
+            if !seen_message_ids.insert(message.message_id.clone()) {
+                duplicate_message_ids.insert(message.message_id.clone());
+            }
+        }
+        let duplicate_retained_message_ids = !duplicate_message_ids.is_empty();
+        if duplicate_retained_message_ids {
+            messages.retain(|message| !duplicate_message_ids.contains(&message.message_id));
+        }
+        let retained_message_ids = messages
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect::<HashSet<_>>();
+        let current_observation_revision = self.message_observation_revision;
+        let mut observation_floor = self
+            .message_observation_floor
+            .min(current_observation_revision);
+        let mut observation_revisions = BTreeMap::new();
+        if current_observation_revision > 0 {
+            let mut inconsistent = duplicate_retained_message_ids;
+            let mut retained_positive_revisions = HashSet::new();
+            for (message_id, revision) in self.message_observation_revisions {
+                if revision > current_observation_revision {
+                    inconsistent = true;
+                    continue;
+                }
+                if retained_message_ids.contains(&message_id) {
+                    // Revision zero is a valid shared baseline for messages restored
+                    // from a pre-observation ledger. Positive revisions, however,
+                    // are assigned one-at-a-time by the canonical writer and must
+                    // remain unique or a revision-only pagination token could skip
+                    // a second retained message with the same revision.
+                    if revision > 0 && !retained_positive_revisions.insert(revision) {
+                        inconsistent = true;
+                    }
+                    observation_revisions.insert(message_id, revision);
+                } else {
+                    observation_floor = observation_floor.max(revision);
+                }
+            }
+            for message_id in &retained_message_ids {
+                if !observation_revisions.contains_key(message_id) {
+                    inconsistent = true;
+                    observation_revisions.insert(message_id.clone(), 0);
+                }
+            }
+            let highest_known_revision = observation_revisions
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(observation_floor);
+            if highest_known_revision != current_observation_revision {
+                // The canonical current revision is always represented either
+                // by the latest state of a retained message or by history already
+                // represented by the floor. If the persisted high-water mark has
+                // no such explanation, cursor continuity cannot be proven.
+                inconsistent = true;
+            }
+            if inconsistent {
+                // Observation metadata is advisory bookkeeping around durable
+                // messages. If it cannot prove the writer's unique ordering,
+                // preserve the messages but fail closed on historical continuity:
+                // old cursors report history_lost and no retained pre-restore
+                // state is paginated under an ambiguous revision.
+                observation_floor = current_observation_revision;
+                observation_revisions.clear();
+                observation_revisions.extend(
+                    retained_message_ids
+                        .iter()
+                        .cloned()
+                        .map(|message_id| (message_id, 0)),
+                );
+            }
+        } else {
+            // Pre-feature ledgers never issued observation tokens. Their retained
+            // messages therefore become safe baseline state at revision zero.
+            observation_revisions.extend(
+                retained_message_ids
+                    .iter()
+                    .cloned()
+                    .map(|message_id| (message_id, 0)),
+            );
+            observation_floor = 0;
+        }
         // On restore, `events_observed` is at least the count of events we just
         // retained, so a freshly-restored legacy ledger does not falsely report
         // eviction. A live ledger that exceeded the cap has the true cumulative
@@ -156,6 +253,9 @@ impl PersistedSessionRecord {
             events_observed: self.events_observed.max(retained_events),
             messages,
             project_instructions: None,
+            message_observation_revision: current_observation_revision,
+            message_observation_floor: observation_floor,
+            message_observation_revisions: observation_revisions,
         })
     }
 }

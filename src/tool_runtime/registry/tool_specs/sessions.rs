@@ -1,10 +1,10 @@
 use super::super::input_schemas::{
     close_session_input_schema, complete_session_message_input_schema,
     current_session_input_schema, list_session_messages_input_schema,
-    post_session_message_input_schema, resolve_session_message_input_schema,
-    session_discussion_summary_input_schema, session_handoff_summary_input_schema,
-    session_summary_input_schema, update_session_context_input_schema,
-    validation_summary_input_schema,
+    observe_session_messages_input_schema, post_session_message_input_schema,
+    resolve_session_message_input_schema, session_discussion_summary_input_schema,
+    session_handoff_summary_input_schema, session_summary_input_schema,
+    update_session_context_input_schema, validation_summary_input_schema,
 };
 use super::tool_spec;
 use crate::tool_runtime::tool_spec::ToolSpec;
@@ -40,6 +40,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
             "list_session_messages",
             "Read bounded session-local messages. Supports exact message_id and reply_to lookup plus kind/status filters with deterministic AND semantics; use it to fetch one assignment or its replies without relying on the recent-message window.",
             list_session_messages_input_schema(),
+        ),
+        tool_spec(
+            "observe_session_messages",
+            "Observe Session message-state delta after an opaque durable cursor. No token establishes the current baseline and returns no history; token calls may wait once for change. Reports retention loss; never a subscription, delivery receipt, or model-context proof.",
+            observe_session_messages_input_schema(),
         ),
         tool_spec(
             "resolve_session_message",
