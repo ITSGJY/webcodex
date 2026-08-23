@@ -1,5 +1,6 @@
 use super::{RecoveryKind, ToolResult, ToolRuntime};
 use crate::auth::{AuthContext, AuthKind};
+use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -12,8 +13,8 @@ use webcodex_core::coding_agent::{
     CodingAgentRequest, CodingAgentResponse, CodingAgentResponsePayload, CodingAgentRunSnapshot,
     CodingAgentRunState, CodingAgentStartRequest, CodingAgentTerminal,
     CODING_AGENT_MAX_CONFIG_OPTIONS, CODING_AGENT_MAX_EVENTS_PER_RESPONSE,
-    CODING_AGENT_OBSERVE_WAIT_MAX_SECS, CODING_AGENT_TIMEOUT_MAX_SECS,
-    CODING_AGENT_TIMEOUT_MIN_SECS,
+    CODING_AGENT_MAX_INVENTORY_RUNS, CODING_AGENT_OBSERVE_WAIT_MAX_SECS,
+    CODING_AGENT_TIMEOUT_MAX_SECS, CODING_AGENT_TIMEOUT_MIN_SECS,
 };
 
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
@@ -21,6 +22,8 @@ const START_RESPONSE_WAIT_SECS: u64 = 32;
 const CONTROL_RESPONSE_WAIT_SECS: u64 = 65;
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
 const PUBLIC_TOKEN_PREFIX: &str = "wcar1";
+const SERVER_TERMINAL_RETENTION_SECS: i64 = 15 * 60;
+const SERVER_MAX_TERMINAL_RUNS: usize = CODING_AGENT_MAX_INVENTORY_RUNS;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ServerRunBinding {
@@ -41,6 +44,26 @@ pub(crate) struct CodingAgentServerState {
     runs: Mutex<HashMap<String, ServerRunBinding>>,
 }
 
+fn prune_server_runs_locked(runs: &mut HashMap<String, ServerRunBinding>, now: i64) {
+    let cutoff = now.saturating_sub(SERVER_TERMINAL_RETENTION_SECS);
+    runs.retain(|_, binding| {
+        !binding.snapshot.state.terminal() || binding.snapshot.updated_at >= cutoff
+    });
+    let mut terminals = runs
+        .iter()
+        .filter(|(_, binding)| binding.snapshot.state.terminal())
+        .map(|(run_id, binding)| (run_id.clone(), binding.snapshot.updated_at))
+        .collect::<Vec<_>>();
+    if terminals.len() <= SERVER_MAX_TERMINAL_RUNS {
+        return;
+    }
+    terminals.sort_by_key(|(_, updated_at)| *updated_at);
+    let remove_count = terminals.len().saturating_sub(SERVER_MAX_TERMINAL_RUNS);
+    for (run_id, _) in terminals.into_iter().take(remove_count) {
+        runs.remove(&run_id);
+    }
+}
+
 impl Default for CodingAgentServerState {
     fn default() -> Self {
         Self {
@@ -58,6 +81,7 @@ impl CodingAgentServerState {
         recording_session_id: Option<String>,
     ) {
         let mut runs = self.runs.lock().await;
+        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
         let existing = runs.get(&run.run_id);
         let recording_session_id = existing
             .and_then(|binding| binding.recording_session_id.clone())
@@ -85,7 +109,9 @@ impl CodingAgentServerState {
         let Some(recording_session_id) = recording_session_id else {
             return;
         };
-        if let Some(binding) = self.runs.lock().await.get_mut(run_id) {
+        let mut runs = self.runs.lock().await;
+        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
+        if let Some(binding) = runs.get_mut(run_id) {
             if binding.recording_session_id.is_none() {
                 binding.recording_session_id = Some(recording_session_id);
             }
@@ -97,6 +123,7 @@ impl CodingAgentServerState {
         run_id: &str,
     ) -> Option<(String, CodingAgentRunSnapshot, &'static str)> {
         let mut runs = self.runs.lock().await;
+        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
         let binding = runs.get_mut(run_id)?;
         let session_id = binding.recording_session_id.clone()?;
         let (bit, kind) = match binding.snapshot.state {
@@ -117,7 +144,9 @@ impl CodingAgentServerState {
     }
 
     async fn get(&self, run_id: &str) -> Option<ServerRunBinding> {
-        self.runs.lock().await.get(run_id).cloned()
+        let mut runs = self.runs.lock().await;
+        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
+        runs.get(run_id).cloned()
     }
 }
 
@@ -233,9 +262,6 @@ impl ToolRuntime {
             .reconcile_run(&run_id, &authority_fingerprint, auth)
             .await
         {
-            self.coding_agent_runs
-                .attach_recorder(&run_id, recording_session_id.clone())
-                .await;
             if existing.snapshot.intent_fingerprint != intent_fingerprint {
                 return coding_agent_error(
                     "idempotency_conflict",
@@ -254,6 +280,9 @@ impl ToolRuntime {
                     Some(&run_id),
                 );
             }
+            self.coding_agent_runs
+                .attach_recorder(&run_id, recording_session_id.clone())
+                .await;
             self.record_coding_agent_lifecycle_if_needed(&run_id).await;
             return ToolResult::ok(start_projection(
                 &existing.snapshot,
@@ -821,25 +850,48 @@ fn validate_start_input(
 
 fn stable_principal(auth: Option<&AuthContext>) -> Result<String, String> {
     let Some(auth) = auth else {
-        return Ok("legacy".to_string());
+        return Ok("local-dev:local-dev".to_string());
     };
-    let prefix = auth.principal_kind();
-    if let Some(project_grant_id) = auth.project_grant_id.as_deref() {
-        return Ok(format!("{prefix}:project:{project_grant_id}"));
-    }
-    if let Some(shared_key_hash) = auth.shared_key_hash.as_deref() {
-        return Ok(format!("{prefix}:shared-key:{shared_key_hash}"));
-    }
-    if let Some(user_id) = auth.user_id.as_deref() {
-        return Ok(format!("{prefix}:user:{user_id}"));
-    }
     if auth.kind == AuthKind::Bootstrap || auth.is_bootstrap {
-        return Ok("bootstrap".to_string());
+        return Ok("bootstrap:server-bootstrap".to_string());
     }
-    if let Some(api_key_id) = auth.api_key_id.as_deref() {
-        return Ok(format!("{prefix}:key:{api_key_id}"));
+    if auth.is_oauth_shared_key_subject() || auth.is_shared_key() {
+        let shared_key_hash = auth
+            .shared_key_hash
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "shared-key authority has no stable CodingAgentRun group identity".to_string()
+            })?;
+        return Ok(format!("shared-key-group:{shared_key_hash}"));
     }
-    Err("authenticated credential has no stable CodingAgentRun principal".to_string())
+    if auth.is_oauth_project_subject() || auth.is_project_credential() || auth.is_agent_token() {
+        let project_grant_id = auth
+            .project_grant_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "project-grant authority has no stable CodingAgentRun grant identity".to_string()
+            })?;
+        return Ok(format!("project-grant:{project_grant_id}"));
+    }
+    if auth.is_open_anonymous() {
+        return Ok("open-anonymous:open-anonymous".to_string());
+    }
+    if matches!(
+        auth.kind,
+        AuthKind::ApiToken | AuthKind::AccountCredential | AuthKind::OAuth2Token
+    ) {
+        let user_id = auth
+            .user_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "managed authority has no stable CodingAgentRun user identity".to_string()
+            })?;
+        return Ok(format!("managed-user:{user_id}"));
+    }
+    Err("authenticated credential has no canonical CodingAgentRun authority identity".to_string())
 }
 
 fn authority_fingerprint(principal: &str) -> String {
@@ -1092,6 +1144,130 @@ fn response_to_tool_error(response: CodingAgentResponse, run_id: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_server_binding(
+        run_id: String,
+        state: CodingAgentRunState,
+        updated_at: i64,
+    ) -> ServerRunBinding {
+        let terminal = state.terminal().then(|| CodingAgentTerminal {
+            stop_reason: Some("end_turn".to_string()),
+            error_code: None,
+            message: None,
+            completed_at: updated_at,
+        });
+        ServerRunBinding {
+            authority_fingerprint: "auth_test".to_string(),
+            client_id: "client".to_string(),
+            agent_instance_id: "instance".to_string(),
+            runtime_project_id: "agent:test:demo".to_string(),
+            provider_id: "codex".to_string(),
+            provider_instance_id: "provider".to_string(),
+            recording_session_id: None,
+            recorded_lifecycle_mask: 0,
+            snapshot: CodingAgentRunSnapshot {
+                run_id,
+                intent_fingerprint: "fingerprint".to_string(),
+                authority_fingerprint: "auth_test".to_string(),
+                runtime_project_id: "agent:test:demo".to_string(),
+                provider_id: "codex".to_string(),
+                provider_instance_id: "provider".to_string(),
+                state,
+                execution_state: if terminal.is_some() {
+                    CodingAgentExecutionState::Completed
+                } else {
+                    CodingAgentExecutionState::Started
+                },
+                observation_revision: 0,
+                created_at: updated_at,
+                updated_at,
+                terminal,
+            },
+        }
+    }
+
+    #[test]
+    fn server_run_registry_prunes_expired_and_bounds_recent_terminals() {
+        let now = 10_000;
+        let mut runs = HashMap::new();
+        runs.insert(
+            "wc_agent_run_active".to_string(),
+            test_server_binding(
+                "wc_agent_run_active".to_string(),
+                CodingAgentRunState::Running,
+                1,
+            ),
+        );
+        runs.insert(
+            "wc_agent_run_expired".to_string(),
+            test_server_binding(
+                "wc_agent_run_expired".to_string(),
+                CodingAgentRunState::Completed,
+                now - SERVER_TERMINAL_RETENTION_SECS - 1,
+            ),
+        );
+        for index in 0..SERVER_MAX_TERMINAL_RUNS + 2 {
+            let run_id = format!("wc_agent_run_recent_{index:03}");
+            runs.insert(
+                run_id.clone(),
+                test_server_binding(run_id, CodingAgentRunState::Completed, now - index as i64),
+            );
+        }
+        prune_server_runs_locked(&mut runs, now);
+        assert!(runs.contains_key("wc_agent_run_active"));
+        assert!(!runs.contains_key("wc_agent_run_expired"));
+        assert_eq!(
+            runs.values()
+                .filter(|binding| binding.snapshot.state.terminal())
+                .count(),
+            SERVER_MAX_TERMINAL_RUNS
+        );
+    }
+
+    #[test]
+    fn stable_principal_canonicalizes_equivalent_credential_transports() {
+        let direct_shared = crate::auth::shared_key_context("coding-agent-shared-key");
+        let shared_hash = direct_shared.shared_key_hash.clone().unwrap();
+        let oauth_shared = AuthContext {
+            token_kind: Some("oauth2_shared_key".to_string()),
+            shared_key_hash: Some(shared_hash),
+            ..AuthContext::new(AuthKind::OAuth2Token)
+        };
+        assert_eq!(
+            stable_principal(Some(&direct_shared)).unwrap(),
+            stable_principal(Some(&oauth_shared)).unwrap()
+        );
+
+        let pat = AuthContext {
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("pat-1".to_string()),
+            ..AuthContext::new(AuthKind::ApiToken)
+        };
+        let oauth_user = AuthContext {
+            user_id: Some("user-1".to_string()),
+            api_key_id: Some("oauth-access-1".to_string()),
+            token_kind: Some("oauth2".to_string()),
+            ..AuthContext::new(AuthKind::OAuth2Token)
+        };
+        assert_eq!(
+            stable_principal(Some(&pat)).unwrap(),
+            stable_principal(Some(&oauth_user)).unwrap()
+        );
+
+        let project = AuthContext {
+            project_grant_id: Some("grant-1".to_string()),
+            ..AuthContext::new(AuthKind::ProjectCredential)
+        };
+        let oauth_project = AuthContext {
+            token_kind: Some(crate::auth::PROJECT_SHARE_OAUTH_TOKEN_KIND.to_string()),
+            project_grant_id: Some("grant-1".to_string()),
+            ..AuthContext::new(AuthKind::OAuth2Token)
+        };
+        assert_eq!(
+            stable_principal(Some(&project)).unwrap(),
+            stable_principal(Some(&oauth_project)).unwrap()
+        );
+    }
 
     #[test]
     fn identities_are_domain_separated_and_tokens_are_run_bound() {

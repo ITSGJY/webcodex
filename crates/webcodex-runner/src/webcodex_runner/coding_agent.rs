@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,15 +21,21 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+#[cfg(test)]
+use webcodex_core::coding_agent::CodingAgentCancelRequest;
 use webcodex_core::coding_agent::{
-    validate_request, CodingAgentCancelRequest, CodingAgentConfigValue, CodingAgentDispatchState,
-    CodingAgentEvent, CodingAgentEventKind, CodingAgentExecutionState, CodingAgentObserveResult,
-    CodingAgentProvider, CodingAgentRequest, CodingAgentResponse, CodingAgentResponsePayload,
-    CodingAgentRunInventory, CodingAgentRunSnapshot, CodingAgentRunState, CodingAgentTerminal,
-    CodingAgentUsage, CODING_AGENT_MAX_EVENTS_PER_RESPONSE, CODING_AGENT_MAX_INVENTORY_RUNS,
+    validate_request, CodingAgentConfigValue, CodingAgentDispatchState, CodingAgentEvent,
+    CodingAgentEventKind, CodingAgentExecutionState, CodingAgentObserveResult, CodingAgentProvider,
+    CodingAgentRequest, CodingAgentResponse, CodingAgentResponsePayload, CodingAgentRunInventory,
+    CodingAgentRunSnapshot, CodingAgentRunState, CodingAgentTerminal, CodingAgentUsage,
+    CODING_AGENT_MAX_EVENTS_PER_RESPONSE, CODING_AGENT_MAX_INVENTORY_RUNS,
     CODING_AGENT_MAX_RETAINED_EVENTS,
 };
 use webcodex_process::ManagedChild;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 const STORE_SCHEMA_VERSION: u32 = 1;
 const STORE_FILE: &str = "state.json";
@@ -167,18 +175,25 @@ impl DurableRunStore {
         fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create ACP Run state dir: {error}"))?;
         let temp = dir.join(format!("state.{}.tmp", Uuid::new_v4().simple()));
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|error| format!("failed to create ACP Run temp state: {error}"))?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("failed to persist ACP Run state: {error}"))?;
-        fs::rename(&temp, self.state_path(&record.run_id))
-            .map_err(|error| format!("failed to publish ACP Run state: {error}"))?;
-        sync_parent(&dir)?;
-        Ok(())
+        let state_path = self.state_path(&record.run_id);
+        let result = (|| {
+            let mut file = File::options()
+                .write(true)
+                .create_new(true)
+                .open(&temp)
+                .map_err(|error| format!("failed to create ACP Run temp state: {error}"))?;
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|error| format!("failed to persist ACP Run state: {error}"))?;
+            drop(file);
+            publish_state_file(&temp, &state_path)?;
+            sync_parent(&dir)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
     }
 
     fn scan(&self) -> Result<Vec<DurableRunRecord>, String> {
@@ -188,6 +203,7 @@ impl DurableRunStore {
             Err(error) => return Err(format!("failed to list ACP Run state: {error}")),
         };
         let mut records = Vec::new();
+        let mut entry_count = 0usize;
         for entry in entries {
             let entry =
                 entry.map_err(|error| format!("failed to inspect ACP Run state: {error}"))?;
@@ -197,20 +213,36 @@ impl DurableRunStore {
             if !ty.is_dir() || ty.is_symlink() {
                 return Err("ACP Run state root contains an unexpected entry".to_string());
             }
-            if records.len() >= CODING_AGENT_MAX_INVENTORY_RUNS {
+            entry_count = entry_count.saturating_add(1);
+            if entry_count > CODING_AGENT_MAX_INVENTORY_RUNS {
                 return Err("ACP Run durable state exceeds bounded record count".to_string());
             }
             let path = entry.path().join(STORE_FILE);
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("failed to read ACP Run state: {error}"))?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::error!(state_path = %path.display(), error = %error, "ACP Run durable state unavailable during recovery; preserving tombstone");
+                    continue;
+                }
+            };
             if bytes.is_empty() || bytes.len() > STORE_MAX_BYTES {
-                return Err("ACP Run state has invalid bounded size".to_string());
+                tracing::error!(state_path = %path.display(), "ACP Run durable state has invalid bounded size; preserving tombstone");
+                continue;
             }
-            let record: DurableRunRecord = serde_json::from_slice(&bytes)
-                .map_err(|_| "ACP Run state is malformed".to_string())?;
-            validate_durable_record(&record)?;
+            let record: DurableRunRecord = match serde_json::from_slice(&bytes) {
+                Ok(record) => record,
+                Err(_) => {
+                    tracing::error!(state_path = %path.display(), "ACP Run durable state is malformed; preserving tombstone");
+                    continue;
+                }
+            };
+            if let Err(error) = validate_durable_record(&record) {
+                tracing::error!(state_path = %path.display(), error = %error, "ACP Run durable state is invalid; preserving tombstone");
+                continue;
+            }
             if self.run_dir(&record.run_id) != entry.path() {
-                return Err("ACP Run state directory identity mismatch".to_string());
+                tracing::error!(state_path = %path.display(), "ACP Run durable state directory identity mismatch; preserving tombstone");
+                continue;
             }
             records.push(record);
         }
@@ -221,6 +253,50 @@ impl DurableRunStore {
     fn remove(&self, run_id: &str) {
         let _ = fs::remove_dir_all(self.run_dir(run_id));
     }
+}
+
+#[cfg(unix)]
+fn publish_state_file(temp: &Path, state_path: &Path) -> Result<(), String> {
+    fs::rename(temp, state_path)
+        .map_err(|error| format!("failed to publish ACP Run state: {error}"))
+}
+
+#[cfg(windows)]
+fn publish_state_file(temp: &Path, state_path: &Path) -> Result<(), String> {
+    let from = temp
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = state_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let retry_deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let retryable = matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33));
+        if !retryable || Instant::now() >= retry_deadline {
+            return Err(format!("failed to publish ACP Run state: {error}"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_state_file(_temp: &Path, _state_path: &Path) -> Result<(), String> {
+    Err("ACP Run durable state is unsupported on this platform".to_string())
 }
 
 fn sync_parent(dir: &Path) -> Result<(), String> {
@@ -1119,7 +1195,8 @@ impl CodingAgentManager {
                         entry.update_snapshot(|snapshot| {
                             snapshot.state = CodingAgentRunState::WaitingPermission
                         });
-                        let permission_deadline = Instant::now() + self.permission_timeout;
+                        let permission_deadline =
+                            (Instant::now() + self.permission_timeout).min(run_deadline);
                         while Instant::now() < permission_deadline
                             && !entry.cancel_requested.load(Ordering::Acquire)
                         {
@@ -2410,13 +2487,31 @@ for line in sys.stdin:
         );
 
         fs::remove_file(manager.store.state_path(run)).unwrap();
-        let missing = manager.handle(request, &projects);
+        let missing = manager.handle(request.clone(), &projects);
         assert_eq!(
             missing.dispatch_state,
             CodingAgentDispatchState::OutcomeUnknown
         );
         assert_eq!(
             missing.error.as_ref().map(|error| error.code.as_str()),
+            Some("coding_agent_durable_state_unavailable")
+        );
+        let store_root = manager.store.root.clone();
+        drop(manager);
+        let restarted = CodingAgentManager::with_store(&cfg, store_root).unwrap();
+        let after_restart = restarted.handle(
+            start_request(&restarted, &root, run, BTreeMap::new()),
+            &projects,
+        );
+        assert_eq!(
+            after_restart.dispatch_state,
+            CodingAgentDispatchState::OutcomeUnknown
+        );
+        assert_eq!(
+            after_restart
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
             Some("coding_agent_durable_state_unavailable")
         );
         assert_eq!(
@@ -2426,6 +2521,45 @@ for line in sys.stdin:
                 .count(),
             1,
             "missing or corrupt durable state after a possible prompt must never become retry authority"
+        );
+    }
+
+    #[test]
+    fn durable_store_replaces_existing_state_cross_platform() {
+        let temp = TempDir::new().unwrap();
+        let store = DurableRunStore {
+            root: temp.path().join("store"),
+        };
+        let timestamp = now();
+        let mut record = DurableRunRecord {
+            schema_version: STORE_SCHEMA_VERSION,
+            run_id: "wc_agent_run_replace_state01".to_string(),
+            intent_fingerprint: "fingerprint".to_string(),
+            authority_fingerprint: "auth_replace".to_string(),
+            runtime_project_id: "agent:test:demo".to_string(),
+            provider_id: "codex".to_string(),
+            provider_instance_id: "acp_replace".to_string(),
+            state: CodingAgentRunState::Starting,
+            execution_state: CodingAgentExecutionState::NotStarted,
+            dispatch_phase: DurableDispatchPhase::BeforePromptBarrier,
+            created_at: timestamp,
+            updated_at: timestamp,
+            terminal: None,
+        };
+        store.write(&record).unwrap();
+        record.state = CodingAgentRunState::Running;
+        record.execution_state = CodingAgentExecutionState::OutcomeUnknown;
+        record.dispatch_phase = DurableDispatchPhase::PromptDispatchMayHaveOccurred;
+        record.updated_at = timestamp.saturating_add(1);
+        store.write(&record).unwrap();
+        let restored = store.read(&record.run_id).unwrap().unwrap();
+        assert_eq!(
+            restored.dispatch_phase,
+            DurableDispatchPhase::PromptDispatchMayHaveOccurred
+        );
+        assert_eq!(
+            restored.execution_state,
+            CodingAgentExecutionState::OutcomeUnknown
         );
     }
 
