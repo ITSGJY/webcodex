@@ -460,6 +460,91 @@ fn flush_and_restore(store: &SessionStore, path: PathBuf) -> SessionStore {
 }
 
 #[test]
+fn coding_agent_lifecycle_evidence_is_project_scoped_body_free_and_durable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let project = "agent:special:acp-test";
+    let session = store.start_session(Some(project.to_string()), Some("ACP recorder".to_string()));
+    let private_prompt = "PRIVATE_PROMPT_MUST_NOT_PERSIST";
+    let private_reasoning = "PRIVATE_REASONING_MUST_NOT_PERSIST";
+
+    assert!(store.record_coding_agent_lifecycle_evidence(
+        &session.session_id,
+        project,
+        "wc_agent_run_recorder0001",
+        "codex",
+        "coding_agent_started",
+        "running",
+        "started",
+        None,
+        None,
+    ));
+    assert!(store.record_coding_agent_lifecycle_evidence(
+        &session.session_id,
+        project,
+        "wc_agent_run_recorder0001",
+        "codex",
+        "coding_agent_waiting_permission",
+        "waiting_permission",
+        "started",
+        None,
+        None,
+    ));
+    assert!(store.record_coding_agent_lifecycle_evidence(
+        &session.session_id,
+        project,
+        "wc_agent_run_recorder0001",
+        "codex",
+        "coding_agent_terminal",
+        "completed",
+        "completed",
+        Some("end_turn"),
+        None,
+    ));
+    assert!(!store.record_coding_agent_lifecycle_evidence(
+        &session.session_id,
+        "agent:special:other",
+        "wc_agent_run_wrongproject",
+        "codex",
+        "coding_agent_started",
+        "running",
+        "started",
+        None,
+        None,
+    ));
+
+    // Sentinels model bodies that are intentionally absent from the lifecycle API.
+    assert!(
+        !serde_json::to_string(&store.summary(&session.session_id, Some(20)).unwrap())
+            .unwrap()
+            .contains(private_prompt)
+    );
+    assert!(
+        !serde_json::to_string(&store.summary(&session.session_id, Some(20)).unwrap())
+            .unwrap()
+            .contains(private_reasoning)
+    );
+
+    let restored = flush_and_restore(&store, ledger.clone());
+    let summary = restored.summary(&session.session_id, Some(20)).unwrap();
+    let kinds = summary
+        .events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"coding_agent_started"));
+    assert!(kinds.contains(&"coding_agent_waiting_permission"));
+    assert!(kinds.contains(&"coding_agent_terminal"));
+    let serialized = std::fs::read_to_string(&ledger).unwrap();
+    assert!(!serialized.contains(private_prompt));
+    assert!(!serialized.contains(private_reasoning));
+    assert!(!serialized.contains("idempotency_key"));
+    assert!(!serialized.contains("acp_session"));
+    assert!(!serialized.contains("wc_agent_run_wrongproject"));
+}
+
+#[test]
 fn session_store_persists_and_restores_basic_session() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");

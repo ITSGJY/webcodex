@@ -359,6 +359,10 @@ pub(crate) const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
     // entry
     "work_on_project",
     "list_projects",
+    // delegated ACP coding-agent Runs (explicit coding_agent:run authority)
+    "coding_agent_start",
+    "coding_agent_observe",
+    "coding_agent_cancel",
     // project discovery + read
     "project_overview",
     "list_project_tracked_files",

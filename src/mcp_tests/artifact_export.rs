@@ -19,6 +19,8 @@ async fn mcp_export_runtime_with_capabilities(
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "exporter".to_string(),
             agent_instance_id: "inst-export".to_string(),
             display_name: None,

@@ -9,6 +9,8 @@ async fn registry_allows_session_scoped_run_without_ssh_resource() {
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "xrh".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

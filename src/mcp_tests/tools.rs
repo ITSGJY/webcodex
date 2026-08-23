@@ -516,6 +516,8 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
         })
         .await
         .unwrap();
@@ -1271,6 +1273,8 @@ async fn mcp_show_changes_distinguishes_reserved_session_id_from_query_session_i
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "mcp-client".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

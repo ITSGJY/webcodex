@@ -9,6 +9,8 @@ async fn touch_client_refreshes_stale_client_back_to_online() {
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

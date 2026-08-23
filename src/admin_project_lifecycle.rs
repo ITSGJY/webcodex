@@ -910,6 +910,8 @@ mod tests {
                 build: None,
                 job_concurrency_limit: None,
                 job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
             })
             .await
             .unwrap();

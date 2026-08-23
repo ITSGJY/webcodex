@@ -44,6 +44,7 @@ fn dispatch_request_run_shell_sends_result_over_sink() {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let ran = dispatch_request(
@@ -115,6 +116,7 @@ fn dispatch_request_detached_process_job_enters_job_manager_without_generic_resu
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
 
@@ -197,6 +199,7 @@ fn dispatch_request_internal_search_uses_posix_runtime_not_configured_shell_pars
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
 
@@ -274,6 +277,7 @@ fn dispatch_request_internal_posix_script_ignores_configured_shell_parser() {
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
 
@@ -342,6 +346,7 @@ fn dispatch_request_run_shell_rejects_oversized_wire_command_before_start() {
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
 
@@ -444,6 +449,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
     assert!(dispatch_request(
@@ -500,6 +506,7 @@ fn dispatch_request_structured_process_uses_typed_argv_and_never_shell_fallback(
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
     assert!(dispatch_request(
@@ -575,6 +582,7 @@ fn dispatch_request_structured_script_uses_typed_file_and_never_shell_fallback()
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
     let mut malformed = request.clone();

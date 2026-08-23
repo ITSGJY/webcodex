@@ -278,6 +278,9 @@ pub fn generated_agent_config_toml(opts: &AgentInitOptions) -> Result<String, St
             // be inferred from computer_control in generated static config.
             computer_text_input: false,
             job_state_reconciliation: false,
+            // ACP autonomous coding is a runtime-only capability and must not be
+            // silently enabled by generated legacy agent config.
+            coding_agent_runs: false,
         },
         policy: GeneratedAgentPolicy {
             allow_raw_shell: true,

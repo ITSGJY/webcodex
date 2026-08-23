@@ -1,5 +1,6 @@
 pub(crate) mod artifacts;
 pub(crate) mod checkpoints;
+pub(crate) mod coding_agent;
 pub(crate) mod computer;
 pub(crate) mod config;
 pub(crate) mod detached_job;

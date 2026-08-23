@@ -7,6 +7,7 @@
 
 mod artifacts;
 mod checkpoints;
+mod coding_agents;
 mod computer;
 mod current_sessions;
 mod discovery;
@@ -59,6 +60,7 @@ pub(crate) use super::tool_policy::{
 };
 use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS, SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
+    SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH,
@@ -138,6 +140,9 @@ pub(crate) enum AgentCapability {
     LspReadOnlyNavigation,
     /// Bounded typed call-hierarchy traversal; never inferred from navigation.
     LspCallHierarchy,
+    /// Runner-owned delegated ACP coding-agent execution. Never inferred from
+    /// shell, Job, MCP, or file-write capability.
+    CodingAgentRuns,
 }
 
 impl AgentCapability {
@@ -173,6 +178,7 @@ impl AgentCapability {
             Self::ComputerTextInput => SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
             Self::LspReadOnlyNavigation => SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
             Self::LspCallHierarchy => SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
+            Self::CodingAgentRuns => SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS,
         }
     }
 
@@ -213,6 +219,7 @@ impl AgentCapability {
             Self::ComputerTextInput => &[SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT],
             Self::LspReadOnlyNavigation => &[SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION],
             Self::LspCallHierarchy => &[SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY],
+            Self::CodingAgentRuns => &[SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS],
         }
     }
 
@@ -267,6 +274,7 @@ pub(crate) struct ToolDefinition {
 
 pub(crate) const TOOL_CATEGORY_ARTIFACT: &str = "artifact";
 pub(crate) const TOOL_CATEGORY_CHECKPOINT: &str = "checkpoint";
+pub(crate) const TOOL_CATEGORY_CODING_AGENT: &str = "coding_agent";
 pub(crate) const TOOL_CATEGORY_COMPUTER: &str = "computer";
 pub(crate) const TOOL_CATEGORY_CLEANUP: &str = "cleanup";
 pub(crate) const TOOL_CATEGORY_EDIT: &str = "edit";
@@ -467,6 +475,7 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     hygiene::DEFINITIONS,
     current_sessions::DEFINITIONS,
     checkpoints::DEFINITIONS,
+    coding_agents::DEFINITIONS,
     computer::DEFINITIONS,
     discovery::DEFINITIONS,
     jobs::EXECUTION_DEFINITIONS,

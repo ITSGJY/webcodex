@@ -398,6 +398,8 @@ mod tests {
                 build: None,
                 job_concurrency_limit: None,
                 job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: instance_id.to_string(),
                 display_name: Some("ws-test".to_string()),
@@ -448,6 +450,7 @@ mod tests {
                     computer_window_activate: false,
                     computer_text_input: false,
                     job_state_reconciliation: false,
+                    coding_agent_runs: false,
                 }),
                 projects: None,
                 agent_protocol_version: Some(

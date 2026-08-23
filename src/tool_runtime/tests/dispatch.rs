@@ -584,6 +584,8 @@ async fn apply_patch_agent_does_not_require_server_local_project_root() {
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "patcher".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

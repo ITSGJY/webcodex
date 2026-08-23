@@ -793,6 +793,7 @@ async fn observe_jobs_recovering_lost_and_stop_requested_match_job_log_semantics
         async_jobs: true,
         async_shell_jobs: true,
         job_state_reconciliation: true,
+        coding_agent_runs: false,
         ..Default::default()
     };
     runtime
@@ -805,6 +806,8 @@ async fn observe_jobs_recovering_lost_and_stop_requested_match_job_log_semantics
                 active_complete: true,
                 jobs: Vec::new(),
             }),
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "observe-recovering".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

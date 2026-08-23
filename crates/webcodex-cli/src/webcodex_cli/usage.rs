@@ -53,6 +53,7 @@ Options:\n\
   --oauth-computer-permissions\n\
                              Allow ordinary OAuth browser consent to offer optional Computer permissions\n\
   --oauth-local-mcp           Explicitly allow this OAuth client to request mcp:local authority\n\
+  --oauth-coding-agent        Explicitly allow this OAuth client to request coding_agent:run authority\n\
   --user USER                Select a logged-in managed user; managed-oauth only\n\
   --key KEY                  Shared key (use --key-file to avoid shell history)\n\
   --key-file PATH            Read the shared key from a file\n\
@@ -68,7 +69,8 @@ browser authorize page; ChatGPT receives OAuth client credentials/tokens, never 
 Without explicit opt-ins the bridge keeps the direct shared-key model-facing baseline.\n\
 --oauth-computer-permissions adds only the fixed launch/display/pointer/clipboard Computer\n\
 ceiling; browser checkboxes decide the actual grant. --oauth-local-mcp adds class-level\n\
-mcp:local authority for Runner-owned MCP providers in this shared-key group. Existing\n\
+mcp:local authority for Runner-owned MCP providers in this shared-key group.\n\
+--oauth-coding-agent adds only coding_agent:run delegated coding-agent authority. Existing\n\
 clients are never widened implicitly. managed-oauth remains a separate managed-user flow.\n"
 }
 

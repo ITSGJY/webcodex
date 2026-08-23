@@ -963,6 +963,7 @@ impl AgentSink {
             },
             command_execution_state: None,
             mcp_gateway: None,
+            coding_agent: None,
         })
     }
 
@@ -986,6 +987,31 @@ impl AgentSink {
             },
             command_execution_state: None,
             mcp_gateway: Some(response),
+            coding_agent: None,
+        })
+    }
+
+    /// Submit one closed CodingAgentRun response. ACP JSON-RPC remains local to
+    /// the Runner and never crosses this typed transport result boundary.
+    pub(crate) fn submit_coding_agent_result(
+        &self,
+        request_id: String,
+        response: webcodex_core::coding_agent::CodingAgentResponse,
+    ) -> Result<ResultSubmission, SubmitResultError> {
+        self.submit_result_payload(ShellAgentResultPayload {
+            result: ShellAgentResultRequest {
+                client_id: self.client_id().to_string(),
+                agent_instance_id: self.agent_instance_id().to_string(),
+                request_id,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: None,
+                error: None,
+            },
+            command_execution_state: None,
+            mcp_gateway: None,
+            coding_agent: Some(response),
         })
     }
 
@@ -1031,6 +1057,7 @@ impl AgentSink {
             },
             command_execution_state: Some(execution_state),
             mcp_gateway: None,
+            coding_agent: None,
         };
         let submitted = self.submit_result_payload(body);
         if matches!(&submitted, Ok(ResultSubmission::Accepted)) {

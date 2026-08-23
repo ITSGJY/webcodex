@@ -1,3 +1,4 @@
+use super::coding_agent::CodingAgentManager;
 use super::external_tools::ExternalToolRouter;
 use super::mcp_gateway::McpGatewayManager;
 use super::shutdown::lock_unpoison;
@@ -76,6 +77,60 @@ pub(crate) struct AgentConfig {
     /// built-in MCP gateway. The public config section is `[mcp]`.
     #[serde(default, rename = "mcp")]
     pub(crate) mcp_gateway: McpGatewayConfig,
+    /// Startup/restart-owned ACP coding-agent providers. This is independent
+    /// from MCP tool providers and never accepts caller-controlled executable/env.
+    #[serde(default)]
+    pub(crate) acp: AcpConfig,
+}
+
+const ACP_MAX_ENV_MAPPINGS: usize = 64;
+const ACP_MAX_ENV_NAME_BYTES: usize = 256;
+const ACP_MAX_ARGS: usize = 64;
+const ACP_MAX_ARG_BYTES: usize = 4096;
+const ACP_MAX_ARGS_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct AcpConfig {
+    #[serde(default = "default_acp_max_concurrent_runs")]
+    pub(crate) max_concurrent_runs: usize,
+    #[serde(default = "default_acp_permission_timeout_secs")]
+    pub(crate) permission_timeout_secs: u64,
+    #[serde(default)]
+    pub(crate) agents: Vec<AcpAgentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(crate) struct AcpAgentConfig {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) executable: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    /// Explicit provider-env-key -> Runner-process-env-key mapping. The child
+    /// environment is cleared before these mappings are injected.
+    #[serde(default)]
+    pub(crate) env_from_env: BTreeMap<String, String>,
+    /// Remote callers may override only live ACP config options whose ids are
+    /// explicitly named here. The live advertised option still validates value.
+    #[serde(default)]
+    pub(crate) allowed_config_options: Vec<String>,
+}
+
+fn default_acp_max_concurrent_runs() -> usize {
+    1
+}
+fn default_acp_permission_timeout_secs() -> u64 {
+    5
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_runs: default_acp_max_concurrent_runs(),
+            permission_timeout_secs: default_acp_permission_timeout_secs(),
+            agents: Vec::new(),
+        }
+    }
 }
 
 const MCP_GATEWAY_MAX_ENV_MAPPINGS: usize = 64;
@@ -385,6 +440,7 @@ impl HotAgentConfig {
 pub(crate) struct ReloadableAgentConfig {
     startup: AgentConfig,
     mcp_gateway: Arc<McpGatewayManager>,
+    coding_agents: Option<Arc<CodingAgentManager>>,
     /// Config file path used by `reload()`. Config reload is a Unix feature
     /// (Windows marks reload as unsupported and never stores the path), but
     /// the reload logic is exercised by cross-platform tests.
@@ -406,8 +462,20 @@ impl ReloadableAgentConfig {
         let _ = &path;
         let current = Arc::new(HotAgentConfig::new(1, &startup, status));
         let external_routers = vec![Arc::downgrade(&current.external_tools)];
+        let coding_agents = if startup.acp.agents.is_empty() {
+            None
+        } else {
+            match CodingAgentManager::new(&startup.acp, &startup.client_id, &startup.server_url) {
+                Ok(manager) => Some(manager),
+                Err(error) => {
+                    tracing::error!(error = %error, "ACP coding-agent manager unavailable; ACP execution disabled fail closed");
+                    None
+                }
+            }
+        };
         Self {
             mcp_gateway: Arc::new(McpGatewayManager::new(&startup.mcp_gateway)),
+            coding_agents,
             startup,
             #[cfg(any(unix, test))]
             path,
@@ -428,6 +496,9 @@ impl ReloadableAgentConfig {
     pub(crate) fn begin_shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         self.mcp_gateway.shutdown();
+        if let Some(manager) = &self.coding_agents {
+            manager.stop_accepting();
+        }
     }
 
     pub(crate) fn shutdown_flag(&self) -> &AtomicBool {
@@ -436,6 +507,10 @@ impl ReloadableAgentConfig {
 
     pub(crate) fn mcp_gateway(&self) -> &McpGatewayManager {
         &self.mcp_gateway
+    }
+
+    pub(crate) fn coding_agents(&self) -> Option<&Arc<CodingAgentManager>> {
+        self.coding_agents.as_ref()
     }
 
     /// Startup-owned managed temporary-project root. Like `projects_dir`, a
@@ -548,6 +623,7 @@ pub(crate) fn restart_required_fields(
         hostname,
         host_context,
         max_concurrent_jobs,
+        acp,
         mcp_gateway,
         owner,
         poll_interval_ms,
@@ -1017,7 +1093,137 @@ pub(crate) fn load_config(path: &Path) -> Result<AgentConfig, String> {
         }
     }
     validate_mcp_gateway_config(&cfg.mcp_gateway)?;
+    validate_acp_config(&cfg.acp)?;
     Ok(cfg)
+}
+
+fn validate_acp_env_name(value: &str) -> Result<(), ()> {
+    if value.is_empty()
+        || value.len() > ACP_MAX_ENV_NAME_BYTES
+        || !value.is_ascii()
+        || value.contains('\0')
+        || value.contains('=')
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
+    use std::collections::HashSet;
+    use webcodex_core::coding_agent::{
+        validate_provider_id, CODING_AGENT_MAX_CONFIG_KEY_BYTES, CODING_AGENT_MAX_PROVIDERS,
+        CODING_AGENT_MAX_PROVIDER_NAME_BYTES,
+    };
+
+    if !(1..=8).contains(&config.max_concurrent_runs) {
+        return Err("acp.max_concurrent_runs must be between 1 and 8".to_string());
+    }
+    if !(1..=60).contains(&config.permission_timeout_secs) {
+        return Err("acp.permission_timeout_secs must be between 1 and 60".to_string());
+    }
+    if config.agents.len() > CODING_AGENT_MAX_PROVIDERS {
+        return Err(format!(
+            "acp.agents may contain at most {CODING_AGENT_MAX_PROVIDERS} entries"
+        ));
+    }
+    let mut ids = HashSet::new();
+    for agent in &config.agents {
+        validate_provider_id(&agent.id)
+            .map_err(|error| format!("ACP agent id is invalid: {error}"))?;
+        if agent.name.trim().is_empty()
+            || agent.name.len() > CODING_AGENT_MAX_PROVIDER_NAME_BYTES
+            || agent.name.chars().any(char::is_control)
+        {
+            return Err(format!("ACP agent '{}' name is invalid", agent.id));
+        }
+        if !ids.insert(agent.id.as_str()) {
+            return Err("ACP agent ids must be unique".to_string());
+        }
+        if agent.executable.is_empty()
+            || agent.executable.len() > 1024
+            || agent.executable.contains('\0')
+            || !Path::new(&agent.executable).is_absolute()
+        {
+            return Err(format!(
+                "ACP agent '{}' executable must be an absolute path of at most 1024 bytes",
+                agent.id
+            ));
+        }
+        if agent.args.len() > ACP_MAX_ARGS {
+            return Err(format!(
+                "ACP agent '{}' args may contain at most {ACP_MAX_ARGS} entries",
+                agent.id
+            ));
+        }
+        let mut args_bytes = 0usize;
+        for arg in &agent.args {
+            if arg.len() > ACP_MAX_ARG_BYTES || arg.contains('\0') {
+                return Err(format!(
+                    "ACP agent '{}' contains an invalid argument",
+                    agent.id
+                ));
+            }
+            args_bytes = args_bytes.saturating_add(arg.len()).saturating_add(1);
+        }
+        if args_bytes > ACP_MAX_ARGS_BYTES {
+            return Err(format!(
+                "ACP agent '{}' args exceed {ACP_MAX_ARGS_BYTES} bytes",
+                agent.id
+            ));
+        }
+        if agent.env_from_env.len() > ACP_MAX_ENV_MAPPINGS {
+            return Err(format!(
+                "ACP agent '{}' env_from_env may contain at most {ACP_MAX_ENV_MAPPINGS} entries",
+                agent.id
+            ));
+        }
+        let mut destinations: Vec<&str> = Vec::new();
+        for (destination, source) in &agent.env_from_env {
+            if validate_acp_env_name(destination).is_err() || validate_acp_env_name(source).is_err()
+            {
+                return Err(format!(
+                    "ACP agent '{}' env_from_env contains an invalid environment variable name",
+                    agent.id
+                ));
+            }
+            if super::shell::is_sensitive_env_key(destination)
+                || super::shell::is_sensitive_env_key(source)
+            {
+                return Err(format!(
+                    "ACP agent '{}' env_from_env may not map WebCodex transport credentials",
+                    agent.id
+                ));
+            }
+            if destinations
+                .iter()
+                .any(|existing| super::shell::env_keys_equal(existing, destination))
+            {
+                return Err(format!("ACP agent '{}' env_from_env contains conflicting destination names for this platform", agent.id));
+            }
+            destinations.push(destination);
+        }
+        if agent.allowed_config_options.len() > 64 {
+            return Err(format!(
+                "ACP agent '{}' allowed_config_options may contain at most 64 entries",
+                agent.id
+            ));
+        }
+        let mut config_ids = HashSet::new();
+        for option in &agent.allowed_config_options {
+            if option.is_empty()
+                || option.len() > CODING_AGENT_MAX_CONFIG_KEY_BYTES
+                || option.contains(['\0', '\r', '\n'])
+                || !config_ids.insert(option.as_str())
+            {
+                return Err(format!(
+                    "ACP agent '{}' contains an invalid or duplicate allowed config option",
+                    agent.id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_mcp_gateway_env_name(value: &str) -> Result<(), ()> {

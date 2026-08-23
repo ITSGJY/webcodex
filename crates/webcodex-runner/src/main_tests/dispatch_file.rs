@@ -100,6 +100,7 @@ fn dispatch_request_edit_routes_to_file_handler() {
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     };
     let pdir = projects_dir(&cfg).unwrap();

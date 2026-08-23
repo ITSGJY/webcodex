@@ -94,6 +94,8 @@ async fn stateless_observation_shell_clients() -> Arc<crate::shell_client::Shell
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "mcp-observation-agent".to_string(),
             agent_instance_id: "inst-mcp-observation".to_string(),
             display_name: None,

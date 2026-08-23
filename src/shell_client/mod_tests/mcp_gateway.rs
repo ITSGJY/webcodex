@@ -39,6 +39,8 @@ async fn register_bridge_runner(registry: &ShellClientRegistry) {
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
         })
         .await
         .unwrap();
@@ -74,6 +76,8 @@ fn bridge_registration(
         build: None,
         job_concurrency_limit: None,
         job_inventory: None,
+        coding_agent_providers: None,
+        coding_agent_inventory: None,
     }
 }
 
@@ -410,6 +414,7 @@ async fn typed_bridge_result_is_correlated_once() {
         mcp_gateway: Some(McpGatewayResponse::success(
             McpGatewayResponsePayload::Tools { tools: Vec::new() },
         )),
+        coding_agent: None,
     };
     registry.complete(payload.clone()).await.unwrap();
     let response = receiver.await.unwrap();

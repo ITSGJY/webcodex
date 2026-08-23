@@ -18,6 +18,58 @@ global install or credential changes. Protocol details below describe that
 observed implementation and the current ACP surface; P1 must continue to
 negotiate and validate rather than hard-code incidental adapter behavior.
 
+## P1 implementation realization
+
+P1 implements this contract as a Codex-first vertical slice without changing the
+product identity model. `CodingAgentRun` remains separate from Jobs and Workflow
+Sessions, and the Server/Runner boundary is a closed typed protocol rather than
+an ACP JSON-RPC tunnel.
+
+The Runner owns an `[acp]` / `[[acp.agents]]` startup configuration. Each agent
+entry supplies a logical id/name, executable, argv, explicit `env_from_env`
+mappings, and an operator ceiling for run-level ACP config option ids. There is
+no production `codex-acp` default. The provider child is always spawned after
+`env_clear()` and receives only configured mappings. Missing source variables
+fail before provider process start.
+
+P1 exposes exactly three model tools: `coding_agent_start`,
+`coding_agent_observe`, and `coding_agent_cancel`. They require the independent
+`coding_agent:run` OAuth scope. Direct shared-key, open-anonymous, project
+credentials, existing OAuth clients, `project:write`, `job:run`, and `mcp:local`
+do not imply it. The hosted shared-key OAuth bridge can add this scope only via
+an explicit client-provisioning opt-in; existing clients are never widened on
+Server upgrade.
+
+`recording_session_id` is carried by the existing generic stateless recorder
+wrapper rather than duplicated as CodingAgentRun business input. It can attach
+bounded `coding_agent_started`, `coding_agent_waiting_permission`, and
+`coding_agent_terminal` lifecycle evidence to an exact Project-matching
+Workflow Session. Recorder provenance never crosses the Server/Runner execution
+request, never grants Run authority, and never stores prompt/reasoning/tool
+bodies or the private ACP session id.
+
+The Runner durable record intentionally retains only recovery identity and
+certainty metadata. Immediately before writing `session/prompt`, it durably
+crosses `prompt_dispatch_may_have_occurred`; any nonterminal restart from that
+phase becomes `lost/outcome_unknown` and is never redispatched. A correlated
+terminal result is durably recorded before active execution state is reclaimed.
+
+P1 uses stable ACP v1 schema types and a narrow stdio client. It advertises only
+implemented client capabilities and supports initialize, session/new, validated
+session/set_config_option, session/prompt, session/update,
+session/request_permission, and session/cancel. Unsupported agent-to-client
+requests fail closed. Permission requests are normalized for observation, never
+auto-allowed, receive ACP `Cancelled` after a bounded deadline (or before prompt
+cancel), and the same prompt is then observed to terminal correlation.
+
+The opt-in P1 real-provider smoke on 2026-08-23 re-queried npm and observed
+`@agentclientprotocol/codex-acp` version 1.6.2. It used a test/operator-owned
+`npx -y @agentclientprotocol/codex-acp` provider declaration, existing local
+Codex authentication, explicit environment mappings, and a read-only prompt on
+the registered ACP worktree. The Run produced normalized agent/activity events
+and correlated `stopReason=end_turn`; no global package install or credential
+mutation was performed.
+
 ## 1. Product model
 
 The intended user flow is:

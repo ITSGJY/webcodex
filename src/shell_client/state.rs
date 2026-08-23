@@ -11,6 +11,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Notify};
+use webcodex_core::coding_agent::{
+    CodingAgentProvider, CodingAgentResponse, CodingAgentRunInventory,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct ProjectInventoryStaging {
@@ -88,6 +91,11 @@ pub(super) struct ShellClientRecord {
     /// Runner-reported effective static Job execution concurrency. This is
     /// safe operational metadata and remains unknown for older Runners.
     pub(super) job_concurrency_limit: Option<usize>,
+    /// Sanitized startup-owned ACP providers for this exact Runner process.
+    pub(super) coding_agent_providers: Vec<CodingAgentProvider>,
+    /// Authoritative active/recent-terminal CodingAgentRun inventory from this
+    /// Runner. Bodies/events are deliberately absent from this durable projection.
+    pub(super) coding_agent_inventory: CodingAgentRunInventory,
     /// Same-Server evidence that a hidden structured terminal Job was already
     /// projected into its initiating tool result and deliberately discarded.
     /// This stays process-local and is preserved only across registrations by
@@ -179,6 +187,13 @@ pub(super) struct PendingShellRequest {
     pub(super) expected_mcp_gateway_provider_id: Option<String>,
     pub(super) expected_mcp_gateway_provider_instance_id: Option<String>,
     pub(super) dispatched: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CodingAgentDispatchFence {
+    pub(super) agent_instance_id: String,
+    pub(super) provider_id: String,
+    pub(super) provider_instance_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -307,6 +322,10 @@ pub(super) struct ShellClientRegistryInner {
     /// separate from shell stdout/stderr so bridge calls cannot become a raw
     /// result tunnel.
     pub(super) mcp_gateway_waiters: HashMap<String, oneshot::Sender<McpGatewayResponse>>,
+    /// Waiters and exact process/provider dispatch fences for CodingAgentRun
+    /// operations. They are independent from shell/Job/MCP result channels.
+    pub(super) coding_agent_waiters: HashMap<String, oneshot::Sender<CodingAgentResponse>>,
+    pub(super) coding_agent_fences: HashMap<String, CodingAgentDispatchFence>,
     pub(super) queues_by_client: HashMap<String, VecDeque<String>>,
     pub(super) jobs_by_id: HashMap<String, ShellJobRecord>,
     pub(super) request_to_job: HashMap<String, String>,

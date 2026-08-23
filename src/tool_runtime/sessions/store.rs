@@ -1759,6 +1759,46 @@ impl SessionStore {
         true
     }
 
+    /// Append bounded recorder-only CodingAgentRun lifecycle evidence. The
+    /// explicit Workflow Session is provenance only: this path grants no Run
+    /// authority and intentionally stores no prompt, ACP session id, event body,
+    /// reasoning, tool payload, credential, or idempotency key.
+    pub(crate) fn record_coding_agent_lifecycle_evidence(
+        &self,
+        session_id: &str,
+        project: &str,
+        run_id: &str,
+        provider_id: &str,
+        kind: &str,
+        state: &str,
+        execution_state: &str,
+        terminal_stop_reason: Option<&str>,
+        terminal_error_code: Option<&str>,
+    ) -> bool {
+        let project_matches = self
+            .with_record_for_query(session_id, |record, _| {
+                record.project.as_deref() == Some(project)
+            })
+            .unwrap_or(false);
+        if !project_matches {
+            return false;
+        }
+        let now = now_ts();
+        self.push_event(coding_agent_lifecycle_event(
+            session_id,
+            project,
+            run_id,
+            provider_id,
+            kind,
+            state,
+            execution_state,
+            terminal_stop_reason,
+            terminal_error_code,
+            now,
+        ));
+        true
+    }
+
     /// Sole entry for appending a session ledger event.
     fn push_event(&self, event: SessionEvent) {
         let session_id = event.session_id.clone();
@@ -2140,6 +2180,82 @@ fn coding_instruction_event(
         execution_context,
         previous_execution_context,
         execution_context_changed: Some(execution_context_changed),
+    }
+}
+
+fn coding_agent_lifecycle_event(
+    session_id: &str,
+    project: &str,
+    run_id: &str,
+    provider_id: &str,
+    kind: &str,
+    state: &str,
+    execution_state: &str,
+    terminal_stop_reason: Option<&str>,
+    terminal_error_code: Option<&str>,
+    now: i64,
+) -> SessionEvent {
+    let input_summary = serde_json::json!({
+        "run_id": bound_summary_string(run_id),
+        "provider_id": bound_summary_string(provider_id),
+        "state": bound_summary_string(state),
+        "execution_state": bound_summary_string(execution_state),
+        "terminal_stop_reason": terminal_stop_reason.map(bound_summary_string),
+        "terminal_error_code": terminal_error_code.map(bound_summary_string),
+    });
+    SessionEvent {
+        event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+        session_id: session_id.to_string(),
+        kind: bound_summary_string(kind),
+        call_id: None,
+        timestamp: now,
+        transport: "system".to_string(),
+        tool_name: "coding_agent_start".to_string(),
+        project: Some(project.to_string()),
+        resolved_project: Some(project.to_string()),
+        risk_class: "job_run".to_string(),
+        read_like: false,
+        write_like: false,
+        shell_like: false,
+        git_like: false,
+        change_summary_like: false,
+        diff_review_like: false,
+        started_at: Some(now),
+        finished_at: Some(now),
+        duration_ms: Some(0),
+        status: Some(bound_summary_string(state)),
+        exit_code: None,
+        failure_kind: None,
+        error_kind: terminal_error_code.map(bound_summary_string),
+        expected_failure: None,
+        expected_failure_kind: None,
+        assertion_name: None,
+        actual_failure_kind: None,
+        failure_expectation_result: None,
+        warning_kind: None,
+        session_project: None,
+        request_project: None,
+        allow_cross_project_session_required: None,
+        allow_cross_project_session: None,
+        error_message_summary: None,
+        changed_paths: Vec::new(),
+        observed_paths: Vec::new(),
+        job_id: None,
+        persistent_shell: None,
+        effect_evidence: None,
+        input_summary: Some(input_summary),
+        validation_output_summary: None,
+        permission: None,
+        instruction: None,
+        requested_mode: None,
+        previous_mode: None,
+        requested_guards: None,
+        previous_guards: None,
+        capability_changed: None,
+        context_refreshed: None,
+        execution_context: None,
+        previous_execution_context: None,
+        execution_context_changed: None,
     }
 }
 

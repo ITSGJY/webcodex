@@ -282,6 +282,7 @@ async fn connect_rejects_invalid_url_and_missing_project_before_network_or_write
         oauth_redirect_uri: None,
         oauth_computer_permissions: false,
         oauth_local_mcp: false,
+        oauth_coding_agent: false,
         username: None,
         project: tmp.path().join("missing"),
         profile: None,

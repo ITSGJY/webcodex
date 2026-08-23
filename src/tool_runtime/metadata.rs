@@ -62,6 +62,7 @@ pub(crate) const RUNTIME_READ: &str = crate::auth::SCOPE_RUNTIME_READ;
 pub(crate) const PROJECT_READ: &str = crate::auth::SCOPE_PROJECT_READ;
 pub(crate) const PROJECT_WRITE: &str = crate::auth::SCOPE_PROJECT_WRITE;
 pub(crate) const JOB_RUN: &str = crate::auth::SCOPE_JOB_RUN;
+pub(crate) const CODING_AGENT_RUN: &str = crate::auth::SCOPE_CODING_AGENT_RUN;
 pub(crate) const COMPUTER_READ: &str = crate::auth::SCOPE_COMPUTER_READ;
 pub(crate) const COMPUTER_CONTROL: &str = crate::auth::SCOPE_COMPUTER_CONTROL;
 pub(crate) const COMPUTER_LAUNCH: &str = crate::auth::SCOPE_COMPUTER_LAUNCH;

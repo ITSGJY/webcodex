@@ -767,6 +767,9 @@ pub(crate) struct ToolCallExpectation {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolCallRecorderMetadata {
+    /// Explicit generic wrapper recorder provenance. It is internal metadata,
+    /// never concrete tool business input or execution authority.
+    pub(crate) recording_session_id: Option<String>,
     pub(crate) expectation: ToolCallExpectation,
     pub(crate) ack_session_message_ids: Vec<String>,
 }

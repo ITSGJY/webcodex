@@ -107,6 +107,7 @@ impl ValidationTerminalReconciliationTestHook {
 pub struct ToolRuntime {
     pub shell_clients: Arc<ShellClientRegistry>,
     pub(crate) mcp_gateway: Arc<crate::mcp_gateway::McpGatewayRuntime>,
+    pub(crate) coding_agent_runs: Arc<super::coding_agent::CodingAgentServerState>,
     pub runtime_info: Arc<RuntimeInfo>,
     model_surface: crate::model_surface::ModelSurface,
     pub(crate) checkpoint_store: checkpoint::CheckpointStore,
@@ -158,6 +159,7 @@ impl ToolRuntime {
         Self {
             shell_clients,
             mcp_gateway: Arc::new(crate::mcp_gateway::McpGatewayRuntime::default()),
+            coding_agent_runs: Arc::new(super::coding_agent::CodingAgentServerState::default()),
             runtime_info,
             model_surface: crate::model_surface::ModelSurface::LocalCoding,
             checkpoint_store: checkpoint::CheckpointStore::default(),

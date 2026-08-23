@@ -139,6 +139,8 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "quic-stop".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

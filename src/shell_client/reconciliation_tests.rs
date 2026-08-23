@@ -35,6 +35,7 @@ fn reconciliation_capabilities() -> ShellClientCapabilities {
         structured_execution_jobs: true,
         structured_validation_argv: true,
         job_state_reconciliation: true,
+        coding_agent_runs: false,
         ..Default::default()
     }
 }
@@ -81,6 +82,8 @@ fn register_request(instance: &str, inventory: ShellJobInventory) -> ShellClient
         build: None,
         job_concurrency_limit: None,
         job_inventory: Some(inventory),
+        coding_agent_providers: None,
+        coding_agent_inventory: None,
     }
 }
 

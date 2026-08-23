@@ -32,6 +32,9 @@ pub const SCOPE_COMPUTER_CLIPBOARD_WRITE: &str = "computer:clipboard_write";
 /// through the built-in `/mcp` gateway. It is intentionally absent from legacy
 /// and lightweight default scope ceilings.
 pub const SCOPE_MCP_LOCAL: &str = "mcp:local";
+/// Explicit authority to start/observe/cancel delegated autonomous ACP coding
+/// agents. It is intentionally absent from all legacy/default shared-key scopes.
+pub const SCOPE_CODING_AGENT_RUN: &str = "coding_agent:run";
 pub const SCOPE_AGENT_REGISTER: &str = "agent:register";
 pub const SCOPE_ADMIN: &str = "admin";
 
@@ -67,6 +70,7 @@ pub(crate) const KNOWN_SCOPES: &[&str] = &[
     SCOPE_COMPUTER_LAUNCH,
     SCOPE_COMPUTER_DISPLAY_READ,
     SCOPE_MCP_LOCAL,
+    SCOPE_CODING_AGENT_RUN,
     SCOPE_ACCOUNT_MANAGE,
     SCOPE_AGENT_REGISTER,
     SCOPE_AGENT_POLL,
@@ -976,6 +980,18 @@ mod tests {
             ("run_shell", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("stop_job", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("cargo_test", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
+            (
+                "coding_agent_start",
+                OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
+            ),
+            (
+                "coding_agent_observe",
+                OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
+            ),
+            (
+                "coding_agent_cancel",
+                OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
+            ),
         ] {
             assert_eq!(oauth_scope_policy_for_runtime_tool(tool), policy, "{tool}");
         }
@@ -1098,6 +1114,31 @@ mod tests {
                 !auth.has_scope(SCOPE_JOB_DETACH),
                 "{label} must not implicitly gain detached execution authority"
             );
+        }
+    }
+
+    #[test]
+    fn coding_agent_scope_is_never_implicit_for_legacy_lightweight_authority() {
+        for (label, auth) in [
+            (
+                "shared-key",
+                crate::auth::shared_key_context("coding-agent-scope-check"),
+            ),
+            ("open", crate::auth::open_anonymous_context()),
+            (
+                "project-credential",
+                crate::auth::shared_key::project_credential_context("wc_pgrant_codingagentscope"),
+            ),
+        ] {
+            assert!(
+                !auth.has_scope(SCOPE_CODING_AGENT_RUN),
+                "{label} must not implicitly gain delegated coding-agent authority"
+            );
+        }
+        for base in [SCOPE_PROJECT_WRITE, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL] {
+            let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::OAuth2Token);
+            auth.scopes = vec![base.to_string()];
+            assert!(!auth.has_scope(SCOPE_CODING_AGENT_RUN), "{base}");
         }
     }
 

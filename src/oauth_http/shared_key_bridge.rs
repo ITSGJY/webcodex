@@ -2,10 +2,10 @@ use salvo::prelude::*;
 
 use crate::auth::{
     generate_oauth_authorization_code, hash_token, shared_key_hash_of, AuthContext,
-    DIRECT_SHARED_KEY_MODEL_SCOPES, SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE,
-    SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH,
-    SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL,
-    SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
+    DIRECT_SHARED_KEY_MODEL_SCOPES, SCOPE_CODING_AGENT_RUN, SCOPE_COMPUTER_CLIPBOARD_READ,
+    SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ,
+    SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_RUN,
+    SCOPE_MCP_LOCAL, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
 };
 use crate::models::OAuthAuthorizationCodeRecord;
 use crate::shell_protocol::ShellClientCapabilities;
@@ -160,21 +160,21 @@ fn bridge_computer_enabled_scope_ceiling(scopes: &[String]) -> Option<Vec<String
     Some(expanded)
 }
 
-fn bridge_scope_ceiling_without_local_mcp(scopes: &[String]) -> Option<Vec<String>> {
+fn bridge_scope_ceiling_without_optional_class_scopes(scopes: &[String]) -> Option<Vec<String>> {
     if !bridge_scope_list_is_unique(scopes) {
         return None;
     }
     Some(
         scopes
             .iter()
-            .filter(|scope| scope.as_str() != SCOPE_MCP_LOCAL)
+            .filter(|scope| !matches!(scope.as_str(), SCOPE_MCP_LOCAL | SCOPE_CODING_AGENT_RUN))
             .cloned()
             .collect(),
     )
 }
 
 fn bridge_scope_ceiling_is_valid(scopes: &[String]) -> bool {
-    let Some(base) = bridge_scope_ceiling_without_local_mcp(scopes) else {
+    let Some(base) = bridge_scope_ceiling_without_optional_class_scopes(scopes) else {
         return false;
     };
     bridge_baseline_scope_ceiling_is_valid(&base) || bridge_computer_scope_ceiling_is_valid(&base)
@@ -184,8 +184,9 @@ fn bridge_scope_ceiling_with_options(
     scopes: &[String],
     computer_permissions: bool,
     local_mcp: bool,
+    coding_agent: bool,
 ) -> Option<Vec<String>> {
-    let base = bridge_scope_ceiling_without_local_mcp(scopes)?;
+    let base = bridge_scope_ceiling_without_optional_class_scopes(scopes)?;
     let mut desired = if computer_permissions {
         bridge_computer_enabled_scope_ceiling(&base)?
     } else if bridge_baseline_scope_ceiling_is_valid(&base) {
@@ -196,13 +197,21 @@ fn bridge_scope_ceiling_with_options(
     if local_mcp {
         desired.push(SCOPE_MCP_LOCAL.to_string());
     }
+    if coding_agent {
+        desired.push(SCOPE_CODING_AGENT_RUN.to_string());
+    }
     Some(desired)
 }
 
-fn bridge_scope_profile_error(computer_permissions: bool, local_mcp: bool) -> &'static str {
-    match (computer_permissions, local_mcp) {
-        (true, false) => "persisted OAuth scope ceiling is not valid for Computer opt-in",
-        (false, true) => "persisted OAuth scope ceiling is not valid for local MCP opt-in",
+fn bridge_scope_profile_error(
+    computer_permissions: bool,
+    local_mcp: bool,
+    coding_agent: bool,
+) -> &'static str {
+    match (computer_permissions, local_mcp, coding_agent) {
+        (true, false, false) => "persisted OAuth scope ceiling is not valid for Computer opt-in",
+        (false, true, false) => "persisted OAuth scope ceiling is not valid for local MCP opt-in",
+        (false, false, true) => "persisted OAuth scope ceiling is not valid for coding-agent opt-in",
         _ => "persisted OAuth scope ceiling is not valid for the requested explicit permission profile",
     }
 }
@@ -211,7 +220,7 @@ fn bridge_client_is_computer_enabled(client: &crate::models::OAuthClientRecord) 
     if !client.is_shared_key_owned() {
         return false;
     }
-    bridge_scope_ceiling_without_local_mcp(&client.allowed_scopes_vec())
+    bridge_scope_ceiling_without_optional_class_scopes(&client.allowed_scopes_vec())
         .is_some_and(|scopes| bridge_computer_scope_ceiling_is_valid(&scopes))
 }
 
@@ -220,6 +229,13 @@ fn bridge_client_has_local_mcp_scope(client: &crate::models::OAuthClientRecord) 
         .allowed_scopes_vec()
         .iter()
         .any(|scope| scope == SCOPE_MCP_LOCAL)
+}
+
+fn bridge_client_has_coding_agent_scope(client: &crate::models::OAuthClientRecord) -> bool {
+    client
+        .allowed_scopes_vec()
+        .iter()
+        .any(|scope| scope == SCOPE_CODING_AGENT_RUN)
 }
 
 fn bridge_client_has_optional_computer_scope(client: &crate::models::OAuthClientRecord) -> bool {
@@ -253,6 +269,7 @@ pub(crate) fn normalize_bridge_oauth_scopes(
     if normalized.split_whitespace().any(|scope| {
         scope != OAUTH_OFFLINE_ACCESS_SCOPE
             && scope != SCOPE_MCP_LOCAL
+            && scope != SCOPE_CODING_AGENT_RUN
             && !SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES.contains(&scope)
     }) {
         return Err(OAuthAuthorizeError::InvalidScope(
@@ -275,7 +292,10 @@ impl BridgeAuthorizeValidated {
     fn standard_grant_scopes(&self) -> Vec<String> {
         self.requestable_scopes
             .split_whitespace()
-            .filter(|scope| bridge_oauth_scopes().contains(scope) || *scope == SCOPE_MCP_LOCAL)
+            .filter(|scope| {
+                bridge_oauth_scopes().contains(scope)
+                    || matches!(*scope, SCOPE_MCP_LOCAL | SCOPE_CODING_AGENT_RUN)
+            })
             .map(str::to_string)
             .collect()
     }
@@ -510,6 +530,8 @@ pub(super) fn validate_bridge_authorize_request(
     let computer_permissions_enabled = bridge_client_is_computer_enabled(&client);
     let local_mcp_enabled =
         client.is_shared_key_owned() && bridge_client_has_local_mcp_scope(&client);
+    let coding_agent_enabled =
+        client.is_shared_key_owned() && bridge_client_has_coding_agent_scope(&client);
     let client_bridge_ceiling = if computer_permissions_enabled {
         SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES
     } else {
@@ -518,6 +540,7 @@ pub(super) fn validate_bridge_authorize_request(
     if requestable_scopes.split_whitespace().any(|scope| {
         scope != OAUTH_OFFLINE_ACCESS_SCOPE
             && !(scope == SCOPE_MCP_LOCAL && local_mcp_enabled)
+            && !(scope == SCOPE_CODING_AGENT_RUN && coding_agent_enabled)
             && !client_bridge_ceiling.contains(&scope)
     }) {
         redirect_with_oauth_error(
@@ -644,6 +667,8 @@ struct ProvisionSharedKeyOAuthClientRequest {
     computer_permissions: bool,
     #[serde(default)]
     local_mcp: bool,
+    #[serde(default)]
+    coding_agent: bool,
 }
 
 fn bridge_client_scopes_are_current(client: &crate::models::OAuthClientRecord) -> bool {
@@ -770,16 +795,28 @@ pub(crate) async fn oauth_shared_key_client_provision(
                     })));
                     return;
                 }
+                if !body.coding_agent && bridge_client_has_coding_agent_scope(&client) {
+                    res.status_code(StatusCode::CONFLICT);
+                    res.render(Json(serde_json::json!({
+                        "error": "OAuth client has coding-agent authority enabled; reconnect with --oauth-coding-agent to reuse this client"
+                    })));
+                    return;
+                }
 
                 let current_scopes = client.allowed_scopes_vec();
                 let Some(desired_scope_vec) = bridge_scope_ceiling_with_options(
                     &current_scopes,
                     body.computer_permissions,
                     body.local_mcp,
+                    body.coding_agent,
                 ) else {
                     res.status_code(StatusCode::CONFLICT);
                     res.render(Json(serde_json::json!({
-                        "error": bridge_scope_profile_error(body.computer_permissions, body.local_mcp)
+                        "error": bridge_scope_profile_error(
+                            body.computer_permissions,
+                            body.local_mcp,
+                            body.coding_agent,
+                        )
                     })));
                     return;
                 };
@@ -862,12 +899,30 @@ pub(crate) async fn oauth_shared_key_client_provision(
         })));
         return;
     }
-    let Some(create_scopes) =
-        bridge_scope_ceiling_with_options(&base_scopes, body.computer_permissions, body.local_mcp)
-    else {
+    if !body.coding_agent
+        && base_scopes
+            .iter()
+            .any(|scope| scope == SCOPE_CODING_AGENT_RUN)
+    {
         res.status_code(StatusCode::CONFLICT);
         res.render(Json(serde_json::json!({
-            "error": bridge_scope_profile_error(body.computer_permissions, body.local_mcp)
+            "error": "persisted OAuth profile has coding-agent authority enabled; reconnect with --oauth-coding-agent"
+        })));
+        return;
+    }
+    let Some(create_scopes) = bridge_scope_ceiling_with_options(
+        &base_scopes,
+        body.computer_permissions,
+        body.local_mcp,
+        body.coding_agent,
+    ) else {
+        res.status_code(StatusCode::CONFLICT);
+        res.render(Json(serde_json::json!({
+            "error": bridge_scope_profile_error(
+                body.computer_permissions,
+                body.local_mcp,
+                body.coding_agent,
+            )
         })));
         return;
     };

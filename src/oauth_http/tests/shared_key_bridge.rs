@@ -152,6 +152,80 @@ async fn bridge_authorize_local_mcp_requires_shared_key_owned_opt_in() {
 }
 
 #[test]
+fn bridge_coding_agent_scope_requires_explicit_client_ceiling_opt_in() {
+    assert!(!bridge_oauth_scopes().contains(&crate::auth::SCOPE_CODING_AGENT_RUN));
+
+    let baseline = bridge_oauth_scopes()
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect::<Vec<_>>();
+    let mut opted_in = baseline.clone();
+    opted_in.push(crate::auth::SCOPE_CODING_AGENT_RUN.to_string());
+    assert!(normalize_bridge_oauth_scopes(
+        Some(crate::auth::SCOPE_CODING_AGENT_RUN),
+        &opted_in.join(" "),
+    )
+    .is_ok());
+    assert!(normalize_bridge_oauth_scopes(
+        Some(crate::auth::SCOPE_CODING_AGENT_RUN),
+        &baseline.join(" "),
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn bridge_authorize_coding_agent_requires_shared_key_owned_opt_in() {
+    let config = test_config(oauth2_enabled_bridge());
+    let (_tmp, db) = test_db();
+    let shared_key = "coding-agent-owned-shared-key";
+    let allowed_scopes = format!(
+        "{} {}",
+        bridge_oauth_scopes().join(" "),
+        crate::auth::SCOPE_CODING_AGENT_RUN
+    );
+    let (owned, _) = seed_shared_key_bridge_client(
+        &db,
+        shared_key,
+        "https://coding-agent.example/callback",
+        &allowed_scopes,
+    );
+    let service = Service::new(build_router(config.clone(), db.clone()));
+    let owned_url = valid_bridge_authorize_url(
+        &owned,
+        "https://coding-agent.example/callback",
+        "runtime:read coding_agent:run",
+    );
+    let mut owned_response = TestClient::get(&owned_url).send(&service).await;
+    assert_eq!(owned_response.status_code, Some(StatusCode::OK));
+    let owned_html = owned_response.take_string().await.unwrap_or_default();
+    assert!(owned_html.contains("coding_agent:run"));
+
+    let user = seed_user(&db, "coding-agent-legacy-owner");
+    let legacy = seed_client_with_redirects_and_scopes(
+        &db,
+        &user,
+        "https://legacy-coding-agent.example/callback",
+        &allowed_scopes,
+    );
+    let legacy_url = valid_bridge_authorize_url(
+        &legacy,
+        "https://legacy-coding-agent.example/callback",
+        "runtime:read coding_agent:run",
+    );
+    let legacy_response = TestClient::get(&legacy_url).send(&service).await;
+    assert_eq!(legacy_response.status_code, Some(StatusCode::FOUND));
+    let location = url::Url::parse(&location_header(&legacy_response).unwrap()).unwrap();
+    assert_eq!(
+        location
+            .query_pairs()
+            .find(|(key, _)| key == "error")
+            .map(|(_, value)| value.into_owned())
+            .as_deref(),
+        Some("invalid_scope")
+    );
+}
+
+#[test]
 fn normalize_bridge_oauth_scopes_accepts_offline_access_as_protocol_scope() {
     let normalized = normalize_bridge_oauth_scopes(
         Some("runtime:read offline_access"),
@@ -198,6 +272,8 @@ async fn register_shared_key_runner_with_capabilities(
                 build: None,
                 job_concurrency_limit: None,
                 job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
             },
             Some(&auth),
         )

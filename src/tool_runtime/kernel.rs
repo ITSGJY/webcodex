@@ -859,6 +859,43 @@ mod tests {
     }
 
     #[test]
+    fn coding_agent_tools_require_independent_execution_scope() {
+        for insufficient in [
+            oauth(&["project:write"]),
+            oauth(&["job:run"]),
+            oauth(&["mcp:local"]),
+            oauth(&["project:write", "job:run", "mcp:local"]),
+        ] {
+            for tool in [
+                "coding_agent_start",
+                "coding_agent_observe",
+                "coding_agent_cancel",
+            ] {
+                assert_eq!(
+                    check_runtime_tool_scope(Some(&insufficient), tool),
+                    Err(ToolCallErrorStatus::InsufficientScope {
+                        required_scope: Some(crate::auth::SCOPE_CODING_AGENT_RUN),
+                        description: "missing required scope: coding_agent:run".to_string(),
+                    }),
+                    "{tool} must not inherit project/job/MCP authority"
+                );
+            }
+        }
+        let allowed = oauth(&["coding_agent:run"]);
+        for tool in [
+            "coding_agent_start",
+            "coding_agent_observe",
+            "coding_agent_cancel",
+        ] {
+            assert_eq!(
+                check_runtime_tool_scope(Some(&allowed), tool),
+                Ok(()),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
     fn computer_tools_require_independent_scope() {
         let denied = oauth(&["runtime:read", "project:read"]);
         assert_eq!(

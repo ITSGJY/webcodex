@@ -2,6 +2,7 @@ use serde_json::Value;
 
 mod artifacts;
 mod checkpoints;
+mod coding_agents;
 mod coding_tasks;
 mod common;
 mod computer;
@@ -19,6 +20,9 @@ mod testing;
 use common::default_output_schema;
 
 pub(crate) fn output_schema_for_tool(name: &str) -> Value {
+    if let Some(schema) = coding_agents::output_schema_for_tool(name) {
+        return schema;
+    }
     if let Some(schema) = computer::output_schema_for_tool(name) {
         return schema;
     }
