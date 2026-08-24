@@ -5,17 +5,18 @@
 # modify credentials, agent configuration, or Scheduled Task definitions.
 #
 # The deployment contract is:
-#   verify candidate -> disable task -> stop exact old runner -> replace with
-#   rollback -> re-enable/start task -> verify the exact new image stays alive.
-# Any failure after replacement restores the previous binary and restarts it.
-# The operator must still verify Control-plane re-registration after this local
-# handoff and redeploy the retained rollback binary if that external check fails.
+#   verify candidate build -> prove exact pre-replacement Server identity ->
+#   P1a exact local replacement -> prove a fresh candidate instance/build Ready.
+# Any failure after destructive replacement begins performs bounded rollback and
+# must prove a fresh rollback instance/build Ready before recovery is considered
+# established. The Server binary/service is never modified by this helper.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$Candidate,
 
     [string]$RunnerPath = "$env:USERPROFILE\.local\bin\webcodex-runner.exe",
+    [string]$WebCodexCliPath = "$env:USERPROFILE\.local\bin\webcodex.exe",
     [string]$TaskName = "WebCodex MSI Dogfood Runner",
     [string]$TaskPath = "\",
 
@@ -23,10 +24,15 @@ param(
     [int]$StopTimeoutSecs = 20,
 
     [ValidateRange(1, 120)]
-    [int]$StartTimeoutSecs = 20
+    [int]$StartTimeoutSecs = 20,
+
+    [ValidateRange(1, 300)]
+    [int]$ReadinessTimeoutSecs = 30
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "windows_runner_process_identity.ps1")
+. (Join-Path $PSScriptRoot "windows_runner_readiness.ps1")
 
 function Get-RunnerIdentity {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -43,19 +49,6 @@ function Get-RunnerIdentity {
         throw "Runner version probe returned an unexpected identity for $Path"
     }
     return $identity
-}
-
-function Get-ExactRunnerProcesses {
-    param([Parameter(Mandatory = $true)][string]$ExactPath)
-
-    $normalized = [System.IO.Path]::GetFullPath($ExactPath)
-    return @(Get-Process -Name "webcodex-runner" -ErrorAction SilentlyContinue | Where-Object {
-        try {
-            $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -ieq $normalized)
-        } catch {
-            $false
-        }
-    })
 }
 
 function Wait-Until {
@@ -89,11 +82,26 @@ if (-not $taskWasEnabled) {
     throw "Scheduled Task is already disabled: $TaskPath$TaskName"
 }
 
+$candidateBuild = Get-RunnerBuildIdentity -Path $Candidate
 $candidateIdentity = Get-RunnerIdentity -Path $Candidate
 if (-not (Test-Path -LiteralPath $RunnerPath -PathType Leaf)) {
     throw "Existing Runner is required so deployment has a concrete rollback binary: $RunnerPath"
 }
+$previousBuild = Get-RunnerBuildIdentity -Path $RunnerPath
 $previousIdentity = Get-RunnerIdentity -Path $RunnerPath
+$oldPrimary = Get-ExactlyOnePrimaryRunner -ExactPath $RunnerPath
+$operatorProfile = Get-RunnerOperatorProfile -PrimaryIdentity $oldPrimary
+$preObservation = Get-RunnerControlPlaneObservation `
+    -WebCodexCliPath $WebCodexCliPath `
+    -ServerUrl $operatorProfile.ServerUrl `
+    -TokenFile $operatorProfile.TokenFile `
+    -ClientId $operatorProfile.ClientId `
+    -RequestTimeoutMilliseconds ([Math]::Min(5000, $ReadinessTimeoutSecs * 1000))
+$null = Assert-PreReplacementRunnerObservation `
+    -Observation $preObservation `
+    -ExpectedClientId $operatorProfile.ClientId `
+    -ExpectedBuild $previousBuild
+$oldAgentInstanceId = [string]$preObservation.agent_instance_id
 
 # Copy first so the source may be a build directory, network path, or even the
 # current RunnerPath. The staged image is fully verified before the old process
@@ -103,6 +111,8 @@ $rollbackPath = "$RunnerPath.rollback"
 $failedPath = "$RunnerPath.failed"
 $replacementInstalled = $false
 $rollbackAvailable = $false
+$candidateObservedInstanceIds = @()
+$candidateReadyObservation = $null
 
 try {
     Copy-Item -LiteralPath $Candidate -Destination $stagedPath -ErrorAction Stop
@@ -110,16 +120,18 @@ try {
     if ($stagedIdentity -ne $candidateIdentity) {
         throw "Staged Runner identity differs from the candidate"
     }
+    $stagedBuild = Get-RunnerBuildIdentity -Path $stagedPath
+    if ($stagedBuild.GitCommit -ne $candidateBuild.GitCommit -or $stagedBuild.GitDirty -ne $candidateBuild.GitDirty) {
+        throw "Staged Runner build identity differs from the candidate"
+    }
 
     # Prevent the Task Scheduler's RestartOnFailure policy from racing the
     # replacement after we intentionally terminate the old Runner.
     Disable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath | Out-Null
 
-    foreach ($process in Get-ExactRunnerProcesses -ExactPath $RunnerPath) {
-        Stop-Process -Id $process.Id -Force -ErrorAction Stop
-    }
-    Wait-Until -TimeoutSecs $StopTimeoutSecs -FailureMessage "Old Runner process did not exit before replacement" -Condition {
-        (Get-ExactRunnerProcesses -ExactPath $RunnerPath).Count -eq 0
+    Stop-CapturedPrimaryRunner -Identity $oldPrimary
+    Wait-Until -TimeoutSecs $StopTimeoutSecs -FailureMessage "Old Runner process identity did not exit before replacement" -Condition {
+        -not (Test-CapturedProcessIdentityLive -Identity $oldPrimary)
     }
     Wait-Until -TimeoutSecs $StopTimeoutSecs -FailureMessage "Scheduled Task wrapper did not stop before replacement" -Condition {
         (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath).State -ne "Running"
@@ -145,14 +157,47 @@ try {
 
     Enable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath | Out-Null
     Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
-    Wait-Until -TimeoutSecs $StartTimeoutSecs -FailureMessage "New Runner process did not start" -Condition {
-        (Get-ExactRunnerProcesses -ExactPath $RunnerPath).Count -eq 1
+    $newPrimary = $null
+    Wait-Until -TimeoutSecs $StartTimeoutSecs -FailureMessage "New primary Runner process did not start" -Condition {
+        $matches = @(Get-PrimaryRunnerProcesses -ExactPath $RunnerPath)
+        if ($matches.Count -eq 1) {
+            $script:newPrimary = $matches[0]
+            return $true
+        }
+        return $false
     }
 
-    # Catch immediate startup failures before declaring the local handoff good.
-    Start-Sleep -Seconds 3
-    if ((Get-ExactRunnerProcesses -ExactPath $RunnerPath).Count -ne 1) {
-        throw "New Runner did not remain alive after startup"
+    # P1b replaces the old arbitrary three-second persistence heuristic with the
+    # stronger bounded Server readiness proof below. The local primary was exact
+    # at startup and is revalidated again after Server readiness before success.
+
+    $candidateObserve = {
+        param([int]$RequestTimeoutMilliseconds)
+        $observation = Get-RunnerControlPlaneObservation `
+            -WebCodexCliPath $WebCodexCliPath `
+            -ServerUrl $operatorProfile.ServerUrl `
+            -TokenFile $operatorProfile.TokenFile `
+            -ClientId $operatorProfile.ClientId `
+            -RequestTimeoutMilliseconds $RequestTimeoutMilliseconds
+        $instanceId = [string]$observation.agent_instance_id
+        if (-not [string]::IsNullOrWhiteSpace($instanceId) -and
+            $instanceId -ne $oldAgentInstanceId -and
+            $script:candidateObservedInstanceIds -notcontains $instanceId) {
+            $script:candidateObservedInstanceIds += $instanceId
+        }
+        return $observation
+    }
+    $candidateReady = Wait-RunnerControlPlaneReadiness `
+        -Observe $candidateObserve `
+        -ExpectedClientId $operatorProfile.ClientId `
+        -ExpectedBuild $candidateBuild `
+        -DeadlineUtc ([DateTime]::UtcNow.AddSeconds($ReadinessTimeoutSecs)) `
+        -DisallowedAgentInstanceIds @($oldAgentInstanceId) `
+        -FailOnBuildMismatch
+    $candidateReadyObservation = $candidateReady.Observation
+    $null = Assert-CapturedPrimaryRunnerIdentity -Identity $newPrimary
+    if ((Get-PrimaryRunnerProcesses -ExactPath $RunnerPath).Count -ne 1) {
+        throw "New Runner did not remain the exactly-one primary Runner after readiness"
     }
 
     # Successful handoff: remove stale per-deployment staging images but retain
@@ -160,24 +205,66 @@ try {
     Get-ChildItem -LiteralPath $RunnerDir -Filter "webcodex-runner.*.new.exe" -File -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    Write-Output "Windows Runner dogfood local handoff succeeded."
-    Write-Output "  candidate: $candidateIdentity"
-    if ($previousIdentity) {
-        Write-Output "  previous:  $previousIdentity"
-        Write-Output "  rollback:  $rollbackPath"
-    }
-    Write-Output "  task:      $TaskPath$TaskName"
-    Write-Output "  runner:    $RunnerPath"
+    Write-Output "Windows Runner dogfood replacement readiness succeeded."
+    Write-Output "  client_id:             $($operatorProfile.ClientId)"
+    Write-Output "  old_agent_instance_id: $oldAgentInstanceId"
+    Write-Output "  new_agent_instance_id: $($candidateReadyObservation.agent_instance_id)"
+    Write-Output "  expected_build:        commit=$($candidateBuild.GitCommit) dirty=$($candidateBuild.GitDirty)"
+    Write-Output "  observed_build:        commit=$($candidateReadyObservation.build.git_commit) dirty=$($candidateReadyObservation.build.git_dirty)"
+    Write-Output "  candidate:             $candidateIdentity"
+    Write-Output "  previous:              $previousIdentity"
+    Write-Output "  rollback:              $rollbackPath"
+    Write-Output "  task:                  $TaskPath$TaskName"
+    Write-Output "  runner:                $RunnerPath"
 } catch {
     $deploymentError = $_
+    $rollbackFailure = $null
+    $rollbackReadyObservation = $null
 
     try {
-        Disable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue | Out-Null
-        foreach ($process in Get-ExactRunnerProcesses -ExactPath $RunnerPath) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        # Capture the local candidate before disabling the Task. The existing
+        # supervisor also reacts to Task disable by stopping its Runner, so doing
+        # discovery afterward can race with that intentional concurrent exit.
+        $rollbackStopTarget = $null
+        $rollbackMatches = @(Get-PrimaryRunnerProcesses -ExactPath $RunnerPath)
+        if ($rollbackMatches.Count -gt 1) {
+            throw "Multiple primary Runners found during rollback: $($rollbackMatches.Count)"
         }
-        Wait-Until -TimeoutSecs $StopTimeoutSecs -FailureMessage "Runner did not stop during rollback" -Condition {
-            (Get-ExactRunnerProcesses -ExactPath $RunnerPath).Count -eq 0
+        if ($rollbackMatches.Count -eq 1) {
+            $rollbackStopTarget = $rollbackMatches[0]
+        }
+
+        # Capture any fresh candidate instance already visible before stopping it,
+        # so that a stale candidate registration cannot satisfy rollback readiness.
+        try {
+            $beforeRollback = Get-RunnerControlPlaneObservation `
+                -WebCodexCliPath $WebCodexCliPath `
+                -ServerUrl $operatorProfile.ServerUrl `
+                -TokenFile $operatorProfile.TokenFile `
+                -ClientId $operatorProfile.ClientId `
+                -RequestTimeoutMilliseconds ([Math]::Min(2000, $ReadinessTimeoutSecs * 1000))
+            $beforeRollbackInstanceId = [string]$beforeRollback.agent_instance_id
+            if (-not [string]::IsNullOrWhiteSpace($beforeRollbackInstanceId) -and
+                $beforeRollbackInstanceId -ne $oldAgentInstanceId -and
+                $script:candidateObservedInstanceIds -notcontains $beforeRollbackInstanceId) {
+                $script:candidateObservedInstanceIds += $beforeRollbackInstanceId
+            }
+        } catch {
+            # Best-effort only: the bounded rollback readiness proof below remains authoritative.
+        }
+
+        Disable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue | Out-Null
+        if ($rollbackStopTarget) {
+            $null = Stop-CapturedPrimaryRunnerForRollback -Identity $rollbackStopTarget
+            Wait-Until -TimeoutSecs $StopTimeoutSecs -FailureMessage "Runner identity did not stop during rollback" -Condition {
+                -not (Test-CapturedProcessIdentityLive -Identity $rollbackStopTarget)
+            }
+        }
+        Wait-Until -TimeoutSecs $StopTimeoutSecs -FailureMessage "Scheduled Task wrapper did not stop during rollback" -Condition {
+            (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath).State -ne "Running"
+        }
+        if ((Get-PrimaryRunnerProcesses -ExactPath $RunnerPath).Count -ne 0) {
+            throw "Primary Runner remained live after rollback stop"
         }
 
         if ($rollbackAvailable -and (Test-Path -LiteralPath $rollbackPath -PathType Leaf)) {
@@ -188,18 +275,54 @@ try {
             $replacementInstalled = $false
             $rollbackAvailable = $false
         }
-
-        Enable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue | Out-Null
-        if (Test-Path -LiteralPath $RunnerPath -PathType Leaf) {
-            Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
-            Wait-Until -TimeoutSecs $StartTimeoutSecs -FailureMessage "Rollback Runner did not restart" -Condition {
-                (Get-ExactRunnerProcesses -ExactPath $RunnerPath).Count -eq 1
-            }
+        if (-not (Test-Path -LiteralPath $RunnerPath -PathType Leaf)) {
+            throw "Rollback binary is unavailable after restore"
         }
+        $restoredBuild = Get-RunnerBuildIdentity -Path $RunnerPath
+        if ($restoredBuild.GitCommit -ne $previousBuild.GitCommit -or $restoredBuild.GitDirty -ne $previousBuild.GitDirty) {
+            throw "Restored rollback binary build identity differs from the pre-replacement Runner"
+        }
+
+        Enable-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+        $rollbackPrimary = $null
+        Wait-Until -TimeoutSecs $StartTimeoutSecs -FailureMessage "Rollback primary Runner did not restart" -Condition {
+            $matches = @(Get-PrimaryRunnerProcesses -ExactPath $RunnerPath)
+            if ($matches.Count -eq 1) {
+                $script:rollbackPrimary = $matches[0]
+                return $true
+            }
+            return $false
+        }
+        $null = Assert-CapturedPrimaryRunnerIdentity -Identity $rollbackPrimary
+
+        $rollbackObserve = {
+            param([int]$RequestTimeoutMilliseconds)
+            Get-RunnerControlPlaneObservation `
+                -WebCodexCliPath $WebCodexCliPath `
+                -ServerUrl $operatorProfile.ServerUrl `
+                -TokenFile $operatorProfile.TokenFile `
+                -ClientId $operatorProfile.ClientId `
+                -RequestTimeoutMilliseconds $RequestTimeoutMilliseconds
+        }
+        $rollbackDisallowedIds = @($oldAgentInstanceId) + @($candidateObservedInstanceIds)
+        $rollbackReady = Wait-RunnerControlPlaneReadiness `
+            -Observe $rollbackObserve `
+            -ExpectedClientId $operatorProfile.ClientId `
+            -ExpectedBuild $previousBuild `
+            -DeadlineUtc ([DateTime]::UtcNow.AddSeconds($ReadinessTimeoutSecs)) `
+            -DisallowedAgentInstanceIds $rollbackDisallowedIds
+        $rollbackReadyObservation = $rollbackReady.Observation
+        $null = Assert-CapturedPrimaryRunnerIdentity -Identity $rollbackPrimary
     } catch {
-        Write-Warning "Rollback/restart also encountered an error: $($_.Exception.Message)"
+        $rollbackFailure = $_.Exception.Message
+        Write-Warning "Rollback/restart readiness failed: $rollbackFailure"
     }
 
+    if ($rollbackFailure) {
+        throw "Deployment failed: $($deploymentError.Exception.Message). Rollback outcome uncertain / rollback readiness failed: $rollbackFailure"
+    }
+    Write-Warning "Deployment failed, but rollback readiness was proven for agent_instance_id=$($rollbackReadyObservation.agent_instance_id) commit=$($rollbackReadyObservation.build.git_commit) dirty=$($rollbackReadyObservation.build.git_dirty)"
     throw $deploymentError
 } finally {
     if (Test-Path -LiteralPath $stagedPath) {
