@@ -1760,14 +1760,16 @@ fn finish_coding_task_output_schema_describes_ledger_validation_summary() {
         .unwrap();
     let description = description.to_lowercase();
     for phrase in [
-        "unified bounded execution evidence",
-        "dedicated validation tools",
-        "purpose-declared execution calls",
-        "validation/test/build/format/release",
+        "validation closeout evidence",
+        "full closeout",
         "historical",
         "resolved",
         "unresolved",
         "stable identity",
+        "summary_only",
+        "final status/reason",
+        "success/failure counts",
+        "zero-test integrity flag",
     ] {
         assert!(
             description.contains(phrase),
@@ -1790,13 +1792,12 @@ fn finish_coding_task_output_schema_describes_ledger_validation_summary() {
         .unwrap()
         .to_lowercase();
     for phrase in [
+        "full-closeout",
         "ledger-derived",
         "non-cargo review evidence",
-        "summary_only",
-        "read/search/diff/workspace/hygiene",
-        "bounded tools",
+        "omitted from summary_only",
+        "internally in canonical task_outcome",
         "does not include file contents",
-        "does not change validation.status",
     ] {
         assert!(
             review_description.contains(phrase),

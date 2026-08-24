@@ -1527,13 +1527,13 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["summary_only"], true);
-    assert_eq!(result.output["project"], project);
-    assert_eq!(result.output["session_id"], session_id);
+    assert!(result.output.get("project").is_none());
+    assert!(result.output.get("session_id").is_none());
     assert_eq!(result.output["workspace_clean"], true);
     assert_eq!(result.output["hygiene_clean"], true);
     assert_eq!(result.output["jobs"]["active_count"], 0);
     assert_eq!(result.output["jobs"]["blocking_active_count"], 0);
-    assert_eq!(result.output["permissions"]["total_approved_count"], 0);
+    assert!(result.output.get("permissions").is_none());
     assert_eq!(result.output["tool_failures"]["expected_count"], 0);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 0);
     assert!(result.output["tool_failures"]
@@ -1547,33 +1547,7 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
         result.output["validation"]["reason"],
         "no_validation_tool_invoked"
     );
-    assert_eq!(result.output["review_evidence"]["available"], true);
-    assert!(
-        result.output["review_evidence"]["total"].as_u64().unwrap() > 0,
-        "finish summary_only should count closeout review evidence: {}",
-        result.output["review_evidence"]
-    );
-    assert!(
-        result.output["review_evidence"]["workspace_review_count"]
-            .as_u64()
-            .unwrap()
-            > 0
-            || result.output["review_evidence"]["hygiene_review_count"]
-                .as_u64()
-                .unwrap()
-                > 0,
-        "finish summary_only should count workspace or hygiene review evidence: {}",
-        result.output["review_evidence"]
-    );
-    assert_eq!(
-        result.output["review_evidence"]["tools"]
-            .as_array()
-            .expect("review evidence tools array")
-            .first()
-            .and_then(Value::as_str),
-        Some("show_changes")
-    );
-    assert_review_evidence_tools_safe(&result.output["review_evidence"]);
+    assert!(result.output.get("review_evidence").is_none());
     assert!(result.output["warnings"].as_array().unwrap().is_empty());
     assert_finish_uses_canonical_outcomes(&result.output);
     assert!(result.output["suggested_next_actions"].is_array());
@@ -1599,8 +1573,32 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
         .iter()
         .any(|action| action.as_str() == Some("run validation before closeout when available")));
 
+    for field in [
+        "project",
+        "session_id",
+        "permissions",
+        "review_evidence",
+        "work_performed",
+        "changed_paths",
+        "handoff_brief",
+        "facts",
+        "evidence_history",
+        "informational_notes",
+    ] {
+        assert!(
+            result.output.get(field).is_none(),
+            "summary_only finish leaked {field}: {}",
+            result.output
+        );
+    }
     let serialized = serde_json::to_string(&result.output).unwrap();
-    for forbidden in ["recent_events", "recent_failed_tools", "command"] {
+    for forbidden in [
+        "recent_events",
+        "recent_failed_tools",
+        "command",
+        "stdout",
+        "stderr",
+    ] {
         assert!(
             !serialized.contains(forbidden),
             "summary_only finish leaked {forbidden}: {serialized}"
@@ -1614,7 +1612,7 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
 }
 
 #[tokio::test]
-async fn finish_coding_task_summary_only_includes_review_evidence_for_docs_only_session() {
+async fn finish_coding_task_summary_only_uses_review_evidence_without_projecting_it() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "docs.md", "hello\n", "add docs");
@@ -1695,31 +1693,7 @@ async fn finish_coding_task_summary_only_includes_review_evidence_for_docs_only_
         result.output["validation"]["reason"],
         "no_validation_tool_invoked"
     );
-    assert_eq!(result.output["review_evidence"]["available"], true);
-    assert!(
-        result.output["review_evidence"]["total"].as_u64().unwrap() >= 2,
-        "finish summary_only should preserve existing and closeout review evidence: {}",
-        result.output["review_evidence"]
-    );
-    assert_eq!(result.output["review_evidence"]["search_count"], 1);
-    assert!(
-        result.output["review_evidence"]["workspace_review_count"]
-            .as_u64()
-            .unwrap()
-            >= 2,
-        "finish summary_only should include manual and closeout workspace review evidence: {}",
-        result.output["review_evidence"]
-    );
-    let tools = result.output["review_evidence"]["tools"]
-        .as_array()
-        .expect("review evidence tools array");
-    assert!(tools
-        .iter()
-        .any(|tool| tool.as_str() == Some("search_project_text")));
-    assert!(tools
-        .iter()
-        .any(|tool| tool.as_str() == Some("show_changes")));
-    assert_review_evidence_tools_safe(&result.output["review_evidence"]);
+    assert!(result.output.get("review_evidence").is_none());
     let task_outcome = &result.output["task_outcome"];
     assert_task_outcome_shape(task_outcome);
     assert_eq!(task_outcome["status"], "warn");
@@ -1866,25 +1840,12 @@ async fn finish_coding_task_does_not_resolve_a_different_validation_identity() {
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 0);
     assert_eq!(result.output["validation"]["status"], "mixed");
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["count"],
-        1
-    );
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["resolved"],
-        false
-    );
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["unresolved"],
-        true
-    );
+    assert_eq!(result.output["validation"]["resolved_failure_count"], 0);
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 1);
     assert_eq!(result.output["task_outcome"]["status"], "fail");
     assert_eq!(result.output["task_outcome"]["blocking"], true);
     assert_task_outcome_shape(&result.output["task_outcome"]);
-    assert_eq!(
-        result.output["evidence_history"]["status"],
-        "mixed_unresolved"
-    );
+    assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
     assert_reason_list_contains(
         &result.output["task_outcome"],
@@ -1948,35 +1909,16 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
         result.output["tool_failures"]["actionable_unexpected_count"],
         0
     );
-    assert_eq!(result.output["validation"]["status"], "mixed");
+    assert_eq!(result.output["validation"]["status"], "passed");
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["resolved"],
-        true
-    );
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["unresolved"],
-        false
-    );
+    assert_eq!(full.output["validation"]["status"], "mixed");
+    assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
     assert_eq!(result.output["task_outcome"]["status"], "pass");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
-    assert!(!result.output["advisories"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|reason| reason == "historical_validation_failures_resolved"));
-    assert!(result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
-    assert_eq!(
-        result.output["evidence_history"]["status"],
-        "mixed_resolved"
-    );
+    assert!(result.output.get("advisories").is_none());
+    assert!(result.output.get("informational_notes").is_none());
+    assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
     assert_reason_list_not_contains(
         &result.output["task_outcome"],
@@ -1988,15 +1930,11 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
         "review unexpected failed tool calls before proceeding",
     );
     assert_eq!(full.output["task_outcome"], result.output["task_outcome"]);
-    assert_eq!(full.output["advisories"], result.output["advisories"]);
-    assert_eq!(
-        full.output["evidence_history"],
-        result.output["evidence_history"]
-    );
-    assert_eq!(
-        full.output["informational_notes"],
-        result.output["informational_notes"]
-    );
+    assert!(full.output["advisories"].is_array());
+    assert!(full.output["evidence_history"].is_object());
+    assert!(full.output["informational_notes"].is_array());
+    assert!(full.output["review_evidence"].is_object());
+    assert!(full.output["facts"].is_object());
     assert_eq!(
         full.output["evidence_integrity"],
         result.output["evidence_integrity"]
@@ -2045,25 +1983,13 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_c
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["resolved"],
-        true
-    );
+    assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
     assert_eq!(result.output["task_outcome"]["status"], "pass");
-    assert_eq!(
-        result.output["evidence_history"]["status"],
-        "mixed_resolved"
-    );
+    assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
-    assert!(result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
+    assert!(result.output.get("informational_notes").is_none());
     assert_reason_list_not_contains(
         &result.output["task_outcome"],
         "blocking_reasons",
@@ -2106,12 +2032,11 @@ async fn finish_coding_task_resolved_history_keeps_real_workspace_advisory() {
     .await;
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["validation"]["status"], "mixed");
+    assert_eq!(result.output["validation"]["status"], "passed");
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(
-        result.output["evidence_history"]["status"],
-        "mixed_resolved"
-    );
+    assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
+    assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
     assert_reason_list_contains(
@@ -2124,14 +2049,7 @@ async fn finish_coding_task_resolved_history_keeps_real_workspace_advisory() {
         "warning_reasons",
         "historical_validation_failures_resolved",
     );
-    assert!(result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
+    assert!(result.output.get("informational_notes").is_none());
 }
 
 #[tokio::test]
@@ -2176,12 +2094,11 @@ async fn finish_coding_task_resolved_history_keeps_real_tool_failure_blocking() 
     .await;
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["validation"]["status"], "mixed");
+    assert_eq!(result.output["validation"]["status"], "passed");
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(
-        result.output["evidence_history"]["status"],
-        "mixed_resolved"
-    );
+    assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
+    assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["task_outcome"]["status"], "fail");
     assert_eq!(result.output["task_outcome"]["blocking"], true);
     assert_reason_list_contains(
@@ -2189,14 +2106,7 @@ async fn finish_coding_task_resolved_history_keeps_real_tool_failure_blocking() 
         "blocking_reasons",
         "unexpected_tool_failures",
     );
-    assert!(result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
+    assert!(result.output.get("informational_notes").is_none());
 }
 
 #[tokio::test]
@@ -2288,7 +2198,8 @@ async fn failure_history_fail_closed_attempts_do_not_block_clean_finish() {
         &result.output["suggested_next_actions"],
         "review unexpected failed tool calls before proceeding",
     );
-    assert!(result.output["informational_notes"]
+    assert!(result.output.get("informational_notes").is_none());
+    assert!(full.output["informational_notes"]
         .as_array()
         .unwrap()
         .iter()
@@ -2513,10 +2424,7 @@ async fn finish_coding_task_summary_only_keeps_cargo_fmt_failure_blocking_when_o
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["resolved"],
-        false
-    );
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 1);
     assert_eq!(result.output["task_outcome"]["status"], "fail");
     assert_eq!(result.output["task_outcome"]["blocking"], true);
     assert_reason_list_contains(
@@ -2581,7 +2489,7 @@ async fn finish_coding_task_summary_only_warns_for_cargo_test_zero_tests_success
     );
     assert_eq!(result.output["task_outcome"]["status"], "pass");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
-    assert_eq!(result.output["evidence_history"]["status"], "clean");
+    assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "warning");
     assert_reason_list_contains(
         &result.output["evidence_integrity"],
@@ -2654,19 +2562,10 @@ async fn finish_coding_task_summary_only_keeps_cargo_test_failure_blocking_after
         result.output["validation"]["cargo_test_zero_tests_run"],
         true
     );
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["resolved"],
-        false
-    );
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["unresolved"],
-        true
-    );
+    assert_eq!(result.output["validation"]["resolved_failure_count"], 0);
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 1);
     assert_eq!(result.output["task_outcome"]["status"], "fail");
-    assert_eq!(
-        result.output["evidence_history"]["status"],
-        "mixed_unresolved"
-    );
+    assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "warning");
     assert_eq!(result.output["task_outcome"]["blocking"], true);
     assert_reason_list_contains(
@@ -2687,14 +2586,7 @@ async fn finish_coding_task_summary_only_keeps_cargo_test_failure_blocking_after
         "warning_reasons",
         "cargo_test_zero_tests",
     );
-    assert!(!result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical validation failures were resolved by later successful validation"
-            )));
+    assert!(result.output.get("informational_notes").is_none());
 }
 
 #[tokio::test]
@@ -2728,10 +2620,7 @@ async fn finish_coding_task_summary_only_blocks_unresolved_cargo_fmt_failure() {
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(result.output["validation"]["status"], "failed");
     assert_eq!(result.output["validation"]["latest_status"], "failed");
-    assert_eq!(
-        result.output["validation"]["historical_failures"]["unresolved"],
-        true
-    );
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 1);
     assert_eq!(result.output["task_outcome"]["status"], "fail");
     assert_eq!(result.output["task_outcome"]["blocking"], true);
     assert_reason_list_contains(
@@ -2798,14 +2687,161 @@ async fn finish_coding_task_summary_only_treats_read_failure_as_historical_non_a
         "blocking_reasons",
         "unexpected_tool_failures",
     );
-    assert!(result.output["informational_notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|note| note.as_str()
-            == Some(
-                "historical fail-closed tool failures are retained as non-actionable evidence"
-            )));
+    assert!(result.output.get("informational_notes").is_none());
+}
+
+#[tokio::test]
+async fn finish_coding_task_summary_only_keeps_active_blocking_job_decision_complete() {
+    let fixture = finish_summary_fixture("coding-finish-compact-jobs").await;
+    seed_session_projection_job(
+        &fixture.runtime,
+        fixture._tmp.path(),
+        "22222222-3333-4444-5555-666666666671",
+        &fixture.project,
+        &fixture.session_id,
+        "running",
+        "compact-secret-job-output\n",
+    )
+    .await;
+
+    let result = finish_coding_task_summary_only_with_agent(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project,
+        fixture.session_id,
+        fixture.auth,
+    )
+    .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["jobs"]["active_count"], 1);
+    assert_eq!(result.output["jobs"]["blocking_active_count"], 1);
+    assert_eq!(result.output["jobs"]["terminal_pending_count"], 0);
+    assert_eq!(result.output["task_outcome"]["status"], "fail");
+    assert_eq!(result.output["task_outcome"]["blocking"], true);
+    assert_reason_list_contains(
+        &result.output["task_outcome"],
+        "blocking_reasons",
+        "blocking_active_jobs",
+    );
+    let serialized = serde_json::to_string(&result.output).unwrap();
+    assert!(!serialized.contains("compact-secret-job-output"));
+    assert!(!serialized.contains("recent"));
+}
+
+#[tokio::test]
+async fn finish_coding_task_summary_only_keeps_evidence_integrity_error_visible() {
+    let fixture = finish_summary_fixture("coding-finish-compact-integrity-error").await;
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_test",
+        json!({
+            "project": fixture.project.clone(),
+            "expected_failure": true,
+            "expected_failure_kind": "validation_failed",
+            "assertion_name": "must fail as validation_failed"
+        }),
+        false,
+        json!({
+            "exit_code": 1,
+            "failure_kind": "process_exit"
+        }),
+    );
+
+    let result = finish_coding_task_summary_only_with_agent(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project,
+        fixture.session_id,
+        fixture.auth,
+    )
+    .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["evidence_integrity"]["status"], "error");
+    assert_reason_list_contains(
+        &result.output["evidence_integrity"],
+        "error_reasons",
+        "expectation_mismatches",
+    );
+    assert_eq!(result.output["task_outcome"]["status"], "fail");
+    assert_eq!(result.output["task_outcome"]["blocking"], true);
+    assert_reason_list_contains(
+        &result.output["task_outcome"],
+        "blocking_reasons",
+        "expectation_mismatches",
+    );
+}
+
+#[tokio::test]
+async fn finish_coding_task_summary_only_has_bounded_clear_size_reduction() {
+    let fixture = finish_summary_fixture("coding-finish-compact-size").await;
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_check",
+        json!({"project": fixture.project.clone()}),
+        true,
+        json!({"exit_code": 0}),
+    );
+
+    let compact = finish_coding_task_summary_only_with_agent(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project.clone(),
+        fixture.session_id.clone(),
+        fixture.auth.clone(),
+    )
+    .await;
+    let full = finish_coding_task_with_agent(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project,
+        fixture.session_id,
+        fixture.auth,
+        false,
+    )
+    .await;
+
+    assert!(compact.success, "{:?}", compact.error);
+    assert!(full.success, "{:?}", full.error);
+    let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
+    let full_bytes = serde_json::to_vec(&full).unwrap().len();
+    eprintln!("compact_finish_bytes={compact_bytes} full_finish_bytes={full_bytes}");
+    assert!(
+        compact_bytes <= 4096,
+        "compact closeout was {compact_bytes} bytes"
+    );
+    assert!(
+        compact_bytes < full_bytes,
+        "compact={compact_bytes} full={full_bytes}"
+    );
+    assert!(
+        compact_bytes * 5 <= full_bytes * 4,
+        "compact closeout should save at least 20%: compact={compact_bytes} full={full_bytes}"
+    );
+    assert_eq!(compact.output["task_outcome"], full.output["task_outcome"]);
+    assert_eq!(
+        compact.output["evidence_integrity"],
+        full.output["evidence_integrity"]
+    );
+    for field in [
+        "review_evidence",
+        "work_performed",
+        "changed_paths",
+        "handoff_brief",
+        "facts",
+    ] {
+        assert!(
+            compact.output.get(field).is_none(),
+            "compact leaked {field}"
+        );
+        assert!(
+            full.output.get(field).is_some(),
+            "full closeout lost {field}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2952,8 +2988,14 @@ fn assert_status_string(value: &Value) {
 
 fn assert_finish_uses_canonical_outcomes(output: &Value) {
     assert!(output["task_outcome"].is_object(), "{output}");
-    assert!(output["evidence_history"].is_object(), "{output}");
     assert!(output["evidence_integrity"].is_object(), "{output}");
+    if output.get("summary_only").and_then(Value::as_bool) == Some(true) {
+        assert!(output.get("evidence_history").is_none(), "{output}");
+        assert!(output.get("informational_notes").is_none(), "{output}");
+        assert!(output.get("facts").is_none(), "{output}");
+    } else {
+        assert!(output["evidence_history"].is_object(), "{output}");
+    }
     assert!(output.get("verdict").is_none(), "{output}");
     assert!(output.get("finish_verdict").is_none(), "{output}");
 }

@@ -604,11 +604,8 @@ async fn stateless_capable_current_session_fallback_exposes_context_continuity()
     assert_eq!(result.output["session_recorded"], true);
     assert_eq!(result.output["session_id"], session.session_id);
     assert_eq!(result.output["session_context_revision"], 1);
-    assert_eq!(
-        result.output["session_continuity"]["status"],
-        "unacknowledged"
-    );
-    assert!(result.output.get("session_recovery").is_some());
+    assert!(result.output.get("session_continuity").is_none());
+    assert!(result.output.get("session_recovery").is_none());
 }
 
 #[tokio::test]

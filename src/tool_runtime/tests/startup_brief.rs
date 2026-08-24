@@ -86,11 +86,22 @@ fn instruction_source<'a>(output: &'a Value, path: &str) -> &'a Value {
 fn assert_builtin_workflow(output: &Value) {
     let workflow = &output["workflow"];
     assert_eq!(workflow["contract"], "webcodex.coding_workflow");
-    assert_eq!(workflow["version"], 1);
+    assert_eq!(workflow["version"], 2);
     assert_eq!(workflow["authority"], "model_guidance_only");
     assert!(workflow["role_selection"]
         .as_str()
         .is_some_and(|value| !value.is_empty()));
+    let ack_guidance = workflow["model_protocol"]["session_context_ack"]
+        .as_str()
+        .expect("Session context ACK guidance");
+    assert!(ack_guidance.contains("newest remembered"));
+    assert!(ack_guidance.contains("omit the ACK rather than guessing"));
+    assert!(ack_guidance.contains("never blocks the business tool"));
+    let closeout_guidance = workflow["model_protocol"]["normal_closeout"]
+        .as_str()
+        .expect("normal closeout guidance");
+    assert!(closeout_guidance.contains("finish_coding_task(summary_only=true)"));
+    assert!(closeout_guidance.contains("full closeout only"));
     for role in ["implementation_owner", "independent_review"] {
         let role = &workflow["roles"][role];
         assert!(role["purpose"]

@@ -188,6 +188,43 @@ fn stateless_tool_output(body: &Value) -> &Value {
     &body["result"]["structuredContent"]["output"]
 }
 
+fn full_trace_dir_with_payload(
+    root: &std::path::Path,
+    phase: &str,
+    expected: &Value,
+) -> std::path::PathBuf {
+    for entry in std::fs::read_dir(root).unwrap().flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(events) = std::fs::read_to_string(path.join("events.jsonl")) else {
+            continue;
+        };
+        for event in events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            if event["event"] != "tool_trace_payload_captured" || event["phase"] != phase {
+                continue;
+            }
+            let Some(relative) = event["payload_path"].as_str() else {
+                continue;
+            };
+            let Ok(compressed) = std::fs::read(path.join(relative)) else {
+                continue;
+            };
+            let Ok(raw) = zstd::stream::decode_all(compressed.as_slice()) else {
+                continue;
+            };
+            if serde_json::from_slice::<Value>(&raw).ok().as_ref() == Some(expected) {
+                return path;
+            }
+        }
+    }
+    panic!("missing full-trace payload phase {phase} matching this request");
+}
+
 async fn start_stateless_observation_session(
     service: &Service,
     id: i64,
@@ -209,6 +246,72 @@ async fn start_stateless_observation_session(
         .as_str()
         .expect("stateless project Workflow Session")
         .to_string()
+}
+
+#[tokio::test]
+async fn stateless_full_trace_preserves_raw_context_ack_and_records_effective_internal_ack() {
+    let trace_root = tempfile::tempdir().unwrap();
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+    env.set(
+        "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+        trace_root.path().to_string_lossy().as_ref(),
+    );
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db, runtime));
+    let arguments = json!({"ack_session_context_revision": 42});
+    let (status, body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        41,
+        "list_tools",
+        arguments.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
+
+    let trace_dir = full_trace_dir_with_payload(trace_root.path(), "raw_arguments", &arguments);
+    let events = std::fs::read_to_string(trace_dir.join("events.jsonl")).unwrap();
+    let events = events
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    let read_phase = |phase: &str| {
+        let relative = events
+            .iter()
+            .find(|event| {
+                event["event"] == "tool_trace_payload_captured" && event["phase"] == phase
+            })
+            .and_then(|event| event["payload_path"].as_str())
+            .unwrap_or_else(|| panic!("missing trace payload phase {phase}"));
+        let compressed = std::fs::read(trace_dir.join(relative)).unwrap();
+        let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        serde_json::from_slice::<Value>(&raw).unwrap()
+    };
+
+    let raw = read_phase("raw_arguments");
+    assert_eq!(
+        raw[crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD],
+        42
+    );
+    let effective = read_phase("effective_arguments");
+    assert!(effective
+        .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD)
+        .is_none());
+    assert_eq!(
+        effective
+            [crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD],
+        42
+    );
+    let final_response = read_phase("final_response");
+    assert_eq!(final_response["result"]["isError"], false);
 }
 
 #[tokio::test]
@@ -738,7 +841,7 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
-    let service = Service::new(build_test_router(config, db, runtime.clone()));
+    let service = Service::new(build_test_router(config, db.clone(), runtime.clone()));
 
     let (status, session_body) = stateless_2026_tool_call(
         &service,
@@ -761,11 +864,8 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     assert_eq!(status, StatusCode::OK, "{first_body}");
     let first = stateless_tool_output(&first_body);
     assert_eq!(first["session_context_revision"], 1);
-    assert_eq!(first["session_continuity"]["status"], "unacknowledged");
-    assert!(first["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(first.get("session_continuity").is_none());
+    assert!(first.get("session_recovery").is_none());
 
     let mut exact_args = with_mcp_recording_session(json!({}), &session_id);
     exact_args.as_object_mut().unwrap().insert(
@@ -835,6 +935,73 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     assert_eq!(omitted["session_context_revision"], 6);
     assert_eq!(omitted["session_continuity"]["status"], "unacknowledged");
     assert!(omitted.get("session_recovery").is_some());
+
+    let mut after_missing_args = with_mcp_recording_session(json!({}), &session_id);
+    after_missing_args.as_object_mut().unwrap().insert(
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
+        json!(6),
+    );
+    let (status, after_missing_body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        234,
+        "list_tools",
+        after_missing_args,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after_missing_body}");
+    let after_missing = stateless_tool_output(&after_missing_body);
+    assert_eq!(after_missing["session_context_revision"], 7);
+    assert!(after_missing.get("session_continuity").is_none());
+    assert!(after_missing.get("session_recovery").is_none());
+
+    let telemetry_rows = {
+        let conn = db.conn_for_tests();
+        let mut statement = conn
+            .prepare(
+                "SELECT summary_json FROM action_events WHERE endpoint = '/mcp' AND operation = 'list_tools' ORDER BY rowid",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let telemetry = telemetry_rows
+        .iter()
+        .map(|row| serde_json::from_str::<Value>(row).unwrap())
+        .map(|summary| summary["model_ergonomics"].clone())
+        .collect::<Vec<_>>();
+    assert!(telemetry.iter().all(|row| row["schema_version"] == 2));
+    assert!(telemetry
+        .iter()
+        .all(|row| row["context_continuity_eligible"] == true));
+    assert_eq!(telemetry[0]["context_ack_present"], false);
+    assert_eq!(telemetry[0]["context_continuity_status"], "unacknowledged");
+    assert_eq!(telemetry[0]["session_recovery_event_count"], 0);
+    assert_eq!(telemetry[1]["context_ack_present"], true);
+    assert_eq!(telemetry[1]["context_continuity_status"], "exact");
+    assert_eq!(telemetry[2]["context_continuity_status"], "behind");
+    assert!(
+        telemetry[2]["session_recovery_event_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(telemetry[4]["context_ack_present"], true);
+    assert_eq!(telemetry[4]["context_continuity_status"], "invalid");
+    assert_eq!(telemetry[5]["context_ack_present"], false);
+    assert_eq!(telemetry[5]["context_continuity_status"], "unacknowledged");
+    assert_eq!(telemetry[6]["context_continuity_status"], "exact");
+    assert!(telemetry
+        .iter()
+        .all(|row| row["serialized_result_bytes"].is_u64()));
+    let serialized_telemetry = serde_json::to_string(&telemetry).unwrap();
+    assert!(!serialized_telemetry.contains(&session_id));
+    assert!(!serialized_telemetry.contains("ack_revision"));
+    assert!(!serialized_telemetry.contains("model_facing_events"));
 
     let audit = serde_json::to_string(
         &runtime

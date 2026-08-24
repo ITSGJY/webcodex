@@ -14,8 +14,8 @@ use super::continuation_feedback::{
 };
 use super::handoff::{
     actionable_unexpected_failure_count, apply_compact_workflow_outcomes, closeout_work_projection,
-    compact_jobs, compact_permissions, compact_review_evidence, compact_tool_failures,
-    compact_validation, project_tool_failure_actionability, review_evidence_summary_for_session,
+    compact_jobs, compact_review_evidence, compact_tool_failures, compact_validation,
+    project_tool_failure_actionability, review_evidence_summary_for_session,
     validation_has_cargo_test_zero_tests,
 };
 use super::handoff_brief::{build_handoff_brief, HandoffBriefInput};
@@ -1592,9 +1592,9 @@ impl ToolRuntime {
             guidance_available,
             existing_suggested_actions: output.get("suggested_next_actions"),
         });
-        let compact = compact_finish_output(&output);
+        let decision = finish_decision_output(&output);
         if summary_only {
-            return ToolResult::ok(compact);
+            return ToolResult::ok(compact_finish_output(&decision));
         }
         for field in [
             "facts",
@@ -1605,9 +1605,9 @@ impl ToolRuntime {
             "evidence_integrity",
             "informational_notes",
         ] {
-            output[field] = compact.get(field).cloned().unwrap_or(Value::Null);
+            output[field] = decision.get(field).cloned().unwrap_or(Value::Null);
         }
-        output["suggested_next_actions"] = compact["suggested_next_actions"].clone();
+        output["suggested_next_actions"] = decision["suggested_next_actions"].clone();
         ToolResult::ok(output)
     }
 
@@ -2544,7 +2544,7 @@ fn workspace_payload_from_git_summary(git: &Value) -> Value {
     })
 }
 
-fn compact_finish_output(output: &Value) -> Value {
+fn finish_decision_output(output: &Value) -> Value {
     let hygiene_checked = output
         .get("hygiene")
         .is_some_and(|hygiene| !hygiene.is_null());
@@ -2570,34 +2570,87 @@ fn compact_finish_output(output: &Value) -> Value {
         .pointer("/hygiene/truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut compact = json!({
-        "summary_only": true,
-        "project": output.get("project").cloned().unwrap_or(Value::Null),
-        "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
+    let mut decision = json!({
         "workspace_clean": workspace_clean,
         "workspace_conflicts": workspace_conflicts,
         "hygiene_clean": hygiene_clean,
         "hygiene_secret_like_paths": hygiene_secret_like_paths,
         "hygiene_truncated": hygiene_truncated,
         "jobs": compact_jobs(output.get("jobs").unwrap_or(&Value::Null)),
-        "permissions": compact_permissions(output.get("permissions").unwrap_or(&Value::Null)),
         "tool_failures": compact_tool_failures(output.get("tool_failures").unwrap_or(&Value::Null)),
         "validation": compact_validation(output.get("validation").unwrap_or(&Value::Null)),
         "review_evidence": compact_review_evidence(output.get("review_evidence").unwrap_or(&Value::Null)),
         "work_performed": output.get("work_performed").cloned().unwrap_or_else(|| json!([])),
         "changed_paths": output.get("changed_paths").cloned().unwrap_or_else(|| json!([])),
-        "handoff_brief": output.get("handoff_brief").cloned().unwrap_or(Value::Null),
         "warnings": output.get("final_warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });
-    apply_compact_workflow_outcomes(&mut compact, true, Some(hygiene_checked));
-    let verdict = compact.get("verdict").cloned().unwrap_or_else(|| json!({}));
-    compact["suggested_next_actions"] = json!(merged_suggested_next_actions(&compact, &verdict));
-    compact
+    apply_compact_workflow_outcomes(&mut decision, true, Some(hygiene_checked));
+    let verdict = decision
+        .get("verdict")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    decision["suggested_next_actions"] = json!(merged_suggested_next_actions(&decision, &verdict));
+    decision
         .as_object_mut()
-        .expect("compact finish output is an object")
+        .expect("finish decision output is an object")
         .remove("verdict");
-    compact
+    decision
+}
+
+fn compact_finish_output(decision: &Value) -> Value {
+    json!({
+        "summary_only": true,
+        "workspace_clean": decision.get("workspace_clean").cloned().unwrap_or(json!(false)),
+        "workspace_conflicts": decision.get("workspace_conflicts").cloned().unwrap_or(json!(0)),
+        "hygiene_clean": decision.get("hygiene_clean").cloned().unwrap_or(json!(true)),
+        "hygiene_secret_like_paths": decision.get("hygiene_secret_like_paths").cloned().unwrap_or(json!(0)),
+        "hygiene_truncated": decision.get("hygiene_truncated").cloned().unwrap_or(json!(false)),
+        "jobs": decision.get("jobs").cloned().unwrap_or_else(|| compact_jobs(&Value::Null)),
+        "validation": compact_finish_validation(decision.get("validation").unwrap_or(&Value::Null)),
+        "tool_failures": decision.get("tool_failures").cloned().unwrap_or_else(|| compact_tool_failures(&Value::Null)),
+        "task_outcome": decision.get("task_outcome").cloned().unwrap_or(Value::Null),
+        "evidence_integrity": decision.get("evidence_integrity").cloned().unwrap_or(Value::Null),
+        "warnings": decision.get("warnings").cloned().unwrap_or_else(|| json!([])),
+        "suggested_next_actions": decision.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
+fn compact_finish_validation(validation: &Value) -> Value {
+    let latest_status = validation
+        .get("latest_status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let successes = validation
+        .get("successes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let unresolved_failure_count = validation
+        .pointer("/unresolved_failures/count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // Full validation history intentionally remains `mixed` after a failure is
+    // resolved. Summary-only closeout instead reports the current authoritative
+    // state so resolved history does not masquerade as an open validation
+    // problem while the dedicated resolved count still preserves that history.
+    let status = if latest_status == "passed" && successes > 0 && unresolved_failure_count == 0 {
+        "passed"
+    } else {
+        validation
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_run")
+    };
+    json!({
+        "status": status,
+        "reason": validation.get("reason").cloned().unwrap_or(Value::Null),
+        "latest_status": latest_status,
+        "successes": successes,
+        "failures": validation.get("failures").and_then(Value::as_u64).unwrap_or(0),
+        "resolved_failure_count": validation.pointer("/resolved_failures/count").and_then(Value::as_u64).unwrap_or(0),
+        "unresolved_failure_count": unresolved_failure_count,
+        "cargo_test_zero_tests_run": validation_has_cargo_test_zero_tests(validation),
+    })
 }
 
 fn startup_verdict(
