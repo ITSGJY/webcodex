@@ -39,7 +39,7 @@ const MAX_ACTION_JSON_BYTES: usize = 384;
 const MAX_INSTRUCTION_EXCERPT_JSON_BYTES: usize = 768;
 
 pub(crate) const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub(crate) const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 1;
+pub(crate) const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 2;
 pub(crate) const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
 
 /// Stable model-facing coding/review semantics owned by WebCodex itself.
@@ -54,6 +54,10 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
         "version": BUILTIN_CODING_WORKFLOW_VERSION,
         "authority": "model_guidance_only",
         "role_selection": "Apply a role when the task instruction explicitly names it; role guidance does not create Session mode or execution authority.",
+        "model_protocol": {
+            "session_context_ack": "When a Session-aware ToolResult returns session_context_revision=N, echo the newest remembered N as ack_session_context_revision on the next Session-aware call. If the revision is unknown, omit the ACK rather than guessing; missing or stale ACK never blocks the business tool and may return bounded recovery context.",
+            "normal_closeout": "Use finish_coding_task(summary_only=true) for normal successful closeout. Use the full closeout only for unresolved validation investigation, evidence inconsistency diagnosis, or handoff/debug detail inspection."
+        },
         "roles": {
             "implementation_owner": {
                 "purpose": "Implement one coherent change through the existing authoritative architecture.",

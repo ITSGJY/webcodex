@@ -738,7 +738,7 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
-    let service = Service::new(build_test_router(config, db, runtime.clone()));
+    let service = Service::new(build_test_router(config, db.clone(), runtime.clone()));
 
     let (status, session_body) = stateless_2026_tool_call(
         &service,
@@ -761,11 +761,8 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     assert_eq!(status, StatusCode::OK, "{first_body}");
     let first = stateless_tool_output(&first_body);
     assert_eq!(first["session_context_revision"], 1);
-    assert_eq!(first["session_continuity"]["status"], "unacknowledged");
-    assert!(first["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(first.get("session_continuity").is_none());
+    assert!(first.get("session_recovery").is_none());
 
     let mut exact_args = with_mcp_recording_session(json!({}), &session_id);
     exact_args.as_object_mut().unwrap().insert(
@@ -835,6 +832,73 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     assert_eq!(omitted["session_context_revision"], 6);
     assert_eq!(omitted["session_continuity"]["status"], "unacknowledged");
     assert!(omitted.get("session_recovery").is_some());
+
+    let mut after_missing_args = with_mcp_recording_session(json!({}), &session_id);
+    after_missing_args.as_object_mut().unwrap().insert(
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
+        json!(6),
+    );
+    let (status, after_missing_body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        234,
+        "list_tools",
+        after_missing_args,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after_missing_body}");
+    let after_missing = stateless_tool_output(&after_missing_body);
+    assert_eq!(after_missing["session_context_revision"], 7);
+    assert!(after_missing.get("session_continuity").is_none());
+    assert!(after_missing.get("session_recovery").is_none());
+
+    let telemetry_rows = {
+        let conn = db.conn_for_tests();
+        let mut statement = conn
+            .prepare(
+                "SELECT summary_json FROM action_events WHERE endpoint = '/mcp' AND operation = 'list_tools' ORDER BY rowid",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let telemetry = telemetry_rows
+        .iter()
+        .map(|row| serde_json::from_str::<Value>(row).unwrap())
+        .map(|summary| summary["model_ergonomics"].clone())
+        .collect::<Vec<_>>();
+    assert!(telemetry.iter().all(|row| row["schema_version"] == 2));
+    assert!(telemetry
+        .iter()
+        .all(|row| row["context_continuity_eligible"] == true));
+    assert_eq!(telemetry[0]["context_ack_present"], false);
+    assert_eq!(telemetry[0]["context_continuity_status"], "unacknowledged");
+    assert_eq!(telemetry[0]["session_recovery_event_count"], 0);
+    assert_eq!(telemetry[1]["context_ack_present"], true);
+    assert_eq!(telemetry[1]["context_continuity_status"], "exact");
+    assert_eq!(telemetry[2]["context_continuity_status"], "behind");
+    assert!(
+        telemetry[2]["session_recovery_event_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(telemetry[4]["context_ack_present"], true);
+    assert_eq!(telemetry[4]["context_continuity_status"], "invalid");
+    assert_eq!(telemetry[5]["context_ack_present"], false);
+    assert_eq!(telemetry[5]["context_continuity_status"], "unacknowledged");
+    assert_eq!(telemetry[6]["context_continuity_status"], "exact");
+    assert!(telemetry
+        .iter()
+        .all(|row| row["serialized_result_bytes"].is_u64()));
+    let serialized_telemetry = serde_json::to_string(&telemetry).unwrap();
+    assert!(!serialized_telemetry.contains(&session_id));
+    assert!(!serialized_telemetry.contains("ack_revision"));
+    assert!(!serialized_telemetry.contains("model_facing_events"));
 
     let audit = serde_json::to_string(
         &runtime

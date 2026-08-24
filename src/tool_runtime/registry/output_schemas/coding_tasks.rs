@@ -439,6 +439,16 @@ fn startup_workflow_schema() -> Value {
             "version": {"type": "integer", "const": BUILTIN_CODING_WORKFLOW_VERSION},
             "authority": {"type": "string", "const": "model_guidance_only"},
             "role_selection": {"type": "string", "maxLength": 240},
+            "model_protocol": {
+                "type": "object",
+                "description": "Shared model-invocation guidance. It is not Session state, authority, or execution policy.",
+                "properties": {
+                    "session_context_ack": {"type": "string", "maxLength": 640},
+                    "normal_closeout": {"type": "string", "maxLength": 480}
+                },
+                "required": ["session_context_ack", "normal_closeout"],
+                "additionalProperties": false
+            },
             "roles": {
                 "type": "object",
                 "properties": {
@@ -449,7 +459,7 @@ fn startup_workflow_schema() -> Value {
                 "additionalProperties": false
             }
         },
-        "required": ["contract", "version", "authority", "role_selection", "roles"],
+        "required": ["contract", "version", "authority", "role_selection", "model_protocol", "roles"],
         "additionalProperties": false
     })
 }

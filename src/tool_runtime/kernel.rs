@@ -152,7 +152,11 @@ impl ToolRuntime {
         context: ToolCallContext<'_>,
         context_continuity_capable: bool,
     ) -> ToolCallOutcome {
-        let telemetry = ModelErgonomicsTimer::start(&request.tool_name);
+        let telemetry = ModelErgonomicsTimer::start_with_protocol(
+            &request.tool_name,
+            &request.arguments,
+            context_continuity_capable,
+        );
         let mut outcome = self
             .call_tool_with_context_inner(request, context, context_continuity_capable)
             .await;
