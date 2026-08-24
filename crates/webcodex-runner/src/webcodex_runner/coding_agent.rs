@@ -483,6 +483,8 @@ pub(crate) struct CodingAgentManager {
     #[cfg(test)]
     prompt_dispatch_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
+    prompt_after_barrier_test_delay: Mutex<Option<Duration>>,
+    #[cfg(test)]
     initial_claim_writes: std::sync::atomic::AtomicUsize,
 }
 
@@ -524,6 +526,8 @@ impl CodingAgentManager {
             #[cfg(test)]
             prompt_dispatch_test_barrier: Mutex::new(None),
             #[cfg(test)]
+            prompt_after_barrier_test_delay: Mutex::new(None),
+            #[cfg(test)]
             initial_claim_writes: std::sync::atomic::AtomicUsize::new(0),
         });
         manager.recover()?;
@@ -561,6 +565,8 @@ impl CodingAgentManager {
             admission_after_accepting_test_reached: AtomicBool::new(false),
             #[cfg(test)]
             prompt_dispatch_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            prompt_after_barrier_test_delay: Mutex::new(None),
             #[cfg(test)]
             initial_claim_writes: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -738,6 +744,31 @@ impl CodingAgentManager {
             let _ = self.request_cancel(run_id, entry);
         }
         entry.snapshot().state.terminal()
+    }
+
+    fn setup_timeout(&self, run_id: &str, entry: &Arc<RunEntry>) {
+        self.setup_failure(
+            run_id,
+            entry,
+            "coding_agent_setup_timeout",
+            "CodingAgentRun total deadline expired before ACP prompt dispatch",
+        );
+    }
+
+    fn pre_prompt_should_stop(
+        &self,
+        run_id: &str,
+        entry: &Arc<RunEntry>,
+        run_deadline: Instant,
+    ) -> bool {
+        if self.pre_prompt_interrupted(run_id, entry) {
+            return true;
+        }
+        if remaining_run_budget(run_deadline).is_none() {
+            self.setup_timeout(run_id, entry);
+            return true;
+        }
+        false
     }
 
     fn start(
@@ -970,10 +1001,11 @@ impl CodingAgentManager {
         environment: Vec<(String, std::ffi::OsString)>,
         entry: Arc<RunEntry>,
     ) {
-        let mut command = Command::new(&provider.config.executable);
-        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+        let run_deadline = Instant::now() + Duration::from_secs(request.timeout_secs);
+        if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
             return;
         }
+        let mut command = Command::new(&provider.config.executable);
         command.args(&provider.config.args).env_clear();
         for (key, value) in environment {
             command.env(key, value);
@@ -995,7 +1027,7 @@ impl CodingAgentManager {
                 return;
             }
         };
-        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+        if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
             let _ = child.terminate_tree();
             let _ = child.wait();
             return;
@@ -1079,6 +1111,11 @@ impl CodingAgentManager {
         };
 
         let mut next_id = 1u64;
+        if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
         let initialize_id = next_id;
         next_id += 1;
         if send_request(
@@ -1102,15 +1139,21 @@ impl CodingAgentManager {
             let _ = child.terminate_tree();
             return;
         }
+        let Some(initialize_wait) = bounded_setup_wait(run_deadline) else {
+            self.setup_timeout(&request.run_id, &entry);
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        };
         let initialize = match wait_response(
             &rx,
             initialize_id,
-            ACP_SETUP_TIMEOUT,
+            initialize_wait,
             Some(&entry.cancel_requested),
         ) {
             Ok(value) => value,
             Err(error) => {
-                if !self.pre_prompt_interrupted(&request.run_id, &entry) {
+                if !self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
                     self.setup_failure(
                         &request.run_id,
                         &entry,
@@ -1123,7 +1166,7 @@ impl CodingAgentManager {
                 return;
             }
         };
-        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+        if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
             let _ = child.terminate_tree();
             let _ = child.wait();
             return;
@@ -1139,7 +1182,7 @@ impl CodingAgentManager {
             return;
         }
 
-        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+        if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
             let _ = child.terminate_tree();
             let _ = child.wait();
             return;
@@ -1167,28 +1210,30 @@ impl CodingAgentManager {
             let _ = child.terminate_tree();
             return;
         }
-        let new_value = match wait_response(
-            &rx,
-            new_id,
-            ACP_SETUP_TIMEOUT,
-            Some(&entry.cancel_requested),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                if !self.pre_prompt_interrupted(&request.run_id, &entry) {
-                    self.setup_failure(
-                        &request.run_id,
-                        &entry,
-                        "coding_agent_session_new_failed",
-                        &error,
-                    );
-                }
-                let _ = child.terminate_tree();
-                let _ = child.wait();
-                return;
-            }
+        let Some(session_new_wait) = bounded_setup_wait(run_deadline) else {
+            self.setup_timeout(&request.run_id, &entry);
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
         };
-        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+        let new_value =
+            match wait_response(&rx, new_id, session_new_wait, Some(&entry.cancel_requested)) {
+                Ok(value) => value,
+                Err(error) => {
+                    if !self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
+                        self.setup_failure(
+                            &request.run_id,
+                            &entry,
+                            "coding_agent_session_new_failed",
+                            &error,
+                        );
+                    }
+                    let _ = child.terminate_tree();
+                    let _ = child.wait();
+                    return;
+                }
+            };
+        if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
             let _ = child.terminate_tree();
             let _ = child.wait();
             return;
@@ -1210,7 +1255,7 @@ impl CodingAgentManager {
         let mut advertised = new_session.config_options.unwrap_or_default();
 
         for (key, value) in &request.config {
-            if self.pre_prompt_interrupted(&request.run_id, &entry) {
+            if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
                 let _ = child.terminate_tree();
                 let _ = child.wait();
                 return;
@@ -1265,28 +1310,30 @@ impl CodingAgentManager {
                 let _ = child.terminate_tree();
                 return;
             }
-            let result = match wait_response(
-                &rx,
-                config_id,
-                ACP_SETUP_TIMEOUT,
-                Some(&entry.cancel_requested),
-            ) {
-                Ok(result) => result,
-                Err(error) => {
-                    if !self.pre_prompt_interrupted(&request.run_id, &entry) {
-                        self.setup_failure(
-                            &request.run_id,
-                            &entry,
-                            "coding_agent_config_failed",
-                            &error,
-                        );
-                    }
-                    let _ = child.terminate_tree();
-                    let _ = child.wait();
-                    return;
-                }
+            let Some(config_wait) = bounded_setup_wait(run_deadline) else {
+                self.setup_timeout(&request.run_id, &entry);
+                let _ = child.terminate_tree();
+                let _ = child.wait();
+                return;
             };
-            if self.pre_prompt_interrupted(&request.run_id, &entry) {
+            let result =
+                match wait_response(&rx, config_id, config_wait, Some(&entry.cancel_requested)) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if !self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
+                            self.setup_failure(
+                                &request.run_id,
+                                &entry,
+                                "coding_agent_config_failed",
+                                &error,
+                            );
+                        }
+                        let _ = child.terminate_tree();
+                        let _ = child.wait();
+                        return;
+                    }
+                };
+            if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
                 let _ = child.terminate_tree();
                 let _ = child.wait();
                 return;
@@ -1339,6 +1386,14 @@ impl CodingAgentManager {
             return;
         }
 
+        if remaining_run_budget(run_deadline).is_none() {
+            self.setup_timeout(&request.run_id, &entry);
+            drop(prompt_gate);
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
+
         // Irreversible uncertainty barrier: durable state is committed before the
         // first byte of session/prompt is allowed onto ACP stdin.
         if let Err(error) = self.persist_phase(
@@ -1355,6 +1410,20 @@ impl CodingAgentManager {
                 "coding_agent_dispatch_barrier_failed",
                 &error,
             );
+            drop(prompt_gate);
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
+        #[cfg(test)]
+        {
+            let delay = *self.prompt_after_barrier_test_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                thread::sleep(delay);
+            }
+        }
+        if remaining_run_budget(run_deadline).is_none() {
+            self.setup_timeout(&request.run_id, &entry);
             drop(prompt_gate);
             let _ = child.terminate_tree();
             let _ = child.wait();
@@ -1404,7 +1473,6 @@ impl CodingAgentManager {
         );
         drop(prompt_gate);
 
-        let run_deadline = Instant::now() + Duration::from_secs(request.timeout_secs);
         let mut cancel_sent = false;
         let mut cancel_deadline = None;
         loop {
@@ -1894,6 +1962,15 @@ enum ReaderEvent {
     Io,
 }
 
+fn remaining_run_budget(run_deadline: Instant) -> Option<Duration> {
+    let remaining = run_deadline.saturating_duration_since(Instant::now());
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn bounded_setup_wait(run_deadline: Instant) -> Option<Duration> {
+    remaining_run_budget(run_deadline).map(|remaining| remaining.min(ACP_SETUP_TIMEOUT))
+}
+
 fn wait_response(
     rx: &Receiver<ReaderEvent>,
     id: u64,
@@ -2252,6 +2329,7 @@ mod tests {
         let script = r#"#!/usr/bin/env python3
 import json,os,sys,time,subprocess
 scenario=sys.argv[1]
+config_values={'one':'a','two':'a','three':'a','four':'a'}
 log_path=os.path.join(os.path.dirname(__file__),'fake-acp.log')
 def log(x):
  with open(log_path,'a',encoding='utf-8') as f: f.write(json.dumps(x,separators=(',',':'))+'\n')
@@ -2271,10 +2349,18 @@ for line in sys.stdin:
    while not os.path.exists(release): time.sleep(0.01)
   send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentCapabilities':{}}})
  elif method=='session/new':
-  opts=[{'id':'mode','name':'Mode','type':'select','currentValue':'agent','options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
+  if scenario=='slow_configs':
+   opts=[{'id':k,'name':k.title(),'type':'select','currentValue':config_values[k],'options':[{'value':'a','name':'A'},{'value':'b','name':'B'}]} for k in config_values]
+  else:
+   opts=[{'id':'mode','name':'Mode','type':'select','currentValue':'agent','options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
   send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s1','configOptions':opts}})
  elif method=='session/set_config_option':
-  v=m['params']['value']; opts=[{'id':'mode','name':'Mode','type':'select','currentValue':v,'options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
+  if scenario=='slow_configs':
+   time.sleep(0.6)
+   k=m['params']['configId']; v=m['params']['value']; config_values[k]=v
+   opts=[{'id':key,'name':key.title(),'type':'select','currentValue':config_values[key],'options':[{'value':'a','name':'A'},{'value':'b','name':'B'}]} for key in config_values]
+  else:
+   v=m['params']['value']; opts=[{'id':'mode','name':'Mode','type':'select','currentValue':v,'options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
   send({'jsonrpc':'2.0','id':rid,'result':{'configOptions':opts}})
  elif method=='session/prompt':
   if scenario=='crash_after_prompt': sys.exit(7)
@@ -2357,6 +2443,22 @@ for line in sys.stdin:
             config,
             timeout_secs: 10,
         })
+    }
+
+    #[cfg(unix)]
+    fn start_request_with_timeout(
+        manager: &CodingAgentManager,
+        root: &Path,
+        run: &str,
+        config: BTreeMap<String, CodingAgentConfigValue>,
+        timeout_secs: u64,
+    ) -> CodingAgentRequest {
+        let mut request = start_request(manager, root, run, config);
+        let CodingAgentRequest::Start(start) = &mut request else {
+            unreachable!();
+        };
+        start.timeout_secs = timeout_secs;
+        request
     }
 
     #[cfg(unix)]
@@ -2939,6 +3041,150 @@ for line in sys.stdin:
             &projects,
         );
         wait_for_snapshot(&manager, winner, |snapshot| snapshot.state.terminal());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn initialize_wait_consumes_total_run_deadline() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "block_initialize");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_totalinitialize01";
+        let started_at = Instant::now();
+        let started = manager.handle(
+            start_request_with_timeout(&manager, &root, run, BTreeMap::new(), 1),
+            &projects,
+        );
+        assert!(started.error.is_none(), "{:?}", started.error);
+        let snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(snapshot.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        assert_eq!(
+            snapshot
+                .terminal
+                .as_ref()
+                .and_then(|t| t.error_code.as_deref()),
+            Some("coding_agent_setup_timeout")
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|m| m.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn config_setup_cumulatively_consumes_total_run_deadline() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "slow_configs");
+        let mut cfg = fake_config(exe, args);
+        cfg.agents[0].allowed_config_options = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_totalconfigs001";
+        let config = ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    CodingAgentConfigValue::String("b".to_string()),
+                )
+            })
+            .collect();
+        let started = manager.handle(
+            start_request_with_timeout(&manager, &root, run, config, 2),
+            &projects,
+        );
+        assert!(started.error.is_none(), "{:?}", started.error);
+        let snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(snapshot.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        assert_eq!(
+            snapshot
+                .terminal
+                .as_ref()
+                .and_then(|t| t.error_code.as_deref()),
+            Some("coding_agent_setup_timeout")
+        );
+        let methods = received_methods(&wire_log(&temp));
+        assert!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "session/set_config_option")
+                .count()
+                >= 3,
+            "expected cumulative config setup before total deadline: {methods:?}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deadline_after_durable_prompt_barrier_still_prevents_prompt_write() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "end");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_deadlinebarrier01";
+        *manager.prompt_after_barrier_test_delay.lock().unwrap() =
+            Some(Duration::from_millis(1100));
+        let started = manager.handle(
+            start_request_with_timeout(&manager, &root, run, BTreeMap::new(), 1),
+            &projects,
+        );
+        assert!(started.error.is_none(), "{:?}", started.error);
+        let snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        *manager.prompt_after_barrier_test_delay.lock().unwrap() = None;
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(snapshot.state, CodingAgentRunState::Failed);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        assert_eq!(
+            snapshot
+                .terminal
+                .as_ref()
+                .and_then(|t| t.error_code.as_deref()),
+            Some("coding_agent_setup_timeout")
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|m| m.as_str() == "session/prompt")
+                .count(),
+            0
+        );
     }
 
     #[test]
