@@ -1,16 +1,17 @@
 use super::auth::ShellClientAuthGroup;
 use crate::mcp_gateway::McpGatewayResponse;
 use crate::shell_protocol::{
-    AgentBuildInfo, AgentHostContext, AgentPolicySummary, PersistentShellResult,
-    ShellAgentProjectSummary, ShellAgentShellRequest, ShellClientCapabilities,
-    ShellCommandExecutionState, ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata,
-    ShellJobValidationProgress, ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
-    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_TERMINAL_RETENTION_SECS,
+    AgentBuildInfo, AgentHostContext, AgentPolicySummary, AgentProtocolSemantics,
+    PersistentShellResult, ShellAgentProjectSummary, ShellAgentShellRequest,
+    ShellClientCapabilities, ShellCommandExecutionState, ShellJobCodexMetadata,
+    ShellJobStructuredExecutionMetadata, ShellJobValidationProgress, ShellProcessArgv,
+    ShellProjectInventoryStatus, ShellRunResponse, JOB_INVENTORY_MAX_TERMINAL_JOBS,
+    JOB_TERMINAL_RETENTION_SECS,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, watch, Notify};
 use webcodex_core::coding_agent::{
     CodingAgentProvider, CodingAgentResponse, CodingAgentRunInventory,
 };
@@ -60,6 +61,9 @@ pub(super) struct ShellClientRecord {
     pub(super) project_inventory: ProjectInventoryState,
     pub(super) last_seen: i64,
     pub(super) agent_protocol_version: String,
+    /// Canonical semantics normalized once from the announced compatibility
+    /// label. Runtime/business logic must not reinterpret the raw string above.
+    pub(super) agent_protocol_semantics: AgentProtocolSemantics,
     /// How this client is currently connected: `"polling"`, `"websocket"`,
     /// or `"quic"`.
     pub(super) transport: String,
@@ -338,7 +342,7 @@ pub(super) struct ShellClientRegistryInner {
     /// holding the same registry mutex, closing the check/start TOCTOU window.
     pub(super) unregistering_projects: HashMap<String, usize>,
     /// Optional push notifiers for agents connected over a long-lived
-    /// transport (WebSocket). When a request is enqueued for a client that
+    /// transport (WebSocket/QUIC). When a request is enqueued for a client that
     /// has a registered notifier, the server pumps the request immediately
     /// instead of waiting for the agent to poll. Polling agents never
     /// register a notifier and are unaffected.
@@ -350,10 +354,13 @@ pub(super) struct ShellClientRegistryInner {
     pub(super) notifiers: HashMap<String, NotifierEntry>,
 }
 
-/// A registered push notifier plus the agent instance id that installed it.
+/// A registered push notifier plus the exact streaming connection lifecycle
+/// that installed it. `cancel` is process-local and is signalled only after a
+/// successful authoritative replacement has committed.
 #[derive(Debug, Clone)]
 pub(super) struct NotifierEntry {
     pub(super) notify: Arc<Notify>,
+    pub(super) cancel: watch::Sender<bool>,
     pub(super) agent_instance_id: String,
     pub(super) connection_id: Option<String>,
 }

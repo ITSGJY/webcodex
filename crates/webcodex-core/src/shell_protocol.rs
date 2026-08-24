@@ -28,14 +28,6 @@ fn default_shell_job_kind() -> String {
     "shell".to_string()
 }
 
-/// Default `agent_protocol_version` used when a client registers without
-/// declaring one. Old agents that predate the version field show up as
-/// `"unknown"` so operators can distinguish them from agents that explicitly
-/// announce `"polling-v1"`.
-fn default_agent_protocol_version() -> String {
-    "unknown".to_string()
-}
-
 /// Default `transport` for `ShellClientView` when deserializing views that
 /// predate the transport field (e.g. older snapshots). Polling is the legacy
 /// default.
@@ -43,10 +35,12 @@ fn default_transport_polling() -> String {
     "polling".to_string()
 }
 
-/// Protocol version announced by current `webcodex-runner` polling builds.
+/// Legacy polling wire label for inline project registration. The `v1`/`v2`
+/// suffix is a rolling-compatibility projection of project inventory strategy,
+/// not the canonical agent protocol generation.
 pub const AGENT_PROTOCOL_VERSION_POLLING_V1: &str = "polling-v1";
-/// Polling registration uses bounded project bootstrap summaries followed by
-/// negotiated paged project-inventory synchronization.
+/// Legacy polling wire label for paged project inventory. Current Servers
+/// normalize this label at registration ingress before business logic sees it.
 pub const AGENT_PROTOCOL_VERSION_POLLING_V2: &str = "polling-v2";
 /// Model/user-authored raw shell command ceiling. Raw shell remains a bounded
 /// escape hatch; larger program text belongs in `run_script`, while large
@@ -122,34 +116,95 @@ pub const GO_TEST_PACKAGE_MAX_ITEMS: usize = 8;
 /// Maximum byte length of one focused `go_test` package pattern.
 pub const GO_TEST_PACKAGE_MAX_BYTES: usize = 256;
 
-/// Protocol version announced by `webcodex-runner` builds that connect over
-/// WebSocket. Kept in the shared protocol module so both the server and the
-/// agent binary reference the same literal.
+/// Legacy WebSocket wire label for inline project registration. Kept in the
+/// shared protocol module so Server and Runner agree on the rolling-compatibility
+/// representation without treating the label as canonical transport semantics.
 pub const AGENT_PROTOCOL_VERSION_WEBSOCKET_V1: &str = "websocket-v1";
-/// WebSocket registration uses bounded project bootstrap summaries followed by
-/// `project_inventory_page` envelopes.
+/// Legacy WebSocket wire label for paged project inventory. The `v2` suffix is
+/// compatibility metadata rather than a distinct canonical protocol generation.
 pub const AGENT_PROTOCOL_VERSION_WEBSOCKET_V2: &str = "websocket-v2";
 
-/// Protocol version announced by `webcodex-runner` builds that connect over the
-/// custom QUIC stream transport. Kept in the shared protocol module so the
-/// server and the agent binary reference the same literal.
-///
-/// `quic-v1` is the custom QUIC stream transport protocol version. It uses the
-/// same `AgentEnvelope` model for registration, keepalive, request dispatch,
-/// results, and job updates. The transport label remains `"quic"` (see
-/// `TRANSPORT_QUIC`).
+/// Legacy QUIC wire label for inline project registration. QUIC still uses the
+/// shared `AgentEnvelope` grammar; the actual transport identity remains the
+/// separate `"quic"` transport state maintained by the Server connection path.
 pub const AGENT_PROTOCOL_VERSION_QUIC_V1: &str = "quic-v1";
-/// QUIC registration uses bounded project bootstrap summaries followed by
-/// `project_inventory_page` envelopes.
+/// Legacy QUIC wire label for paged project inventory. The `v2` suffix is
+/// compatibility metadata rather than a distinct canonical protocol generation.
 pub const AGENT_PROTOCOL_VERSION_QUIC_V2: &str = "quic-v2";
 
-pub fn agent_protocol_uses_paged_project_inventory(version: &str) -> bool {
-    matches!(
-        version,
+/// Canonical compatibility identity for the agent request/response grammar.
+///
+/// All six historical transport x `v1`/`v2` labels below describe the same
+/// compatibility generation. Their suffix difference only projects registration
+/// inventory strategy for rolling compatibility with older Servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProtocolCompatibility {
+    V1,
+    Unsupported,
+}
+
+impl Default for AgentProtocolCompatibility {
+    fn default() -> Self {
+        Self::Unsupported
+    }
+}
+
+impl AgentProtocolCompatibility {
+    pub fn is_supported(self) -> bool {
+        matches!(self, Self::V1)
+    }
+
+    /// V1 project summaries have an explicit optional Git metadata contract, so
+    /// absent Git fields mean "not a Git project" rather than "old peer unknown".
+    pub fn reports_project_git_metadata(self) -> bool {
+        matches!(self, Self::V1)
+    }
+}
+
+/// Canonical project inventory synchronization strategy for one registration.
+/// This is deliberately independent from transport and protocol compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProjectInventoryStrategy {
+    Inline,
+    Paged,
+}
+
+impl Default for AgentProjectInventoryStrategy {
+    fn default() -> Self {
+        Self::Inline
+    }
+}
+
+/// Server-normalized semantics derived once from the legacy announced wire label.
+/// Business logic must consume this representation rather than reinterpreting the
+/// raw transport/version string.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProtocolSemantics {
+    pub compatibility: AgentProtocolCompatibility,
+    pub project_inventory: AgentProjectInventoryStrategy,
+}
+
+/// Compatibility ingress adapter for historical `transport-v1/v2` labels.
+/// Unknown labels fail closed to an unsupported compatibility identity and do
+/// not opt into paged inventory by suffix guessing.
+pub fn normalize_agent_protocol_semantics(version: &str) -> AgentProtocolSemantics {
+    match version {
+        AGENT_PROTOCOL_VERSION_POLLING_V1
+        | AGENT_PROTOCOL_VERSION_WEBSOCKET_V1
+        | AGENT_PROTOCOL_VERSION_QUIC_V1 => AgentProtocolSemantics {
+            compatibility: AgentProtocolCompatibility::V1,
+            project_inventory: AgentProjectInventoryStrategy::Inline,
+        },
         AGENT_PROTOCOL_VERSION_POLLING_V2
-            | AGENT_PROTOCOL_VERSION_WEBSOCKET_V2
-            | AGENT_PROTOCOL_VERSION_QUIC_V2
-    )
+        | AGENT_PROTOCOL_VERSION_WEBSOCKET_V2
+        | AGENT_PROTOCOL_VERSION_QUIC_V2 => AgentProtocolSemantics {
+            compatibility: AgentProtocolCompatibility::V1,
+            project_inventory: AgentProjectInventoryStrategy::Paged,
+        },
+        _ => AgentProtocolSemantics::default(),
+    }
 }
 pub const AGENT_QUIC_ALPN_V1: &str = "webcodex-runner/1";
 
@@ -910,8 +965,10 @@ pub struct ShellClientRegisterRequest {
     pub host_context: Option<AgentHostContext>,
     #[serde(default)]
     pub projects: Option<Vec<ShellAgentProjectSummary>>,
-    /// Protocol version announced by the agent during registration. Older
-    /// agents that omit this field are treated as `"unknown"` by the server.
+    /// Protocol identity announced by the agent during registration. The wire
+    /// field remains optional at deserialization so every transport can return
+    /// the same explicit registration-validation error for an omitted field;
+    /// successful registration requires a non-empty value.
     #[serde(default)]
     pub agent_protocol_version: Option<String>,
     /// Sanitized agent policy summary. Older agents that omit this field
@@ -1095,10 +1152,13 @@ pub struct ShellClientView {
     /// predates paged inventory synchronization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_inventory: Option<ShellProjectInventoryStatus>,
-    /// Agent-announced protocol version. Defaults to `"unknown"` for agents
-    /// that registered before this field existed.
-    #[serde(default = "default_agent_protocol_version")]
+    /// Agent-announced protocol identity preserved for diagnostics. Successful
+    /// registration always supplies this value; there is no omission fallback.
     pub agent_protocol_version: String,
+    /// Canonical Server-normalized semantics for business decisions. The raw
+    /// announced label above remains diagnostics-only after registration ingress.
+    #[serde(skip)]
+    pub agent_protocol_semantics: AgentProtocolSemantics,
     /// Transport the agent is currently connected over: `"polling"`,
     /// `"websocket"`, or `"quic"`. Defaults to `"polling"` for older
     /// agents/views.
@@ -2595,21 +2655,13 @@ pub struct ShellClientJobsListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEnvelope {
-    /// Agent -> server. First message after the WebSocket handshake. Carries
-    /// the same payload as `POST /api/shell/agent/register`.
+    /// Agent -> server registration application envelope. WebSocket sends this
+    /// after its authenticated HTTP handshake. QUIC keeps authentication in its
+    /// transport-specific first-register codec and enters the shared envelope
+    /// lifecycle only after transport authentication succeeds.
     Register {
         #[serde(flatten)]
         payload: ShellClientRegisterRequest,
-        /// Optional agent/bearer token carried inline. Used ONLY by the QUIC
-        /// transport, which has no HTTP middleware to inject an
-        /// `Authorization` header. WebSocket always leaves this `None` (auth
-        /// is enforced by `AuthMiddleware` on the HTTP handshake) and the
-        /// server ignores it on that path. The field is
-        /// `skip_serializing_if = None` so the WebSocket wire format is
-        /// byte-identical to before. Never logged: the QUIC handler reads it
-        /// once and drops it before any tracing.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth_token: Option<String>,
     },
     /// Server -> agent. Acknowledgement of `Register`.
     Registered {
@@ -2699,6 +2751,47 @@ impl AgentEnvelope {
     }
 }
 
+/// QUIC-v1 transport registration wire. Authentication remains transport-owned
+/// while retaining the byte-compatible first-frame JSON shape expected by
+/// rolling-old Servers and Runners: `type=register`, flattened registration
+/// payload fields, and an optional `auth_token`.
+///
+/// Deliberately does not implement `Debug`: the credential must not become
+/// printable through routine transport diagnostics.
+#[derive(Serialize, Deserialize)]
+pub struct QuicRegisterFrame {
+    #[serde(rename = "type")]
+    frame_type: QuicRegisterFrameType,
+    #[serde(flatten)]
+    payload: ShellClientRegisterRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_token: Option<String>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum QuicRegisterFrameType {
+    #[serde(rename = "register")]
+    Register,
+}
+
+impl QuicRegisterFrame {
+    pub fn new(payload: ShellClientRegisterRequest, auth_token: Option<String>) -> Self {
+        Self {
+            frame_type: QuicRegisterFrameType::Register,
+            payload,
+            auth_token,
+        }
+    }
+
+    pub fn payload_mut(&mut self) -> &mut ShellClientRegisterRequest {
+        &mut self.payload
+    }
+
+    pub fn into_parts(self) -> (ShellClientRegisterRequest, Option<String>) {
+        (self.payload, self.auth_token)
+    }
+}
+
 // ============================================================================
 // QUIC length-prefixed frame codec
 // ============================================================================
@@ -2754,9 +2847,8 @@ impl std::fmt::Display for QuicFrameError {
 
 impl std::error::Error for QuicFrameError {}
 
-/// Encode an envelope as a length-prefixed frame: `u32_be(len) || json`.
-pub fn encode_quic_frame(env: &AgentEnvelope) -> Result<Vec<u8>, QuicFrameError> {
-    let json = serde_json::to_vec(env).map_err(QuicFrameError::Json)?;
+fn encode_quic_json<T: Serialize>(value: &T) -> Result<Vec<u8>, QuicFrameError> {
+    let json = serde_json::to_vec(value).map_err(QuicFrameError::Json)?;
     // u32 cap is far above QUIC_FRAME_MAX_BYTES, but guard anyway so a
     // pathological payload can never overflow the length prefix.
     if json.len() > QUIC_FRAME_MAX_BYTES {
@@ -2772,6 +2864,17 @@ pub fn encode_quic_frame(env: &AgentEnvelope) -> Result<Vec<u8>, QuicFrameError>
     Ok(out)
 }
 
+/// Encode an envelope as a length-prefixed frame: `u32_be(len) || json`.
+pub fn encode_quic_frame(env: &AgentEnvelope) -> Result<Vec<u8>, QuicFrameError> {
+    encode_quic_json(env)
+}
+
+/// Encode the QUIC-v1 transport-owned register frame without routing its
+/// credential through [`AgentEnvelope`].
+pub fn encode_quic_register_frame(frame: &QuicRegisterFrame) -> Result<Vec<u8>, QuicFrameError> {
+    encode_quic_json(frame)
+}
+
 /// Write a single length-prefixed frame to an async sink.
 pub async fn write_quic_frame<W>(w: &mut W, env: &AgentEnvelope) -> Result<(), QuicFrameError>
 where
@@ -2783,8 +2886,21 @@ where
     Ok(())
 }
 
-/// Read a single length-prefixed frame from an async source and decode it.
-pub async fn read_quic_frame<R>(r: &mut R) -> Result<AgentEnvelope, QuicFrameError>
+/// Write the transport-owned QUIC-v1 registration frame.
+pub async fn write_quic_register_frame<W>(
+    w: &mut W,
+    frame: &QuicRegisterFrame,
+) -> Result<(), QuicFrameError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let buf = encode_quic_register_frame(frame)?;
+    w.write_all(&buf).await.map_err(QuicFrameError::Io)?;
+    Ok(())
+}
+
+async fn read_quic_frame_body<R>(r: &mut R) -> Result<Vec<u8>, QuicFrameError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -2813,12 +2929,74 @@ where
             QuicFrameError::Io(e)
         }
     })?;
+    Ok(buf)
+}
+
+/// Read a single length-prefixed shared application envelope.
+pub async fn read_quic_frame<R>(r: &mut R) -> Result<AgentEnvelope, QuicFrameError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let buf = read_quic_frame_body(r).await?;
     AgentEnvelope::from_slice(&buf).map_err(QuicFrameError::Json)
+}
+
+/// Read the transport-owned first QUIC-v1 registration frame. A structurally
+/// valid registration with a missing token decodes successfully so the Server
+/// can preserve the existing external `unauthorized` behavior.
+pub async fn read_quic_register_frame<R>(r: &mut R) -> Result<QuicRegisterFrame, QuicFrameError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let buf = read_quic_frame_body(r).await?;
+    serde_json::from_slice(&buf).map_err(QuicFrameError::Json)
 }
 
 #[cfg(test)]
 mod envelope_tests {
     use super::*;
+
+    #[test]
+    fn legacy_agent_protocol_labels_normalize_into_one_protocol_generation() {
+        for version in [
+            AGENT_PROTOCOL_VERSION_POLLING_V1,
+            AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+            AGENT_PROTOCOL_VERSION_QUIC_V1,
+        ] {
+            let semantics = normalize_agent_protocol_semantics(version);
+            assert_eq!(semantics.compatibility, AgentProtocolCompatibility::V1);
+            assert!(semantics.compatibility.reports_project_git_metadata());
+            assert_eq!(
+                semantics.project_inventory,
+                AgentProjectInventoryStrategy::Inline
+            );
+        }
+        for version in [
+            AGENT_PROTOCOL_VERSION_POLLING_V2,
+            AGENT_PROTOCOL_VERSION_WEBSOCKET_V2,
+            AGENT_PROTOCOL_VERSION_QUIC_V2,
+        ] {
+            let semantics = normalize_agent_protocol_semantics(version);
+            assert_eq!(semantics.compatibility, AgentProtocolCompatibility::V1);
+            assert!(semantics.compatibility.reports_project_git_metadata());
+            assert_eq!(
+                semantics.project_inventory,
+                AgentProjectInventoryStrategy::Paged
+            );
+        }
+
+        let unknown = normalize_agent_protocol_semantics("future-v2");
+        assert_eq!(
+            unknown.compatibility,
+            AgentProtocolCompatibility::Unsupported
+        );
+        assert!(!unknown.compatibility.reports_project_git_metadata());
+        assert_eq!(
+            unknown.project_inventory,
+            AgentProjectInventoryStrategy::Inline,
+            "unknown suffixes must not opt into paged inventory"
+        );
+    }
 
     fn sample_process_request() -> ShellAgentShellRequest {
         ShellAgentShellRequest {
@@ -3080,13 +3258,10 @@ mod envelope_tests {
     fn register_envelope_round_trips_with_type_tag() {
         let env = AgentEnvelope::Register {
             payload: sample_register(),
-            auth_token: None,
         };
         let json = env.to_json().unwrap();
         assert!(json.contains(r#""type":"register""#), "json was: {json}");
         assert!(json.contains(r#""client_id":"ws-1""#));
-        // WebSocket sets auth_token=None; the field must not appear on the
-        // wire so the websocket format is unchanged.
         assert!(!json.contains(r#""auth_token""#), "json was: {json}");
         let back = AgentEnvelope::from_slice(json.as_bytes()).unwrap();
         match back {
@@ -3103,6 +3278,39 @@ mod envelope_tests {
                 assert!(caps.persistent_shell);
             }
             other => panic!("expected register, got {:?}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn current_websocket_register_remains_latest_stable_v038_envelope_readable() {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LatestStableV038Envelope {
+            Register {
+                #[serde(flatten)]
+                payload: ShellClientRegisterRequest,
+                #[serde(default)]
+                auth_token: Option<String>,
+            },
+        }
+
+        let json = AgentEnvelope::Register {
+            payload: sample_register(),
+        }
+        .to_json()
+        .unwrap();
+        match serde_json::from_str::<LatestStableV038Envelope>(&json).unwrap() {
+            LatestStableV038Envelope::Register {
+                payload,
+                auth_token,
+            } => {
+                assert_eq!(payload.client_id, "ws-1");
+                assert_eq!(
+                    payload.agent_protocol_version.as_deref(),
+                    Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1)
+                );
+                assert!(auth_token.is_none());
+            }
         }
     }
 
@@ -3419,12 +3627,9 @@ mod envelope_tests {
 
         let mut websocket = polling.clone();
         websocket.agent_protocol_version = Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string());
-        let websocket_json = AgentEnvelope::Register {
-            payload: websocket,
-            auth_token: None,
-        }
-        .to_json()
-        .unwrap();
+        let websocket_json = AgentEnvelope::Register { payload: websocket }
+            .to_json()
+            .unwrap();
         let websocket_back = AgentEnvelope::from_slice(websocket_json.as_bytes()).unwrap();
         match websocket_back {
             AgentEnvelope::Register { payload, .. } => {
@@ -3436,19 +3641,19 @@ mod envelope_tests {
 
         let mut quic = polling;
         quic.agent_protocol_version = Some(AGENT_PROTOCOL_VERSION_QUIC_V1.to_string());
-        let quic_frame = encode_quic_frame(&AgentEnvelope::Register {
-            payload: quic,
-            auth_token: Some("test-only-token".to_string()),
-        })
+        let quic_frame = encode_quic_register_frame(&QuicRegisterFrame::new(
+            quic,
+            Some("test-only-token".to_string()),
+        ))
         .unwrap();
         let mut quic_reader = quic_frame.as_slice();
-        match read_quic_frame(&mut quic_reader).await.unwrap() {
-            AgentEnvelope::Register { payload, .. } => {
-                assert_eq!(payload.job_inventory.as_ref(), Some(&inventory));
-                assert_eq!(payload.job_concurrency_limit, Some(4));
-            }
-            other => panic!("expected quic register, got {:?}", other.kind()),
-        }
+        let (payload, auth_token) = read_quic_register_frame(&mut quic_reader)
+            .await
+            .unwrap()
+            .into_parts();
+        assert_eq!(payload.job_inventory.as_ref(), Some(&inventory));
+        assert_eq!(payload.job_concurrency_limit, Some(4));
+        assert_eq!(auth_token.as_deref(), Some("test-only-token"));
     }
 
     #[test]
@@ -4306,44 +4511,68 @@ mod envelope_tests {
         assert!(matches!(err, QuicFrameError::EmptyStream), "got {err:?}");
     }
 
-    #[test]
-    fn register_envelope_with_auth_token_serializes_when_some() {
-        // QUIC sets auth_token=Some; the field appears on the wire so the
-        // server can authenticate the agent. WebSocket leaves it None (tested
-        // separately) so its wire format is unchanged.
-        let env = AgentEnvelope::Register {
-            payload: ShellClientRegisterRequest {
-                process_started_at: None,
-                build: None,
-                client_id: "q-1".to_string(),
-                agent_instance_id: "11111111-1111-1111-1111-111111111111".to_string(),
-                display_name: None,
-                owner: None,
-                hostname: None,
-                capabilities: None,
-                host_context: None,
-                projects: None,
-                agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_QUIC_V1.to_string()),
-                policy: None,
-                job_concurrency_limit: None,
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-            },
-            auth_token: Some("wc_agent_secret".to_string()),
+    #[tokio::test]
+    async fn quic_register_codec_preserves_legacy_wire_shape_and_round_trips() {
+        let payload = ShellClientRegisterRequest {
+            process_started_at: None,
+            build: None,
+            client_id: "q-1".to_string(),
+            agent_instance_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            display_name: None,
+            owner: None,
+            hostname: None,
+            capabilities: None,
+            host_context: None,
+            projects: None,
+            agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_QUIC_V1.to_string()),
+            policy: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
         };
-        let json = env.to_json().unwrap();
+        let frame = QuicRegisterFrame::new(payload, Some("wc_agent_secret".to_string()));
+        let encoded = encode_quic_register_frame(&frame).unwrap();
+        let json = std::str::from_utf8(&encoded[4..]).unwrap();
+        assert!(json.contains(r#""type":"register""#), "json was: {json}");
+        assert!(json.contains(r#""client_id":"q-1""#), "json was: {json}");
         assert!(
             json.contains(r#""auth_token":"wc_agent_secret""#),
             "json was: {json}"
         );
-        let back = AgentEnvelope::from_slice(json.as_bytes()).unwrap();
-        match back {
-            AgentEnvelope::Register { auth_token, .. } => {
+
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyQuicRegisterEnvelope {
+            Register {
+                #[serde(flatten)]
+                payload: ShellClientRegisterRequest,
+                #[serde(default)]
+                auth_token: Option<String>,
+            },
+        }
+        match serde_json::from_str::<LegacyQuicRegisterEnvelope>(json).unwrap() {
+            LegacyQuicRegisterEnvelope::Register {
+                payload,
+                auth_token,
+            } => {
+                assert_eq!(payload.client_id, "q-1");
                 assert_eq!(auth_token.as_deref(), Some("wc_agent_secret"));
             }
-            other => panic!("expected register, got {:?}", other.kind()),
         }
+
+        let legacy_json = format!(
+            r#"{{"type":"register","client_id":"q-legacy","agent_instance_id":"11111111-1111-1111-1111-111111111112","agent_protocol_version":"quic-v1","auth_token":"legacy-secret"}}"#
+        );
+        let mut legacy_wire = Vec::new();
+        legacy_wire.extend_from_slice(&(legacy_json.len() as u32).to_be_bytes());
+        legacy_wire.extend_from_slice(legacy_json.as_bytes());
+        let (legacy_payload, legacy_token) = read_quic_register_frame(&mut legacy_wire.as_slice())
+            .await
+            .unwrap()
+            .into_parts();
+        assert_eq!(legacy_payload.client_id, "q-legacy");
+        assert_eq!(legacy_token.as_deref(), Some("legacy-secret"));
     }
 }
 

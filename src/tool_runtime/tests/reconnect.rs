@@ -7,7 +7,9 @@ use crate::auth::AuthContext;
 use crate::client_window::ClientWindow;
 use crate::shell_protocol::{
     AgentBuildInfo, AgentHostContext, ShellClientCapabilities, ShellClientRegisterRequest,
-    ShellJobOpRequest,
+    ShellJobOpRequest, AGENT_PROTOCOL_VERSION_POLLING_V1, AGENT_PROTOCOL_VERSION_POLLING_V2,
+    AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_QUIC_V2,
+    AGENT_PROTOCOL_VERSION_WEBSOCKET_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V2,
 };
 use crate::tool_runtime::tool_inputs::{SessionMode, StartupDetail};
 use crate::tool_runtime::{ToolCall, ToolRuntime};
@@ -1555,6 +1557,86 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
 }
 
 #[tokio::test]
+async fn version_compatibility_accepts_all_normalized_legacy_wire_forms() {
+    let runtime = test_runtime();
+    let cases = [
+        (
+            "polling-inline",
+            AGENT_PROTOCOL_VERSION_POLLING_V1,
+            "polling",
+            "inline",
+        ),
+        (
+            "polling-paged",
+            AGENT_PROTOCOL_VERSION_POLLING_V2,
+            "polling",
+            "paged",
+        ),
+        (
+            "websocket-inline",
+            AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
+            "websocket",
+            "inline",
+        ),
+        (
+            "websocket-paged",
+            AGENT_PROTOCOL_VERSION_WEBSOCKET_V2,
+            "websocket",
+            "paged",
+        ),
+        (
+            "quic-inline",
+            AGENT_PROTOCOL_VERSION_QUIC_V1,
+            "quic",
+            "inline",
+        ),
+        (
+            "quic-paged",
+            AGENT_PROTOCOL_VERSION_QUIC_V2,
+            "quic",
+            "paged",
+        ),
+    ];
+
+    for (client_id, protocol, transport, _) in cases.iter().copied() {
+        runtime
+            .shell_clients
+            .register(register_request(client_id, "inst", None, None, protocol))
+            .await
+            .unwrap();
+        runtime
+            .shell_clients
+            .set_transport(client_id, transport)
+            .await
+            .unwrap();
+    }
+
+    let status = runtime.runtime_status(None).await;
+    assert!(status.success);
+    let runners = status.output["version_compatibility"]["runners"]
+        .as_array()
+        .unwrap();
+    let clients = status.output["agents"]["clients"].as_array().unwrap();
+    for (client_id, raw_protocol, transport, inventory_strategy) in cases.iter().copied() {
+        let runner = runners
+            .iter()
+            .find(|runner| runner["client_id"] == client_id)
+            .unwrap_or_else(|| panic!("runner {client_id} missing"));
+        assert_eq!(runner["agent_protocol_version"], raw_protocol);
+        assert_eq!(runner["protocol_supported"], true);
+        assert_eq!(runner["protocol_compatibility"], "v1");
+        assert_eq!(runner["project_inventory_strategy"], inventory_strategy);
+        assert_eq!(runner["status"], "compatible");
+
+        let client = clients
+            .iter()
+            .find(|client| client["client_id"] == client_id)
+            .unwrap_or_else(|| panic!("client {client_id} missing"));
+        assert_eq!(client["transport"], transport);
+    }
+}
+
+#[tokio::test]
 async fn version_compatibility_reports_stable_mismatch_facts() {
     let runtime = test_runtime();
     let server_version = env!("CARGO_PKG_VERSION");
@@ -1597,8 +1679,9 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
         ))
         .await
         .unwrap();
-    // Unrecognized protocol → capability_mismatch.
-    runtime
+    // Unsupported protocol identities fail registration and therefore never
+    // become a diagnostic-but-operational runtime client.
+    let unsupported = runtime
         .shell_clients
         .register(register_request(
             "legacy",
@@ -1608,12 +1691,13 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
             "prehistoric-v0",
         ))
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(unsupported, "agent_protocol_version is unsupported");
 
     let status = runtime.runtime_status(None).await;
     assert!(status.success);
     let compat = &status.output["version_compatibility"];
-    assert_eq!(compat["status"], "capability_mismatch");
+    assert_eq!(compat["status"], "version_mismatch");
     assert_eq!(compat["server"]["version"], server_version);
     let runners = compat["runners"].as_array().unwrap();
     let by_id = |id: &str| {
@@ -1642,11 +1726,6 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
         .as_str()
         .unwrap()
         .contains("align"));
-    assert_eq!(by_id("legacy")["status"], "capability_mismatch");
-    assert_eq!(
-        by_id("legacy")["reason_code"],
-        "agent_protocol_version_unsupported"
-    );
     let compact = crate::tool_runtime::runtime_info::compact_runtime_status(&status.output);
     let compact_runner = compact["agents"]["clients"]
         .as_array()

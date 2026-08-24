@@ -248,7 +248,7 @@ async fn authenticated_project_fixture_for(recipe: &str) -> AuthenticatedProject
                     updated_at: 1,
                     shell_profile: None,
                 }]),
-                agent_protocol_version: Some("test".to_string()),
+                agent_protocol_version: Some("polling-v1".to_string()),
                 policy: None,
             },
             Some(&agent_auth),
@@ -372,6 +372,7 @@ fn agent_transport_cases(client_id: &str) -> [(&'static str, serde_json::Value);
             serde_json::json!({
                 "client_id": client_id,
                 "agent_instance_id": PROJECT_AGENT_INSTANCE,
+                "agent_protocol_version": "polling-v1",
                 "owner": "local-owner"
             }),
         ),
@@ -446,6 +447,7 @@ async fn project_agent_token_enforces_client_id_and_bootstrap_still_registers() 
         serde_json::json!({
             "client_id": "bootstrap-client",
             "agent_instance_id": "bootstrap-instance",
+            "agent_protocol_version": "polling-v1",
             "owner": "local-owner"
         }),
     )

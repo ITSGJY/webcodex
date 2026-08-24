@@ -23,12 +23,34 @@ use crate::shell_client::{
 };
 use crate::shell_protocol::{AgentEnvelope, ShellAgentPollRequest, ShellClientRegisterRequest};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
 /// Channel capacity for outgoing envelopes (requests + pongs). Provides
 /// backpressure if the agent reads slowly. Shared by both transports.
 pub(crate) const OUTGOING_CHANNEL_CAPACITY: usize = 64;
+
+/// Bound post-session joins for the request pump and transport writer.
+const STREAM_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Transport writer completion without retaining an unsent envelope or error body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriterExit {
+    ChannelClosed,
+    TransportFailed,
+}
+
+/// Request-pump completion without retaining a registry error or request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PumpExit {
+    /// The shared writer feed has closed as part of session teardown.
+    ChannelClosed,
+    /// This concrete connection no longer owns the active registry lease.
+    LeaseLost,
+    /// The registry rejected the pump for another bounded internal reason.
+    RegistryFailed,
+}
 
 /// Error from [`register_session_prelude`]: the agent transport boundary
 /// rejected the register. Both variants surface to the wire as the
@@ -114,56 +136,52 @@ pub(crate) struct SessionContext<'a> {
     pub(crate) agent_instance_id: &'a str,
     pub(crate) connection_id: &'a str,
     pub(crate) notify: Arc<Notify>,
+    /// Exact process-local cancellation lease for this streaming connection.
+    /// Successful replacement signals it only after the new connection commits.
+    pub(crate) cancel: watch::Receiver<bool>,
     /// Log label: `"websocket"` or `"quic"`.
     pub(crate) transport_label: &'static str,
 }
 
-/// Drive the post-register session to completion: request pump, reader-loop
-/// dispatch, and teardown.
+/// Drive the post-register session to completion: request pump, reader-loop,
+/// replacement cancellation, writer health, and bounded teardown.
 ///
 /// The caller owns the transport-specific **writer task** (`writer_task`),
-/// which drains `out_tx` (an `AgentEnvelope` mpsc) onto the wire; this function
-/// owns the **pump** (which feeds `out_tx`) and the **reader loop**. On exit
-/// the pump is aborted, `out_tx` is dropped (so the writer flushes and exits),
-/// the writer is joined, and the disconnect is reconciled according to the
-/// registered capability: reconciliation-capable runners enter the bounded
-/// `recovering` state, while legacy runners become `lost`; the client then
-/// decays to stale/offline.
-///
-/// Returns when the reader loop ends (peer closed, sent `Goodbye`, or a fatal
-/// read). The caller is responsible for any post-teardown transport logging.
+/// which drains `out_tx` (an `AgentEnvelope` mpsc) onto the wire. This function
+/// owns the connection-scoped **request pump** and directly observes its task,
+/// the reader, the writer, and the exact replacement-cancellation lease. A
+/// silent pump exit therefore cannot leave a pending reader/writer registered
+/// as a zombie session.
 pub(crate) async fn run_agent_session(
     ctx: SessionContext<'_>,
     out_tx: mpsc::Sender<AgentEnvelope>,
-    mut reader: impl AgentReader,
-    writer_task: JoinHandle<()>,
+    reader: impl AgentReader,
+    writer_task: JoinHandle<WriterExit>,
 ) {
-    let SessionContext {
-        registry,
-        client_id,
-        agent_instance_id,
-        connection_id,
-        notify,
-        transport_label,
-    } = ctx;
+    let pump_task = spawn_request_pump(&ctx, out_tx.clone());
+    run_agent_session_with_pump(ctx, out_tx, reader, writer_task, pump_task).await;
+}
 
-    // Request pump: drain the shared registry queue for this connection and
-    // push Request envelopes. Waits on the notifier when idle. This is the
-    // only consumer of the queue for this connection; polling agents use the
-    // HTTP poll endpoint against the same queue.
-    //
-    // The pump is bound to this concrete connection's lease. A same-instance
-    // reconnect installs a new connection_id; once this connection loses the
-    // lease, the scoped poll rejects it before dequeuing, so an older socket
-    // cannot steal requests that belong to the new connection. On rejection
-    // the pump stops rather than falling back to an unscoped poll or retrying.
-    let pump_tx = out_tx.clone();
-    let pump_registry = Arc::clone(registry);
-    let pump_client_id = client_id.to_string();
-    let pump_instance_id = agent_instance_id.to_string();
-    let pump_connection_id = connection_id.to_string();
-    let pump_notify = Arc::clone(&notify);
-    let pump_task = tokio::spawn(async move {
+fn classify_pump_poll_error(error: &str) -> PumpExit {
+    if error.contains("transport connection is no longer active")
+        || error.contains("no longer the active instance")
+    {
+        PumpExit::LeaseLost
+    } else {
+        PumpExit::RegistryFailed
+    }
+}
+
+fn spawn_request_pump(
+    ctx: &SessionContext<'_>,
+    pump_tx: mpsc::Sender<AgentEnvelope>,
+) -> JoinHandle<PumpExit> {
+    let pump_registry = Arc::clone(ctx.registry);
+    let pump_client_id = ctx.client_id.to_string();
+    let pump_instance_id = ctx.agent_instance_id.to_string();
+    let pump_connection_id = ctx.connection_id.to_string();
+    let pump_notify = Arc::clone(&ctx.notify);
+    tokio::spawn(async move {
         loop {
             // Create the notified future before polling so an enqueue that
             // happens while poll returns None is not missed.
@@ -178,76 +196,176 @@ pub(crate) async fn run_agent_session(
                 .await
             {
                 Ok(Some(request)) => {
-                    // Do not log the SendError: its Debug representation can
-                    // include the unsent request envelope, which may carry
-                    // command/stdin payloads. The closed channel is enough.
+                    // Do not retain/log SendError<AgentEnvelope>: it can include
+                    // command/stdin payloads. The semantic channel exit is enough.
                     if pump_tx
                         .send(AgentEnvelope::Request { request })
                         .await
                         .is_err()
                     {
-                        tracing::debug!(
-                            client_id = %pump_client_id,
-                            "agent {} pump send channel closed; stopping pump",
-                            transport_label
-                        );
-                        break;
+                        return PumpExit::ChannelClosed;
                     }
                 }
-                Ok(None) => {
-                    notified.await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        client_id = %pump_client_id,
-                        error = %e,
-                        "agent {} pump poll failed; stopping pump",
-                        transport_label
-                    );
-                    break;
-                }
+                Ok(None) => notified.await,
+                Err(error) => return classify_pump_poll_error(&error),
             }
         }
-    });
+    })
+}
 
-    // Reader loop: dispatch inbound envelopes into the connection lease. A
-    // `Goodbye` reconciles the disconnect inline and then breaks the loop.
+async fn run_agent_session_with_pump(
+    ctx: SessionContext<'_>,
+    out_tx: mpsc::Sender<AgentEnvelope>,
+    mut reader: impl AgentReader,
+    writer_task: JoinHandle<WriterExit>,
+    pump_task: JoinHandle<PumpExit>,
+) {
+    let SessionContext {
+        registry,
+        client_id,
+        agent_instance_id,
+        connection_id,
+        notify: _,
+        mut cancel,
+        transport_label,
+    } = ctx;
+
+    let mut pump_task = pump_task;
+    let mut writer_task = writer_task;
+    let mut pump_observed = false;
+    let mut writer_observed = false;
+
     loop {
-        match reader.recv().await {
-            RecvOutcome::Envelope(env) => {
-                let is_goodbye = matches!(&env, AgentEnvelope::Goodbye { .. });
-                dispatch_inbound(
-                    env,
-                    registry,
-                    client_id,
-                    agent_instance_id,
-                    connection_id,
-                    &out_tx,
-                    transport_label,
-                )
-                .await;
-                if is_goodbye {
-                    break;
+        tokio::select! {
+            pump = &mut pump_task => {
+                pump_observed = true;
+                let reason_code = match pump {
+                    Ok(PumpExit::ChannelClosed) => "pump_channel_closed",
+                    Ok(PumpExit::LeaseLost) => "pump_lease_lost",
+                    Ok(PumpExit::RegistryFailed) => "pump_registry_failed",
+                    Err(error) if error.is_panic() => "pump_task_panicked",
+                    Err(_) => "pump_task_cancelled",
+                };
+                tracing::debug!(
+                    client_id = client_id,
+                    reason_code,
+                    "agent {} request pump ended; terminating session",
+                    transport_label
+                );
+                break;
+            }
+            writer = &mut writer_task => {
+                writer_observed = true;
+                let reason_code = match writer {
+                    Ok(WriterExit::ChannelClosed) => "writer_channel_closed",
+                    Ok(WriterExit::TransportFailed) => "writer_transport_failed",
+                    Err(error) if error.is_panic() => "writer_task_panicked",
+                    Err(_) => "writer_task_cancelled",
+                };
+                tracing::debug!(
+                    client_id = client_id,
+                    reason_code,
+                    "agent {} writer ended; terminating session",
+                    transport_label
+                );
+                break;
+            }
+            cancellation = cancel.changed() => {
+                if cancellation.is_ok() && !*cancel.borrow() {
+                    continue;
+                }
+                let reason_code = if cancellation.is_ok() {
+                    "connection_replaced"
+                } else {
+                    "connection_cancel_channel_closed"
+                };
+                tracing::debug!(
+                    client_id = client_id,
+                    reason_code,
+                    "agent {} session cancellation observed; terminating session",
+                    transport_label
+                );
+                break;
+            }
+            received = reader.recv() => {
+                match received {
+                    RecvOutcome::Envelope(env) => {
+                        let is_goodbye = matches!(&env, AgentEnvelope::Goodbye { .. });
+                        dispatch_inbound(
+                            env,
+                            registry,
+                            client_id,
+                            agent_instance_id,
+                            connection_id,
+                            &out_tx,
+                            transport_label,
+                        )
+                        .await;
+                        if is_goodbye {
+                            break;
+                        }
+                    }
+                    RecvOutcome::Skip => continue,
+                    RecvOutcome::Closed => break,
                 }
             }
-            RecvOutcome::Skip => continue,
-            RecvOutcome::Closed => break,
         }
     }
 
-    // Teardown: stop the pump, drop the writer's feed so it flushes and exits,
-    // join the writer, and reconcile the disconnect so a disconnected agent
-    // never leaves jobs permanently "running" or stays online forever (the
-    // client decays to stale via last_seen).
-    pump_task.abort();
+    // Unified bounded teardown. An unobserved pump is aborted and joined before
+    // the writer feed is dropped, ensuring its Sender clone cannot orphan the
+    // writer. Exact connection reconciliation keeps every stale-A exit harmless
+    // after a successful replacement has already committed B.
+    if !pump_observed {
+        pump_task.abort();
+        match tokio::time::timeout(STREAM_TASK_JOIN_TIMEOUT, &mut pump_task).await {
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => {
+                tracing::debug!(
+                    client_id = client_id,
+                    reason_code = "pump_join_timeout",
+                    "agent {} request pump join timed out after abort",
+                    transport_label
+                );
+            }
+        }
+    }
+
     drop(out_tx);
-    if let Err(e) = writer_task.await {
-        tracing::debug!(
-            client_id = client_id,
-            error = ?e,
-            "agent {} writer task join failed",
-            transport_label
-        );
+    if !writer_observed {
+        match tokio::time::timeout(STREAM_TASK_JOIN_TIMEOUT, &mut writer_task).await {
+            Ok(Ok(WriterExit::ChannelClosed)) => {}
+            Ok(Ok(WriterExit::TransportFailed)) => {
+                tracing::debug!(
+                    client_id = client_id,
+                    reason_code = "writer_transport_failed_during_teardown",
+                    "agent {} writer failed during teardown",
+                    transport_label
+                );
+            }
+            Ok(Err(error)) => {
+                let reason_code = if error.is_panic() {
+                    "writer_task_panicked_during_teardown"
+                } else {
+                    "writer_task_cancelled_during_teardown"
+                };
+                tracing::debug!(
+                    client_id = client_id,
+                    reason_code,
+                    "agent {} writer join failed during teardown",
+                    transport_label
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    client_id = client_id,
+                    reason_code = "writer_join_timeout",
+                    "agent {} writer join timed out; aborting writer",
+                    transport_label
+                );
+                writer_task.abort();
+            }
+        }
     }
     registry
         .reconcile_disconnect_for_connection(client_id, agent_instance_id, connection_id)
@@ -446,3 +564,7 @@ async fn dispatch_inbound(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agent_session_tests.rs"]
+mod tests;

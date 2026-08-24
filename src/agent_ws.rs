@@ -37,9 +37,10 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// WebSocket agent endpoint: `GET /api/agents/ws` (also mounted at
 /// `/api/agents/ws`). Requires auth via the shared `AuthMiddleware`, exactly
-/// like the polling endpoints. The normal path is `Authorization: Bearer
-/// <token>`; `?token=` is accepted only on this WebSocket handshake path for
-/// compatibility with clients that cannot set handshake headers.
+/// like the polling endpoints. The supported path is `Authorization: Bearer
+/// <token>`. The Server temporarily retains the exact `/api/agents/ws?token=`
+/// v0.1.0 compatibility surface; it is deprecated, never emitted by the
+/// first-party Runner, and must not expand to other endpoints.
 #[handler]
 pub async fn agent_ws(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(registry) = depot.obtain::<Arc<ShellClientRegistry>>().ok().cloned() else {
@@ -117,92 +118,55 @@ async fn handle_agent_ws(
         return;
     }
 
-    // 2. Register into the shared registry (same path as polling register),
-    //    then flip the transport label and install a push notifier so the
-    //    request pump can be woken on enqueue.
-    if let Err(e) = registry
-        .register_with_auth_connection(register_payload, auth.as_ref(), Some(&connection_id))
-        .await
-    {
-        send_envelope_or_log(
-            &mut ws,
-            AgentEnvelope::Error {
-                code: "register_failed".to_string(),
-                message: e,
-            },
-            "register_failed",
-        )
-        .await;
-        return;
-    }
-    if let Err(e) = registry
-        .set_transport_for_connection(
-            &client_id,
-            &agent_instance_id,
+    // 2. Commit the complete streaming session in one registry transaction.
+    //    Transport identity comes from this handler, not the raw protocol label.
+    let notify = Arc::new(Notify::new());
+    let (view, cancel) = match registry
+        .register_streaming_session_with_cancel(
+            register_payload,
+            auth.as_ref(),
             &connection_id,
             TRANSPORT_WEBSOCKET,
-        )
-        .await
-    {
-        send_envelope_or_log(
-            &mut ws,
-            AgentEnvelope::Error {
-                code: "register_failed".to_string(),
-                message: e,
-            },
-            "register_failed",
-        )
-        .await;
-        registry
-            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
-            .await;
-        return;
-    }
-    let notify = Arc::new(Notify::new());
-    if registry
-        .register_notifier_for_connection(
-            &client_id,
-            &agent_instance_id,
-            &connection_id,
             notify.clone(),
         )
         .await
-        .is_err()
     {
-        send_envelope_or_log(
-            &mut ws,
-            AgentEnvelope::Error {
-                code: "register_failed".to_string(),
-                message: "failed to install push notifier".to_string(),
-            },
-            "register_failed",
-        )
-        .await;
-        registry
-            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
+        Ok(session) => session,
+        Err(e) => {
+            send_envelope_or_log(
+                &mut ws,
+                AgentEnvelope::Error {
+                    code: "register_failed".to_string(),
+                    message: e,
+                },
+                "register_failed",
+            )
             .await;
-        return;
-    }
-    // Fetch the view after set_transport so the ack reflects the websocket
-    // transport label rather than the default "polling".
-    let Some(view) = registry
-        .get_client_view_for_connection(&client_id, &agent_instance_id, &connection_id)
-        .await
-    else {
-        return;
+            return;
+        }
     };
 
-    // 3. Acknowledge the register.
-    send_envelope_or_log(
+    // 3. Acknowledge the register. A failed post-commit ack means this
+    //    concrete connection never completed its handshake, so revoke only
+    //    this exact connection lease before returning. A same-instance newer
+    //    reconnect remains protected by the connection_id fence.
+    if send_envelope(
         &mut ws,
         AgentEnvelope::Registered {
             success: true,
             client: Some(view),
             error: None,
         },
-        "registered",
     )
-    .await;
+    .await
+    .is_err()
+    {
+        tracing::debug!(client_id = %client_id, "agent websocket registered ack send failed");
+        registry
+            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
+            .await;
+        return;
+    }
     tracing::info!(client_id = %client_id, "agent websocket connected");
 
     // 4. Split the socket into a writer (owned by a writer task) and a reader
@@ -218,21 +182,17 @@ async fn handle_agent_ws(
         let mut sink = sink;
         let mut out_rx = out_rx;
         while let Some(env) = out_rx.recv().await {
-            match env.to_json() {
-                Ok(json) => {
-                    if let Err(e) = sink.send(Message::text(json)).await {
-                        tracing::debug!(error = ?e, "agent websocket writer send failed; stopping writer");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "agent websocket writer failed to encode envelope; stopping writer");
-                    break;
-                }
+            let Ok(json) = env.to_json() else {
+                return crate::agent_session::WriterExit::TransportFailed;
+            };
+            if sink.send(Message::text(json)).await.is_err() {
+                return crate::agent_session::WriterExit::TransportFailed;
             }
         }
-        if let Err(e) = sink.close().await {
-            tracing::debug!(error = ?e, "agent websocket writer close failed");
+        if sink.close().await.is_err() {
+            crate::agent_session::WriterExit::TransportFailed
+        } else {
+            crate::agent_session::WriterExit::ChannelClosed
         }
     });
 
@@ -247,6 +207,7 @@ async fn handle_agent_ws(
             agent_instance_id: &agent_instance_id,
             connection_id: &connection_id,
             notify,
+            cancel,
             transport_label: "websocket",
         },
         out_tx,
@@ -459,7 +420,6 @@ mod tests {
                 ),
                 policy: Some(AgentPolicySummary::default()),
             },
-            auth_token: None,
         }
     }
 
@@ -601,10 +561,7 @@ mod tests {
             updated_at: chrono::Utc::now().timestamp(),
             shell_profile: None,
         }]);
-        AgentEnvelope::Register {
-            payload,
-            auth_token: None,
-        }
+        AgentEnvelope::Register { payload }
     }
 
     #[tokio::test]
@@ -749,6 +706,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.stdout.as_deref(), Some("authentic"));
+    }
+
+    #[tokio::test]
+    async fn ws_register_requires_explicit_protocol_version() {
+        let registry = Arc::new(ShellClientRegistry::default());
+        let addr = start_server(registry.clone()).await;
+        let url = format!("ws://{}/api/agents/ws", addr);
+        let (mut ws, _resp) = connect_async(url).await.expect("ws connect");
+        let mut register = register_envelope("ws-missing-protocol");
+        let AgentEnvelope::Register { payload, .. } = &mut register else {
+            unreachable!("register helper must return Register")
+        };
+        payload.agent_protocol_version = None;
+        ws.send(TungsteniteMessage::Text(register.to_json().unwrap().into()))
+            .await
+            .unwrap();
+
+        match recv_envelope(&mut ws).await {
+            AgentEnvelope::Error { code, message } => {
+                assert_eq!(code, "register_failed");
+                assert_eq!(message, "agent_protocol_version is required");
+            }
+            other => panic!("expected register_failed, got {:?}", other.kind()),
+        }
+        assert!(registry
+            .get_client_view("ws-missing-protocol")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ws_register_rejects_unsupported_protocol_version() {
+        let registry = Arc::new(ShellClientRegistry::default());
+        let addr = start_server(registry.clone()).await;
+        let url = format!("ws://{}/api/agents/ws", addr);
+        let (mut ws, _resp) = connect_async(url).await.expect("ws connect");
+        let mut register = register_envelope("ws-unsupported-protocol");
+        let AgentEnvelope::Register { payload, .. } = &mut register else {
+            unreachable!("register helper must return Register")
+        };
+        payload.agent_protocol_version = Some("websocket-next".to_string());
+        ws.send(TungsteniteMessage::Text(register.to_json().unwrap().into()))
+            .await
+            .unwrap();
+
+        match recv_envelope(&mut ws).await {
+            AgentEnvelope::Error { code, message } => {
+                assert_eq!(code, "register_failed");
+                assert_eq!(message, "agent_protocol_version is unsupported");
+            }
+            other => panic!("expected register_failed, got {:?}", other.kind()),
+        }
+        assert!(registry
+            .get_client_view("ws-unsupported-protocol")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -1539,18 +1552,20 @@ mod tests {
         // Sleep so a successful touch would observably advance last_seen.
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
-        // A sends a Ping. The server replies with a Pong (best-effort keepalive
-        // echo) but the underlying touch must be rejected, so B's last_seen is
-        // unchanged.
-        ws_a.send(TungsteniteMessage::Text(
-            AgentEnvelope::Ping { ts: 1 }.to_json().unwrap().into(),
-        ))
-        .await
-        .unwrap();
-        // Best-effort: drain the Pong if it arrived so it doesn't back up.
-        let _ = tokio::time::timeout(Duration::from_millis(500), recv_envelope(&mut ws_a)).await;
-        // Give the server a moment to finish processing.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // P5a actively terminates A after B commits, so a stale socket no
+        // longer remains usable as a keepalive source at all. Observe its
+        // terminal state within a bounded window, then verify B's liveness was
+        // not refreshed while only the replaced connection was being closed.
+        let stale_exit = tokio::time::timeout(Duration::from_millis(500), ws_a.next())
+            .await
+            .expect("replaced WebSocket A must terminate promptly");
+        assert!(
+            matches!(
+                stale_exit,
+                None | Some(Ok(TungsteniteMessage::Close(_))) | Some(Err(_))
+            ),
+            "replaced WebSocket A must close instead of receiving application traffic"
+        );
 
         let after_a = registry
             .get_client_view("ws-stale-ping")
@@ -1559,7 +1574,7 @@ mod tests {
             .last_seen;
         assert_eq!(
             after_a, before,
-            "stale instance ping must not refresh active last_seen"
+            "replaced instance termination must not refresh active last_seen"
         );
 
         // B sends a Ping and its liveness IS refreshed.
@@ -1642,12 +1657,17 @@ mod tests {
             other => panic!("expected request on B, got {:?}", other),
         }
 
-        // A must not receive the (already-dispatched) request: it remains
-        // quiet. Give it a window and assert nothing arrives.
-        let stolen = tokio::time::timeout(Duration::from_millis(500), ws_a.next()).await;
+        // P5a actively cancels A once B commits. The stale socket must
+        // terminate promptly; it must not remain open/quiet behind a dead pump.
+        let stale_exit = tokio::time::timeout(Duration::from_millis(500), ws_a.next())
+            .await
+            .expect("replaced WebSocket A must terminate promptly");
         assert!(
-            stolen.is_err(),
-            "stale connection pump must not steal the request dispatched to B"
+            matches!(
+                stale_exit,
+                None | Some(Ok(TungsteniteMessage::Close(_))) | Some(Err(_))
+            ),
+            "replaced WebSocket A must close instead of receiving application traffic"
         );
     }
 }

@@ -136,6 +136,8 @@ mod apply_text_edits;
 mod artifact_read;
 #[path = "main_tests/artifact_upload.rs"]
 mod artifact_upload;
+#[path = "main_tests/compatibility.rs"]
+mod compatibility;
 #[path = "main_tests/config_reload.rs"]
 mod config_reload;
 #[path = "main_tests/dispatch_file.rs"]
@@ -1161,6 +1163,11 @@ fn generated_agent_instance_id_is_non_empty_uuid_like() {
     let body = build_register_request(&cfg, Vec::new(), AGENT_PROTOCOL_VERSION_POLLING_V1, &id, 0);
     assert_eq!(body.agent_instance_id, id);
     assert!(!body.agent_instance_id.is_empty());
+    assert_eq!(
+        body.agent_protocol_version.as_deref(),
+        Some(AGENT_PROTOCOL_VERSION_POLLING_V1),
+        "first-party registration builders must always declare protocol identity"
+    );
 }
 
 fn ws_sink(client_id: &str) -> (AgentSink, tokio::sync::mpsc::Receiver<AgentEnvelope>) {
@@ -1448,6 +1455,11 @@ fn empty_tokens_are_not_sent_as_credentials() {
     assert_eq!(
         request.headers().get(AUTHORIZATION).unwrap(),
         "Bearer abc123"
+    );
+    assert_eq!(request.uri().path(), "/api/agents/ws");
+    assert!(
+        request.uri().query().is_none(),
+        "first-party WebSocket auth must not put credentials in the URL"
     );
 
     assert_eq!(non_empty_token(""), None);

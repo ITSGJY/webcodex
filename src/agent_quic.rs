@@ -18,7 +18,11 @@
 use crate::auth::authenticate_bearer;
 use crate::config::{Config, QuicRuntimeStatus, QuicServerConfig};
 use crate::shell_client::{ShellClientRegistry, TRANSPORT_QUIC};
-use crate::shell_protocol::{read_quic_frame, write_quic_frame, AgentEnvelope};
+use crate::shell_protocol::{
+    read_quic_frame, read_quic_register_frame, write_quic_frame, AgentEnvelope,
+};
+#[cfg(test)]
+use crate::shell_protocol::{write_quic_register_frame, QuicRegisterFrame};
 use crate::Database;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
@@ -227,14 +231,17 @@ async fn handle_quic_connection(
         }
     };
 
-    // 1. Read the first frame within a deadline; it must be a Register.
-    let register_env =
-        match tokio::time::timeout(REGISTER_TIMEOUT, read_quic_frame(&mut recv)).await {
-            Ok(Ok(env)) => env,
+    // 1. QUIC owns its credential-bearing first-register wire. The codec keeps
+    //    the current QUIC-v1 JSON shape for rolling compatibility, but the
+    //    shared AgentEnvelope lifecycle never sees the credential.
+    let register_frame =
+        match tokio::time::timeout(REGISTER_TIMEOUT, read_quic_register_frame(&mut recv)).await {
+            Ok(Ok(frame)) => frame,
             Ok(Err(e)) => {
                 tracing::debug!(
+                    reason_code = "malformed_register",
                     error = %e,
-                    "quic agent wrong first frame or register read failed"
+                    "quic agent first register frame rejected"
                 );
                 send_error(&mut send, &mut recv, "expected_register", &e.to_string()).await;
                 return;
@@ -251,26 +258,7 @@ async fn handle_quic_connection(
                 return;
             }
         };
-    let (mut register_payload, auth_token) = match register_env {
-        AgentEnvelope::Register {
-            payload,
-            auth_token,
-        } => (payload, auth_token),
-        other => {
-            tracing::debug!(
-                kind = other.kind(),
-                "quic agent wrong first frame; expected register"
-            );
-            send_error(
-                &mut send,
-                &mut recv,
-                "expected_register",
-                &format!("expected register envelope, got {}", other.kind()),
-            )
-            .await;
-            return;
-        }
-    };
+    let (mut register_payload, auth_token) = register_frame.into_parts();
     let client_id = register_payload.client_id.clone();
     let agent_instance_id = register_payload.agent_instance_id.clone();
     let connection_id = uuid::Uuid::new_v4().to_string();
@@ -278,6 +266,7 @@ async fn handle_quic_connection(
     // 2. Authenticate the agent token exactly like the HTTP/WebSocket paths.
     //    The token is dropped immediately after auth so it is never logged.
     let auth = authenticate_bearer(&config, db.as_ref(), auth_token.as_deref()).await;
+    drop(auth_token);
     let auth = match auth {
         Some(ctx) => ctx,
         None => {
@@ -321,102 +310,70 @@ async fn handle_quic_connection(
         return;
     }
 
-    // 4. Register into the shared registry (same path as polling/ws), then
-    //    flip the transport label to "quic". QUIC v1 is the full envelope flow
-    //    and keeps the agent's real capabilities.
-    if let Err(e) = registry
-        .register_with_auth_connection(register_payload, Some(&auth), Some(&connection_id))
-        .await
-    {
-        tracing::warn!(
-            client_id = %client_id,
-            error = %e,
-            "quic agent register failed in registry"
-        );
-        send_error(&mut send, &mut recv, "register_failed", &e).await;
-        return;
-    }
-    if let Err(e) = registry
-        .set_transport_for_connection(
-            &client_id,
-            &agent_instance_id,
+    // 4. Commit the complete QUIC session in one registry transaction. The
+    //    transport credential is already gone; only AuthContext and the
+    //    registration payload enter shared session state.
+    let notify = Arc::new(Notify::new());
+    let (view, cancel) = match registry
+        .register_streaming_session_with_cancel(
+            register_payload,
+            Some(&auth),
             &connection_id,
             TRANSPORT_QUIC,
-        )
-        .await
-    {
-        send_error(&mut send, &mut recv, "register_failed", &e).await;
-        registry
-            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
-            .await;
-        return;
-    }
-    let notify = Arc::new(Notify::new());
-    if let Err(e) = registry
-        .register_notifier_for_connection(
-            &client_id,
-            &agent_instance_id,
-            &connection_id,
             notify.clone(),
         )
         .await
     {
-        send_error(&mut send, &mut recv, "register_failed", &e).await;
-        registry
-            .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
-            .await;
-        return;
-    }
-    let Some(view) = registry
-        .get_client_view_for_connection(&client_id, &agent_instance_id, &connection_id)
-        .await
-    else {
-        send_error(
-            &mut send,
-            &mut recv,
-            "register_failed",
-            "client vanished after register",
-        )
-        .await;
-        return;
+        Ok(session) => session,
+        Err(e) => {
+            tracing::warn!(
+                client_id = %client_id,
+                error = %e,
+                "quic agent register failed in registry"
+            );
+            send_error(&mut send, &mut recv, "register_failed", &e).await;
+            return;
+        }
     };
 
-    // 5. From this point on, all writes go through one writer task so the
-    //    request pump and keepalive replies never concurrently hold SendStream.
-    let (out_tx, mut out_rx) =
-        mpsc::channel::<AgentEnvelope>(crate::agent_session::OUTGOING_CHANNEL_CAPACITY);
-    let writer_client_id = client_id.clone();
-    let writer_task = tokio::spawn(async move {
-        while let Some(env) = out_rx.recv().await {
-            if let Err(e) = write_quic_frame(&mut send, &env).await {
-                tracing::debug!(
-                    client_id = %writer_client_id,
-                    error = %e,
-                    "quic writer send failed; stopping writer"
-                );
-                break;
-            }
-        }
-        let _ = send.finish();
-    });
-
-    // 6. Acknowledge the register.
+    // 5. Acknowledge the committed registration before the writer task takes
+    //    ownership of SendStream. Queueing the ack into an mpsc would only prove
+    //    local admission, not that the handshake reached the QUIC stream. If the
+    //    actual write fails, revoke only this exact connection lease.
     let ack = AgentEnvelope::Registered {
         success: true,
         client: Some(view),
         error: None,
     };
-    if out_tx.send(ack).await.is_err() {
+    if let Err(e) = write_quic_frame(&mut send, &ack).await {
         tracing::debug!(
             client_id = %client_id,
-            "quic agent register ack channel closed"
+            error = %e,
+            "quic agent registered ack send failed"
         );
         registry
             .reconcile_disconnect_for_connection(&client_id, &agent_instance_id, &connection_id)
             .await;
-        let _ = writer_task.await;
         return;
     }
+
+    // 6. After the registration handshake, all writes go through one writer
+    //    task so the request pump and keepalive replies never concurrently hold
+    //    SendStream.
+    let (out_tx, mut out_rx) =
+        mpsc::channel::<AgentEnvelope>(crate::agent_session::OUTGOING_CHANNEL_CAPACITY);
+    let writer_task = tokio::spawn(async move {
+        while let Some(env) = out_rx.recv().await {
+            if write_quic_frame(&mut send, &env).await.is_err() {
+                return crate::agent_session::WriterExit::TransportFailed;
+            }
+        }
+        if send.finish().is_err() {
+            crate::agent_session::WriterExit::TransportFailed
+        } else {
+            crate::agent_session::WriterExit::ChannelClosed
+        }
+    });
     tracing::info!(client_id = %client_id, "agent quic connected");
 
     // 7-9. Pump, reader loop, and teardown are shared with the WebSocket
@@ -429,6 +386,7 @@ async fn handle_quic_connection(
             agent_instance_id: &agent_instance_id,
             connection_id: &connection_id,
             notify,
+            cancel,
             transport_label: "quic",
         },
         out_tx,
@@ -436,6 +394,11 @@ async fn handle_quic_connection(
         writer_task,
     )
     .await;
+    // The shared session has already drained/stopped its stream writer and
+    // reconciled the exact lease. Explicitly close this connection so a
+    // graceful Goodbye or reader/writer termination does not leave connection
+    // lifetime to object-drop timing.
+    conn.close(quinn::VarInt::from_u32(0), b"session complete");
     tracing::info!(client_id = %client_id, "agent quic disconnected");
 }
 
@@ -592,7 +555,7 @@ mod tests {
         quinn::crypto::rustls::QuicClientConfig::try_from(cfg).expect("quinn client crypto")
     }
 
-    fn register_envelope(client_id: &str, instance: &str) -> AgentEnvelope {
+    fn register_envelope(client_id: &str, instance: &str) -> QuicRegisterFrame {
         register_envelope_with_protocol(client_id, instance, AGENT_PROTOCOL_VERSION_QUIC_V1, None)
     }
 
@@ -601,9 +564,9 @@ mod tests {
         instance: &str,
         protocol: &str,
         auth_token: Option<String>,
-    ) -> AgentEnvelope {
-        AgentEnvelope::Register {
-            payload: ShellClientRegisterRequest {
+    ) -> QuicRegisterFrame {
+        QuicRegisterFrame::new(
+            ShellClientRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -668,7 +631,7 @@ mod tests {
                 policy: None,
             },
             auth_token,
-        }
+        )
     }
 
     use crate::test_support::test_config;
@@ -748,7 +711,11 @@ mod tests {
         match error {
             AgentEnvelope::Error { code, message } => {
                 assert_eq!(code, "expected_register");
-                assert!(message.contains("expected register envelope"));
+                assert!(message.contains("register"), "message was: {message}");
+                assert!(
+                    !message.contains('{'),
+                    "raw first-frame JSON leaked: {message}"
+                );
             }
             other => panic!("expected error, got {:?}", other.kind()),
         }
@@ -757,6 +724,82 @@ mod tests {
             .await
             .expect("server handler should exit without peer close")
             .expect("server task should not panic");
+        client_endpoint.close(quinn::VarInt::from_u32(0), b"");
+        conn.close(quinn::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn quic_register_requires_explicit_protocol_version() {
+        let (cert_der, key_der) = self_signed_cert();
+        let registry = Arc::new(ShellClientRegistry::default());
+        let addr = start_quic_server(
+            registry.clone(),
+            test_config(None),
+            cert_der.clone(),
+            key_der,
+        )
+        .await;
+        let (client_endpoint, conn, mut send, mut recv) =
+            connect_quic_client(&cert_der, addr).await;
+        let mut register = register_envelope("quic-missing-protocol", "inst-missing-protocol");
+        register.payload_mut().agent_protocol_version = None;
+        write_quic_register_frame(&mut send, &register)
+            .await
+            .expect("write register");
+
+        let error = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv))
+            .await
+            .expect("register error timeout")
+            .expect("read register error");
+        match error {
+            AgentEnvelope::Error { code, message } => {
+                assert_eq!(code, "register_failed");
+                assert_eq!(message, "agent_protocol_version is required");
+            }
+            other => panic!("expected register_failed, got {:?}", other.kind()),
+        }
+        assert!(registry
+            .get_client_view("quic-missing-protocol")
+            .await
+            .is_none());
+        client_endpoint.close(quinn::VarInt::from_u32(0), b"");
+        conn.close(quinn::VarInt::from_u32(0), b"done");
+    }
+
+    #[tokio::test]
+    async fn quic_register_rejects_unsupported_protocol_version() {
+        let (cert_der, key_der) = self_signed_cert();
+        let registry = Arc::new(ShellClientRegistry::default());
+        let addr = start_quic_server(
+            registry.clone(),
+            test_config(None),
+            cert_der.clone(),
+            key_der,
+        )
+        .await;
+        let (client_endpoint, conn, mut send, mut recv) =
+            connect_quic_client(&cert_der, addr).await;
+        let mut register = register_envelope("quic-unsupported-protocol", "inst-unsupported");
+        register.payload_mut().agent_protocol_version = Some("quic-next".to_string());
+        write_quic_register_frame(&mut send, &register)
+            .await
+            .expect("write register");
+
+        let error = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv))
+            .await
+            .expect("register error timeout")
+            .expect("read register error");
+        match error {
+            AgentEnvelope::Error { code, message } => {
+                assert_eq!(code, "register_failed");
+                assert_eq!(message, "agent_protocol_version is unsupported");
+            }
+            other => panic!("expected register_failed, got {:?}", other.kind()),
+        }
+        assert!(registry
+            .get_client_view("quic-unsupported-protocol")
+            .await
+            .is_none());
         client_endpoint.close(quinn::VarInt::from_u32(0), b"");
         conn.close(quinn::VarInt::from_u32(0), b"done");
     }
@@ -800,7 +843,7 @@ mod tests {
             .expect("quic connect");
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
 
-        write_quic_frame(&mut send, &register_envelope("quic-rt", "inst-rt"))
+        write_quic_register_frame(&mut send, &register_envelope("quic-rt", "inst-rt"))
             .await
             .expect("write register");
 
@@ -890,7 +933,7 @@ mod tests {
         let (client_endpoint, conn, mut send, mut recv) =
             connect_quic_client(&cert_der, addr).await;
 
-        write_quic_frame(
+        write_quic_register_frame(
             &mut send,
             &register_envelope_with_protocol(
                 "quic-v1-rt",
@@ -1010,7 +1053,7 @@ mod tests {
         let (client_endpoint, conn, mut send, mut recv) =
             connect_quic_client(&cert_der, addr).await;
 
-        write_quic_frame(
+        write_quic_register_frame(
             &mut send,
             &register_envelope_with_protocol(
                 "quic-job",
@@ -1113,7 +1156,7 @@ mod tests {
         let (client_endpoint, conn, mut send, mut recv) =
             connect_quic_client(&cert_der, addr).await;
 
-        write_quic_frame(
+        write_quic_register_frame(
             &mut send,
             &register_envelope_with_protocol(
                 "quic-disc",
@@ -1222,7 +1265,7 @@ mod tests {
         let (endpoint_a, conn_a, mut send_a, mut recv_a) =
             connect_quic_client(&cert_der, addr).await;
 
-        write_quic_frame(
+        write_quic_register_frame(
             &mut send_a,
             &register_envelope_with_protocol(
                 "quic-goodbye",
@@ -1264,7 +1307,7 @@ mod tests {
 
         let (endpoint_b, conn_b, mut send_b, mut recv_b) =
             connect_quic_client(&cert_der, addr).await;
-        write_quic_frame(
+        write_quic_register_frame(
             &mut send_b,
             &register_envelope_with_protocol(
                 "quic-goodbye",
@@ -1313,7 +1356,7 @@ mod tests {
 
         let (client_endpoint, conn, mut send, mut recv) =
             connect_quic_client(&cert_der, addr).await;
-        write_quic_frame(
+        write_quic_register_frame(
             &mut send,
             &register_envelope_with_protocol(
                 "quic-auth-ok",
@@ -1336,9 +1379,38 @@ mod tests {
         client_endpoint.close(quinn::VarInt::from_u32(0), b"");
         conn.close(quinn::VarInt::from_u32(0), b"done");
 
+        let (missing_endpoint, missing_conn, mut missing_send, mut missing_recv) =
+            connect_quic_client(&cert_der, addr).await;
+        write_quic_register_frame(
+            &mut missing_send,
+            &register_envelope_with_protocol(
+                "quic-auth-missing",
+                "inst-auth-missing",
+                AGENT_PROTOCOL_VERSION_QUIC_V1,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut missing_recv))
+            .await
+            .unwrap()
+            .unwrap();
+        match err {
+            AgentEnvelope::Error { code, .. } => assert_eq!(code, "unauthorized"),
+            other => panic!("expected unauthorized error, got {:?}", other.kind()),
+        }
+        assert!(registry
+            .get_client_view("quic-auth-missing")
+            .await
+            .is_none());
+        let _ = missing_send.finish();
+        missing_endpoint.close(quinn::VarInt::from_u32(0), b"");
+        missing_conn.close(quinn::VarInt::from_u32(0), b"done");
+
         let (bad_endpoint, bad_conn, mut bad_send, mut bad_recv) =
             connect_quic_client(&cert_der, addr).await;
-        write_quic_frame(
+        write_quic_register_frame(
             &mut bad_send,
             &register_envelope_with_protocol(
                 "quic-auth-bad",
@@ -1452,7 +1524,7 @@ mod tests {
             .await
             .expect("quic connect");
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
-        write_quic_frame(&mut send, &register_envelope("quic-list", "inst-list"))
+        write_quic_register_frame(&mut send, &register_envelope("quic-list", "inst-list"))
             .await
             .unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv))
@@ -1507,7 +1579,7 @@ mod tests {
         // Connection A registers.
         let (client_endpoint_a, conn_a, mut send_a, mut recv_a) =
             connect_quic_client(&cert_der, addr).await;
-        write_quic_frame(&mut send_a, &register_envelope("quic-steal", "inst-x"))
+        write_quic_register_frame(&mut send_a, &register_envelope("quic-steal", "inst-x"))
             .await
             .expect("write register A");
         let _ = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv_a))
@@ -1518,7 +1590,7 @@ mod tests {
         // Same instance reconnects over B (reconnect/refresh: accepted).
         let (client_endpoint_b, conn_b, mut send_b, mut recv_b) =
             connect_quic_client(&cert_der, addr).await;
-        write_quic_frame(&mut send_b, &register_envelope("quic-steal", "inst-x"))
+        write_quic_register_frame(&mut send_b, &register_envelope("quic-steal", "inst-x"))
             .await
             .expect("write register B");
         let _ = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv_b))
@@ -1552,12 +1624,17 @@ mod tests {
             other => panic!("expected request on B, got {:?}", other.kind()),
         }
 
-        // A must not receive the (already-dispatched) request: it stays quiet.
-        let stolen =
-            tokio::time::timeout(Duration::from_millis(500), read_quic_frame(&mut recv_a)).await;
+        // P5a actively cancels A once B commits. The stale connection must
+        // terminate promptly rather than remaining open/quiet behind a dead
+        // request pump. Any successfully decoded application envelope here
+        // would mean A stayed authoritative long enough to receive traffic.
+        let stale_exit =
+            tokio::time::timeout(Duration::from_millis(500), read_quic_frame(&mut recv_a))
+                .await
+                .expect("replaced QUIC connection A must terminate promptly");
         assert!(
-            stolen.is_err(),
-            "stale quic connection pump must not steal the request dispatched to B"
+            stale_exit.is_err(),
+            "replaced QUIC connection A must close instead of receiving an application envelope"
         );
 
         send_a.finish().unwrap();

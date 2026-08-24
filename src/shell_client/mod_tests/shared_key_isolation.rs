@@ -52,7 +52,7 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
                     host_context: None,
                     capabilities: Some(async_job_capabilities()),
                     projects: Some(vec![project_summary(client_id, "/tmp/project")]),
-                    agent_protocol_version: None,
+                    agent_protocol_version: Some("polling-v1".to_string()),
                     policy: None,
                 },
                 Some(auth),
@@ -76,7 +76,7 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
             host_context: None,
             capabilities: Some(async_job_capabilities()),
             projects: Some(vec![project_summary("managed", "/tmp/managed")]),
-            agent_protocol_version: None,
+            agent_protocol_version: Some("polling-v1".to_string()),
             policy: None,
         })
         .await
@@ -194,7 +194,7 @@ async fn same_client_id_in_different_project_grants_is_isolated() {
         host_context: None,
         capabilities: Some(async_job_capabilities()),
         projects: Some(vec![project_summary(project, "/tmp/project")]),
-        agent_protocol_version: None,
+        agent_protocol_version: Some("polling-v1".to_string()),
         policy: None,
     };
     registry
@@ -257,21 +257,23 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
             host_context: None,
             capabilities: Some(async_job_capabilities()),
             projects: Some(vec![project_summary("project", "/tmp/project")]),
-            agent_protocol_version: None,
+            agent_protocol_version: Some("polling-v1".to_string()),
             policy: None,
         }
     };
 
     registry
-        .register_with_auth_connection(
+        .register_streaming_session(
             registration("shared-client", "shared-instance", "host-a", None),
             Some(&shared_a),
-            Some("connection-a"),
+            "connection-a",
+            TRANSPORT_WEBSOCKET,
+            Arc::new(Notify::new()),
         )
         .await
         .unwrap();
     registry
-        .register_with_auth_connection(
+        .register_streaming_session(
             registration(
                 "managed-client",
                 "managed-instance",
@@ -279,16 +281,20 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
                 Some("managed"),
             ),
             Some(&managed),
-            Some("managed-connection"),
+            "managed-connection",
+            TRANSPORT_WEBSOCKET,
+            Arc::new(Notify::new()),
         )
         .await
         .unwrap();
 
     let collision = registry
-        .register_with_auth_connection(
+        .register_streaming_session(
             registration("shared-client", "shared-instance", "host-b", None),
             Some(&shared_b),
-            Some("connection-b"),
+            "connection-b",
+            TRANSPORT_WEBSOCKET,
+            Arc::new(Notify::new()),
         )
         .await
         .unwrap_err();
@@ -324,10 +330,12 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
     // Same key + same process identity is a legitimate reconnect and replaces
     // only the concrete connection lease.
     registry
-        .register_with_auth_connection(
+        .register_streaming_session(
             registration("shared-client", "shared-instance", "host-a-new", None),
             Some(&shared_a),
-            Some("connection-new"),
+            "connection-new",
+            TRANSPORT_WEBSOCKET,
+            Arc::new(Notify::new()),
         )
         .await
         .unwrap();

@@ -19,6 +19,7 @@ fn synthetic_projects(count: usize) -> Vec<ShellAgentProjectSummary> {
 fn paged_registration(client_id: &str, instance_id: &str) -> ShellClientRegisterRequest {
     let mut registration = runner_registration(client_id, instance_id, Vec::new());
     registration.projects = None;
+    registration.agent_protocol_version = Some(AGENT_PROTOCOL_VERSION_POLLING_V2.to_string());
     registration
 }
 
@@ -156,6 +157,59 @@ async fn v2_registration_project_bootstrap_is_not_published_as_authoritative_inv
             .len(),
         65
     );
+}
+
+#[tokio::test]
+async fn inventory_pages_require_paged_registration_strategy() {
+    let registry = ShellClientRegistry::default();
+    let client_id = "inventory-strategy-inline";
+    let instance_id = "inventory-strategy-inline-instance";
+    let original = project_summary("original", "/tmp/original");
+    let registered = registry
+        .register(runner_registration(
+            client_id,
+            instance_id,
+            vec![original.clone()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(registered.projects.len(), 1);
+    assert_eq!(registered.projects[0].id, "original");
+
+    let replacement = vec![project_summary("replacement", "/tmp/replacement")];
+    let status = registry
+        .apply_project_inventory_page(
+            client_id,
+            instance_id,
+            snapshot_pages("unexpected-page", 1, &replacement).remove(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status.last_error_code.as_deref(),
+        Some("project_inventory_paging_not_negotiated")
+    );
+    let published = registry.list_client_projects(client_id).await.unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].id, "original");
+}
+
+#[tokio::test]
+async fn unsupported_protocol_registration_does_not_publish_project_inventory() {
+    let registry = ShellClientRegistry::default();
+    let client_id = "inventory-strategy-unsupported";
+    let instance_id = "inventory-strategy-unsupported-instance";
+    let mut registration = runner_registration(
+        client_id,
+        instance_id,
+        vec![project_summary("untrusted", "/tmp/untrusted")],
+    );
+    registration.agent_protocol_version = Some("future-v2".to_string());
+
+    let error = registry.register(registration).await.unwrap_err();
+    assert_eq!(error, "agent_protocol_version is unsupported");
+    assert!(registry.get_client_view(client_id).await.is_none());
+    assert!(registry.list_client_projects(client_id).await.is_err());
 }
 
 #[tokio::test]
@@ -655,9 +709,12 @@ async fn malformed_and_oversized_inventory_degrades_without_revoking_runner_live
     let instance_id = "inventory-bounds-instance";
     let trusted = synthetic_projects(3);
     registry
-        .register(runner_registration(client_id, instance_id, trusted.clone()))
+        .register(paged_registration(client_id, instance_id))
         .await
         .unwrap();
+    let trusted_status =
+        apply_snapshot(&registry, client_id, instance_id, "trusted", 1, &trusted).await;
+    assert_eq!(trusted_status.sync_state, "complete");
 
     let malformed = ShellProjectInventoryPage {
         generation: "bad/generation".to_string(),

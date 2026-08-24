@@ -220,9 +220,9 @@ impl Default for ClaudeCodeMcpConfig {
 /// Agent-side QUIC transport configuration (`[quic]` in `agent.toml`). All
 /// fields are required when `transport = "quic"`; `run_quic_agent` validates
 /// them before connecting. The token is NOT stored here — it stays in the
-/// top-level `token` field and is carried in the `Register` envelope's
-/// `auth_token` field, mirroring the `Authorization: Bearer` header used by
-/// the websocket/polling paths.
+/// top-level `AgentConfig.token`. QUIC encodes that credential only in its v1
+/// transport-specific first-register frame; it never enters `AgentEnvelope`.
+/// WebSocket and polling continue to use `Authorization: Bearer`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct QuicClientConfig {
     /// `host:port` of the server's QUIC listener (e.g. `host:8443`).
@@ -240,6 +240,11 @@ pub(crate) struct QuicClientConfig {
     #[serde(default = "default_quic_keepalive_interval_secs")]
     pub(crate) keepalive_interval_secs: u64,
 }
+
+/// Quinn's Server/Client default idle timeout is 30 seconds. Keep the
+/// operator-configured transport keepalive below it with explicit scheduling
+/// slack so current and rolling-upgrade peers do not time out first.
+pub(crate) const MAX_QUIC_KEEPALIVE_INTERVAL_SECS: u64 = 25;
 
 pub(crate) fn default_quic_alpn() -> String {
     crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string()
@@ -933,6 +938,11 @@ pub(crate) fn validate_quic_config(quic: &QuicClientConfig) -> Result<(), String
     }
     if quic.keepalive_interval_secs == 0 {
         return Err("[quic] keepalive_interval_secs must be > 0".to_string());
+    }
+    if quic.keepalive_interval_secs > MAX_QUIC_KEEPALIVE_INTERVAL_SECS {
+        return Err(format!(
+            "[quic] keepalive_interval_secs must be <= {MAX_QUIC_KEEPALIVE_INTERVAL_SECS}"
+        ));
     }
     Ok(())
 }

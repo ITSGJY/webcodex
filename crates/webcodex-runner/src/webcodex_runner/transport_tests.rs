@@ -827,6 +827,7 @@ fn register_inventory_support_response() -> ConcurrentHttpResponse {
                 "capabilities": {},
                 "pending_requests": 0,
                 "projects": [],
+                "agent_protocol_version": crate::shell_protocol::AGENT_PROTOCOL_VERSION_POLLING_V2,
                 "project_inventory": {
                     "sync_state": "pending",
                     "generation": null,
@@ -4777,6 +4778,165 @@ async fn websocket_proxy_connect_response_header_is_bounded_and_redacted() {
     assert!(error.contains("response headers exceeded"), "{error}");
     assert!(!error.contains(proxy_secret), "{error}");
     assert!(!error.contains(server_token), "{error}");
+}
+
+#[test]
+fn quic_transport_config_applies_keepalive_without_changing_application_ping() {
+    let quic = QuicClientConfig {
+        server_addr: "127.0.0.1:8443".to_string(),
+        server_name: "localhost".to_string(),
+        alpn: crate::webcodex_runner::default_quic_alpn(),
+        connect_timeout_secs: 10,
+        keepalive_interval_secs: 17,
+    };
+    let transport = build_quic_transport_config(&quic).unwrap();
+    let rendered = format!("{transport:?}");
+    assert!(
+        rendered.contains("max_idle_timeout: Some(30000)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("keep_alive_interval: Some(17s)"),
+        "{rendered}"
+    );
+    assert_eq!(QUIC_PING_INTERVAL, Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn quic_graceful_writer_waits_for_flush_and_stuck_writer_is_bounded() {
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel::<()>();
+    let writer = tokio::spawn(async move {
+        let _ = release_rx.await;
+        let _ = flushed_tx.send(());
+        StreamWriterExit::GracefulClose
+    });
+    let finish = finish_quic_writer(Some(writer), true, Duration::from_secs(1));
+    tokio::pin!(finish);
+    tokio::select! {
+        _ = &mut finish => panic!("graceful QUIC finish returned before writer flush"),
+        _ = tokio::task::yield_now() => {}
+    }
+    release_tx.send(()).unwrap();
+    assert!(
+        finish.await,
+        "graceful writer must report a flushed Goodbye"
+    );
+    flushed_rx.await.expect("writer flush marker");
+
+    let stuck = tokio::spawn(async { std::future::pending::<StreamWriterExit>().await });
+    let stuck_graceful = tokio::time::timeout(
+        Duration::from_millis(100),
+        finish_quic_writer(Some(stuck), true, Duration::from_millis(10)),
+    )
+    .await
+    .expect("stuck graceful QUIC writer must be bounded");
+    assert!(!stuck_graceful);
+
+    let broken = tokio::spawn(async { std::future::pending::<StreamWriterExit>().await });
+    let broken_graceful = tokio::time::timeout(
+        Duration::from_millis(100),
+        finish_quic_writer(Some(broken), false, Duration::from_secs(1)),
+    )
+    .await
+    .expect("non-graceful QUIC writer teardown must abort promptly");
+    assert!(!broken_graceful);
+}
+
+#[tokio::test]
+async fn quic_graceful_close_waits_for_peer_within_remaining_budget() {
+    let (peer_closed_tx, peer_closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let wait = wait_for_quic_peer_close(
+        async {
+            let _ = peer_closed_rx.await;
+        },
+        Duration::from_secs(1),
+    );
+    tokio::pin!(wait);
+
+    tokio::select! {
+        _ = &mut wait => panic!("graceful QUIC close skipped the peer-close grace period"),
+        _ = tokio::task::yield_now() => {}
+    }
+
+    peer_closed_tx.send(()).unwrap();
+    wait.await;
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        wait_for_quic_peer_close(std::future::pending::<()>(), Duration::from_millis(10)),
+    )
+    .await
+    .expect("non-responsive QUIC peer grace wait must remain bounded");
+}
+
+#[tokio::test]
+async fn streaming_writer_failure_terminates_pending_reader_for_ws_and_quic() {
+    for transport in [StreamTransport::WebSocket, StreamTransport::Quic] {
+        let cfg = test_agent_config("http://127.0.0.1:9".to_string());
+        let runtime = test_runtime(&cfg);
+        let registered_jobs = ShellJobInventory::default();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+        let (_read_tx, read_rx) = tokio::sync::mpsc::channel::<StreamRead>(1);
+        let writer_task = tokio::spawn(async { StreamWriterExit::TransportFailed });
+
+        let exit = tokio::time::timeout(
+            Duration::from_millis(250),
+            serve_registered_stream(
+                transport,
+                &cfg,
+                "inst-writer-fail",
+                &registered_jobs,
+                out_tx,
+                RegisteredStream::Test { reader: read_rx },
+                writer_task,
+                None,
+                &runtime,
+                std::future::pending::<()>(),
+            ),
+        )
+        .await
+        .expect("writer failure must not wait for pending reader")
+        .expect("writer failure is a transport disconnect, not a session error");
+        assert_eq!(
+            exit,
+            AgentSessionExit::TransportDisconnected,
+            "{transport:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn streaming_graceful_writer_completion_is_not_a_failure_signal() {
+    let cfg = test_agent_config("http://127.0.0.1:9".to_string());
+    let runtime = test_runtime(&cfg);
+    let registered_jobs = ShellJobInventory::default();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+    let (_read_tx, read_rx) = tokio::sync::mpsc::channel::<StreamRead>(1);
+    let writer_task = tokio::spawn(async move {
+        while let Some(env) = out_rx.recv().await {
+            if matches!(env, AgentEnvelope::Goodbye { .. }) {
+                return StreamWriterExit::GracefulClose;
+            }
+        }
+        StreamWriterExit::ChannelClosed
+    });
+
+    let exit = serve_registered_stream(
+        StreamTransport::WebSocket,
+        &cfg,
+        "inst-graceful",
+        &registered_jobs,
+        out_tx,
+        RegisteredStream::Test { reader: read_rx },
+        writer_task,
+        None,
+        &runtime,
+        async {},
+    )
+    .await
+    .expect("graceful shutdown must not be classified as writer failure");
+    assert_eq!(exit, AgentSessionExit::Shutdown);
 }
 
 #[tokio::test]

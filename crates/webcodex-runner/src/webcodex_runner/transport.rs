@@ -15,14 +15,14 @@ use super::util::contains_any;
 use super::{PersistentShellManager, ShellCommandResult};
 use crate::agent_init::{TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET};
 use crate::shell_protocol::{
-    read_quic_frame, write_quic_frame, AgentEnvelope, QuicFrameError, ShellAgentJobUpdateRequest,
-    ShellAgentJobUpdateResponse, ShellAgentPersistentShellResultRequest,
-    ShellAgentPersistentShellResultResponse, ShellAgentProjectSummary, ShellAgentResultPayload,
-    ShellAgentResultRequest, ShellAgentResultResponse, ShellJobInventory,
-    ShellProjectInventoryPage, ShellProjectInventoryStatus, AGENT_PROTOCOL_VERSION_QUIC_V1,
-    AGENT_PROTOCOL_VERSION_QUIC_V2, AGENT_PROTOCOL_VERSION_WEBSOCKET_V1,
-    AGENT_PROTOCOL_VERSION_WEBSOCKET_V2, PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES,
-    PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
+    read_quic_frame, write_quic_frame, write_quic_register_frame, AgentEnvelope, QuicFrameError,
+    QuicRegisterFrame, ShellAgentJobUpdateRequest, ShellAgentJobUpdateResponse,
+    ShellAgentPersistentShellResultRequest, ShellAgentPersistentShellResultResponse,
+    ShellAgentProjectSummary, ShellAgentResultPayload, ShellAgentResultRequest,
+    ShellAgentResultResponse, ShellJobInventory, ShellProjectInventoryPage,
+    ShellProjectInventoryStatus, AGENT_PROTOCOL_VERSION_QUIC_V1, AGENT_PROTOCOL_VERSION_QUIC_V2,
+    AGENT_PROTOCOL_VERSION_WEBSOCKET_V1, AGENT_PROTOCOL_VERSION_WEBSOCKET_V2,
+    PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
 };
 use crate::{
     build_register_request_with_provider_status, dispatch_request, handle_one_poll, is_project_op,
@@ -68,14 +68,15 @@ const PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS: [Duration; 5] = [
 /// Reset reconnect backoff after a connection stayed up long enough to prove
 /// the endpoint is healthy. Immediate flapping still escalates.
 const RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
-/// Bounded wait for the writer task to flush its last frame and close the
-/// sink during shutdown. A split WebSocket sink's `close()` waits for the
-/// peer's close acknowledgement, which is delivered through the read half;
-/// once the read loop has broken the read half is no longer polled, so
-/// `close()` can hang indefinitely on a half-closed socket. Bounding it
-/// guarantees `websocket_session` (and therefore the reconnect loop) always
-/// makes progress instead of stalling forever after a disconnect.
-const WS_WRITER_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bounded wait for a streaming writer to flush its final control frame and
+/// close its send side during graceful shutdown. WebSocket additionally polls
+/// the read half for its close handshake; QUIC waits for the writer to finish
+/// the SendStream before closing the connection. Neither path may hang process
+/// shutdown on a non-responsive peer.
+const STREAM_WRITER_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Quinn's default peer idle timeout is 30 seconds. Keep this explicit on the
+/// Runner side so the configured QUIC keepalive contract has a stable bound.
+const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Process-shutdown control frames are best effort, but enqueueing them must
 /// never wait behind a permanently full transport channel.
 const TRANSPORT_CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(250);
@@ -2426,16 +2427,25 @@ enum StreamRead {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamWriterExit {
+    ChannelClosed,
+    GracefulClose,
+    TransportFailed,
+}
+
 enum RegisteredStream {
     WebSocket {
         reader: futures_util::stream::SplitStream<RunnerWebSocket>,
-        writer: tokio::task::JoinHandle<()>,
     },
     Quic {
         reader: quinn::RecvStream,
-        writer: tokio::task::JoinHandle<()>,
         connection: quinn::Connection,
         endpoint: quinn::Endpoint,
+    },
+    #[cfg(test)]
+    Test {
+        reader: tokio::sync::mpsc::Receiver<StreamRead>,
     },
 }
 
@@ -2501,17 +2511,23 @@ impl RegisteredStream {
                 }
                 Err(error) => Err(format!("quic stream read error: {}", error)),
             },
+            #[cfg(test)]
+            Self::Test { reader } => Ok(reader.recv().await.unwrap_or(StreamRead::Closed)),
         }
     }
 
-    async fn finish(self, graceful: bool) {
+    async fn finish(
+        self,
+        graceful: bool,
+        writer: Option<tokio::task::JoinHandle<StreamWriterExit>>,
+    ) {
         use futures_util::StreamExt;
 
         match self {
-            Self::WebSocket {
-                mut reader,
-                mut writer,
-            } => {
+            Self::WebSocket { mut reader } => {
+                let Some(mut writer) = writer else {
+                    return;
+                };
                 if !graceful {
                     writer.abort();
                     return;
@@ -2519,7 +2535,7 @@ impl RegisteredStream {
                 // Continue polling the read half while the writer flushes
                 // Goodbye and the close frame. One absolute deadline bounds
                 // both the writer and peer-close observation.
-                let close_deadline = tokio::time::Instant::now() + WS_WRITER_CLOSE_TIMEOUT;
+                let close_deadline = tokio::time::Instant::now() + STREAM_WRITER_CLOSE_TIMEOUT;
                 let mut reader_open = true;
                 let mut writer_finished = false;
                 loop {
@@ -2551,26 +2567,80 @@ impl RegisteredStream {
                 }
             }
             Self::Quic {
-                mut writer,
                 connection,
                 endpoint,
                 ..
             } => {
-                if graceful {
-                    connection.close(quinn::VarInt::from_u32(0), b"process shutdown");
-                    endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
-                    if tokio::time::timeout(WS_WRITER_CLOSE_TIMEOUT, &mut writer)
-                        .await
-                        .is_err()
-                    {
+                // Graceful order is deliberate: serve_registered_stream has
+                // already queued Goodbye and dropped all producers. Let the
+                // writer drain it and finish the SendStream first. Quinn's
+                // SendStream::finish only queues the FIN; Connection::close is
+                // immediate and can discard buffered stream data. Use the same
+                // absolute close budget to give the peer a chance to close the
+                // connection after receiving Goodbye, then force-close if it
+                // does not cooperate. Broken transports skip this grace wait.
+                let close_started = tokio::time::Instant::now();
+                let writer_graceful =
+                    finish_quic_writer(writer, graceful, STREAM_WRITER_CLOSE_TIMEOUT).await;
+                if graceful && writer_graceful {
+                    let remaining =
+                        STREAM_WRITER_CLOSE_TIMEOUT.saturating_sub(close_started.elapsed());
+                    wait_for_quic_peer_close(
+                        async {
+                            let _ = connection.closed().await;
+                        },
+                        remaining,
+                    )
+                    .await;
+                }
+                connection.close(quinn::VarInt::from_u32(0), b"process shutdown");
+                endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
+            }
+            #[cfg(test)]
+            Self::Test { .. } => {
+                if let Some(mut writer) = writer {
+                    if graceful {
+                        let _ =
+                            tokio::time::timeout(STREAM_WRITER_CLOSE_TIMEOUT, &mut writer).await;
+                    } else {
                         writer.abort();
                     }
-                } else {
-                    writer.abort();
                 }
             }
         }
     }
+}
+
+async fn finish_quic_writer(
+    writer: Option<tokio::task::JoinHandle<StreamWriterExit>>,
+    graceful: bool,
+    timeout: Duration,
+) -> bool {
+    let Some(mut writer) = writer else {
+        return false;
+    };
+    if !graceful {
+        writer.abort();
+        return false;
+    }
+    match tokio::time::timeout(timeout, &mut writer).await {
+        Ok(Ok(StreamWriterExit::GracefulClose)) => true,
+        Ok(_) => false,
+        Err(_) => {
+            writer.abort();
+            false
+        }
+    }
+}
+
+async fn wait_for_quic_peer_close<F>(peer_closed: F, timeout: Duration)
+where
+    F: std::future::Future<Output = ()>,
+{
+    if timeout.is_zero() {
+        return;
+    }
+    let _ = tokio::time::timeout(timeout, peer_closed).await;
 }
 
 fn registered_ack(ack: AgentEnvelope) -> Result<Option<ShellProjectInventoryStatus>, String> {
@@ -2903,6 +2973,7 @@ async fn serve_registered_stream<F>(
     registered_jobs: &ShellJobInventory,
     out_tx: tokio::sync::mpsc::Sender<AgentEnvelope>,
     mut stream: RegisteredStream,
+    mut writer_task: tokio::task::JoinHandle<StreamWriterExit>,
     project_inventory_sync: Option<ProjectInventorySync>,
     runtime: &AgentRuntimeState,
     shutdown: F,
@@ -2933,6 +3004,7 @@ where
     let mut shutdown = Box::pin(shutdown);
     let mut shutdown_requested = false;
     let mut session_error = None;
+    let mut writer_observed = false;
 
     loop {
         let project_inventory_retry_at = project_inventory.retry_at();
@@ -2956,6 +3028,22 @@ where
             _ = &mut shutdown => {
                 runtime.request_shutdown_signal();
                 shutdown_requested = true;
+                break;
+            }
+            writer = &mut writer_task => {
+                writer_observed = true;
+                let reason_code = match writer {
+                    Ok(StreamWriterExit::ChannelClosed) => "writer_channel_closed",
+                    Ok(StreamWriterExit::GracefulClose) => "writer_graceful_close_unexpected",
+                    Ok(StreamWriterExit::TransportFailed) => "writer_transport_failed",
+                    Err(error) if error.is_panic() => "writer_task_panicked",
+                    Err(_) => "writer_task_cancelled",
+                };
+                tracing::debug!(
+                    transport = transport.name(),
+                    reason_code,
+                    "webcodex-runner stream writer ended; terminating session"
+                );
                 break;
             }
             read = stream.receive() => {
@@ -3025,7 +3113,8 @@ where
     }
     drop(sink);
     drop(out_tx);
-    stream.finish(shutdown_requested).await;
+    let writer = (!writer_observed).then_some(writer_task);
+    stream.finish(shutdown_requested, writer).await;
     if !shutdown_requested && transport == StreamTransport::WebSocket {
         runtime
             .persistent_shells
@@ -3131,6 +3220,16 @@ fn build_quic_client_crypto(
         .map_err(|e| format!("failed to build quinn client crypto: {}", e))
 }
 
+fn build_quic_transport_config(quic: &QuicClientConfig) -> Result<quinn::TransportConfig, String> {
+    let idle_timeout: quinn::IdleTimeout = QUIC_IDLE_TIMEOUT
+        .try_into()
+        .map_err(|_| "failed to encode QUIC idle timeout".to_string())?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(idle_timeout));
+    transport.keep_alive_interval(Some(Duration::from_secs(quic.keepalive_interval_secs)));
+    Ok(transport)
+}
+
 fn classify_quic_agent_connect_error(error: &str) -> &'static str {
     let lower = error.to_ascii_lowercase();
     if lower.contains("certificate")
@@ -3166,7 +3265,8 @@ async fn quic_session(
 ) -> Result<AgentSessionExit, String> {
     let quic = resolve_quic_config(cfg)?;
     let client_crypto = build_quic_client_crypto(&quic)?;
-    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    client_config.transport_config(Arc::new(build_quic_transport_config(&quic)?));
     let server_addrs = resolve_quic_server_addrs(&quic.server_addr)?;
     let mut connect_errors = Vec::new();
     let mut client_endpoint = None;
@@ -3247,11 +3347,15 @@ async fn quic_session(
     let (mut send, mut recv) =
         open_result.map_err(|e| format!("failed to open quic bidirectional stream: {}", e))?;
 
-    // Register. The token is carried in `auth_token`; the server authenticates
-    // it exactly like the websocket/polling paths. It is never logged.
+    // QUIC-v1 transport registration retains the legacy first-frame JSON shape
+    // for rolling-old Servers, but credential ownership stays outside the
+    // transport-neutral AgentEnvelope lifecycle. The token is never logged.
     let projects_count = enabled_projects_count(&projects);
     let registered_jobs = runtime.jobs.inventory();
     let bootstrap = project_registration_bootstrap(&cfg.client_id, &projects, &registered_jobs);
+    // Preserve the legacy QUIC `v1/v2` label solely as the old-Server
+    // projection of inline versus paged registration inventory. Current Servers
+    // normalize it before registry/business decisions.
     let protocol_version = if bootstrap.paged_inventory {
         AGENT_PROTOCOL_VERSION_QUIC_V2
     } else {
@@ -3267,12 +3371,12 @@ async fn quic_session(
             0,
             bootstrap.job_inventory,
         );
-    let reg_env = AgentEnvelope::Register {
-        payload: register_payload,
-        auth_token: non_empty_token(&cfg.token),
-    };
-    let Some(register_write) =
-        future_or_shutdown(write_quic_frame(&mut send, &reg_env), runtime).await
+    let register_frame = QuicRegisterFrame::new(register_payload, non_empty_token(&cfg.token));
+    let Some(register_write) = future_or_shutdown(
+        write_quic_register_frame(&mut send, &register_frame),
+        runtime,
+    )
+    .await
     else {
         conn.close(quinn::VarInt::from_u32(0), b"process shutdown");
         client_endpoint.close(quinn::VarInt::from_u32(0), b"process shutdown");
@@ -3334,14 +3438,33 @@ async fn quic_session(
             AgentEnvelope::Pong { .. } => {}
             other => return Err(format!("expected pong, got {}", other.kind())),
         }
-        let _ = write_quic_frame(
-            &mut send,
-            &AgentEnvelope::Goodbye {
-                reason: Some("once complete".to_string()),
-            },
+        let goodbye = AgentEnvelope::Goodbye {
+            reason: Some("once complete".to_string()),
+        };
+        let close_started = tokio::time::Instant::now();
+        let goodbye_result = tokio::time::timeout(
+            STREAM_WRITER_CLOSE_TIMEOUT,
+            write_quic_frame(&mut send, &goodbye),
         )
         .await;
-        let _ = send.finish();
+        let goodbye_sent = matches!(&goodbye_result, Ok(Ok(())));
+        let finish_result = send.finish();
+        if goodbye_sent && finish_result.is_ok() {
+            let remaining = STREAM_WRITER_CLOSE_TIMEOUT.saturating_sub(close_started.elapsed());
+            wait_for_quic_peer_close(
+                async {
+                    let _ = conn.closed().await;
+                },
+                remaining,
+            )
+            .await;
+        }
+        conn.close(quinn::VarInt::from_u32(0), b"once complete");
+        client_endpoint.close(quinn::VarInt::from_u32(0), b"once complete");
+        goodbye_result
+            .map_err(|_| "quic once goodbye flush timed out".to_string())?
+            .map_err(|e| format!("quic once goodbye send failed: {e}"))?;
+        finish_result.map_err(|e| format!("quic once send finish failed: {e}"))?;
         return Ok(AgentSessionExit::Completed);
     }
 
@@ -3351,11 +3474,23 @@ async fn quic_session(
     try_queue_project_inventory_page(StreamTransport::Quic, &mut project_inventory_sync, &out_tx);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
+            let graceful = matches!(env, AgentEnvelope::Goodbye { .. });
             if write_quic_frame(&mut send, &env).await.is_err() {
-                break;
+                return StreamWriterExit::TransportFailed;
+            }
+            if graceful {
+                return if send.finish().is_ok() {
+                    StreamWriterExit::GracefulClose
+                } else {
+                    StreamWriterExit::TransportFailed
+                };
             }
         }
-        let _ = send.finish();
+        if send.finish().is_ok() {
+            StreamWriterExit::ChannelClosed
+        } else {
+            StreamWriterExit::TransportFailed
+        }
     });
     serve_registered_stream(
         StreamTransport::Quic,
@@ -3365,10 +3500,10 @@ async fn quic_session(
         out_tx,
         RegisteredStream::Quic {
             reader: recv,
-            writer: writer_task,
             connection: conn,
             endpoint: client_endpoint,
         },
+        writer_task,
         project_inventory_sync,
         runtime,
         runtime.wait_for_shutdown(),
@@ -3841,6 +3976,9 @@ where
     let projects_count = enabled_projects_count(&projects);
     let registered_jobs = runtime.jobs.inventory();
     let bootstrap = project_registration_bootstrap(&cfg.client_id, &projects, &registered_jobs);
+    // Preserve the legacy WebSocket `v1/v2` label solely as the old-Server
+    // projection of inline versus paged registration inventory. Current Servers
+    // normalize it before registry/business decisions.
     let protocol_version = if bootstrap.paged_inventory {
         AGENT_PROTOCOL_VERSION_WEBSOCKET_V2
     } else {
@@ -3858,7 +3996,6 @@ where
         );
     let reg_env = AgentEnvelope::Register {
         payload: register_payload,
-        auth_token: None,
     };
     let reg_json =
         serde_json::to_string(&reg_env).map_err(|e| format!("failed to encode register: {}", e))?;
@@ -3906,28 +4043,26 @@ where
         &out_tx,
     );
     let writer_task = tokio::spawn(async move {
-        let mut graceful_close = false;
         while let Some(env) = out_rx.recv().await {
             let is_goodbye = matches!(env, AgentEnvelope::Goodbye { .. });
-            match serde_json::to_string(&env) {
-                Ok(json) => {
-                    if sink.send(WsMessage::Text(json.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+            let Ok(json) = serde_json::to_string(&env) else {
+                return StreamWriterExit::TransportFailed;
+            };
+            if sink.send(WsMessage::Text(json.into())).await.is_err() {
+                return StreamWriterExit::TransportFailed;
             }
             if is_goodbye {
-                graceful_close = true;
-                break;
+                // The session loop continues polling the split read half while
+                // awaiting this task, allowing tungstenite's close handshake to
+                // progress without turning this into an unbounded wait.
+                return if sink.close().await.is_ok() {
+                    StreamWriterExit::GracefulClose
+                } else {
+                    StreamWriterExit::TransportFailed
+                };
             }
         }
-        if graceful_close {
-            // The session loop continues polling the split read half while
-            // awaiting this task, allowing tungstenite's close handshake to
-            // progress without turning this into an unbounded wait.
-            let _ = sink.close().await;
-        }
+        StreamWriterExit::ChannelClosed
     });
     serve_registered_stream(
         StreamTransport::WebSocket,
@@ -3935,10 +4070,8 @@ where
         agent_instance_id,
         &registered_jobs,
         out_tx,
-        RegisteredStream::WebSocket {
-            reader: stream,
-            writer: writer_task,
-        },
+        RegisteredStream::WebSocket { reader: stream },
+        writer_task,
         project_inventory_sync,
         runtime,
         shutdown,
