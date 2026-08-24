@@ -57,6 +57,28 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
         schema["properties"]["items"]["items"]["properties"]["path"]["minLength"],
         1
     );
+    assert_eq!(
+        schema["properties"]["max_result_bytes"]["default"],
+        64 * 1024
+    );
+    assert_eq!(
+        schema["properties"]["max_result_bytes"]["maximum"],
+        256 * 1024
+    );
+    assert!(schema["properties"]["max_result_bytes"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("protocol overlays"));
+    assert!(validates(&json!({
+        "project": "demo",
+        "items": [{"path": "a.rs"}],
+        "max_result_bytes": 128 * 1024
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "items": [{"path": "a.rs"}],
+        "max_result_bytes": 256 * 1024 + 1
+    })));
     assert!(!validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs", "unexpected": true}]
@@ -400,6 +422,7 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
                         ],
                         session_id: None,
                         with_line_numbers: Some(true),
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -473,6 +496,64 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
 }
 
 #[tokio::test]
+async fn read_files_dispatch_large_default_batch_uses_sparse_fit_before_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "read-sparse-budget-order";
+    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let auth = auth_context(None, true);
+    let paths = (0..8)
+        .map(|index| format!("src/{index}.rs"))
+        .collect::<Vec<_>>();
+    let expected_text = "x".repeat(7_400);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        let paths = paths.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::ReadFiles {
+                        project,
+                        items: paths.iter().map(|path| item(path, None, None)).collect(),
+                        session_id: None,
+                        with_line_numbers: None,
+                        max_result_bytes: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    for _ in 0..8 {
+        let request = next_read_request(&runtime, client_id).await;
+        complete_read(&runtime, client_id, &request, &expected_text).await;
+    }
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert!(
+        result.output.get("output_truncated").is_none(),
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.get("next_index").is_none(),
+        "{}",
+        result.output
+    );
+    let items = result.output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 8);
+    for item in items {
+        assert_eq!(item["output"]["text"], expected_text);
+        assert!(item["output"].get("start_line").is_none());
+        assert!(item["output"].get("next_start_line").is_none());
+    }
+}
+
+#[tokio::test]
 async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -493,6 +574,7 @@ async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
                         items: vec![item("good.txt", None, None), item(".env", None, None)],
                         session_id: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -750,6 +832,7 @@ async fn read_files_records_one_outer_session_event_and_keeps_metadata_outer_onl
                         items: vec![item("a.rs", None, None), item("b.rs", None, None)],
                         session_id: Some(session_id),
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )

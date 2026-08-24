@@ -940,6 +940,8 @@ pub enum ToolCall {
         session_id: Option<String>,
         #[serde(default)]
         with_line_numbers: Option<bool>,
+        #[serde(default)]
+        max_result_bytes: Option<usize>,
     },
 
     /// Start an async background job (long-running commands, codex CLI, etc.).
@@ -1092,6 +1094,8 @@ pub enum ToolCall {
         queries: Vec<SearchProjectTextsQuery>,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        max_result_bytes: Option<usize>,
     },
 
     /// Read-only git diff summary for a project: `git status --porcelain`,
@@ -1845,6 +1849,7 @@ fn reject_unknown_read_files_fields(arguments: &Value) -> Result<(), String> {
         "items",
         "session_id",
         "with_line_numbers",
+        "max_result_bytes",
         // Wrapper/session metadata that transports may leave in params.
         "allow_cross_project_session",
         "recording_session_id",
@@ -1899,6 +1904,7 @@ fn reject_unknown_search_project_texts_fields(arguments: &Value) -> Result<(), S
         "project",
         "queries",
         "session_id",
+        "max_result_bytes",
         // Wrapper/session metadata that transports may leave in params.
         "allow_cross_project_session",
         "recording_session_id",

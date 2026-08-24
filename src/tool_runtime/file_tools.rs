@@ -35,6 +35,7 @@ impl ToolRuntime {
                 items,
                 session_id: _,
                 with_line_numbers,
+                max_result_bytes: _,
             } => match project_resolution {
                 Some(Ok(resolved)) => {
                     self.read_files_resolved(&resolved, items, with_line_numbers)
@@ -120,6 +121,7 @@ impl ToolRuntime {
                 project,
                 queries,
                 session_id: _,
+                max_result_bytes: _,
             } => match project_resolution {
                 Some(Ok(resolved)) => self.search_project_texts_resolved(&resolved, queries).await,
                 Some(Err(error)) => error.into_tool_result(),

@@ -174,6 +174,37 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         schema["properties"]["queries"]["items"]["additionalProperties"],
         false
     );
+    assert_eq!(
+        schema["properties"]["max_result_bytes"]["default"],
+        64 * 1024
+    );
+    assert_eq!(
+        schema["properties"]["max_result_bytes"]["maximum"],
+        256 * 1024
+    );
+    let budget_description = schema["properties"]["max_result_bytes"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(budget_description.contains("whole-query"));
+    assert!(budget_description.contains("narrow"));
+    let removed_input_cursor = ["match", "offset"].join("_");
+    assert!(schema["properties"]["queries"]["items"]["properties"]
+        .get(&removed_input_cursor)
+        .is_none());
+    let mut removed_cursor_input = json!({
+        "project": "demo",
+        "queries": [{"pattern": "needle"}]
+    });
+    removed_cursor_input["queries"][0]
+        .as_object_mut()
+        .unwrap()
+        .insert(removed_input_cursor, json!(1));
+    assert!(!validates(&removed_cursor_input));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "queries": [{"pattern": "needle"}],
+        "max_result_bytes": 256 * 1024 + 1
+    })));
     assert!(
         schema["properties"].get("session_id").is_some(),
         "missing outer business session_id field"
@@ -225,6 +256,18 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         json!(["project", "pattern"]),
         "single-query schema remains unchanged"
     );
+    let success_full = &batch.output_schema["properties"]["output"]["anyOf"][0]["anyOf"][0]
+        ["properties"]["items"]["items"]["properties"]["output"]["anyOf"][0]["anyOf"][0];
+    let removed_output_cursor = ["next", "match", "offset"].join("_");
+    assert!(success_full["properties"]
+        .get(&removed_output_cursor)
+        .is_none());
+    assert!(success_full["properties"].get("budget_truncated").is_none());
+    let producer_reasons = success_full["properties"]["truncation_reason"]["anyOf"][0]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(!producer_reasons.contains(&json!("batch_response_budget")));
+    assert!(!producer_reasons.contains(&json!("hard_result_cap")));
     let failure = &batch.output_schema["properties"]["output"]["anyOf"][0]["anyOf"][0]
         ["properties"]["items"]["items"]["properties"]["output"]["anyOf"][1];
     assert_eq!(
@@ -468,6 +511,7 @@ async fn search_project_texts_default_matches_items_are_sparse_and_schema_valid(
                         project,
                         queries: vec![query("first", None), query("second", None)],
                         session_id: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -538,6 +582,70 @@ async fn search_project_texts_default_matches_items_are_sparse_and_schema_valid(
 }
 
 #[tokio::test]
+async fn search_project_texts_dispatch_large_default_batch_uses_sparse_fit_before_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "search-sparse-budget-order";
+    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let auth = auth_context(None, true);
+    let patterns = (0..8)
+        .map(|index| format!("needle-{index}"))
+        .collect::<Vec<_>>();
+    let expected_preview = "x".repeat(7_400);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        let patterns = patterns.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::SearchProjectTexts {
+                        project,
+                        queries: patterns
+                            .iter()
+                            .map(|pattern| query(pattern, None))
+                            .collect(),
+                        session_id: None,
+                        max_result_bytes: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    for _ in 0..8 {
+        let request = wait_for_patch_agent_request(&runtime, client_id).await;
+        let pattern = request_pattern(&request);
+        let path = format!("src/{pattern}.rs");
+        let stdout = search_stdout("matches", &path, &expected_preview);
+        complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, &stdout, "")
+            .await;
+    }
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert!(
+        result.output.get("output_truncated").is_none(),
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.get("next_index").is_none(),
+        "{}",
+        result.output
+    );
+    let items = result.output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 8);
+    for item in items {
+        assert_eq!(item["output"]["matches"][0]["preview"], expected_preview);
+        assert!(item["output"].get("backend").is_none());
+        assert!(item["output"].get("truncation_reason").is_none());
+    }
+}
+
+#[tokio::test]
 async fn search_project_texts_dispatch_mixed_batch_only_sparsifies_success_item() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -559,6 +667,7 @@ async fn search_project_texts_dispatch_mixed_batch_only_sparsifies_success_item(
                         project,
                         queries: vec![query("steady", None), invalid],
                         session_id: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -1474,6 +1583,7 @@ async fn search_project_texts_records_one_event_without_patterns_and_aggregates_
                             ),
                         ],
                         session_id: Some(session_id),
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )

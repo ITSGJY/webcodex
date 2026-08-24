@@ -34,7 +34,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "search_project_texts",
-            "Run 1 to 8 bounded searches in request order. Item failures stay isolated with failure_stage/detail_code, distinct from successful empty results. Uses two Runner requests concurrently, one 30-second batch deadline, and bounded output with next_index; never reads files automatically.",
+            "Run 1 to 8 searches in request order with isolated failures and two Runner requests in flight. Primary batch budget is ~64 KiB, up to 256 KiB. Budget continuation returns whole queries via next_index; if the first remaining query cannot fit, raise max_result_bytes or narrow it.",
             search_project_texts_input_schema(),
         ),
         tool_spec(
@@ -44,7 +44,7 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool_spec(
             "read_files",
-            "Read 1 to 8 targeted UTF-8 project files or ranges in request order. Item failures are isolated. Runner reads have true four-request concurrency, one 30-second batch deadline, and a 256 KiB serialized-result cap with next_index continuation.",
+            "Read 1 to 8 UTF-8 file ranges in request order with isolated failures and four Runner reads in flight. The primary batch projection defaults to ~64 KiB; max_result_bytes raises it to 256 KiB. Session/continuity overlays stay separately bounded. Partial reads return deterministic cursors.",
             read_files_input_schema(),
         ),
     ]

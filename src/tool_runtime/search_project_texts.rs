@@ -13,6 +13,8 @@ use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 pub(crate) const MAX_SEARCH_PROJECT_TEXTS_QUERIES: usize = 8;
 pub(crate) const MAX_SEARCH_PROJECT_TEXTS_CONCURRENCY: usize = 2;
 pub(crate) const DEFAULT_SEARCH_PROJECT_TEXTS_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES: usize = 64 * 1024;
+pub(crate) const MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES: usize = 8 * 1024;
 
 impl From<SearchProjectTextsQuery> for SearchRequest {
     fn from(query: SearchProjectTextsQuery) -> Self {
@@ -30,19 +32,29 @@ impl From<SearchProjectTextsQuery> for SearchRequest {
     }
 }
 
+fn normalized_result_budget(max_result_bytes: Option<usize>) -> usize {
+    max_result_bytes
+        .unwrap_or(DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES)
+        .clamp(
+            MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES,
+            MAX_SERIALIZED_OUTPUT_BYTES,
+        )
+}
+
 fn batch_output(
     project: &str,
     requested_count: usize,
     items: Vec<Value>,
     output_truncated: bool,
     next_index: Option<usize>,
+    truncation_reason: Option<&str>,
 ) -> Value {
     let succeeded_count = items
         .iter()
         .filter(|item| item["success"].as_bool() == Some(true))
         .count();
     let returned_count = items.len();
-    json!({
+    let mut output = json!({
         "project": project,
         "requested_count": requested_count,
         "returned_count": returned_count,
@@ -51,16 +63,51 @@ fn batch_output(
         "items": items,
         "output_truncated": output_truncated,
         "next_index": next_index,
-    })
+    });
+    if let Some(reason) = truncation_reason {
+        output["truncation_reason"] = json!(reason);
+    }
+    output
 }
 
-fn serialized_batch_fits(output: &Value) -> bool {
+#[cfg(test)]
+fn serialized_batch_len(output: &Value) -> usize {
     serde_json::to_vec(&ToolResult::ok(output.clone()))
-        .map(|bytes| {
-            bytes.len()
-                <= MAX_SERIALIZED_OUTPUT_BYTES.saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
-        })
-        .unwrap_or(false)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn serialized_value_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn projected_batch_serialized_len(output: &Value, default_queries: &[bool]) -> usize {
+    let mut projected = ToolResult::ok(output.clone());
+    super::dispatch::sparsify_complete_default_search_batch_success(
+        default_queries,
+        &mut projected,
+    );
+    serde_json::to_vec(&projected)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn projected_search_item_len(item: &Value, default_query: bool) -> usize {
+    let mut projected = item.clone();
+    if default_query && projected["success"].as_bool() == Some(true) {
+        if let Some(output) = projected.get_mut("output").and_then(Value::as_object_mut) {
+            super::dispatch::sparsify_complete_default_search_output(output, true);
+        }
+    }
+    serialized_value_len(&projected)
+}
+
+fn projected_batch_len(base_len: usize, item_bytes: usize, item_count: usize) -> usize {
+    base_len
+        .saturating_add(item_bytes)
+        .saturating_add(item_count.saturating_sub(1))
 }
 
 fn retryable_agent_request_failure(result: &ToolResult) -> bool {
@@ -68,29 +115,99 @@ fn retryable_agent_request_failure(result: &ToolResult) -> bool {
         && result.output.get("code").and_then(Value::as_str) == Some("search_request_dropped")
 }
 
-fn apply_output_budget(project: &str, requested_count: usize, completed: Vec<Value>) -> Value {
+fn apply_output_budget(
+    project: &str,
+    requested_count: usize,
+    completed: Vec<Value>,
+    default_queries: &[bool],
+    max_result_bytes: Option<usize>,
+) -> Value {
+    let result_budget = normalized_result_budget(max_result_bytes);
+    let payload_budget = result_budget.saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES);
+    let complete = batch_output(
+        project,
+        requested_count,
+        completed.clone(),
+        false,
+        None,
+        None,
+    );
+    // First evaluate the exact sparse model projection. Canonical search
+    // metadata stays intact unless that final applicable projection itself
+    // exceeds the response budget.
+    if projected_batch_serialized_len(&complete, default_queries) <= payload_budget {
+        return complete;
+    }
+
+    let truncation_reason = if result_budget == MAX_SERIALIZED_OUTPUT_BYTES {
+        "hard_result_cap"
+    } else {
+        "batch_response_budget"
+    };
+    let base_len = projected_batch_serialized_len(
+        &batch_output(
+            project,
+            requested_count,
+            Vec::new(),
+            true,
+            Some(0),
+            Some(truncation_reason),
+        ),
+        default_queries,
+    );
     let mut returned = Vec::with_capacity(completed.len());
+    let mut returned_item_bytes = 0usize;
     let mut next_index = None;
 
     for item in completed {
         let index = item["index"].as_u64().unwrap_or(returned.len() as u64) as usize;
-        let mut candidate_items = returned.clone();
-        candidate_items.push(item.clone());
-        let candidate = batch_output(project, requested_count, candidate_items, false, None);
-        if !serialized_batch_fits(&candidate) {
-            next_index = Some(index);
-            break;
+        let item_len =
+            projected_search_item_len(&item, default_queries.get(index).copied().unwrap_or(false));
+        let candidate_item_count = returned.len() + 1;
+        if projected_batch_len(
+            base_len,
+            returned_item_bytes.saturating_add(item_len),
+            candidate_item_count,
+        ) <= payload_budget
+        {
+            returned_item_bytes = returned_item_bytes.saturating_add(item_len);
+            returned.push(item);
+            continue;
         }
-        returned.push(item);
+
+        // Search batch continuation is query-granular. Backend match order is
+        // intentionally unstable, so exposing a partial query and resuming by
+        // match position would permit duplicates and gaps across reruns.
+        next_index = Some(index);
+        break;
     }
 
-    batch_output(
+    let mut output = batch_output(
         project,
         requested_count,
         returned,
-        next_index.is_some(),
+        true,
         next_index,
-    )
+        Some(truncation_reason),
+    );
+    while projected_batch_serialized_len(&output, default_queries) > payload_budget {
+        let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) else {
+            break;
+        };
+        let Some(removed) = items.pop() else {
+            break;
+        };
+        next_index = removed["index"].as_u64().map(|index| index as usize);
+        output = batch_output(
+            project,
+            requested_count,
+            items.clone(),
+            true,
+            next_index,
+            Some(truncation_reason),
+        );
+    }
+    output
 }
 
 fn failure_reason_code(result: &ToolResult) -> &'static str {
@@ -248,6 +365,65 @@ fn batch_item(index: usize, mut result: ToolResult) -> Value {
     })
 }
 
+pub(crate) fn apply_model_facing_output_budget(
+    result: &mut ToolResult,
+    default_queries: &[bool],
+    max_result_bytes: Option<usize>,
+) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object() else {
+        return;
+    };
+    let Some(project) = output
+        .get("project")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(requested_count) = output
+        .get("requested_count")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+    else {
+        return;
+    };
+    let Some(completed) = output.get("items").and_then(Value::as_array).cloned() else {
+        return;
+    };
+
+    let budgeted = apply_output_budget(
+        &project,
+        requested_count,
+        completed,
+        default_queries,
+        max_result_bytes,
+    );
+    let Some(root) = result.output.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "project",
+        "requested_count",
+        "returned_count",
+        "succeeded_count",
+        "failed_count",
+        "items",
+        "output_truncated",
+        "next_index",
+        "truncation_reason",
+    ] {
+        root.remove(key);
+    }
+    if let Some(budgeted) = budgeted.as_object() {
+        for (key, value) in budgeted {
+            root.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 impl ToolRuntime {
     pub(crate) async fn search_project_texts(
         &self,
@@ -273,7 +449,6 @@ impl ToolRuntime {
         let runtime_project_id = resolved.resolved_id.clone();
         let requested_count = queries.len();
         let deadline = Instant::now() + self.search_project_texts_deadline;
-
         // Validation, Runner enqueue, and response waiting all happen inside
         // the concurrency slot. A third query cannot enter the Runner queue
         // while two earlier queries still hold their slots.
@@ -324,10 +499,13 @@ impl ToolRuntime {
             .await;
         completed.sort_by_key(|item| item["index"].as_u64().unwrap_or(u64::MAX));
 
-        ToolResult::ok(apply_output_budget(
+        ToolResult::ok(batch_output(
             &runtime_project_id,
             requested_count,
             completed,
+            false,
+            None,
+            None,
         ))
     }
 }
@@ -335,6 +513,96 @@ impl ToolRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matches_item(index: usize, count: usize, preview_bytes: usize) -> Value {
+        let matches = (0..count)
+            .map(|match_index| {
+                json!({
+                    "path": format!("src/{index}-{match_index:03}.rs"),
+                    "line": match_index + 1,
+                    "preview": format!("m{match_index:03}-{}", "界".repeat(preview_bytes / 3)),
+                    "context_before": [],
+                    "context_after": []
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "index": index,
+            "success": true,
+            "output": {
+                "backend": "rg",
+                "result_mode": "matches",
+                "count": count,
+                "matches": matches,
+                "truncated": false,
+                "truncation_reason": null
+            },
+            "error": null
+        })
+    }
+
+    fn default_matches_item(index: usize, count: usize, preview_bytes: usize) -> Value {
+        let mut item = matches_item(index, count, preview_bytes);
+        let output = item["output"].as_object_mut().unwrap();
+        output.insert("path".to_string(), json!("."));
+        output.insert("effective_timeout_secs".to_string(), json!(30));
+        output.insert("exit_code".to_string(), json!(0));
+        output.insert("context_before".to_string(), json!(0));
+        output.insert("context_after".to_string(), json!(0));
+        item
+    }
+
+    #[test]
+    fn complete_default_sparse_fit_is_not_preemptively_budget_truncated() {
+        let payload_budget =
+            DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES - MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
+        let mut selected = None;
+        for preview_bytes in 6_000..=9_000 {
+            let completed = (0..8)
+                .map(|index| default_matches_item(index, 1, preview_bytes))
+                .collect::<Vec<_>>();
+            let canonical = batch_output("agent:oe:demo", 8, completed.clone(), false, None, None);
+            let canonical_bytes = serialized_batch_len(&canonical);
+            let sparse_bytes = projected_batch_serialized_len(&canonical, &[true; 8]);
+            if canonical_bytes > payload_budget && sparse_bytes <= payload_budget {
+                selected = Some((completed, canonical_bytes, sparse_bytes));
+                break;
+            }
+        }
+        let (completed, canonical_bytes, sparse_bytes) =
+            selected.expect("test fixture must straddle canonical/sparse budget boundary");
+        assert!(canonical_bytes > payload_budget);
+        assert!(sparse_bytes <= payload_budget);
+
+        let mut result = ToolResult::ok(batch_output(
+            "agent:oe:demo",
+            8,
+            completed.clone(),
+            false,
+            None,
+            None,
+        ));
+        apply_model_facing_output_budget(&mut result, &[true; 8], None);
+        assert_eq!(result.output["output_truncated"], false);
+        assert!(result.output["next_index"].is_null());
+        assert_eq!(result.output["items"].as_array().unwrap().len(), 8);
+        for (actual, expected) in result.output["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(completed.iter())
+        {
+            assert_eq!(actual["output"]["matches"], expected["output"]["matches"]);
+        }
+
+        super::super::dispatch::sparsify_complete_default_search_batch_success(
+            &[true; 8],
+            &mut result,
+        );
+        assert!(result.output.get("output_truncated").is_none());
+        assert!(result.output.get("next_index").is_none());
+        assert_eq!(result.output["items"].as_array().unwrap().len(), 8);
+    }
 
     #[test]
     fn output_budget_keeps_whole_items_and_reserves_outer_metadata_space() {
@@ -367,6 +635,8 @@ mod tests {
                 item(1, "y".repeat(120 * 1024)),
                 item(2, "z".repeat(120 * 1024)),
             ],
+            &[false, false, false],
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
         );
         assert_eq!(output["returned_count"], 2);
         assert_eq!(output["next_index"], 2);
@@ -388,5 +658,105 @@ mod tests {
             "suggested_next_tool": "session_discussion_summary"
         });
         assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_SERIALIZED_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn single_query_soft_budget_omits_whole_item_then_larger_budget_returns_it() {
+        let completed = vec![default_matches_item(0, 120, 900)];
+        let default = apply_output_budget("agent:oe:demo", 1, completed.clone(), &[true], None);
+        assert_eq!(default["returned_count"], 0);
+        assert!(default["items"].as_array().unwrap().is_empty());
+        assert_eq!(default["next_index"], 0);
+        assert_eq!(default["output_truncated"], true);
+        assert_eq!(default["truncation_reason"], "batch_response_budget");
+
+        let large = apply_output_budget(
+            "agent:oe:demo",
+            1,
+            completed,
+            &[true],
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+        );
+        assert_eq!(large["output_truncated"], false);
+        assert!(large["next_index"].is_null());
+        assert_eq!(large["returned_count"], 1);
+        assert_eq!(
+            large["items"][0]["output"]["matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            120
+        );
+    }
+
+    #[test]
+    fn whole_query_continuation_is_independent_of_backend_match_order() {
+        let first_query = default_matches_item(0, 1, 100);
+        let omitted_query = default_matches_item(1, 90, 900);
+        let first = apply_output_budget(
+            "agent:oe:demo",
+            2,
+            vec![first_query.clone(), omitted_query],
+            &[true, true],
+            None,
+        );
+        assert_eq!(first["returned_count"], 1);
+        assert_eq!(first["items"][0], first_query);
+        assert_eq!(first["next_index"], 1);
+        assert_eq!(first["output_truncated"], true);
+
+        // A suffix rerun is a fresh query execution. Deliberately reverse its
+        // match order to prove continuation does not stitch by match position.
+        let mut rerun = default_matches_item(0, 90, 900);
+        rerun["output"]["matches"].as_array_mut().unwrap().reverse();
+        let rerun_matches = rerun["output"]["matches"].clone();
+        let continuation = apply_output_budget(
+            "agent:oe:demo",
+            1,
+            vec![rerun],
+            &[true],
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+        );
+        assert_eq!(continuation["output_truncated"], false);
+        assert_eq!(continuation["returned_count"], 1);
+        assert_eq!(continuation["items"][0]["output"]["matches"], rerun_matches);
+    }
+
+    #[test]
+    fn fitting_producer_truncation_remains_independent_of_batch_budget() {
+        for reason in ["limit", "output_bytes"] {
+            let mut original = matches_item(0, 2, 100);
+            original["output"]["truncated"] = json!(true);
+            original["output"]["truncation_reason"] = json!(reason);
+            let expected = original.clone();
+            let output = apply_output_budget("agent:oe:demo", 1, vec![original], &[false], None);
+            assert_eq!(output["output_truncated"], false);
+            assert!(output["next_index"].is_null());
+            assert_eq!(output["items"][0], expected);
+        }
+    }
+
+    #[test]
+    fn hard_cap_pressure_omits_oversized_query_without_partial_matches() {
+        let output = apply_output_budget(
+            "agent:oe:demo",
+            1,
+            vec![matches_item(0, 199, 2_000)],
+            &[false],
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+        );
+        assert_eq!(output["returned_count"], 0);
+        assert!(output["items"].as_array().unwrap().is_empty());
+        assert_eq!(output["next_index"], 0);
+        assert_eq!(output["output_truncated"], true);
+        assert_eq!(output["truncation_reason"], "hard_result_cap");
+    }
+
+    #[test]
+    fn search_result_budget_clamps_to_existing_hard_cap() {
+        assert_eq!(
+            normalized_result_budget(Some(MAX_SERIALIZED_OUTPUT_BYTES * 2)),
+            MAX_SERIALIZED_OUTPUT_BYTES
+        );
     }
 }
