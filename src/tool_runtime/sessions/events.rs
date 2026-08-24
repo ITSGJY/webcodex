@@ -16,17 +16,26 @@ use super::model::{
     PersistentShellEventEvidence, SessionEvent, ToolCallExpectation, ToolCallRecorderMetadata,
     MAX_OBSERVED_PATHS_PER_EVENT, MAX_VALIDATION_EXCERPT_CHARS, SESSION_ID_PREFIX,
     TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_SESSION_MESSAGE_IDS_INTERNAL_FIELD,
-    TOOL_CALL_EXPECTATION_METADATA_FIELDS, TOOL_EXPECTATION_RESULT_MATCHED,
-    TOOL_EXPECTATION_RESULT_MISMATCH, TOOL_EXPECTATION_RESULT_NONE,
-    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS,
-    TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD,
+    TOOL_CALL_EXPECTATION_METADATA_FIELDS, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    TOOL_EXPECTATION_RESULT_MATCHED, TOOL_EXPECTATION_RESULT_MISMATCH,
+    TOOL_EXPECTATION_RESULT_NONE, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
+    TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS, TOOL_EXPECTED_FAILURE_FIELD,
+    TOOL_EXPECTED_FAILURE_KIND_FIELD,
 };
 use super::util::redact_and_bound_value;
 use super::util::{bound_summary_string, validation_excerpt};
 
 impl ToolCallRecorderMetadata {
     pub(crate) fn from_arguments(arguments: &Value) -> Self {
+        let recording_session_id = arguments
+            .as_object()
+            .and_then(|object| object.get(TOOL_CALL_RECORDING_SESSION_ID_FIELD))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| is_valid_session_id(value))
+            .map(str::to_string);
         Self {
+            recording_session_id,
             expectation: tool_call_expectation_from_arguments(arguments),
             ack_session_message_ids: arguments
                 .as_object()

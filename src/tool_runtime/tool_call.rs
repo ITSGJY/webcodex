@@ -19,7 +19,7 @@ use crate::lsp_bridge::{
 use crate::shell_protocol::ShellScriptLanguage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 pub(crate) const TOOL_CALL_TOOL_FIELD: &str = "tool";
 pub(crate) const TOOL_CALL_PARAMS_FIELD: &str = "params";
@@ -395,7 +395,9 @@ pub enum ToolCall {
     /// explicit `session_id` (never current-session fallback). Idempotent when
     /// already closed. Does not archive or evict; clears bindings to the closed
     /// Session.
-    CloseSession { session_id: String },
+    CloseSession {
+        session_id: String,
+    },
 
     /// Read bounded structured validation evidence already present in an
     /// explicit project-scoped session ledger. Never executes validation,
@@ -508,15 +510,22 @@ pub enum ToolCall {
 
     /// Explicitly bind an existing project-scoped session as current for the
     /// client window, caller, transport, and project.
-    BindCurrentSession { project: String, session_id: String },
+    BindCurrentSession {
+        project: String,
+        session_id: String,
+    },
 
     /// Return this window/caller/transport's exact current session binding for
     /// a project, restoring its process-local cache from the ledger if needed.
-    CurrentSession { project: String },
+    CurrentSession {
+        project: String,
+    },
 
     /// Remove this window/caller/transport's exact current session binding from
     /// both the process-local cache and durable ledger projection. Idempotent.
-    UnbindCurrentSession { project: String },
+    UnbindCurrentSession {
+        project: String,
+    },
 
     /// Create a bounded last-known-good workspace checkpoint outside the
     /// project worktree.
@@ -615,6 +624,28 @@ pub enum ToolCall {
         cwd: Option<String>,
         #[serde(default)]
         purpose: Option<ExecutionPurpose>,
+    },
+    CodingAgentStart {
+        project: String,
+        provider_id: String,
+        idempotency_key: String,
+        instruction: String,
+        #[serde(default)]
+        config: Option<BTreeMap<String, webcodex_core::coding_agent::CodingAgentConfigValue>>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        recording_session_id: Option<String>,
+    },
+    CodingAgentObserve {
+        run_id: String,
+        #[serde(default)]
+        after_observation_token: Option<String>,
+        #[serde(default)]
+        wait_secs: Option<u64>,
+    },
+    CodingAgentCancel {
+        run_id: String,
     },
 
     /// Execute bounded script content transported as typed data and written to
@@ -1414,7 +1445,9 @@ pub enum ToolCall {
     },
 
     /// Read the exact Runner's macOS Accessibility trust status without prompting.
-    ComputerAccessibilityStatus { client_id: String },
+    ComputerAccessibilityStatus {
+        client_id: String,
+    },
 
     /// Inspect one exact previously listed macOS surface as a bounded AX tree.
     ComputerAccessibilityTree {
@@ -1482,10 +1515,15 @@ pub enum ToolCall {
     },
 
     /// Read bounded native plain Unicode text from the global clipboard.
-    ComputerReadClipboard { client_id: String },
+    ComputerReadClipboard {
+        client_id: String,
+    },
 
     /// Replace the global clipboard with bounded native plain Unicode text.
-    ComputerWriteClipboard { client_id: String, text: String },
+    ComputerWriteClipboard {
+        client_id: String,
+        text: String,
+    },
 
     /// Move the native macOS or Windows pointer using one latest unspent full-display snapshot generation.
     ComputerPointerMove {
@@ -2083,6 +2121,9 @@ impl ToolCall {
             Self::WorkspaceCheckpointDelete { .. } => "workspace_checkpoint_delete",
             Self::RunProcess { .. } => "run_process",
             Self::RunDetachedProcess { .. } => "run_detached_process",
+            Self::CodingAgentStart { .. } => "coding_agent_start",
+            Self::CodingAgentObserve { .. } => "coding_agent_observe",
+            Self::CodingAgentCancel { .. } => "coding_agent_cancel",
             Self::RunScript { .. } => "run_script",
             Self::RunShell { .. } => "run_shell",
             Self::OpenSessionShell { .. } => "open_session_shell",
@@ -2240,6 +2281,8 @@ impl ToolCall {
     }
 
     pub(crate) fn with_effective_session_id(mut self, effective_session_id: String) -> Self {
+        // CodingAgentRun recorder provenance is intentionally not a business
+        // Session id and never participates in current-Session inheritance.
         match &mut self {
             Self::RunProcess { session_id, .. }
             | Self::RunDetachedProcess { session_id, .. }
@@ -2308,6 +2351,27 @@ impl ToolCall {
         self
     }
 
+    /// Attach explicit generic recorder provenance to a CodingAgentStart only.
+    /// This never makes the recorder a business Session or Run authority.
+    pub(crate) fn with_coding_agent_recording_session_id(
+        mut self,
+        recorder_session_id: Option<String>,
+    ) -> Self {
+        if let (
+            Self::CodingAgentStart {
+                recording_session_id,
+                ..
+            },
+            Some(recorder_session_id),
+        ) = (&mut self, recorder_session_id)
+        {
+            if recording_session_id.is_none() {
+                *recording_session_id = Some(recorder_session_id);
+            }
+        }
+        self
+    }
+
     /// Apply project-matched Session defaults without overwriting explicit
     /// per-call arguments.
     pub(crate) fn with_session_execution_context(
@@ -2341,6 +2405,7 @@ impl ToolCall {
         match self {
             Self::RunProcess { project, .. }
             | Self::RunDetachedProcess { project, .. }
+            | Self::CodingAgentStart { project, .. }
             | Self::RunScript { project, .. }
             | Self::RunShell { project, .. }
             | Self::OpenSessionShell { project, .. }

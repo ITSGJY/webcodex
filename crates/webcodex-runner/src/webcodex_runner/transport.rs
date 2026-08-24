@@ -361,16 +361,22 @@ impl AgentRuntimeState {
         let joined = self.background_threads.join_until(background_deadline);
         let workers_done = self.jobs.wait_for_workers(background_deadline);
         let dispatches_done = self.dispatches.wait_until(background_deadline);
+        let coding_agents = self
+            .config
+            .coding_agents()
+            .map(|manager| manager.drain_workers_until(background_deadline))
+            .unwrap_or_default();
         let background_timeouts = reload_retry.timed_out
             + joined.timed_out
             + usize::from(!workers_done)
-            + usize::from(!dispatches_done);
+            + usize::from(!dispatches_done)
+            + coding_agents.timed_out;
         phases.push(shutdown_phase(
             "background_threads_join",
             started,
-            background_resources,
+            background_resources + coding_agents.resources,
             background_timeouts,
-            reload_retry.panicked + joined.panicked,
+            reload_retry.panicked + joined.panicked + coding_agents.panicked,
             "background_thread_panicked",
         ));
 
@@ -963,6 +969,7 @@ impl AgentSink {
             },
             command_execution_state: None,
             mcp_gateway: None,
+            coding_agent: None,
         })
     }
 
@@ -986,6 +993,31 @@ impl AgentSink {
             },
             command_execution_state: None,
             mcp_gateway: Some(response),
+            coding_agent: None,
+        })
+    }
+
+    /// Submit one closed CodingAgentRun response. ACP JSON-RPC remains local to
+    /// the Runner and never crosses this typed transport result boundary.
+    pub(crate) fn submit_coding_agent_result(
+        &self,
+        request_id: String,
+        response: webcodex_core::coding_agent::CodingAgentResponse,
+    ) -> Result<ResultSubmission, SubmitResultError> {
+        self.submit_result_payload(ShellAgentResultPayload {
+            result: ShellAgentResultRequest {
+                client_id: self.client_id().to_string(),
+                agent_instance_id: self.agent_instance_id().to_string(),
+                request_id,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: None,
+                error: None,
+            },
+            command_execution_state: None,
+            mcp_gateway: None,
+            coding_agent: Some(response),
         })
     }
 
@@ -1031,6 +1063,7 @@ impl AgentSink {
             },
             command_execution_state: Some(execution_state),
             mcp_gateway: None,
+            coding_agent: None,
         };
         let submitted = self.submit_result_payload(body);
         if matches!(&submitted, Ok(ResultSubmission::Accepted)) {

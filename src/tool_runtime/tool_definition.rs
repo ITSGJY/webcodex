@@ -7,6 +7,7 @@
 
 mod artifacts;
 mod checkpoints;
+mod coding_agents;
 mod computer;
 mod current_sessions;
 mod discovery;
@@ -50,7 +51,7 @@ pub(crate) use super::tool_policy::{
     is_model_visible_tool_name, lookup_tool_definition, model_visible_tool_definitions,
     model_visible_tool_names_csv, runtime_tool_agent_capability,
     runtime_tool_allows_current_session_fallback, runtime_tool_captures_validation_output,
-    runtime_tool_category, runtime_tool_disabled_message,
+    runtime_tool_category, runtime_tool_disabled_message, runtime_tool_effect_annotations,
     runtime_tool_extra_accepted_flattened_args, runtime_tool_is_change_summary_like,
     runtime_tool_is_git_like, runtime_tool_is_read_like, runtime_tool_is_shell_like,
     runtime_tool_is_write_like, runtime_tool_metadata, runtime_tool_permission_risk,
@@ -59,6 +60,7 @@ pub(crate) use super::tool_policy::{
 };
 use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS, SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
+    SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH,
@@ -138,6 +140,9 @@ pub(crate) enum AgentCapability {
     LspReadOnlyNavigation,
     /// Bounded typed call-hierarchy traversal; never inferred from navigation.
     LspCallHierarchy,
+    /// Runner-owned delegated ACP coding-agent execution. Never inferred from
+    /// shell, Job, MCP, or file-write capability.
+    CodingAgentRuns,
 }
 
 impl AgentCapability {
@@ -173,6 +178,7 @@ impl AgentCapability {
             Self::ComputerTextInput => SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT,
             Self::LspReadOnlyNavigation => SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
             Self::LspCallHierarchy => SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY,
+            Self::CodingAgentRuns => SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS,
         }
     }
 
@@ -213,6 +219,7 @@ impl AgentCapability {
             Self::ComputerTextInput => &[SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT],
             Self::LspReadOnlyNavigation => &[SHELL_CLIENT_CAPABILITY_LSP_READ_ONLY_NAVIGATION],
             Self::LspCallHierarchy => &[SHELL_CLIENT_CAPABILITY_LSP_CALL_HIERARCHY],
+            Self::CodingAgentRuns => &[SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS],
         }
     }
 
@@ -267,6 +274,7 @@ pub(crate) struct ToolDefinition {
 
 pub(crate) const TOOL_CATEGORY_ARTIFACT: &str = "artifact";
 pub(crate) const TOOL_CATEGORY_CHECKPOINT: &str = "checkpoint";
+pub(crate) const TOOL_CATEGORY_CODING_AGENT: &str = "coding_agent";
 pub(crate) const TOOL_CATEGORY_COMPUTER: &str = "computer";
 pub(crate) const TOOL_CATEGORY_CLEANUP: &str = "cleanup";
 pub(crate) const TOOL_CATEGORY_EDIT: &str = "edit";
@@ -289,14 +297,24 @@ pub(crate) const PERMISSION_RISK_VALIDATION: &str = "validation";
 pub(crate) const PERMISSION_RISK_WRITE: &str = "write";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolEffectAnnotations {
+    pub(crate) read_only_hint: bool,
+    pub(crate) destructive_hint: bool,
+    pub(crate) idempotent_hint: bool,
+    pub(crate) open_world_hint: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ToolDefinitionPolicy {
     pub(crate) change_summary_like: bool,
     pub(crate) captures_validation_output: bool,
     pub(crate) current_session_control: bool,
     pub(crate) creates_or_binds_session: bool,
+    pub(crate) current_session_fallback_disabled: bool,
     pub(crate) disabled_message: Option<&'static str>,
     pub(crate) extra_accepted_flattened_args: &'static [&'static str],
     pub(crate) git_like: bool,
+    pub(crate) effect_annotations: Option<ToolEffectAnnotations>,
     pub(crate) permission_risk: Option<&'static str>,
     pub(crate) requires_artifact_upload_path_binding: bool,
     pub(crate) requires_explicit_business_session: bool,
@@ -309,9 +327,11 @@ impl ToolDefinitionPolicy {
         captures_validation_output: false,
         current_session_control: false,
         creates_or_binds_session: false,
+        current_session_fallback_disabled: false,
         disabled_message: None,
         extra_accepted_flattened_args: &[],
         git_like: false,
+        effect_annotations: None,
         permission_risk: None,
         requires_artifact_upload_path_binding: false,
         requires_explicit_business_session: false,
@@ -389,6 +409,19 @@ const fn model_spec(
     }
 }
 
+const fn effect_annotations(
+    definition: ToolDefinition,
+    annotations: ToolEffectAnnotations,
+) -> ToolDefinition {
+    ToolDefinition {
+        policy: ToolDefinitionPolicy {
+            effect_annotations: Some(annotations),
+            ..definition.policy
+        },
+        ..definition
+    }
+}
+
 macro_rules! bool_policy_modifier {
     ($function:ident, $field:ident) => {
         const fn $function(definition: ToolDefinition) -> ToolDefinition {
@@ -412,6 +445,11 @@ bool_policy_modifier!(current_session_control, current_session_control);
 bool_policy_modifier!(git_like, git_like);
 
 bool_policy_modifier!(creates_or_binds_session, creates_or_binds_session);
+
+bool_policy_modifier!(
+    disable_current_session_fallback,
+    current_session_fallback_disabled
+);
 
 const fn extra_accepted_flattened_args(
     definition: ToolDefinition,
@@ -467,6 +505,7 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     hygiene::DEFINITIONS,
     current_sessions::DEFINITIONS,
     checkpoints::DEFINITIONS,
+    coding_agents::DEFINITIONS,
     computer::DEFINITIONS,
     discovery::DEFINITIONS,
     jobs::EXECUTION_DEFINITIONS,

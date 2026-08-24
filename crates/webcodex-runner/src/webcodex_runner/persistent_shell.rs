@@ -1094,6 +1094,7 @@ mod tests {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: Some(PersistentShellRequest {
                 action: action.to_string(),
                 shell_id: shell_id.to_string(),

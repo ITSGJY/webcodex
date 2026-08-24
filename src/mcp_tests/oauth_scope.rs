@@ -521,6 +521,93 @@ async fn oauth2_tools_list_projects_optional_computer_tools_from_actual_token_sc
 }
 
 #[tokio::test]
+async fn oauth2_coding_agent_tools_require_independent_scope_in_catalog_and_direct_call() {
+    let insufficient = "runtime:read project:read project:write job:run mcp:local";
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface(insufficient, ModelSurface::FullOperatorRuntime);
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let names = listed_tool_names(&body);
+    for name in [
+        "coding_agent_start",
+        "coding_agent_observe",
+        "coding_agent_cancel",
+    ] {
+        assert!(!names.contains(name), "insufficient scopes leaked {name}");
+    }
+
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": "coding_agent_cancel",
+            "arguments": {"run_id": "wc_agent_run_scopeprobe0001"}
+        }),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_CODING_AGENT_RUN),
+    );
+
+    let coding_agent_without_write = "runtime:read project:read coding_agent:run mcp:local";
+    let (_tmp, service, token) = oauth_mcp_service_with_surface(
+        coding_agent_without_write,
+        ModelSurface::FullOperatorRuntime,
+    );
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let names = listed_tool_names(&body);
+    assert!(names.contains("coding_agent_observe"));
+    assert!(names.contains("coding_agent_cancel"));
+    assert!(
+        !names.contains("coding_agent_start"),
+        "delegated start must also require project:write"
+    );
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": "coding_agent_start",
+            "arguments": {
+                "project": "agent:missing:demo",
+                "provider_id": "codex",
+                "idempotency_key": "scope-probe",
+                "instruction": "inspect"
+            }
+        }),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_PROJECT_WRITE),
+    );
+
+    let allowed = format!("{insufficient} coding_agent:run");
+    let (_tmp, service, token) =
+        oauth_mcp_service_with_surface(&allowed, ModelSurface::FullOperatorRuntime);
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let names = listed_tool_names(&body);
+    for name in [
+        "coding_agent_start",
+        "coding_agent_observe",
+        "coding_agent_cancel",
+    ] {
+        assert!(
+            names.contains(name),
+            "explicit coding_agent:run should list {name}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oauth2_pointer_tool_call_still_requires_display_scope_even_if_invoked_directly() {
     let scopes = "runtime:read computer:read computer:control computer:pointer_control";
     let (_tmp, service, token) =

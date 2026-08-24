@@ -12,6 +12,7 @@ const BRIDGE_PROFILE_VERSION: u32 = 1;
 const BRIDGE_PROFILE_PREFIX: &str = "shared-key-oauth-";
 const BRIDGE_SECRET_DISCLOSED_PREFIX: &str = ".shared-key-oauth-secret-disclosed-";
 const LOCAL_MCP_SCOPE: &str = "mcp:local";
+const CODING_AGENT_SCOPE: &str = "coding_agent:run";
 const BRIDGE_BASELINE_SCOPES: &[&str] = &[
     "runtime:read",
     "project:read",
@@ -55,6 +56,8 @@ struct SharedKeyOAuthProfile {
     computer_permissions_enabled: bool,
     #[serde(default)]
     local_mcp_enabled: bool,
+    #[serde(default)]
+    coding_agent_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -127,10 +130,10 @@ fn scope_list_is_unique(scopes: &[String]) -> bool {
         == scopes.len()
 }
 
-fn without_local_mcp(scopes: &[String]) -> Vec<String> {
+fn without_optional_class_scopes(scopes: &[String]) -> Vec<String> {
     scopes
         .iter()
-        .filter(|scope| scope.as_str() != LOCAL_MCP_SCOPE)
+        .filter(|scope| !matches!(scope.as_str(), LOCAL_MCP_SCOPE | CODING_AGENT_SCOPE))
         .cloned()
         .collect()
 }
@@ -188,7 +191,14 @@ fn profile_scope_ceiling_is_valid(profile: &SharedKeyOAuthProfile) -> bool {
     if local_mcp_present != profile.local_mcp_enabled {
         return false;
     }
-    let authority_scopes = without_local_mcp(&profile.allowed_scopes);
+    let coding_agent_present = profile
+        .allowed_scopes
+        .iter()
+        .any(|scope| scope == CODING_AGENT_SCOPE);
+    if coding_agent_present != profile.coding_agent_enabled {
+        return false;
+    }
+    let authority_scopes = without_optional_class_scopes(&profile.allowed_scopes);
     if profile.computer_permissions_enabled {
         computer_enabled_scope_ceiling_is_valid(&authority_scopes)
     } else {
@@ -282,6 +292,7 @@ async fn provision_client(
             "previous_allowed_scopes": existing.map(|profile| profile.allowed_scopes.as_slice()),
             "computer_permissions": opts.oauth_computer_permissions,
             "local_mcp": opts.oauth_local_mcp,
+            "coding_agent": opts.oauth_coding_agent,
         }),
     })
     .await?;
@@ -315,7 +326,16 @@ async fn provision_client(
                 .to_string(),
         );
     }
-    let authority_scopes = without_local_mcp(&allowed_scopes);
+    let coding_agent_present = allowed_scopes
+        .iter()
+        .any(|scope| scope == CODING_AGENT_SCOPE);
+    if coding_agent_present != opts.oauth_coding_agent {
+        return Err(
+            "Server changed coding-agent OAuth authority without matching the explicit connect opt-in"
+                .to_string(),
+        );
+    }
+    let authority_scopes = without_optional_class_scopes(&allowed_scopes);
     if opts.oauth_computer_permissions {
         if !computer_enabled_scope_ceiling_is_valid(&authority_scopes) {
             return Err(
@@ -323,7 +343,7 @@ async fn provision_client(
             );
         }
         let expected_scopes = if let Some(existing) = existing {
-            computer_enabled_scope_ceiling_from_existing(&without_local_mcp(&existing.allowed_scopes))
+            computer_enabled_scope_ceiling_from_existing(&without_optional_class_scopes(&existing.allowed_scopes))
                 .ok_or_else(|| {
                     "existing shared-key OAuth profile cannot be safely upgraded to Computer permissions"
                         .to_string()
@@ -348,7 +368,7 @@ async fn provision_client(
             );
         }
         let expected_scopes = existing
-            .map(|profile| without_local_mcp(&profile.allowed_scopes))
+            .map(|profile| without_optional_class_scopes(&profile.allowed_scopes))
             .unwrap_or_else(|| {
                 BRIDGE_BASELINE_SCOPES
                     .iter()
@@ -381,6 +401,7 @@ async fn provision_client(
         updated.allowed_scopes = allowed_scopes;
         updated.computer_permissions_enabled = opts.oauth_computer_permissions;
         updated.local_mcp_enabled = opts.oauth_local_mcp;
+        updated.coding_agent_enabled = opts.oauth_coding_agent;
         let changed = updated != *existing;
         return Ok((updated, changed));
     }
@@ -400,6 +421,7 @@ async fn provision_client(
             allowed_scopes,
             computer_permissions_enabled: opts.oauth_computer_permissions,
             local_mcp_enabled: opts.oauth_local_mcp,
+            coding_agent_enabled: opts.oauth_coding_agent,
         },
         true,
     ))
@@ -488,6 +510,12 @@ pub(super) async fn finish_shared_key_oauth_connect(
                     .to_string(),
             );
         }
+        if existing.coding_agent_enabled && !opts.oauth_coding_agent {
+            return Err(
+                "this shared-key OAuth profile already has coding-agent authority enabled; reconnect with --oauth-coding-agent to reuse it, or use a different profile/redirect URI"
+                    .to_string(),
+            );
+        }
     }
     let metadata = fetch_metadata(opts, server_url).await?;
     let (oauth, created_or_rotated) = provision_client(
@@ -554,6 +582,7 @@ mod tests {
             oauth_redirect_uri: Some("https://chatgpt.example/callback".to_string()),
             oauth_computer_permissions: false,
             oauth_local_mcp: false,
+            oauth_coding_agent: false,
             username: None,
             project: PathBuf::from("."),
             profile: None,
@@ -689,6 +718,7 @@ mod tests {
             allowed_scopes: vec!["runtime:read".to_string(), "project:read".to_string()],
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
+            coding_agent_enabled: false,
         };
         let (upgraded, changed) = provision_client(
             &opts,
@@ -820,6 +850,7 @@ mod tests {
             allowed_scopes: vec!["runtime:read".to_string(), "project:read".to_string()],
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
+            coding_agent_enabled: false,
         };
         assert!(profile_scope_ceiling_is_valid(&baseline));
 
@@ -905,6 +936,7 @@ mod tests {
             allowed_scopes: vec!["runtime:read".to_string()],
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
+            coding_agent_enabled: false,
         };
         let state_path = Path::new("/protected/profile/shared-key-oauth.toml");
         let first = bridge_client_secret_line(&oauth, true, state_path);

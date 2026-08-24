@@ -390,6 +390,11 @@ fn required_agent_capability_matches_metadata_risk_table() {
             ToolRisk::JobRun,
             AgentCapability::StructuredScript,
         ),
+        (
+            "coding_agent_start",
+            ToolRisk::JobRun,
+            AgentCapability::CodingAgentRuns,
+        ),
         ("run_shell", ToolRisk::JobRun, AgentCapability::Shell),
         (
             "open_session_shell",

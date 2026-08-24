@@ -54,6 +54,17 @@ fn tool_specs_annotations_cover_safety_hints() {
         assert_eq!(annotations["destructiveHint"], false);
         assert_eq!(annotations["openWorldHint"], false);
     }
+
+    let cancel = &spec_named(&specs, "coding_agent_cancel").annotations;
+    assert_eq!(cancel["readOnlyHint"], false);
+    assert_eq!(cancel["destructiveHint"], false);
+    assert_eq!(cancel["idempotentHint"], true);
+    assert_eq!(cancel["openWorldHint"], false);
+    assert!(
+        !crate::tool_runtime::tool_definition::runtime_tool_requires_permission(
+            "coding_agent_cancel"
+        )
+    );
 }
 
 #[test]

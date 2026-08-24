@@ -535,6 +535,7 @@ async fn run_shell_via_agent_lifecycle_error(
             },
             command_execution_state: Some(execution_state),
             mcp_gateway: None,
+            coding_agent: None,
         })
         .await
         .unwrap();
@@ -873,6 +874,8 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
                 build: None,
                 job_concurrency_limit: Some(4),
                 job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,
@@ -1347,6 +1350,7 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
             },
             command_execution_state: Some(ShellCommandExecutionState::TimedOut),
             mcp_gateway: None,
+            coding_agent: None,
         })
         .await
         .unwrap();
@@ -2447,6 +2451,8 @@ async fn register_job_agent_for_auth(
                 build: None,
                 job_concurrency_limit: Some(4),
                 job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
                 client_id: client_id.to_string(),
                 agent_instance_id: "inst".to_string(),
                 display_name: None,

@@ -13,6 +13,10 @@ use crate::shell_protocol::{
     ShellAgentPersistentShellResultRequest, ShellAgentPollRequest, ShellAgentResultPayload,
     ShellAgentResultRequest, ShellAgentShellRequest, ShellCommandExecutionState, ShellRunResponse,
 };
+use webcodex_core::coding_agent::{
+    validate_response_for_request as validate_coding_agent_response, CodingAgentDispatchState,
+    CodingAgentResponse,
+};
 
 impl ShellClientRegistry {
     /// Polling-transport entry point. Polling registrations do not carry a
@@ -189,6 +193,57 @@ impl ShellClientRegistry {
                 inner.persistent_waiters.remove(&request_id);
                 continue;
             }
+            let stale_coding_agent_error =
+                inner.pending_by_id.get(&request_id).and_then(|pending| {
+                    if pending.request.coding_agent.is_none() {
+                        return None;
+                    }
+                    let Some(fence) = inner.coding_agent_fences.get(&request_id) else {
+                        return Some((
+                            "stale_coding_agent_fence",
+                            "CodingAgentRun exact dispatch fence is missing".to_string(),
+                        ));
+                    };
+                    let Some(client) = inner.clients.get(&body.client_id) else {
+                        return Some((
+                            "stale_runner",
+                            "CodingAgentRun target Runner disappeared before dispatch".to_string(),
+                        ));
+                    };
+                    if client.agent_instance_id != fence.agent_instance_id {
+                        return Some((
+                            "stale_runner",
+                            "CodingAgentRun target Runner changed before dispatch".to_string(),
+                        ));
+                    }
+                    if !client.coding_agent_providers.iter().any(|provider| {
+                        provider.provider_id == fence.provider_id
+                            && provider.provider_instance_id == fence.provider_instance_id
+                    }) {
+                        return Some((
+                            "stale_provider",
+                            "CodingAgentRun target ACP provider changed before dispatch"
+                                .to_string(),
+                        ));
+                    }
+                    None
+                });
+            if let Some((code, message)) = stale_coding_agent_error {
+                inner.pending_by_id.remove(&request_id);
+                if let Some(waiter) = inner.coding_agent_waiters.remove(&request_id) {
+                    let _ = waiter.send(CodingAgentResponse::error(
+                        CodingAgentDispatchState::NotStarted,
+                        code,
+                        message,
+                        Some("stale_state"),
+                        Some("reobserve"),
+                    ));
+                }
+                inner.coding_agent_fences.remove(&request_id);
+                inner.mcp_gateway_waiters.remove(&request_id);
+                inner.persistent_waiters.remove(&request_id);
+                continue;
+            }
             let stale_project_error = inner.pending_by_id.get(&request_id).and_then(|pending| {
                 match (
                     pending.expected_project_id.as_deref(),
@@ -283,6 +338,7 @@ impl ShellClientRegistry {
             payload.result,
             payload.command_execution_state,
             payload.mcp_gateway,
+            payload.coding_agent,
             None,
         )
         .await
@@ -304,6 +360,7 @@ impl ShellClientRegistry {
             payload.result,
             payload.command_execution_state,
             payload.mcp_gateway,
+            payload.coding_agent,
             Some(connection_id),
         )
         .await
@@ -314,6 +371,7 @@ impl ShellClientRegistry {
         body: ShellAgentResultRequest,
         command_execution_state: Option<ShellCommandExecutionState>,
         mcp_gateway: Option<crate::mcp_gateway::McpGatewayResponse>,
+        coding_agent: Option<CodingAgentResponse>,
         expected_connection_id: Option<&str>,
     ) -> Result<(), String> {
         validate_id(&body.client_id, "client_id")?;
@@ -379,6 +437,54 @@ impl ShellClientRegistry {
                 let _ = waiter.send(response);
             }
             return Ok(());
+        }
+        if pending.request.coding_agent.is_some() {
+            let response = match coding_agent {
+                Some(response)
+                    if command_execution_state.is_none()
+                        && mcp_gateway.is_none()
+                        && body.exit_code.is_none()
+                        && body.stdout.is_none()
+                        && body.stderr.is_none()
+                        && body.duration_ms.is_none()
+                        && body.error.is_none()
+                        && validate_coding_agent_response(
+                            pending
+                                .request
+                                .coding_agent
+                                .as_ref()
+                                .expect("checked above"),
+                            &response,
+                        )
+                        .is_ok() =>
+                {
+                    response
+                }
+                _ => CodingAgentResponse::error(
+                    if pending.dispatched {
+                        CodingAgentDispatchState::OutcomeUnknown
+                    } else {
+                        CodingAgentDispatchState::NotStarted
+                    },
+                    "invalid_runner_response",
+                    if pending.dispatched {
+                        "Runner returned an invalid CodingAgentRun response after dispatch; reconcile the same run_id before any new initiation"
+                    } else {
+                        "Runner returned an invalid CodingAgentRun response before dispatch"
+                    },
+                    Some("protocol"),
+                    Some("reobserve"),
+                ),
+            };
+            let waiter = inner.coding_agent_waiters.remove(&body.request_id);
+            inner.coding_agent_fences.remove(&body.request_id);
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(response);
+            }
+            return Ok(());
+        }
+        if coding_agent.is_some() {
+            return Err("unexpected CodingAgentRun result for non-coding request".to_string());
         }
         if mcp_gateway.is_some() {
             return Err("unexpected MCP gateway result for non-bridge request".to_string());

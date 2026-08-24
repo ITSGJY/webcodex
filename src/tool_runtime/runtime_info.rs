@@ -1563,6 +1563,7 @@ mod phase_e2_status_tests {
             connected: true,
             last_seen: 0,
             capabilities: Default::default(),
+            coding_agent_providers: None,
             pending_requests: 0,
             projects: Vec::new(),
             project_inventory: None,

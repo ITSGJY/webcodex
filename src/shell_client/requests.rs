@@ -4,7 +4,7 @@ use super::jobs::{
     request_preview, PendingRequestEnqueueError,
 };
 use super::projects::{capability_enabled, ShellClientLookupError};
-use super::state::{PendingShellRequest, ShellClientRegistryInner};
+use super::state::{CodingAgentDispatchFence, PendingShellRequest, ShellClientRegistryInner};
 use super::validation::{
     validate_file_request, validate_id, validate_process_request, validate_run_request,
     validate_script_enqueue_request,
@@ -42,6 +42,10 @@ use crate::shell_protocol::{
 use std::fmt;
 use tokio::sync::oneshot;
 use uuid::Uuid;
+use webcodex_core::coding_agent::{
+    validate_request as validate_coding_agent_request, CodingAgentDispatchState,
+    CodingAgentRequest, CodingAgentResponse,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EnqueueLspError {
@@ -249,6 +253,25 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
                 },
             ));
         }
+        if let Some(waiter) = inner.coding_agent_waiters.remove(&request_id) {
+            let state = if pending.dispatched {
+                CodingAgentDispatchState::OutcomeUnknown
+            } else {
+                CodingAgentDispatchState::NotStarted
+            };
+            let _ = waiter.send(CodingAgentResponse::error(
+                state,
+                "runner_unavailable",
+                if pending.dispatched {
+                    "Runner transport failed after CodingAgentRun dispatch; reconcile the same run_id before any new initiation"
+                } else {
+                    "Runner transport failed before CodingAgentRun dispatch; request was not started"
+                },
+                Some("unavailable"),
+                Some("reobserve"),
+            ));
+        }
+        inner.coding_agent_fences.remove(&request_id);
         inner.persistent_waiters.remove(&request_id);
     }
 }
@@ -295,6 +318,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -365,6 +389,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -454,6 +479,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -536,6 +562,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -620,6 +647,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -702,6 +730,7 @@ impl ShellClientRegistry {
             sandbox: sandbox.clone(),
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -785,6 +814,7 @@ impl ShellClientRegistry {
             sandbox: sandbox.clone(),
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -877,6 +907,7 @@ impl ShellClientRegistry {
             sandbox: sandbox.clone(),
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -984,6 +1015,7 @@ impl ShellClientRegistry {
             sandbox: sandbox.clone(),
             job_context: ssh_context,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -1055,6 +1087,10 @@ impl ShellClientRegistry {
                         || inner
                             .mcp_gateway_waiters
                             .get(&pending.request.request_id)
+                            .is_some_and(tokio::sync::oneshot::Sender::is_closed)
+                        || inner
+                            .coding_agent_waiters
+                            .get(&pending.request.request_id)
                             .is_some_and(tokio::sync::oneshot::Sender::is_closed))
             })
             .map(|(request_id, _)| request_id.clone())
@@ -1062,6 +1098,8 @@ impl ShellClientRegistry {
         for request_id in &abandoned {
             inner.persistent_waiters.remove(request_id);
             inner.mcp_gateway_waiters.remove(request_id);
+            inner.coding_agent_waiters.remove(request_id);
+            inner.coding_agent_fences.remove(request_id);
             remove_pending_request_locked(&mut inner, request_id);
         }
         abandoned.len()
@@ -1075,6 +1113,8 @@ impl ShellClientRegistry {
         let mut inner = self.inner.lock().await;
         inner.persistent_waiters.remove(request_id);
         inner.mcp_gateway_waiters.remove(request_id);
+        inner.coding_agent_waiters.remove(request_id);
+        inner.coding_agent_fences.remove(request_id);
         remove_pending_request_locked(&mut inner, request_id).map(|pending| pending.dispatched)
     }
 
@@ -1123,6 +1163,7 @@ impl ShellClientRegistry {
             job_context: None,
             persistent_shell: None,
             mcp_gateway: Some(operation),
+            coding_agent: None,
         };
         let mut inner = self.inner.lock().await;
         let client = inner
@@ -1167,6 +1208,108 @@ impl ShellClientRegistry {
         pending.expected_mcp_gateway_provider_id = Some(expected_provider_id);
         pending.expected_mcp_gateway_provider_instance_id = Some(expected_provider_instance_id);
         inner.mcp_gateway_waiters.insert(request_id.clone(), tx);
+        notify_client_locked(&inner, client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue one closed CodingAgentRun operation for one exact Runner/provider
+    /// process lease. The caller supplies only WebCodex typed Run semantics; raw
+    /// ACP method/params never enter this registry.
+    pub(crate) async fn enqueue_coding_agent(
+        &self,
+        client_id: &str,
+        expected_agent_instance_id: &str,
+        expected_provider_id: &str,
+        expected_provider_instance_id: &str,
+        operation: CodingAgentRequest,
+        auth: Option<&crate::auth::AuthContext>,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<CodingAgentResponse>), String> {
+        validate_coding_agent_request(&operation)
+            .map_err(|error| format!("invalid CodingAgentRun request: {error}"))?;
+        if let Some((provider_id, provider_instance_id)) = operation.provider_binding() {
+            if provider_id != expected_provider_id
+                || provider_instance_id != expected_provider_instance_id
+            {
+                return Err(
+                    "CodingAgentRun provider binding does not match exact dispatch fence"
+                        .to_string(),
+                );
+            }
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.to_string(),
+            kind: "coding_agent".to_string(),
+            job_id: None,
+            cwd: None,
+            path: None,
+            content: None,
+            max_bytes: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            create_dirs: false,
+            command: String::new(),
+            process: None,
+            script: None,
+            stdin: None,
+            timeout_secs: 120,
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: None,
+            persistent_shell: None,
+            mcp_gateway: None,
+            coding_agent: Some(operation),
+        };
+        let mut inner = self.inner.lock().await;
+        let client = inner
+            .clients
+            .get(client_id)
+            .ok_or_else(|| "exact Runner is unavailable".to_string())?;
+        assert_shell_client_access(auth, client)
+            .map_err(|_| "exact Runner is unavailable".to_string())?;
+        if !client.capabilities.coding_agent_runs {
+            return Err("exact Runner does not support CodingAgentRun".to_string());
+        }
+        if client.agent_instance_id != expected_agent_instance_id {
+            return Err("stale Runner identity; CodingAgentRun was not dispatched".to_string());
+        }
+        let provider_is_current = client.coding_agent_providers.iter().any(|provider| {
+            provider.provider_id == expected_provider_id
+                && provider.provider_instance_id == expected_provider_instance_id
+        });
+        if !provider_is_current {
+            return Err(
+                "stale ACP provider identity; CodingAgentRun was not dispatched".to_string(),
+            );
+        }
+        if now_ts().saturating_sub(client.last_seen) > super::CLIENT_ONLINE_WINDOW_SECS {
+            return Err("exact Runner is offline; CodingAgentRun was not dispatched".to_string());
+        }
+        enqueue_pending_request_locked(
+            &mut inner,
+            client_id,
+            request_id.clone(),
+            request,
+            None,
+            None,
+        )?;
+        inner.coding_agent_fences.insert(
+            request_id.clone(),
+            CodingAgentDispatchFence {
+                agent_instance_id: expected_agent_instance_id.to_string(),
+                provider_id: expected_provider_id.to_string(),
+                provider_instance_id: expected_provider_instance_id.to_string(),
+            },
+        );
+        inner.coding_agent_waiters.insert(request_id.clone(), tx);
         notify_client_locked(&inner, client_id);
         Ok((request_id, rx))
     }
@@ -1245,6 +1388,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: job_context.clone(),
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: Some(request),
         };
         let mut inner = self.inner.lock().await;
@@ -1338,6 +1482,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -1430,6 +1575,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;
@@ -1509,6 +1655,7 @@ impl ShellClientRegistry {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let mut inner = self.inner.lock().await;

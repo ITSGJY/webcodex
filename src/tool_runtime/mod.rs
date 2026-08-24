@@ -8,6 +8,7 @@ mod agent_authorization;
 mod cargo;
 mod cargo_tools;
 mod checkpoint;
+mod coding_agent;
 mod coding_task;
 mod coding_task_tools;
 mod computer_tools;

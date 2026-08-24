@@ -49,6 +49,7 @@ fn apply_text_edits_request(
         sandbox: None,
         job_context: None,
         mcp_gateway: None,
+        coding_agent: None,
         persistent_shell: None,
     }
 }

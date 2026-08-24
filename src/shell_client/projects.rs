@@ -8,7 +8,7 @@ use crate::shell_protocol::{
     ShellAgentProjectSummary, ShellClientCapabilities,
     SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
     SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA, SHELL_CLIENT_CAPABILITY_ASYNC_JOBS,
-    SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
+    SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS, SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
     SHELL_CLIENT_CAPABILITY_COMPUTER_APPLICATION_LAUNCH,
@@ -107,6 +107,7 @@ pub(super) fn capability_enabled(caps: &ShellClientCapabilities, capability: &st
         SHELL_CLIENT_CAPABILITY_COMPUTER_WINDOW_ACTIVATE => caps.computer_window_activate,
         SHELL_CLIENT_CAPABILITY_COMPUTER_TEXT_INPUT => caps.computer_text_input,
         SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION => caps.job_state_reconciliation,
+        SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS => caps.coding_agent_runs,
         _ => false,
     }
 }
@@ -153,8 +154,8 @@ impl ShellClientRegistry {
     /// `internal_posix_script`, `structured_execution_jobs`,
     /// `lsp_read_only_navigation`, `lsp_call_hierarchy`,
     /// `sandbox_inspect_commands`, `project_lifecycle`,
-    /// `project_path_registration`, `job_state_reconciliation`, `computer_observe`. Unknown capability
-    /// names return `false`.
+    /// `project_path_registration`, `job_state_reconciliation`, `coding_agent_runs`,
+    /// `computer_observe`. Unknown capability names return `false`.
     #[cfg(test)]
     pub(crate) async fn client_supports(
         &self,

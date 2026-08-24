@@ -236,6 +236,8 @@ async fn mcp_import_runtime(
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "importer".to_string(),
             agent_instance_id: "inst-import".to_string(),
             display_name: None,

@@ -2,6 +2,7 @@ mod artifacts;
 mod checkpoints;
 mod cleanup;
 mod coding;
+mod coding_agents;
 mod common;
 mod computer;
 mod discovery;
@@ -35,6 +36,10 @@ pub(super) use cleanup::{
 };
 pub(super) use coding::{
     finish_coding_task_input_schema, start_coding_task_input_schema, work_on_project_input_schema,
+};
+pub(crate) use coding_agents::{
+    coding_agent_cancel_input_schema, coding_agent_observe_input_schema,
+    coding_agent_start_input_schema,
 };
 pub(super) use computer::{
     computer_accessibility_status_input_schema, computer_accessibility_tree_input_schema,

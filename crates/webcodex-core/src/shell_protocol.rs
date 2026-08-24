@@ -307,6 +307,7 @@ pub fn shell_computer_request_payload_max_bytes(kind: &str) -> usize {
     }
 }
 pub const SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION: &str = "job_state_reconciliation";
+pub const SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS: &str = "coding_agent_runs";
 pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_SHELL,
     SHELL_CLIENT_CAPABILITY_FILE_READ,
@@ -346,6 +347,7 @@ pub const SHELL_CLIENT_CAPABILITY_NAMES: &[&str] = &[
     SHELL_CLIENT_CAPABILITY_COMPUTER_ACCESSIBILITY_OBSERVE,
     SHELL_CLIENT_CAPABILITY_COMPUTER_ELEMENT_STATE,
     SHELL_CLIENT_CAPABILITY_JOB_STATE_RECONCILIATION,
+    SHELL_CLIENT_CAPABILITY_CODING_AGENT_RUNS,
     SHELL_CLIENT_CAPABILITY_COMPUTER_CONTROL,
     SHELL_CLIENT_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
     SHELL_CLIENT_CAPABILITY_COMPUTER_KEY_INPUT,
@@ -558,6 +560,10 @@ pub struct ShellClientCapabilities {
     /// submits a complete active inventory at register/re-register time.
     #[serde(default, skip_serializing_if = "is_false")]
     pub job_state_reconciliation: bool,
+    /// Runner-owned ACP coding-agent execution with closed typed Run lifecycle.
+    /// Missing on older Runners is false and is never inferred from shell/MCP.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub coding_agent_runs: bool,
 }
 
 /// Bounded, non-secret status for the agent's active configuration generation.
@@ -630,6 +636,7 @@ impl Default for ShellClientCapabilities {
             computer_window_activate: false,
             computer_text_input: false,
             job_state_reconciliation: false,
+            coding_agent_runs: false,
         }
     }
 }
@@ -917,6 +924,14 @@ pub struct ShellClientRegisterRequest {
     /// absent for older runners.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_inventory: Option<ShellJobInventory>,
+    /// Bounded non-secret startup-owned ACP provider inventory. Executable,
+    /// argv, environment, credentials, PID, and private ACP session ids are
+    /// never projected to the Server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent_providers: Option<Vec<crate::coding_agent::CodingAgentProvider>>,
+    /// Complete active plus bounded recent-terminal CodingAgentRun inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent_inventory: Option<crate::coding_agent::CodingAgentRunInventory>,
 }
 
 /// Non-secret runner build identity for mixed-version diagnostics.
@@ -1054,6 +1069,11 @@ pub struct ShellClientView {
     pub connected: bool,
     pub last_seen: i64,
     pub capabilities: ShellClientCapabilities,
+    /// Bounded sanitized startup-owned ACP provider inventory. Logical ids are
+    /// model-visible planning metadata; executable/argv/env/PID/private ACP ids
+    /// never enter this view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent_providers: Option<Vec<crate::coding_agent::CodingAgentProvider>>,
     pub pending_requests: usize,
     #[serde(default)]
     pub projects: Vec<ShellAgentProjectSummary>,
@@ -1514,6 +1534,10 @@ pub struct ShellAgentShellRequest {
     /// separate from shell/file fields and never carries arbitrary JSON-RPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_gateway: Option<crate::mcp_gateway::McpGatewayRequest>,
+    /// Closed typed ACP CodingAgentRun operation. Raw ACP JSON-RPC stays local
+    /// to the Runner and is never accepted through this transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<crate::coding_agent::CodingAgentRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1573,6 +1597,10 @@ pub struct ShellAgentResultPayload {
     /// `mcp_gateway` field was present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_gateway: Option<crate::mcp_gateway::McpGatewayResponse>,
+    /// Typed CodingAgentRun result. Present only for a request whose
+    /// `coding_agent` field was present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<crate::coding_agent::CodingAgentResponse>,
 }
 
 impl From<ShellAgentResultRequest> for ShellAgentResultPayload {
@@ -1581,6 +1609,7 @@ impl From<ShellAgentResultRequest> for ShellAgentResultPayload {
             result,
             command_execution_state: None,
             mcp_gateway: None,
+            coding_agent: None,
         }
     }
 }
@@ -2801,6 +2830,7 @@ mod envelope_tests {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         }
     }
@@ -2862,6 +2892,7 @@ mod envelope_tests {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         }
     }
@@ -2988,12 +3019,15 @@ mod envelope_tests {
                 computer_window_activate: false,
                 computer_text_input: false,
                 job_state_reconciliation: false,
+                coding_agent_runs: false,
             }),
             projects: None,
             agent_protocol_version: Some(AGENT_PROTOCOL_VERSION_WEBSOCKET_V1.to_string()),
             policy: None,
             job_concurrency_limit: Some(4),
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
         }
     }
 
@@ -3420,6 +3454,7 @@ mod envelope_tests {
             sandbox: None,
             job_context: None,
             mcp_gateway: None,
+            coding_agent: None,
             persistent_shell: None,
         };
         let env = AgentEnvelope::Request { request };
@@ -3912,6 +3947,7 @@ mod envelope_tests {
                 },
                 command_execution_state: Some(ShellCommandExecutionState::Completed),
                 mcp_gateway: None,
+                coding_agent: None,
             },
         };
         let json = result_env.to_json().unwrap();
@@ -4266,6 +4302,8 @@ mod envelope_tests {
                 policy: None,
                 job_concurrency_limit: None,
                 job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
             },
             auth_token: Some("wc_agent_secret".to_string()),
         };

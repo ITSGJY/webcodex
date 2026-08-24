@@ -90,6 +90,8 @@ async fn register_legacy_031_runner(
             }),
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: client_id.to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: Some("legacy v0.3.1 runner".to_string()),

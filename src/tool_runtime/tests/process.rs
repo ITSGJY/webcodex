@@ -239,6 +239,7 @@ async fn complete_process_lifecycle(
             },
             command_execution_state: Some(state),
             mcp_gateway: None,
+            coding_agent: None,
         })
         .await
         .unwrap();
@@ -679,6 +680,7 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
         structured_execution_jobs: true,
         detached_process_jobs: true,
         job_state_reconciliation: true,
+        coding_agent_runs: false,
         ..Default::default()
     };
     restarted
@@ -707,6 +709,8 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
                     validation_progress: None,
                 }],
             }),
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "detached-restart-recovery".to_string(),
             agent_instance_id: "inst".to_string(),
             display_name: None,

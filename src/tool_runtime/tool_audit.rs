@@ -60,6 +60,45 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
             );
             copy_keys(obj, &mut out, &["timeout_secs", "cwd", "purpose"]);
         }
+        "coding_agent_start" => {
+            copy_keys(obj, &mut out, &["provider_id", "timeout_secs"]);
+            out.insert(
+                "instruction_bytes".to_string(),
+                Value::from(
+                    obj.get("instruction")
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "config_count".to_string(),
+                Value::from(
+                    obj.get("config")
+                        .and_then(Value::as_object)
+                        .map(serde_json::Map::len)
+                        .unwrap_or_default(),
+                ),
+            );
+            out.insert(
+                "idempotency_key_present".to_string(),
+                Value::Bool(obj.get("idempotency_key").and_then(Value::as_str).is_some()),
+            );
+        }
+        "coding_agent_observe" => {
+            copy_keys(obj, &mut out, &["run_id", "wait_secs"]);
+            out.insert(
+                "token_present".to_string(),
+                Value::Bool(
+                    obj.get("after_observation_token")
+                        .and_then(Value::as_str)
+                        .is_some(),
+                ),
+            );
+        }
+        "coding_agent_cancel" => {
+            copy_keys(obj, &mut out, &["run_id"]);
+        }
         "run_script" => {
             if let Some(language) = obj.get("language").cloned() {
                 out.insert("language".to_string(), language);
@@ -775,6 +814,58 @@ pub(crate) fn session_log_arguments_for_tool_request(tool_name: &str, arguments:
 
 pub(crate) fn session_log_result_for_tool(tool_name: &str, output: &Value) -> Value {
     match tool_name {
+        "coding_agent_start" | "coding_agent_cancel" => serde_json::json!({
+            "run_id": output.get("run_id").cloned().unwrap_or(Value::Null),
+            "project": output.get("project").cloned().unwrap_or(Value::Null),
+            "provider_id": output.get("provider_id").cloned().unwrap_or(Value::Null),
+            "state": output.get("state").cloned().unwrap_or(Value::Null),
+            "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
+            "cancel_requested": output.get("cancel_requested").cloned().unwrap_or(Value::Null),
+            "terminal_stop_reason": output.pointer("/terminal/stop_reason").cloned().unwrap_or(Value::Null),
+            "terminal_error_code": output.pointer("/terminal/error_code").cloned().unwrap_or(Value::Null),
+            "terminal_completed_at": output.pointer("/terminal/completed_at").cloned().unwrap_or(Value::Null),
+            "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+            "recovery_kind": output.get("recovery_kind").cloned().unwrap_or(Value::Null),
+        }),
+        "coding_agent_observe" => {
+            let mut kind_counts = serde_json::Map::new();
+            let mut event_count = 0usize;
+            let mut event_body_bytes = 0usize;
+            if let Some(events) = output.get("events").and_then(Value::as_array) {
+                event_count = events.len();
+                for event in events {
+                    if let Some(kind) = event.get("kind").and_then(Value::as_str) {
+                        let count = kind_counts.get(kind).and_then(Value::as_u64).unwrap_or(0) + 1;
+                        kind_counts.insert(kind.to_string(), Value::from(count));
+                    }
+                    event_body_bytes = event_body_bytes.saturating_add(
+                        event
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::len)
+                            .unwrap_or(0),
+                    );
+                }
+            }
+            serde_json::json!({
+                "run_id": output.get("run_id").cloned().unwrap_or(Value::Null),
+                "project": output.get("project").cloned().unwrap_or(Value::Null),
+                "provider_id": output.get("provider_id").cloned().unwrap_or(Value::Null),
+                "state": output.get("state").cloned().unwrap_or(Value::Null),
+                "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
+                "event_count": event_count,
+                "event_kind_counts": kind_counts,
+                "event_body_bytes": event_body_bytes,
+                "has_more": output.get("has_more").cloned().unwrap_or(Value::Null),
+                "history_lost": output.get("history_lost").cloned().unwrap_or(Value::Null),
+                "first_retained_sequence": output.get("first_retained_sequence").cloned().unwrap_or(Value::Null),
+                "terminal_stop_reason": output.pointer("/terminal/stop_reason").cloned().unwrap_or(Value::Null),
+                "terminal_error_code": output.pointer("/terminal/error_code").cloned().unwrap_or(Value::Null),
+                "terminal_completed_at": output.pointer("/terminal/completed_at").cloned().unwrap_or(Value::Null),
+                "recovery_kind": output.get("recovery_kind").cloned().unwrap_or(Value::Null),
+                "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+            })
+        }
         "git_review_summary" => serde_json::json!({
             "project": output.get("project").cloned().unwrap_or(Value::Null),
             "scope": output.get("scope").cloned().unwrap_or(Value::Null),
@@ -1934,6 +2025,78 @@ mod computer_privacy_tests {
         assert!(!result_serialized.contains("Private App"));
         assert!(!result_serialized.contains("Confidential"));
     }
+    #[test]
+    fn coding_agent_audit_is_body_free_for_requests_and_observations() {
+        const PROMPT: &str = "PRIVATE_ACP_PROMPT_DO_NOT_PERSIST";
+        const IDEMPOTENCY: &str = "PRIVATE_ACP_IDEMPOTENCY_KEY";
+        const MESSAGE: &str = "PRIVATE_AGENT_MESSAGE_BODY";
+        const REASONING: &str = "PRIVATE_REASONING_BODY";
+        const TOOL_LABEL: &str = "PRIVATE_TOOL_LABEL";
+        const TOKEN: &str = "PRIVATE_OBSERVATION_TOKEN";
+
+        let request = json!({
+            "project": "agent:special:demo",
+            "provider_id": "codex",
+            "idempotency_key": IDEMPOTENCY,
+            "instruction": PROMPT,
+            "config": {"mode": "agent"},
+            "timeout_secs": 60,
+            "recording_session_id": "wc_sess_safe"
+        });
+        let request_summary =
+            session_log_arguments_for_tool_request("coding_agent_start", &request);
+        let request_serialized = serde_json::to_string(&request_summary).unwrap();
+        assert_eq!(request_summary["instruction_bytes"], PROMPT.len());
+        assert_eq!(request_summary["config_count"], 1);
+        assert_eq!(request_summary["idempotency_key_present"], true);
+        assert!(!request_serialized.contains(PROMPT));
+        assert!(!request_serialized.contains(IDEMPOTENCY));
+        assert!(!request_serialized.contains("agent\""));
+        assert!(request_summary.get("recording_session_id").is_none());
+        assert!(!request_serialized.contains("wc_sess_safe"));
+
+        let observe_request = json!({
+            "run_id": "wc_agent_run_safe",
+            "after_observation_token": TOKEN,
+            "wait_secs": 3
+        });
+        let observe_request_summary =
+            session_log_arguments_for_tool_request("coding_agent_observe", &observe_request);
+        let observe_request_serialized = serde_json::to_string(&observe_request_summary).unwrap();
+        assert_eq!(observe_request_summary["token_present"], true);
+        assert!(!observe_request_serialized.contains(TOKEN));
+
+        let output = json!({
+            "run_id": "wc_agent_run_safe",
+            "project": "agent:special:demo",
+            "provider_id": "codex",
+            "state": "running",
+            "execution_state": "started",
+            "events": [
+                {"sequence": 1, "kind": "agent_message", "text": MESSAGE, "label": null, "status": null, "usage": null},
+                {"sequence": 2, "kind": "reasoning", "text": REASONING, "label": null, "status": null, "usage": null},
+                {"sequence": 3, "kind": "tool_activity", "text": null, "label": TOOL_LABEL, "status": "running", "usage": null}
+            ],
+            "observation_token": TOKEN,
+            "has_more": false,
+            "history_lost": false,
+            "first_retained_sequence": 1,
+            "terminal": null,
+            "recovery_kind": "reobserve"
+        });
+        let result_summary = session_log_result_for_tool("coding_agent_observe", &output);
+        let result_serialized = serde_json::to_string(&result_summary).unwrap();
+        assert_eq!(result_summary["event_count"], 3);
+        assert_eq!(
+            result_summary["event_body_bytes"],
+            MESSAGE.len() + REASONING.len()
+        );
+        for private in [MESSAGE, REASONING, TOOL_LABEL, TOKEN] {
+            assert!(!result_serialized.contains(private));
+        }
+        assert!(result_summary.get("events").is_none());
+        assert!(result_summary.get("observation_token").is_none());
+    }
 }
 
 impl ToolCall {
@@ -1960,6 +2123,34 @@ impl ToolCall {
                 "timeout_secs": timeout_secs,
                 "cwd": cwd,
                 "purpose": purpose,
+            }),
+            Self::CodingAgentStart {
+                project,
+                provider_id,
+                idempotency_key,
+                instruction,
+                config,
+                timeout_secs,
+                recording_session_id: _,
+            } => serde_json::json!({
+                "project": project,
+                "provider_id": provider_id,
+                "idempotency_key_present": !idempotency_key.is_empty(),
+                "instruction_bytes": instruction.len(),
+                "config_count": config.as_ref().map(std::collections::BTreeMap::len).unwrap_or_default(),
+                "timeout_secs": timeout_secs,
+            }),
+            Self::CodingAgentObserve {
+                run_id,
+                after_observation_token,
+                wait_secs,
+            } => serde_json::json!({
+                "run_id": run_id,
+                "token_present": after_observation_token.is_some(),
+                "wait_secs": wait_secs,
+            }),
+            Self::CodingAgentCancel { run_id } => serde_json::json!({
+                "run_id": run_id,
             }),
             Self::RunScript {
                 project,

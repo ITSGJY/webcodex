@@ -2132,7 +2132,13 @@ fn build_register_request_with_provider_status(
     u64,
 ) {
     let hot = runtime.snapshot();
-    let capabilities = agent_register_capabilities(cfg);
+    let mut capabilities = agent_register_capabilities(cfg);
+    let coding_agent_providers = runtime
+        .coding_agents()
+        .map(|manager| manager.providers())
+        .unwrap_or_default();
+    let coding_agent_inventory = runtime.coding_agents().map(|manager| manager.inventory());
+    capabilities.coding_agent_runs = !coding_agent_providers.is_empty();
     let (mut tool_providers, revision) = hot.external_tools.registration_status();
     tool_providers.config_reload = hot.reload_status();
     (
@@ -2163,6 +2169,9 @@ fn build_register_request_with_provider_status(
             } else {
                 Some(job_inventory)
             },
+            coding_agent_providers: (!coding_agent_providers.is_empty())
+                .then_some(coding_agent_providers),
+            coding_agent_inventory,
         },
         Arc::clone(&hot.external_tools),
         revision,

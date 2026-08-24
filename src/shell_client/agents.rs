@@ -26,6 +26,87 @@ use crate::shell_protocol::{
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Notify;
+use webcodex_core::coding_agent::{
+    validate_coding_agent_run_snapshot, validate_provider_id as validate_coding_agent_provider_id,
+    validate_provider_instance_id as validate_coding_agent_provider_instance_id,
+    CodingAgentProvider, CodingAgentRunInventory, CodingAgentRunSnapshot,
+    CODING_AGENT_MAX_INVENTORY_RUNS, CODING_AGENT_MAX_PROVIDERS,
+    CODING_AGENT_MAX_PROVIDER_NAME_BYTES,
+};
+
+fn validate_coding_agent_registration(
+    client_id: &str,
+    capability: bool,
+    providers: Option<&[CodingAgentProvider]>,
+    inventory: Option<&CodingAgentRunInventory>,
+) -> Result<(), String> {
+    match (capability, providers, inventory) {
+        (false, None, None) => return Ok(()),
+        (false, _, _) => {
+            return Err(
+                "coding-agent provider/inventory metadata requires coding_agent_runs capability"
+                    .to_string(),
+            )
+        }
+        (true, Some(providers), Some(inventory)) if !providers.is_empty() => {
+            if providers.len() > CODING_AGENT_MAX_PROVIDERS {
+                return Err("coding-agent provider inventory exceeds bounded limit".to_string());
+            }
+            if inventory.runs.len() > CODING_AGENT_MAX_INVENTORY_RUNS {
+                return Err("coding-agent Run inventory exceeds bounded limit".to_string());
+            }
+            let mut provider_ids = HashSet::new();
+            let mut provider_instances = HashSet::new();
+            for provider in providers {
+                validate_coding_agent_provider_id(&provider.provider_id)
+                    .map_err(|error| format!("invalid coding-agent provider id: {error}"))?;
+                validate_coding_agent_provider_instance_id(&provider.provider_instance_id)
+                    .map_err(|error| format!("invalid coding-agent provider instance: {error}"))?;
+                if provider.name.trim().is_empty()
+                    || provider.name.len() > CODING_AGENT_MAX_PROVIDER_NAME_BYTES
+                    || provider.name.chars().any(char::is_control)
+                {
+                    return Err("invalid coding-agent provider name".to_string());
+                }
+                if !provider_ids.insert(provider.provider_id.as_str())
+                    || !provider_instances.insert(provider.provider_instance_id.as_str())
+                {
+                    return Err("duplicate coding-agent provider identity".to_string());
+                }
+            }
+            let expected_project_prefix = format!("agent:{client_id}:");
+            let mut run_ids = HashSet::new();
+            for run in &inventory.runs {
+                validate_coding_agent_run_snapshot(run)
+                    .map_err(|error| format!("invalid coding-agent Run snapshot: {error}"))?;
+                if !run_ids.insert(run.run_id.as_str()) {
+                    return Err("duplicate coding-agent Run id in inventory".to_string());
+                }
+                if !run.runtime_project_id.starts_with(&expected_project_prefix) {
+                    return Err(
+                        "coding-agent Run inventory references another Runner project namespace"
+                            .to_string(),
+                    );
+                }
+                if !run.state.terminal()
+                    && !providers.iter().any(|provider| {
+                        provider.provider_id == run.provider_id
+                            && provider.provider_instance_id == run.provider_instance_id
+                    })
+                {
+                    return Err(
+                        "active coding-agent Run references a stale provider instance".to_string(),
+                    );
+                }
+            }
+            Ok(())
+        }
+        (true, _, _) => Err(
+            "coding_agent_runs capability requires non-empty provider inventory and Run inventory"
+                .to_string(),
+        ),
+    }
+}
 
 impl ShellClientRegistry {
     #[cfg(test)]
@@ -68,6 +149,16 @@ impl ShellClientRegistry {
         let agent_instance_id = body.agent_instance_id.trim().to_string();
         let capabilities = body.capabilities.clone().unwrap_or_default();
         let job_inventory = body.job_inventory.clone();
+        let coding_agent_providers = body.coding_agent_providers.clone();
+        let coding_agent_inventory = body.coding_agent_inventory.clone();
+        validate_coding_agent_registration(
+            &client_id,
+            capabilities.coding_agent_runs,
+            coding_agent_providers.as_deref(),
+            coding_agent_inventory.as_ref(),
+        )?;
+        let coding_agent_providers = coding_agent_providers.unwrap_or_default();
+        let coding_agent_inventory = coding_agent_inventory.unwrap_or_default();
         let agent_protocol_version = body
             .agent_protocol_version
             .as_deref()
@@ -134,6 +225,8 @@ impl ShellClientRegistry {
             process_started_at: body.process_started_at,
             build: body.build,
             job_concurrency_limit: body.job_concurrency_limit,
+            coding_agent_providers: coding_agent_providers.clone(),
+            coding_agent_inventory,
             projected_structured_terminal_suppressions: VecDeque::new(),
         };
         match (
@@ -229,6 +322,24 @@ impl ShellClientRegistry {
         }) {
             return Err(
                 "same runner instance cannot downgrade job_state_reconciliation capability"
+                    .to_string(),
+            );
+        }
+        if inner.clients.get(&client_id).is_some_and(|existing| {
+            existing.agent_instance_id == agent_instance_id
+                && existing.capabilities.coding_agent_runs
+                && !capabilities.coding_agent_runs
+        }) {
+            return Err(
+                "same runner instance cannot downgrade coding_agent_runs capability".to_string(),
+            );
+        }
+        if inner.clients.get(&client_id).is_some_and(|existing| {
+            existing.agent_instance_id == agent_instance_id
+                && existing.coding_agent_providers != coding_agent_providers
+        }) {
+            return Err(
+                "same runner instance cannot change ACP coding-agent provider inventory"
                     .to_string(),
             );
         }
@@ -1034,6 +1145,67 @@ impl ShellClientRegistry {
         Self::client_view_locked(&inner, client_id)
     }
 
+    pub(crate) async fn coding_agent_run_for_client_for_auth(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        client_id: &str,
+        run_id: &str,
+    ) -> Option<(ShellClientView, CodingAgentRunSnapshot)> {
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now_ts());
+        let client = inner.clients.get(client_id)?;
+        if !shell_client_visible_to_auth(auth, client) {
+            return None;
+        }
+        let run = client
+            .coding_agent_inventory
+            .runs
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .cloned()?;
+        let view = Self::client_view_locked(&inner, client_id)?;
+        Some((view, run))
+    }
+
+    pub(crate) async fn coding_agent_run_for_auth(
+        &self,
+        auth: Option<&crate::auth::AuthContext>,
+        run_id: &str,
+    ) -> Option<(ShellClientView, CodingAgentRunSnapshot)> {
+        let now = now_ts();
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_clients_locked(&mut inner, now);
+        let mut ids = inner.clients.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        let mut matched = None;
+        for client_id in ids {
+            let Some(client) = inner.clients.get(&client_id) else {
+                continue;
+            };
+            if !shell_client_visible_to_auth(auth, client) {
+                continue;
+            }
+            let Some(run) = client
+                .coding_agent_inventory
+                .runs
+                .iter()
+                .find(|run| run.run_id == run_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if matched.is_some() {
+                // A Server restart has no process-local binding to disambiguate
+                // duplicate run ids. Fail closed instead of choosing a Runner by
+                // registry iteration order and silently retargeting provenance.
+                return None;
+            }
+            let view = Self::client_view_locked(&inner, &client_id)?;
+            matched = Some((view, run));
+        }
+        matched
+    }
+
     pub(crate) async fn assert_client_access(
         &self,
         auth: Option<&crate::auth::AuthContext>,
@@ -1071,6 +1243,8 @@ impl ShellClientRegistry {
             connected,
             last_seen: client.last_seen,
             capabilities: client.capabilities.clone(),
+            coding_agent_providers: (!client.coding_agent_providers.is_empty())
+                .then(|| client.coding_agent_providers.clone()),
             pending_requests,
             projects: client.projects.clone(),
             project_inventory: Some(client.project_inventory.status.clone()),

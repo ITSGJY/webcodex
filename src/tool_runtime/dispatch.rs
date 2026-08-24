@@ -660,6 +660,8 @@ impl ToolRuntime {
         inherited_sandbox: Option<&'static str>,
         window: Option<&crate::client_window::ClientWindow>,
     ) -> ToolResult {
+        call = call
+            .with_coding_agent_recording_session_id(recorder_metadata.recording_session_id.clone());
         let project_resolution = match call.project() {
             Some(project) => Some(self.resolve_project_input_for_auth(project, auth).await),
             None => None,
@@ -1149,6 +1151,37 @@ impl ToolRuntime {
             | ToolCall::RegisterProject { .. }
             | ToolCall::UnregisterProject { .. }
             | ToolCall::CreateProject { .. }) => self.dispatch_project_tool(call, auth).await,
+
+            ToolCall::CodingAgentStart {
+                project,
+                provider_id,
+                idempotency_key,
+                instruction,
+                config,
+                timeout_secs,
+                recording_session_id,
+            } => {
+                self.coding_agent_start(
+                    project,
+                    provider_id,
+                    idempotency_key,
+                    instruction,
+                    config,
+                    timeout_secs,
+                    recording_session_id,
+                    auth,
+                )
+                .await
+            }
+            ToolCall::CodingAgentObserve {
+                run_id,
+                after_observation_token,
+                wait_secs,
+            } => {
+                self.coding_agent_observe(run_id, after_observation_token, wait_secs, auth)
+                    .await
+            }
+            ToolCall::CodingAgentCancel { run_id } => self.coding_agent_cancel(run_id, auth).await,
 
             call @ (ToolCall::RunProcess { .. }
             | ToolCall::RunDetachedProcess { .. }

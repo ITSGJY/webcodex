@@ -15,6 +15,7 @@ fn sequenced_job_capabilities() -> ShellClientCapabilities {
         async_shell_jobs: true,
         jobs: true,
         job_state_reconciliation: true,
+        coding_agent_runs: false,
         structured_validation_argv: true,
         ..Default::default()
     }
@@ -59,6 +60,8 @@ async fn register_sequenced(registry: &ShellClientRegistry, instance: &str) {
                 active_complete: true,
                 jobs: Vec::new(),
             }),
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "oe".to_string(),
             agent_instance_id: instance.to_string(),
             display_name: None,
@@ -450,6 +453,8 @@ async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
             build: None,
             job_concurrency_limit: None,
             job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
             client_id: "legacy".to_string(),
             agent_instance_id: "legacy-inst".to_string(),
             display_name: None,

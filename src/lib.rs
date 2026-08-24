@@ -195,11 +195,14 @@ only for local/trusted-network demos."
     let runtime_info = Arc::new(tool_runtime::RuntimeInfo::from_env_with_quic_config(
         &quic_cfg,
     ));
+    let runtime_state_dir = config.runtime_state_dir();
     let mut tool_runtime_builder =
         tool_runtime::ToolRuntime::new(shell_registry.clone(), runtime_info.clone())
             .with_model_surface(model_surface)
-            .with_checkpoint_state_dir(config.runtime_state_dir())
-            .with_session_ledger(config.session_ledger_path());
+            .with_checkpoint_state_dir(runtime_state_dir.clone())
+            .with_session_ledger(config.session_ledger_path())
+            .with_persistent_coding_agent_observation_state(&runtime_state_dir)
+            .map_err(std::io::Error::other)?;
     if let Some(activity_store) = db::WorkspaceActivityStore::from_env(db.clone()) {
         tool_runtime_builder =
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));

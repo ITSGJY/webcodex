@@ -96,6 +96,44 @@ pub(crate) fn dispatch_request(
     if runtime.shutdown_flag().load(Ordering::SeqCst) {
         return Ok(false);
     }
+    if request.kind == "coding_agent" {
+        let request_id = request.request_id.clone();
+        let response = match (runtime.coding_agents(), request.coding_agent) {
+            (Some(manager), Some(operation)) => manager.handle(operation, projects_dir),
+            (None, _) => webcodex_core::coding_agent::CodingAgentResponse::error(
+                webcodex_core::coding_agent::CodingAgentDispatchState::NotStarted,
+                "coding_agent_unavailable",
+                "Runner ACP coding-agent execution is not configured/available",
+                Some("unavailable"),
+                Some("reobserve"),
+            ),
+            (Some(_), None) => webcodex_core::coding_agent::CodingAgentResponse::error(
+                webcodex_core::coding_agent::CodingAgentDispatchState::NotStarted,
+                "invalid_coding_agent_request",
+                "Typed CodingAgentRun operation is required; request was not started",
+                Some("invalid_input"),
+                Some("fix_input"),
+            ),
+        };
+        return sink
+            .submit_coding_agent_result(request_id, response)
+            .map(|_| true);
+    }
+    if request.coding_agent.is_some() {
+        let result = CommandResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            duration_ms: Some(0),
+            error: Some(
+                "invalid_request: coding_agent payload is valid only for coding_agent requests; command was not started"
+                    .to_string(),
+            ),
+        };
+        return sink
+            .submit_result_with_metadata(request.request_id, result, config, runtime)
+            .map(|_| true);
+    }
     if request.kind == "mcp_gateway" {
         let request_id = request.request_id.clone();
         let response = match request.mcp_gateway {

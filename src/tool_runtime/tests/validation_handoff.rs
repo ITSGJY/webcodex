@@ -97,6 +97,7 @@ async fn complete_sync_shell_lifecycle(
             },
             command_execution_state: Some(execution_state),
             mcp_gateway: None,
+            coding_agent: None,
         })
         .await
         .unwrap();
