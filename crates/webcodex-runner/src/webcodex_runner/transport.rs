@@ -361,16 +361,22 @@ impl AgentRuntimeState {
         let joined = self.background_threads.join_until(background_deadline);
         let workers_done = self.jobs.wait_for_workers(background_deadline);
         let dispatches_done = self.dispatches.wait_until(background_deadline);
+        let coding_agents = self
+            .config
+            .coding_agents()
+            .map(|manager| manager.drain_workers_until(background_deadline))
+            .unwrap_or_default();
         let background_timeouts = reload_retry.timed_out
             + joined.timed_out
             + usize::from(!workers_done)
-            + usize::from(!dispatches_done);
+            + usize::from(!dispatches_done)
+            + coding_agents.timed_out;
         phases.push(shutdown_phase(
             "background_threads_join",
             started,
-            background_resources,
+            background_resources + coding_agents.resources,
             background_timeouts,
-            reload_retry.panicked + joined.panicked,
+            reload_retry.panicked + joined.panicked + coding_agents.panicked,
             "background_thread_panicked",
         ));
 

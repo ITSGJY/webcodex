@@ -1,6 +1,7 @@
 use super::config::{AcpAgentConfig, AcpConfig};
 use super::projects::load_agent_project_summaries_from_dir;
 use super::shell::canonicalize_existing;
+use super::shutdown::{ActivityTracker, BackgroundThreads};
 use agent_client_protocol_schema::v1::{
     NewSessionResponse, PromptResponse, RequestPermissionRequest, SessionConfigKind,
     SessionConfigOption, SessionConfigSelectOptions, SetSessionConfigOptionResponse, StopReason,
@@ -340,11 +341,18 @@ struct LiveRunState {
     next_sequence: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptDispatchGateState {
+    PrePrompt,
+    PromptDispatchMayHaveOccurred,
+}
+
 #[derive(Debug)]
 struct RunEntry {
     state: Mutex<LiveRunState>,
     changed: Condvar,
     cancel_requested: AtomicBool,
+    prompt_dispatch: Mutex<PromptDispatchGateState>,
 }
 
 impl RunEntry {
@@ -358,6 +366,7 @@ impl RunEntry {
             }),
             changed: Condvar::new(),
             cancel_requested: AtomicBool::new(false),
+            prompt_dispatch: Mutex::new(PromptDispatchGateState::PrePrompt),
         }
     }
 
@@ -446,6 +455,13 @@ impl RunEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CodingAgentWorkerDrain {
+    pub(crate) resources: usize,
+    pub(crate) timed_out: usize,
+    pub(crate) panicked: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct CodingAgentManager {
     client_id: String,
@@ -456,8 +472,16 @@ pub(crate) struct CodingAgentManager {
     admission: Mutex<()>,
     runs: Mutex<HashMap<String, Arc<RunEntry>>>,
     accepting: AtomicBool,
+    workers: ActivityTracker,
+    worker_threads: BackgroundThreads,
     #[cfg(test)]
     admission_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    admission_after_accepting_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    admission_after_accepting_test_reached: AtomicBool,
+    #[cfg(test)]
+    prompt_dispatch_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     initial_claim_writes: std::sync::atomic::AtomicUsize,
 }
@@ -489,8 +513,16 @@ impl CodingAgentManager {
             admission: Mutex::new(()),
             runs: Mutex::new(HashMap::new()),
             accepting: AtomicBool::new(true),
+            workers: ActivityTracker::default(),
+            worker_threads: BackgroundThreads::default(),
             #[cfg(test)]
             admission_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            admission_after_accepting_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            admission_after_accepting_test_reached: AtomicBool::new(false),
+            #[cfg(test)]
+            prompt_dispatch_test_barrier: Mutex::new(None),
             #[cfg(test)]
             initial_claim_writes: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -519,8 +551,16 @@ impl CodingAgentManager {
             admission: Mutex::new(()),
             runs: Mutex::new(HashMap::new()),
             accepting: AtomicBool::new(true),
+            workers: ActivityTracker::default(),
+            worker_threads: BackgroundThreads::default(),
             #[cfg(test)]
             admission_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            admission_after_accepting_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            admission_after_accepting_test_reached: AtomicBool::new(false),
+            #[cfg(test)]
+            prompt_dispatch_test_barrier: Mutex::new(None),
             #[cfg(test)]
             initial_claim_writes: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -554,12 +594,37 @@ impl CodingAgentManager {
     }
 
     pub(crate) fn stop_accepting(&self) {
+        // Publish shutdown intent before taking the admission fence. A Start that
+        // already owns admission may finish publishing its authoritative RunEntry,
+        // but it cannot cross the prompt gate after this store becomes visible.
         self.accepting.store(false, Ordering::Release);
-        for entry in self.runs.lock().unwrap().values() {
+        let _admission = self.admission.lock().unwrap();
+        let entries = self
+            .runs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(run_id, entry)| (run_id.clone(), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        for (run_id, entry) in entries {
             if !entry.snapshot().state.terminal() {
-                entry.cancel_requested.store(true, Ordering::Release);
-                entry.changed.notify_all();
+                let _ = self.request_cancel(&run_id, &entry);
             }
+        }
+    }
+
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers.active().max(self.worker_threads.pending())
+    }
+
+    pub(crate) fn drain_workers_until(&self, deadline: Instant) -> CodingAgentWorkerDrain {
+        let resources = self.worker_count();
+        let workers_done = self.workers.wait_until(deadline);
+        let joined = self.worker_threads.join_until(deadline);
+        CodingAgentWorkerDrain {
+            resources,
+            timed_out: joined.timed_out.max(usize::from(!workers_done)),
+            panicked: joined.panicked,
         }
     }
 
@@ -613,12 +678,8 @@ impl CodingAgentManager {
                 let entry = self.runs.lock().unwrap().get(&request.run_id).cloned();
                 match entry {
                     Some(entry) => {
-                        if !entry.snapshot().state.terminal() {
-                            entry.cancel_requested.store(true, Ordering::Release);
-                            entry.changed.notify_all();
-                        }
                         CodingAgentResponse::success(CodingAgentResponsePayload::Cancel {
-                            run: entry.snapshot(),
+                            run: self.request_cancel(&request.run_id, &entry),
                         })
                     }
                     None => response_error(
@@ -631,6 +692,52 @@ impl CodingAgentManager {
                 }
             }
         }
+    }
+
+    fn request_cancel(&self, run_id: &str, entry: &Arc<RunEntry>) -> CodingAgentRunSnapshot {
+        let prompt_gate = entry.prompt_dispatch.lock().unwrap();
+        let current = entry.snapshot();
+        if current.state.terminal() {
+            return current;
+        }
+        entry.cancel_requested.store(true, Ordering::Release);
+        entry.changed.notify_all();
+        if *prompt_gate == PromptDispatchGateState::PrePrompt {
+            self.finish_pre_prompt_cancelled(run_id, entry);
+        }
+        entry.snapshot()
+    }
+
+    fn finish_pre_prompt_cancelled(&self, run_id: &str, entry: &Arc<RunEntry>) {
+        let terminal = CodingAgentTerminal {
+            stop_reason: None,
+            error_code: None,
+            message: Some("ACP prompt was not dispatched; CodingAgentRun was cancelled before prompt dispatch".to_string()),
+            completed_at: now(),
+        };
+        let _ = self.persist_phase(
+            run_id,
+            entry,
+            DurableDispatchPhase::Terminal,
+            CodingAgentRunState::Cancelled,
+            CodingAgentExecutionState::NotStarted,
+            Some(terminal.clone()),
+        );
+        entry.push_event(CodingAgentEvent {
+            sequence: 0,
+            kind: CodingAgentEventKind::Terminal,
+            text: terminal.message.clone(),
+            label: None,
+            status: Some("cancelled".to_string()),
+            usage: None,
+        });
+    }
+
+    fn pre_prompt_interrupted(&self, run_id: &str, entry: &Arc<RunEntry>) -> bool {
+        if !self.accepting.load(Ordering::Acquire) && !entry.snapshot().state.terminal() {
+            let _ = self.request_cancel(run_id, entry);
+        }
+        entry.snapshot().state.terminal()
     }
 
     fn start(
@@ -658,6 +765,19 @@ impl CodingAgentManager {
                 "unavailable",
                 "wait",
             );
+        }
+        #[cfg(test)]
+        {
+            self.admission_after_accepting_test_reached
+                .store(true, Ordering::SeqCst);
+            let barrier = self
+                .admission_after_accepting_test_barrier
+                .lock()
+                .unwrap()
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
         }
         self.cleanup_expired();
         if let Some(existing) = self.runs.lock().unwrap().get(&request.run_id).cloned() {
@@ -805,24 +925,38 @@ impl CodingAgentManager {
             .lock()
             .unwrap()
             .insert(request.run_id.clone(), Arc::clone(&entry));
+        let worker_guard = self.workers.enter();
         drop(admission);
+        let _ = self.worker_threads.reap_finished();
         let run_id = request.run_id.clone();
         let thread_entry = Arc::clone(&entry);
         let thread_manager = Arc::clone(self);
+        let (start_tx, start_rx) = mpsc::sync_channel(0);
         let spawn_result = thread::Builder::new()
             .name(format!(
                 "wc-acp-{}",
                 run_id.chars().take(24).collect::<String>()
             ))
-            .spawn(move || thread_manager.run_turn(request, provider, environment, thread_entry));
-        if let Err(error) = spawn_result {
-            manager_finish_setup_failure(
-                self,
-                &run_id,
-                &entry,
-                "coding_agent_thread_spawn_failed",
-                &error.to_string(),
-            );
+            .spawn(move || {
+                let _worker_guard = worker_guard;
+                if start_rx.recv().is_ok() {
+                    thread_manager.run_turn(request, provider, environment, thread_entry);
+                }
+            });
+        match spawn_result {
+            Ok(handle) => {
+                self.worker_threads.register(handle);
+                let _ = start_tx.send(());
+            }
+            Err(error) => {
+                manager_finish_setup_failure(
+                    self,
+                    &run_id,
+                    &entry,
+                    "coding_agent_thread_spawn_failed",
+                    &error.to_string(),
+                );
+            }
         }
         CodingAgentResponse::success(CodingAgentResponsePayload::Start {
             run: entry.snapshot(),
@@ -837,6 +971,9 @@ impl CodingAgentManager {
         entry: Arc<RunEntry>,
     ) {
         let mut command = Command::new(&provider.config.executable);
+        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+            return;
+        }
         command.args(&provider.config.args).env_clear();
         for (key, value) in environment {
             command.env(key, value);
@@ -858,6 +995,11 @@ impl CodingAgentManager {
                 return;
             }
         };
+        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
         let mut stdin = match child.child_mut().stdin.take() {
             Some(stdin) => stdin,
             None => {
@@ -960,19 +1102,32 @@ impl CodingAgentManager {
             let _ = child.terminate_tree();
             return;
         }
-        let initialize = match wait_response(&rx, initialize_id, ACP_SETUP_TIMEOUT) {
+        let initialize = match wait_response(
+            &rx,
+            initialize_id,
+            ACP_SETUP_TIMEOUT,
+            Some(&entry.cancel_requested),
+        ) {
             Ok(value) => value,
             Err(error) => {
-                self.setup_failure(
-                    &request.run_id,
-                    &entry,
-                    "coding_agent_initialize_failed",
-                    &error,
-                );
+                if !self.pre_prompt_interrupted(&request.run_id, &entry) {
+                    self.setup_failure(
+                        &request.run_id,
+                        &entry,
+                        "coding_agent_initialize_failed",
+                        &error,
+                    );
+                }
                 let _ = child.terminate_tree();
+                let _ = child.wait();
                 return;
             }
         };
+        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
         if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
             self.setup_failure(
                 &request.run_id,
@@ -981,6 +1136,12 @@ impl CodingAgentManager {
                 "ACP v1 was not negotiated",
             );
             let _ = child.terminate_tree();
+            return;
+        }
+
+        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+            let _ = child.terminate_tree();
+            let _ = child.wait();
             return;
         }
 
@@ -1006,19 +1167,32 @@ impl CodingAgentManager {
             let _ = child.terminate_tree();
             return;
         }
-        let new_value = match wait_response(&rx, new_id, ACP_SETUP_TIMEOUT) {
+        let new_value = match wait_response(
+            &rx,
+            new_id,
+            ACP_SETUP_TIMEOUT,
+            Some(&entry.cancel_requested),
+        ) {
             Ok(value) => value,
             Err(error) => {
-                self.setup_failure(
-                    &request.run_id,
-                    &entry,
-                    "coding_agent_session_new_failed",
-                    &error,
-                );
+                if !self.pre_prompt_interrupted(&request.run_id, &entry) {
+                    self.setup_failure(
+                        &request.run_id,
+                        &entry,
+                        "coding_agent_session_new_failed",
+                        &error,
+                    );
+                }
                 let _ = child.terminate_tree();
+                let _ = child.wait();
                 return;
             }
         };
+        if self.pre_prompt_interrupted(&request.run_id, &entry) {
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
         let new_session: NewSessionResponse = match serde_json::from_value(new_value) {
             Ok(response) => response,
             Err(_) => {
@@ -1036,6 +1210,11 @@ impl CodingAgentManager {
         let mut advertised = new_session.config_options.unwrap_or_default();
 
         for (key, value) in &request.config {
+            if self.pre_prompt_interrupted(&request.run_id, &entry) {
+                let _ = child.terminate_tree();
+                let _ = child.wait();
+                return;
+            }
             if !provider
                 .config
                 .allowed_config_options
@@ -1086,19 +1265,32 @@ impl CodingAgentManager {
                 let _ = child.terminate_tree();
                 return;
             }
-            let result = match wait_response(&rx, config_id, ACP_SETUP_TIMEOUT) {
+            let result = match wait_response(
+                &rx,
+                config_id,
+                ACP_SETUP_TIMEOUT,
+                Some(&entry.cancel_requested),
+            ) {
                 Ok(result) => result,
                 Err(error) => {
-                    self.setup_failure(
-                        &request.run_id,
-                        &entry,
-                        "coding_agent_config_failed",
-                        &error,
-                    );
+                    if !self.pre_prompt_interrupted(&request.run_id, &entry) {
+                        self.setup_failure(
+                            &request.run_id,
+                            &entry,
+                            "coding_agent_config_failed",
+                            &error,
+                        );
+                    }
                     let _ = child.terminate_tree();
+                    let _ = child.wait();
                     return;
                 }
             };
+            if self.pre_prompt_interrupted(&request.run_id, &entry) {
+                let _ = child.terminate_tree();
+                let _ = child.wait();
+                return;
+            }
             let refreshed: SetSessionConfigOptionResponse = match serde_json::from_value(result) {
                 Ok(result) => result,
                 Err(_) => {
@@ -1125,6 +1317,28 @@ impl CodingAgentManager {
             }
         }
 
+        #[cfg(test)]
+        {
+            let barrier = self.prompt_dispatch_test_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait();
+            }
+        }
+        let mut prompt_gate = entry.prompt_dispatch.lock().unwrap();
+        if entry.snapshot().state.terminal()
+            || entry.cancel_requested.load(Ordering::Acquire)
+            || !self.accepting.load(Ordering::Acquire)
+        {
+            if !entry.snapshot().state.terminal() {
+                entry.cancel_requested.store(true, Ordering::Release);
+                self.finish_pre_prompt_cancelled(&request.run_id, &entry);
+            }
+            drop(prompt_gate);
+            let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
+
         // Irreversible uncertainty barrier: durable state is committed before the
         // first byte of session/prompt is allowed onto ACP stdin.
         if let Err(error) = self.persist_phase(
@@ -1141,7 +1355,20 @@ impl CodingAgentManager {
                 "coding_agent_dispatch_barrier_failed",
                 &error,
             );
+            drop(prompt_gate);
             let _ = child.terminate_tree();
+            let _ = child.wait();
+            return;
+        }
+        // Shutdown intent may become visible while the durable uncertainty barrier
+        // is being written. The gate is still pre-prompt, so overwrite the durable
+        // barrier with a truthful cancelled/not_started terminal before any write.
+        if !self.accepting.load(Ordering::Acquire) {
+            entry.cancel_requested.store(true, Ordering::Release);
+            self.finish_pre_prompt_cancelled(&request.run_id, &entry);
+            drop(prompt_gate);
+            let _ = child.terminate_tree();
+            let _ = child.wait();
             return;
         }
         let prompt_id = next_id;
@@ -1161,9 +1388,12 @@ impl CodingAgentManager {
                 &entry,
                 "coding_agent_prompt_write_uncertain",
             );
+            drop(prompt_gate);
             let _ = child.terminate_tree();
+            let _ = child.wait();
             return;
         }
+        *prompt_gate = PromptDispatchGateState::PromptDispatchMayHaveOccurred;
         entry.update_snapshot(|snapshot| {
             snapshot.execution_state = CodingAgentExecutionState::Started
         });
@@ -1172,6 +1402,7 @@ impl CodingAgentManager {
             &entry,
             DurableDispatchPhase::PromptDispatchMayHaveOccurred,
         );
+        drop(prompt_gate);
 
         let run_deadline = Instant::now() + Duration::from_secs(request.timeout_secs);
         let mut cancel_sent = false;
@@ -1663,9 +1894,17 @@ enum ReaderEvent {
     Io,
 }
 
-fn wait_response(rx: &Receiver<ReaderEvent>, id: u64, timeout: Duration) -> Result<Value, String> {
+fn wait_response(
+    rx: &Receiver<ReaderEvent>,
+    id: u64,
+    timeout: Duration,
+    interrupted: Option<&AtomicBool>,
+) -> Result<Value, String> {
     let deadline = Instant::now() + timeout;
     loop {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("ACP setup interrupted".to_string());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("ACP request timed out".to_string());
@@ -2023,6 +2262,13 @@ for line in sys.stdin:
  m=json.loads(line); log({'recv':m}); method=m.get('method'); rid=m.get('id')
  if method=='initialize':
   if scenario=='crash_before_prompt': sys.exit(9)
+  if scenario in ('block_initialize','block_initialize_tree'):
+   if scenario=='block_initialize_tree':
+    child=subprocess.Popen(['/bin/sh','-c','sleep 60']); log({'descendant_pid':child.pid})
+   ready=os.path.join(os.path.dirname(__file__),'initialize.ready')
+   release=os.path.join(os.path.dirname(__file__),'initialize.release')
+   open(ready,'w').close()
+   while not os.path.exists(release): time.sleep(0.01)
   send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':1,'agentCapabilities':{}}})
  elif method=='session/new':
   opts=[{'id':'mode','name':'Mode','type':'select','currentValue':'agent','options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
@@ -2215,6 +2461,32 @@ for line in sys.stdin:
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_proc_exit(pid: u64) {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while proc_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !proc_path.exists(),
+            "process {pid} survived CodingAgent worker drain"
+        );
     }
 
     fn successful_start_run_id(response: &CodingAgentResponse) -> Option<String> {
@@ -2667,6 +2939,259 @@ for line in sys.stdin:
             &projects,
         );
         wait_for_snapshot(&manager, winner, |snapshot| snapshot.state.terminal());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancel_during_initialize_never_dispatches_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "block_initialize");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_cancelinitialize01";
+        let started = manager.handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        );
+        assert!(started.error.is_none(), "{:?}", started.error);
+        wait_for_path(&temp.path().join("initialize.ready"));
+
+        let cancelled = manager.handle(
+            CodingAgentRequest::Cancel(CodingAgentCancelRequest {
+                run_id: run.to_string(),
+            }),
+            &projects,
+        );
+        let snapshot = match cancelled.payload.unwrap() {
+            CodingAgentResponsePayload::Cancel { run } => run,
+            other => panic!("unexpected cancel payload: {other:?}"),
+        };
+        assert_eq!(snapshot.state, CodingAgentRunState::Cancelled);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        assert_eq!(
+            snapshot
+                .terminal
+                .as_ref()
+                .and_then(|t| t.stop_reason.as_deref()),
+            None
+        );
+        fs::write(temp.path().join("initialize.release"), b"release").unwrap();
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(drain.panicked, 0);
+        let methods = received_methods(&wire_log(&temp));
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "session/cancel")
+                .count(),
+            0
+        );
+        let final_snapshot = manager.runs.lock().unwrap().get(run).unwrap().snapshot();
+        assert_eq!(final_snapshot.state, CodingAgentRunState::Cancelled);
+        assert_eq!(
+            final_snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancel_and_prompt_gate_race_has_only_linearized_outcomes() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "wait_cancel");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_promptgaterace01";
+        let race = Arc::new(std::sync::Barrier::new(2));
+        *manager.prompt_dispatch_test_barrier.lock().unwrap() = Some(Arc::clone(&race));
+        let started = manager.handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        );
+        assert!(started.error.is_none(), "{:?}", started.error);
+
+        let cancel_manager = Arc::clone(&manager);
+        let cancel_projects = projects.clone();
+        let cancel_race = Arc::clone(&race);
+        let cancel = thread::spawn(move || {
+            cancel_race.wait();
+            cancel_manager.handle(
+                CodingAgentRequest::Cancel(CodingAgentCancelRequest {
+                    run_id: run.to_string(),
+                }),
+                &cancel_projects,
+            )
+        });
+        let cancelled = cancel.join().unwrap();
+        assert!(cancelled.error.is_none(), "{:?}", cancelled.error);
+        *manager.prompt_dispatch_test_barrier.lock().unwrap() = None;
+        let final_snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        let methods = received_methods(&wire_log(&temp));
+        let prompts = methods
+            .iter()
+            .filter(|m| m.as_str() == "session/prompt")
+            .count();
+        let cancels = methods
+            .iter()
+            .filter(|m| m.as_str() == "session/cancel")
+            .count();
+        assert!(
+            prompts <= 1,
+            "prompt dispatched more than once: {methods:?}"
+        );
+        match prompts {
+            0 => {
+                assert_eq!(final_snapshot.state, CodingAgentRunState::Cancelled);
+                assert_eq!(
+                    final_snapshot.execution_state,
+                    CodingAgentExecutionState::NotStarted
+                );
+                assert_eq!(cancels, 0);
+            }
+            1 => {
+                assert_eq!(final_snapshot.state, CodingAgentRunState::Cancelled);
+                assert_eq!(
+                    final_snapshot.execution_state,
+                    CodingAgentExecutionState::Completed
+                );
+                assert_eq!(cancels, 1);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_during_admission_catches_published_run_before_prompt() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "wait_cancel");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_shutdownadmission01";
+        let publish_barrier = Arc::new(std::sync::Barrier::new(2));
+        *manager
+            .admission_after_accepting_test_barrier
+            .lock()
+            .unwrap() = Some(Arc::clone(&publish_barrier));
+        manager
+            .admission_after_accepting_test_reached
+            .store(false, Ordering::SeqCst);
+
+        let start_manager = Arc::clone(&manager);
+        let start_projects = projects.clone();
+        let request = start_request(&manager, &root, run, BTreeMap::new());
+        let start = thread::spawn(move || start_manager.handle(request, &start_projects));
+        let reached_deadline = Instant::now() + Duration::from_secs(5);
+        while !manager
+            .admission_after_accepting_test_reached
+            .load(Ordering::SeqCst)
+        {
+            assert!(Instant::now() < reached_deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let shutdown_manager = Arc::clone(&manager);
+        let shutdown = thread::spawn(move || shutdown_manager.stop_accepting());
+        let stopping_deadline = Instant::now() + Duration::from_secs(5);
+        while manager.accepting.load(Ordering::Acquire) {
+            assert!(Instant::now() < stopping_deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        publish_barrier.wait();
+        let started = start.join().unwrap();
+        assert!(started.error.is_none(), "{:?}", started.error);
+        shutdown.join().unwrap();
+        *manager
+            .admission_after_accepting_test_barrier
+            .lock()
+            .unwrap() = None;
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        let final_snapshot = manager.runs.lock().unwrap().get(run).unwrap().snapshot();
+        assert_eq!(final_snapshot.state, CodingAgentRunState::Cancelled);
+        assert_eq!(
+            final_snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|m| m.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_drains_setup_worker_and_reaps_provider_tree() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "block_initialize_tree");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_shutdowndrain01";
+        let started = manager.handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        );
+        assert!(started.error.is_none(), "{:?}", started.error);
+        wait_for_path(&temp.path().join("initialize.ready"));
+        assert!(manager.worker_count() > 0);
+        let log = wire_log(&temp);
+        let startup_pid = log
+            .iter()
+            .find_map(|entry| entry.get("startup_pid").and_then(Value::as_u64))
+            .unwrap();
+        let descendant_pid = log
+            .iter()
+            .find_map(|entry| entry.get("descendant_pid").and_then(Value::as_u64))
+            .unwrap();
+
+        manager.stop_accepting();
+        fs::write(temp.path().join("initialize.release"), b"release").unwrap();
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert!(drain.resources > 0);
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(drain.panicked, 0);
+        assert_eq!(manager.worker_count(), 0);
+        let final_snapshot = manager.runs.lock().unwrap().get(run).unwrap().snapshot();
+        assert_eq!(final_snapshot.state, CodingAgentRunState::Cancelled);
+        assert_eq!(
+            final_snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        assert_eq!(
+            received_methods(&wire_log(&temp))
+                .iter()
+                .filter(|m| m.as_str() == "session/prompt")
+                .count(),
+            0
+        );
+        #[cfg(target_os = "linux")]
+        {
+            wait_for_proc_exit(startup_pid);
+            wait_for_proc_exit(descendant_pid);
+        }
     }
 
     #[test]

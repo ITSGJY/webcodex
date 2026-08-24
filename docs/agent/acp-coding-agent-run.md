@@ -603,11 +603,15 @@ multiplying states. Reuse the existing concepts `not_started`, `started`,
 | `waiting_permission` | Prompt is active and a real ACP permission callback is pending. | No prompt retry and no automatic allow. | `wait`; P1 fail-closes the permission deadline. |
 | `completed` | Correlated terminal prompt result proves normal terminal completion. | No retry of the same Run. | `none`. |
 | `failed` | Deterministic terminal failure is known, or setup failed before prompt dispatch. | The retained Run itself is terminal and same-key replay only returns it. A new initiation with a new idempotency key is safe only when `execution_state=not_started`; otherwise caller must not infer retry safety. | `none` for the retained terminal Run. Pre-admission tool-call failures may separately use `fix_input` or exact `retry_same`. |
-| `cancelled` | Cancellation reached a correlated terminal cancelled result, or the Run was cancelled while prompt was provably not started. | Do not resend the cancelled prompt as a retry. | `none`. |
+| `cancelled` | Cancellation reached a correlated terminal cancelled result, or the Run was cancelled while prompt was provably not started. Pre-prompt cancellation uses `execution_state=not_started`, no ACP `stop_reason`/`error_code`, and a bounded terminal message stating that no ACP prompt was dispatched. | Do not resend the cancelled prompt as a retry. | `none`. |
 | `lost` | No terminal prompt result is available and exact continuation cannot currently be proved. Prompt may have run. | Never blind retry. | `reconcile` / `reobserve`; create a new Run only after authoritative evidence establishes safety or the user intentionally requests new work. |
 
 ACP v1 terminal `stopReason` mapping is closed for P1: `end_turn` becomes
 `completed`; `cancelled` becomes `cancelled`; `max_tokens`,
+A `cancelled/not_started` Run is not an ACP terminal response: its `stop_reason`
+remains absent because the prompt never crossed the dispatch boundary. Only a
+correlated post-dispatch ACP cancellation carries `stopReason=cancelled`.
+
 `max_turn_requests`, and `refusal` become deterministic `failed` outcomes. Those
 non-success stop reasons are correlated terminal responses, so they are not
 `lost`, but they also do not prove that the turn had no coding effects and do not

@@ -584,11 +584,37 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
             }
         }
         CodingAgentRunState::Cancelled => {
-            let terminal = terminal_for_state(run, CodingAgentExecutionState::Completed)?;
-            if terminal.stop_reason.as_deref() != Some(CODING_AGENT_STOP_REASON_CANCELLED)
-                || terminal.error_code.is_some()
-            {
-                return Err("cancelled CodingAgentRun snapshot lacks cancelled truth".to_string());
+            let terminal = run.terminal.as_ref().ok_or_else(|| {
+                "cancelled CodingAgentRun snapshot lacks terminal metadata".to_string()
+            })?;
+            match run.execution_state {
+                CodingAgentExecutionState::NotStarted => {
+                    if terminal.stop_reason.is_some()
+                        || terminal.error_code.is_some()
+                        || terminal.message.as_deref().is_none_or(str::is_empty)
+                    {
+                        return Err(
+                            "pre-prompt cancelled CodingAgentRun snapshot claims ACP terminal truth"
+                                .to_string(),
+                        );
+                    }
+                }
+                CodingAgentExecutionState::Completed => {
+                    if terminal.stop_reason.as_deref() != Some(CODING_AGENT_STOP_REASON_CANCELLED)
+                        || terminal.error_code.is_some()
+                    {
+                        return Err(
+                            "post-prompt cancelled CodingAgentRun snapshot lacks cancelled truth"
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => {
+                    return Err(
+                        "cancelled CodingAgentRun snapshot has inconsistent execution state"
+                            .to_string(),
+                    )
+                }
             }
         }
         CodingAgentRunState::Failed => {
@@ -894,6 +920,21 @@ mod tests {
                 Some(CODING_AGENT_STOP_REASON_CANCELLED),
                 None,
             ),
+            {
+                let mut run = snapshot(
+                    CodingAgentRunState::Cancelled,
+                    CodingAgentExecutionState::NotStarted,
+                    None,
+                    None,
+                );
+                run.terminal = Some(CodingAgentTerminal {
+                    stop_reason: None,
+                    error_code: None,
+                    message: Some("ACP prompt was not dispatched".to_string()),
+                    completed_at: 1,
+                });
+                run
+            },
             snapshot(
                 CodingAgentRunState::Failed,
                 CodingAgentExecutionState::Completed,
@@ -952,6 +993,18 @@ mod tests {
                 CodingAgentExecutionState::Completed,
                 Some(CODING_AGENT_STOP_REASON_MAX_TOKENS),
                 Some(CODING_AGENT_STOP_REASON_MAX_TOKENS),
+            ),
+            snapshot(
+                CodingAgentRunState::Cancelled,
+                CodingAgentExecutionState::NotStarted,
+                Some(CODING_AGENT_STOP_REASON_CANCELLED),
+                None,
+            ),
+            snapshot(
+                CodingAgentRunState::Cancelled,
+                CodingAgentExecutionState::NotStarted,
+                None,
+                None,
             ),
             snapshot(
                 CodingAgentRunState::Lost,

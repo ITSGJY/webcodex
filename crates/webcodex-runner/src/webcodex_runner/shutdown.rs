@@ -340,7 +340,7 @@ impl Drop for ActivityGuard {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BackgroundThreads {
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
