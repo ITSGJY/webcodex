@@ -473,18 +473,166 @@ fn validation_summary_exposes_failed_test_details_on_latest_and_latest_failure()
 }
 
 #[test]
-fn cargo_test_run_metadata_sums_mixed_rust_test_harness_sections() {
+fn cargo_test_run_metadata_counts_only_executed_tests() {
     let metadata = parse_cargo_test_run_metadata(
-        "running 0 tests\n\
-         test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\n\
-         running 1 test\n\
-         test archived_items_do_not_count_toward_total_quantity ... ok\n\
-         test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        "running 7 tests\n\
+         test result: ok. 1 passed; 0 failed; 3 ignored; 2 measured; 4 filtered out\n",
     );
 
     assert!(metadata.tests_detected);
     assert_eq!(metadata.tests_run_count, Some(1));
     assert_eq!(metadata.zero_tests_run, Some(false));
+
+    let measured_only = parse_cargo_test_run_metadata(
+        "running 2 tests\n\
+         test result: ok. 0 passed; 0 failed; 0 ignored; 2 measured; 0 filtered out\n",
+    );
+    assert_eq!(measured_only.tests_run_count, Some(0));
+    assert_eq!(measured_only.zero_tests_run, Some(true));
+}
+
+#[test]
+fn cargo_test_run_metadata_reports_ignored_only_as_zero_executed() {
+    let metadata = parse_cargo_test_run_metadata(
+        "running 1 test\n\
+         test ignored_only ... ignored\n\
+         test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n",
+    );
+
+    assert!(metadata.tests_detected);
+    assert_eq!(metadata.tests_run_count, Some(0));
+    assert_eq!(metadata.zero_tests_run, Some(true));
+}
+
+#[test]
+fn cargo_test_run_metadata_counts_failed_tests_as_executed() {
+    let metadata = parse_cargo_test_run_metadata(
+        "running 3 tests\n\
+         test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
+    );
+
+    assert!(metadata.tests_detected);
+    assert_eq!(metadata.tests_run_count, Some(3));
+    assert_eq!(metadata.zero_tests_run, Some(false));
+}
+
+#[test]
+fn cargo_test_run_metadata_aggregates_complete_harness_summaries() {
+    let metadata = parse_cargo_test_run_metadata(
+        "running 5 tests\n\
+         test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out\n\n\
+         running 6 tests\n\
+         test result: FAILED. 1 passed; 1 failed; 4 ignored; 0 measured; 0 filtered out\n",
+    );
+
+    assert!(metadata.tests_detected);
+    assert_eq!(metadata.tests_run_count, Some(4));
+    assert_eq!(metadata.zero_tests_run, Some(false));
+}
+
+#[test]
+fn cargo_test_run_metadata_does_not_guess_from_running_or_partial_summary() {
+    for output in [
+        "running 10 tests\n",
+        "running 10 tests\ntest result: ok. 10 passed;\n",
+        "test result: ok. 10 passed; 0 failed\n",
+        "test result: unknown. 10 passed; 0 failed; 0 ignored\n",
+        "test result: FAILED. 2 passed; 1 failed; 0 ignored\n\
+         test result: ok. 4 passed;\n",
+    ] {
+        let metadata = parse_cargo_test_run_metadata(output);
+        assert!(metadata.tests_detected, "{output:?}");
+        assert_eq!(metadata.tests_run_count, None, "{output:?}");
+        assert_eq!(metadata.zero_tests_run, None, "{output:?}");
+    }
+}
+
+#[test]
+fn cargo_test_session_metadata_preserves_explicit_unproven_count_authority() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        json!({"project": "agent:eval:demo", "filter": "focused"}),
+        true,
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "test result: ok. 10 passed; 0 failed\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": null,
+            "zero_tests_run": null
+        }),
+    );
+
+    let session = store.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&session);
+    let event = &validation["latest"];
+
+    assert_eq!(event["success"], true);
+    assert_eq!(event["tests_detected"], true);
+    assert!(event["tests_run_count"].is_null());
+    assert!(event["zero_tests_run"].is_null());
+    assert!(event["detected_summary"]["tests_run_count"].is_null());
+    assert!(event["detected_summary"]["zero_tests_run"].is_null());
+    assert_eq!(event["diagnostics"]["test_summary"]["passed"], 10);
+    assert_eq!(event["diagnostics"]["test_summary"]["failed"], 0);
+}
+
+#[test]
+fn legacy_persisted_cargo_test_metadata_absence_uses_diagnostics_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 10, 10);
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        json!({"project": "agent:eval:demo", "filter": "legacy"}),
+        true,
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "test result: ok. 2 passed; 0 failed; 0 ignored\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": 2,
+            "zero_tests_run": false
+        }),
+    );
+    store.flush_persistence();
+    drop(store);
+
+    let mut ledger_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let events = ledger_json["sessions"][0]["events"].as_array_mut().unwrap();
+    let finished = events
+        .iter_mut()
+        .find(|event| event["kind"] == "tool_call_finished" && event["tool_name"] == "cargo_test")
+        .unwrap();
+    let output_summary = finished["validation_output_summary"]
+        .as_object_mut()
+        .unwrap();
+    output_summary.remove("tests_run_count");
+    output_summary.remove("zero_tests_run");
+    std::fs::write(&ledger, serde_json::to_vec(&ledger_json).unwrap()).unwrap();
+
+    let restored = SessionStore::with_persistence(&ledger, 10, 10);
+    let session = restored.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&session);
+    let event = &validation["latest"];
+
+    assert_eq!(event["tests_detected"], true);
+    assert_eq!(event["tests_run_count"], 2);
+    assert_eq!(event["zero_tests_run"], false);
+    assert_eq!(event["diagnostics"]["test_summary"]["passed"], 2);
+    assert_eq!(event["diagnostics"]["test_summary"]["failed"], 0);
 }
 
 #[test]
@@ -737,6 +885,60 @@ fn failed_cargo_test_followed_by_zero_tests_remains_historically_unresolved() {
 }
 
 #[test]
+fn failed_cargo_test_followed_by_unproven_success_remains_historically_unresolved() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    let arguments = json!({"project": "agent:eval:demo", "filter": "focused"});
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        arguments.clone(),
+        false,
+        json!({"exit_code": 101}),
+    );
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "cargo_test",
+        arguments,
+        true,
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "test result: ok. 10 passed; 0 failed\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": null,
+            "zero_tests_run": null
+        }),
+    );
+
+    let session = store.summary(&session.session_id, Some(50)).unwrap();
+    let validation = validation_summary_for_session(&session);
+
+    assert_eq!(validation["status"], "mixed");
+    assert_eq!(validation["latest_status"], "passed");
+    assert_eq!(validation["latest"]["success"], true);
+    assert!(validation["latest"]["tests_run_count"].is_null());
+    assert!(validation["latest"]["zero_tests_run"].is_null());
+    assert_eq!(
+        validation["latest"]["diagnostics"]["test_summary"]["passed"],
+        10
+    );
+    assert_eq!(
+        validation["latest"]["diagnostics"]["test_summary"]["failed"],
+        0
+    );
+    assert_eq!(validation["historical_failures"]["count"], 1);
+    assert_eq!(validation["historical_failures"]["resolved"], false);
+    assert_eq!(validation["historical_failures"]["unresolved"], true);
+    assert_eq!(validation["resolved_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
+}
+
+#[test]
 fn different_check_success_after_zero_tests_does_not_resolve_test_failure() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);
@@ -864,6 +1066,7 @@ fn validation_job_terminal_identity_survives_event_eviction_and_restart_without_
         target,
         "completed",
         Some(0),
+        Some(true),
         Some(authoritative_finished_at.saturating_sub(1)),
         Some(authoritative_finished_at),
         Some(1000),
@@ -915,6 +1118,7 @@ fn validation_job_terminal_identity_survives_event_eviction_and_restart_without_
             target,
             "completed",
             Some(0),
+            Some(true),
             Some(authoritative_finished_at.saturating_sub(1)),
             Some(authoritative_finished_at),
             Some(1000),
@@ -948,6 +1152,7 @@ fn validation_job_terminal_identity_survives_event_eviction_and_restart_without_
             target,
             "completed",
             Some(0),
+            Some(true),
             Some(authoritative_finished_at.saturating_sub(1)),
             Some(authoritative_finished_at),
             Some(1000),
@@ -1090,6 +1295,37 @@ fn structured_validation_target_resolves_equivalent_semantic_arguments() {
         .as_str()
         .unwrap();
     assert!(identity.starts_with("target:"), "{identity}");
+}
+
+#[test]
+fn cargo_test_target_identity_includes_effective_count_contract() {
+    let target = |arguments| {
+        super::super::tool_audit::structured_validation_target_identity("cargo_test", &arguments)
+            .unwrap()
+    };
+    let require_one = target(json!({
+        "cwd": ".",
+        "filter": "focused",
+        "require_tests": true
+    }));
+    let min_one = target(json!({
+        "cwd": ".",
+        "filter": "focused",
+        "min_tests": 1
+    }));
+    let min_six = target(json!({
+        "cwd": ".",
+        "filter": "focused",
+        "require_tests": true,
+        "min_tests": 6
+    }));
+    let compatible_default = target(json!({
+        "cwd": ".",
+        "filter": "focused"
+    }));
+    assert_eq!(require_one, min_one);
+    assert_ne!(require_one, min_six);
+    assert_ne!(require_one, compatible_default);
 }
 
 #[test]
@@ -1528,6 +1764,8 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                         features: None,
                         package: None,
                         no_run: None,
+                        require_tests: None,
+                        min_tests: None,
                         timeout_secs: Some(60),
                     },
                     Some(&auth),

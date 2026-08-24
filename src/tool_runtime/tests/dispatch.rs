@@ -35,10 +35,20 @@ fn structured_validation_tools_are_known_and_parse() {
     assert!(matches!(
         ToolCall::from_tool_name(
             "cargo_test",
-            json!({"project":"agent:oe:webcodex","filter":"tool_runtime"})
+            json!({
+                "project":"agent:oe:webcodex",
+                "filter":"tool_runtime",
+                "require_tests": true,
+                "min_tests": 6
+            })
         )
         .unwrap(),
-        ToolCall::CargoTest { filter: Some(filter), .. } if filter == "tool_runtime"
+        ToolCall::CargoTest {
+            filter: Some(filter),
+            require_tests: Some(true),
+            min_tests: Some(6),
+            ..
+        } if filter == "tool_runtime"
     ));
     assert!(matches!(
         ToolCall::from_tool_name(
@@ -396,7 +406,7 @@ async fn cargo_test_passing_output_includes_empty_failed_test_details_diagnostic
         "cargo-pass-diag",
         &req.request_id,
         0,
-        "running 12 tests\n\
+        "running 14 tests\n\
 test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out\n",
         "",
     )
@@ -466,6 +476,7 @@ test result: ok. 0 passed; 0 failed; 2 ignored\n",
     assert_eq!(result.output["failure_kind"], "validation_failed");
     // Top-level counts (full combined output) and diagnostics (bounded tails)
     // must agree when every summary is still present in the tails.
+    assert_eq!(result.output["tests_run_count"], 6);
     assert_eq!(result.output["tests_passed"], 5);
     assert_eq!(result.output["tests_failed"], 1);
     let diagnostics = &result.output["diagnostics"];

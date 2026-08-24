@@ -76,6 +76,8 @@ pub(crate) struct ValidationEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) zero_tests_run: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) test_count_assertion: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stdout_lines: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stderr_lines: Option<u64>,
@@ -476,6 +478,7 @@ impl ToolRuntime {
                 "tests_passed",
                 "tests_failed",
                 "zero_tests_run",
+                "test_count_assertion",
                 "diagnostics",
             ] {
                 if let Some(value) = validation.get(field) {
@@ -517,6 +520,7 @@ impl ToolRuntime {
                 validation_target_id,
                 terminal_status,
                 status.output.get("exit_code").and_then(Value::as_i64),
+                validation.get("passed").and_then(Value::as_bool),
                 status.output.get("started_at").and_then(Value::as_i64),
                 status.output.get("ended_at").and_then(Value::as_i64),
                 status.output.get("duration_ms").and_then(Value::as_u64),
@@ -708,7 +712,14 @@ fn classify_validation_failures(
 }
 
 fn validation_event_decides_historical_failure_status(event: &ValidationEvent) -> bool {
-    !cargo_test_zero_tests_success(event)
+    !cargo_test_zero_tests_success(event) && !cargo_test_unproven_execution_success(event)
+}
+
+fn cargo_test_unproven_execution_success(event: &ValidationEvent) -> bool {
+    event.tool_name == "cargo_test"
+        && event.validation_kind == "test"
+        && event.success
+        && (event.tests_run_count.is_none() || event.zero_tests_run.is_none())
 }
 
 fn no_historical_failures() -> ValidationHistoricalFailures {
@@ -916,6 +927,11 @@ fn validation_event_from_finished(
     ) = execution_output_evidence(finished);
     let (tests_detected, tests_run_count, zero_tests_run) =
         validation_test_run_metadata(finished, adapter, diagnostics.as_ref());
+    let test_count_assertion = finished
+        .validation_output_summary
+        .as_ref()
+        .and_then(|summary| summary.get("test_count_assertion"))
+        .cloned();
     let detected_summary = adapter.map(|adapter| {
         json!({
             "kind": adapter.validation_kind(),
@@ -954,6 +970,7 @@ fn validation_event_from_finished(
         tests_detected,
         tests_run_count,
         zero_tests_run,
+        test_count_assertion,
         stdout_lines,
         stderr_lines,
         stdout_truncated,
@@ -1259,14 +1276,14 @@ fn validation_test_run_metadata(
         .and_then(|value| value.get("tests_detected"))
         .and_then(Value::as_bool)
         .or_else(|| Some(parsed_test_summary.is_some()));
-    let tests_run_count = summary
-        .and_then(|value| value.get("tests_run_count"))
-        .and_then(Value::as_u64)
-        .or(parsed_tests_run);
-    let zero_tests_run = summary
-        .and_then(|value| value.get("zero_tests_run"))
-        .and_then(Value::as_bool)
-        .or_else(|| parsed_tests_run.map(|count| count == 0));
+    let tests_run_count = match summary.and_then(|value| value.get("tests_run_count")) {
+        Some(value) => value.as_u64(),
+        None => parsed_tests_run,
+    };
+    let zero_tests_run = match summary.and_then(|value| value.get("zero_tests_run")) {
+        Some(value) => value.as_bool(),
+        None => parsed_tests_run.map(|count| count == 0),
+    };
     (tests_detected, tests_run_count, zero_tests_run)
 }
 
