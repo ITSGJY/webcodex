@@ -51,6 +51,7 @@ const ACP_MESSAGE_MAX_BYTES: usize = 1024 * 1024;
 const ACP_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const ACP_CANCEL_GRACE: Duration = Duration::from_secs(5);
 const ACP_POLL: Duration = Duration::from_millis(25);
+const ACP_IO_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -771,6 +772,158 @@ impl CodingAgentManager {
         false
     }
 
+    fn write_pre_prompt_frame(
+        &self,
+        run_id: &str,
+        entry: &Arc<RunEntry>,
+        child: &mut ManagedChild,
+        outbound: &mut AcpOutboundWriter,
+        frame: std::io::Result<Vec<u8>>,
+        run_deadline: Instant,
+        failure_code: &str,
+        failure_message: &str,
+    ) -> bool {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.setup_failure(
+                    run_id,
+                    entry,
+                    failure_code,
+                    &format!("{failure_message}: {error}"),
+                );
+                self.terminate_run_io(child, outbound);
+                return false;
+            }
+        };
+        let pending = match outbound.start_frame(frame) {
+            Ok(pending) => pending,
+            Err(error) => {
+                if !self.pre_prompt_should_stop(run_id, entry, run_deadline) {
+                    self.setup_failure(
+                        run_id,
+                        entry,
+                        failure_code,
+                        &format!("{failure_message}: {error}"),
+                    );
+                }
+                self.terminate_run_io(child, outbound);
+                return false;
+            }
+        };
+        match wait_outbound_write(
+            pending,
+            run_deadline,
+            Some(&entry.cancel_requested),
+            Some(&self.accepting),
+        ) {
+            OutboundWriteOutcome::Written => true,
+            OutboundWriteOutcome::Failed(error) => {
+                if !self.pre_prompt_should_stop(run_id, entry, run_deadline) {
+                    self.setup_failure(
+                        run_id,
+                        entry,
+                        failure_code,
+                        &format!("{failure_message}: {error}"),
+                    );
+                }
+                self.terminate_run_io(child, outbound);
+                false
+            }
+            OutboundWriteOutcome::Interrupted(OutboundInterruption::Deadline) => {
+                self.setup_timeout(run_id, entry);
+                self.terminate_run_io(child, outbound);
+                false
+            }
+            OutboundWriteOutcome::Interrupted(
+                OutboundInterruption::Cancelled | OutboundInterruption::Shutdown,
+            ) => {
+                let _ = self.pre_prompt_interrupted(run_id, entry);
+                self.terminate_run_io(child, outbound);
+                false
+            }
+        }
+    }
+
+    fn terminate_run_io(&self, child: &mut ManagedChild, outbound: &mut AcpOutboundWriter) {
+        let _ = child.terminate_tree();
+        outbound.close();
+        let deadline = Instant::now() + ACP_IO_CLEANUP_TIMEOUT;
+        let _ = outbound.wait_finished_until(deadline);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = child.wait_tree_exit(remaining);
+        }
+        let _ = child.try_wait();
+        let _ = self.worker_threads.reap_finished();
+    }
+
+    fn cleanup_run_io(&self, child: &mut ManagedChild, outbound: &mut AcpOutboundWriter) {
+        outbound.close();
+        let graceful_deadline = Instant::now() + ACP_IO_CLEANUP_TIMEOUT;
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            if Instant::now() >= graceful_deadline {
+                let _ = child.terminate_tree();
+                break;
+            }
+            thread::sleep(ACP_POLL);
+        }
+        let forced_deadline = Instant::now() + ACP_IO_CLEANUP_TIMEOUT;
+        let _ = outbound.wait_finished_until(forced_deadline);
+        let remaining = forced_deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = child.wait_tree_exit(remaining);
+        }
+        let _ = child.try_wait();
+        let _ = self.worker_threads.reap_finished();
+    }
+
+    fn write_post_prompt_frame(
+        &self,
+        run_id: &str,
+        entry: &Arc<RunEntry>,
+        child: &mut ManagedChild,
+        outbound: &mut AcpOutboundWriter,
+        frame: std::io::Result<Vec<u8>>,
+        deadline: Instant,
+        observe_cancel: bool,
+        uncertainty_code: &str,
+    ) -> bool {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(_) => {
+                self.terminate_run_io(child, outbound);
+                self.mark_lost(run_id, entry, uncertainty_code);
+                return false;
+            }
+        };
+        let pending = match outbound.start_frame(frame) {
+            Ok(pending) => pending,
+            Err(_) => {
+                self.terminate_run_io(child, outbound);
+                self.mark_lost(run_id, entry, uncertainty_code);
+                return false;
+            }
+        };
+        let cancelled = observe_cancel.then_some(&entry.cancel_requested);
+        match wait_outbound_write(pending, deadline, cancelled, Some(&self.accepting)) {
+            OutboundWriteOutcome::Written => true,
+            OutboundWriteOutcome::Failed(_)
+            | OutboundWriteOutcome::Interrupted(
+                OutboundInterruption::Cancelled
+                | OutboundInterruption::Shutdown
+                | OutboundInterruption::Deadline,
+            ) => {
+                self.terminate_run_io(child, outbound);
+                self.mark_lost(run_id, entry, uncertainty_code);
+                false
+            }
+        }
+    }
+
     fn start(
         self: &Arc<Self>,
         request: webcodex_core::coding_agent::CodingAgentStartRequest,
@@ -1032,7 +1185,7 @@ impl CodingAgentManager {
             let _ = child.wait();
             return;
         }
-        let mut stdin = match child.child_mut().stdin.take() {
+        let stdin = match child.child_mut().stdin.take() {
             Some(stdin) => stdin,
             None => {
                 self.setup_failure(
@@ -1066,6 +1219,21 @@ impl CodingAgentManager {
                     let _ = std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink());
                 });
         }
+        let mut outbound = match AcpOutboundWriter::spawn(stdin, &self.worker_threads) {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                self.setup_failure(
+                    &request.run_id,
+                    &entry,
+                    "coding_agent_writer_unavailable",
+                    &error.to_string(),
+                );
+                let _ = child.terminate_tree();
+                let _ = child.wait_tree_exit(ACP_IO_CLEANUP_TIMEOUT);
+                let _ = child.try_wait();
+                return;
+            }
+        };
         let (tx, rx) = mpsc::sync_channel(32);
         let _reader = match thread::Builder::new()
             .name("wc-acp-stdout".to_string())
@@ -1105,44 +1273,41 @@ impl CodingAgentManager {
                     "coding_agent_reader_unavailable",
                     &error.to_string(),
                 );
-                let _ = child.terminate_tree();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
         };
 
         let mut next_id = 1u64;
         if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
         let initialize_id = next_id;
         next_id += 1;
-        if send_request(
-            &mut stdin,
-            initialize_id,
-            "initialize",
-            json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {},
-                "clientInfo": {"name":"webcodex-runner","version":env!("CARGO_PKG_VERSION")}
-            }),
-        )
-        .is_err()
-        {
-            self.setup_failure(
-                &request.run_id,
-                &entry,
-                "coding_agent_initialize_write_failed",
-                "failed to write initialize",
-            );
-            let _ = child.terminate_tree();
+        if !self.write_pre_prompt_frame(
+            &request.run_id,
+            &entry,
+            &mut child,
+            &mut outbound,
+            request_frame(
+                initialize_id,
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name":"webcodex-runner","version":env!("CARGO_PKG_VERSION")}
+                }),
+            ),
+            run_deadline,
+            "coding_agent_initialize_write_failed",
+            "failed to write initialize",
+        ) {
             return;
         }
         let Some(initialize_wait) = bounded_setup_wait(run_deadline) else {
             self.setup_timeout(&request.run_id, &entry);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         };
         let initialize = match wait_response(
@@ -1161,14 +1326,12 @@ impl CodingAgentManager {
                         &error,
                     );
                 }
-                let _ = child.terminate_tree();
-                let _ = child.wait();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
         };
         if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
         if initialize.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
@@ -1178,42 +1341,39 @@ impl CodingAgentManager {
                 "coding_agent_protocol_version_unsupported",
                 "ACP v1 was not negotiated",
             );
-            let _ = child.terminate_tree();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
 
         if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
 
         let new_id = next_id;
         next_id += 1;
-        if send_request(
-            &mut stdin,
-            new_id,
-            "session/new",
-            json!({
-                "cwd": request.project_root,
-                "mcpServers": []
-            }),
-        )
-        .is_err()
-        {
-            self.setup_failure(
-                &request.run_id,
-                &entry,
-                "coding_agent_session_new_write_failed",
-                "failed to write session/new",
-            );
-            let _ = child.terminate_tree();
+        if !self.write_pre_prompt_frame(
+            &request.run_id,
+            &entry,
+            &mut child,
+            &mut outbound,
+            request_frame(
+                new_id,
+                "session/new",
+                json!({
+                    "cwd": request.project_root,
+                    "mcpServers": []
+                }),
+            ),
+            run_deadline,
+            "coding_agent_session_new_write_failed",
+            "failed to write session/new",
+        ) {
             return;
         }
         let Some(session_new_wait) = bounded_setup_wait(run_deadline) else {
             self.setup_timeout(&request.run_id, &entry);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         };
         let new_value =
@@ -1228,14 +1388,12 @@ impl CodingAgentManager {
                             &error,
                         );
                     }
-                    let _ = child.terminate_tree();
-                    let _ = child.wait();
+                    self.terminate_run_io(&mut child, &mut outbound);
                     return;
                 }
             };
         if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
         let new_session: NewSessionResponse = match serde_json::from_value(new_value) {
@@ -1247,7 +1405,7 @@ impl CodingAgentManager {
                     "coding_agent_session_new_invalid",
                     "invalid ACP session/new result",
                 );
-                let _ = child.terminate_tree();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
         };
@@ -1256,8 +1414,7 @@ impl CodingAgentManager {
 
         for (key, value) in &request.config {
             if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-                let _ = child.terminate_tree();
-                let _ = child.wait();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
             if !provider
@@ -1272,7 +1429,7 @@ impl CodingAgentManager {
                     "coding_agent_config_not_allowed",
                     "ACP config override is not operator-allowed",
                 );
-                let _ = child.terminate_tree();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
             if !config_override_is_valid(&advertised, key, value) {
@@ -1282,7 +1439,7 @@ impl CodingAgentManager {
                     "coding_agent_config_invalid",
                     "ACP config override is not currently advertised/legal",
                 );
-                let _ = child.terminate_tree();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
             let config_id = next_id;
@@ -1296,24 +1453,25 @@ impl CodingAgentManager {
                         "coding_agent_config_invalid",
                         "ACP config value type is unsupported by stable v1",
                     );
-                    let _ = child.terminate_tree();
+                    self.terminate_run_io(&mut child, &mut outbound);
                     return;
                 }
             };
-            if send_request(&mut stdin, config_id, "session/set_config_option", params).is_err() {
-                self.setup_failure(
-                    &request.run_id,
-                    &entry,
-                    "coding_agent_config_write_failed",
-                    "failed to write session/set_config_option",
-                );
-                let _ = child.terminate_tree();
+            if !self.write_pre_prompt_frame(
+                &request.run_id,
+                &entry,
+                &mut child,
+                &mut outbound,
+                request_frame(config_id, "session/set_config_option", params),
+                run_deadline,
+                "coding_agent_config_write_failed",
+                "failed to write session/set_config_option",
+            ) {
                 return;
             }
             let Some(config_wait) = bounded_setup_wait(run_deadline) else {
                 self.setup_timeout(&request.run_id, &entry);
-                let _ = child.terminate_tree();
-                let _ = child.wait();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             };
             let result =
@@ -1328,14 +1486,12 @@ impl CodingAgentManager {
                                 &error,
                             );
                         }
-                        let _ = child.terminate_tree();
-                        let _ = child.wait();
+                        self.terminate_run_io(&mut child, &mut outbound);
                         return;
                     }
                 };
             if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline) {
-                let _ = child.terminate_tree();
-                let _ = child.wait();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
             let refreshed: SetSessionConfigOptionResponse = match serde_json::from_value(result) {
@@ -1347,7 +1503,7 @@ impl CodingAgentManager {
                         "coding_agent_config_invalid_response",
                         "invalid refreshed ACP config options",
                     );
-                    let _ = child.terminate_tree();
+                    self.terminate_run_io(&mut child, &mut outbound);
                     return;
                 }
             };
@@ -1359,7 +1515,7 @@ impl CodingAgentManager {
                     "coding_agent_config_not_applied",
                     "ACP config override was not reflected by provider",
                 );
-                let _ = child.terminate_tree();
+                self.terminate_run_io(&mut child, &mut outbound);
                 return;
             }
         }
@@ -1371,6 +1527,27 @@ impl CodingAgentManager {
                 barrier.wait();
             }
         }
+        let prompt_id = next_id;
+        let prompt_frame = match request_frame(
+            prompt_id,
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type":"text","text":request.instruction}]
+            }),
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.setup_failure(
+                    &request.run_id,
+                    &entry,
+                    "coding_agent_prompt_write_failed",
+                    &error.to_string(),
+                );
+                self.terminate_run_io(&mut child, &mut outbound);
+                return;
+            }
+        };
         let mut prompt_gate = entry.prompt_dispatch.lock().unwrap();
         if entry.snapshot().state.terminal()
             || entry.cancel_requested.load(Ordering::Acquire)
@@ -1381,21 +1558,19 @@ impl CodingAgentManager {
                 self.finish_pre_prompt_cancelled(&request.run_id, &entry);
             }
             drop(prompt_gate);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
 
         if remaining_run_budget(run_deadline).is_none() {
             self.setup_timeout(&request.run_id, &entry);
             drop(prompt_gate);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
 
         // Irreversible uncertainty barrier: durable state is committed before the
-        // first byte of session/prompt is allowed onto ACP stdin.
+        // first byte of session/prompt can be handed to the sole stdin writer.
         if let Err(error) = self.persist_phase(
             &request.run_id,
             &entry,
@@ -1411,8 +1586,7 @@ impl CodingAgentManager {
                 &error,
             );
             drop(prompt_gate);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
         #[cfg(test)]
@@ -1425,85 +1599,106 @@ impl CodingAgentManager {
         if remaining_run_budget(run_deadline).is_none() {
             self.setup_timeout(&request.run_id, &entry);
             drop(prompt_gate);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
         // Shutdown intent may become visible while the durable uncertainty barrier
         // is being written. The gate is still pre-prompt, so overwrite the durable
-        // barrier with a truthful cancelled/not_started terminal before any write.
+        // barrier with truthful cancelled/not_started state before writer handoff.
         if !self.accepting.load(Ordering::Acquire) {
             entry.cancel_requested.store(true, Ordering::Release);
             self.finish_pre_prompt_cancelled(&request.run_id, &entry);
             drop(prompt_gate);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
+            self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
-        let prompt_id = next_id;
-        if send_request(
-            &mut stdin,
-            prompt_id,
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{"type":"text","text":request.instruction}]
-            }),
-        )
-        .is_err()
-        {
-            self.mark_lost(
-                &request.run_id,
-                &entry,
-                "coding_agent_prompt_write_uncertain",
-            );
-            drop(prompt_gate);
-            let _ = child.terminate_tree();
-            let _ = child.wait();
-            return;
-        }
+
+        // Mark possible dispatch before the writer can consume any prompt byte.
+        // If the bounded queue handoff itself fails, no prompt byte was writable,
+        // so restore the in-memory gate while it is still exclusively held.
         *prompt_gate = PromptDispatchGateState::PromptDispatchMayHaveOccurred;
-        entry.update_snapshot(|snapshot| {
-            snapshot.execution_state = CodingAgentExecutionState::Started
-        });
-        let _ = self.persist_from_entry(
-            &request.run_id,
-            &entry,
-            DurableDispatchPhase::PromptDispatchMayHaveOccurred,
-        );
+        let prompt_pending = match outbound.start_frame(prompt_frame) {
+            Ok(pending) => pending,
+            Err(error) => {
+                *prompt_gate = PromptDispatchGateState::PrePrompt;
+                self.setup_failure(
+                    &request.run_id,
+                    &entry,
+                    "coding_agent_prompt_write_failed",
+                    &error,
+                );
+                drop(prompt_gate);
+                self.terminate_run_io(&mut child, &mut outbound);
+                return;
+            }
+        };
+        // The authoritative possible-dispatch boundary is the successful writer
+        // handoff. Never retain this gate while waiting on ChildStdin backpressure.
         drop(prompt_gate);
+        match wait_outbound_write(
+            prompt_pending,
+            run_deadline,
+            Some(&entry.cancel_requested),
+            Some(&self.accepting),
+        ) {
+            OutboundWriteOutcome::Written => {
+                entry.update_snapshot(|snapshot| {
+                    snapshot.execution_state = CodingAgentExecutionState::Started
+                });
+                let _ = self.persist_from_entry(
+                    &request.run_id,
+                    &entry,
+                    DurableDispatchPhase::PromptDispatchMayHaveOccurred,
+                );
+            }
+            OutboundWriteOutcome::Failed(_)
+            | OutboundWriteOutcome::Interrupted(
+                OutboundInterruption::Cancelled
+                | OutboundInterruption::Shutdown
+                | OutboundInterruption::Deadline,
+            ) => {
+                self.terminate_run_io(&mut child, &mut outbound);
+                self.mark_lost(
+                    &request.run_id,
+                    &entry,
+                    "coding_agent_prompt_write_uncertain",
+                );
+                return;
+            }
+        }
 
         let mut cancel_sent = false;
         let mut cancel_deadline = None;
         loop {
-            if entry.cancel_requested.load(Ordering::Acquire) || Instant::now() >= run_deadline {
+            if entry.cancel_requested.load(Ordering::Acquire)
+                || Instant::now() >= run_deadline
+                || !self.accepting.load(Ordering::Acquire)
+            {
                 if !cancel_sent {
-                    if send_notification(
-                        &mut stdin,
-                        "session/cancel",
-                        json!({"sessionId":session_id}),
-                    )
-                    .is_err()
-                    {
-                        self.mark_lost(
-                            &request.run_id,
-                            &entry,
-                            "coding_agent_cancel_write_uncertain",
-                        );
-                        let _ = child.terminate_tree();
+                    let deadline =
+                        *cancel_deadline.get_or_insert_with(|| Instant::now() + ACP_CANCEL_GRACE);
+                    if !self.write_post_prompt_frame(
+                        &request.run_id,
+                        &entry,
+                        &mut child,
+                        &mut outbound,
+                        notification_frame("session/cancel", json!({"sessionId":session_id})),
+                        deadline,
+                        false,
+                        "coding_agent_cancel_write_uncertain",
+                    ) {
                         return;
                     }
                     cancel_sent = true;
-                    cancel_deadline = Some(Instant::now() + ACP_CANCEL_GRACE);
                 }
             }
             if cancel_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.terminate_run_io(&mut child, &mut outbound);
                 self.mark_lost(
                     &request.run_id,
                     &entry,
                     "coding_agent_cancel_terminal_missing",
                 );
-                let _ = child.terminate_tree();
                 return;
             }
             match rx.recv_timeout(ACP_POLL) {
@@ -1518,24 +1713,24 @@ impl CodingAgentManager {
                         == Some("session/request_permission")
                     {
                         let Some(id) = message.get("id").and_then(Value::as_u64) else {
+                            self.terminate_run_io(&mut child, &mut outbound);
                             self.mark_lost(
                                 &request.run_id,
                                 &entry,
                                 "coding_agent_permission_id_invalid",
                             );
-                            let _ = child.terminate_tree();
                             return;
                         };
                         let params = message.get("params").cloned().unwrap_or(Value::Null);
                         if serde_json::from_value::<RequestPermissionRequest>(params.clone())
                             .is_err()
                         {
+                            self.terminate_run_io(&mut child, &mut outbound);
                             self.mark_lost(
                                 &request.run_id,
                                 &entry,
                                 "coding_agent_permission_invalid",
                             );
-                            let _ = child.terminate_tree();
                             return;
                         }
                         entry.push_event(permission_event(&params));
@@ -1546,63 +1741,96 @@ impl CodingAgentManager {
                             (Instant::now() + self.permission_timeout).min(run_deadline);
                         while Instant::now() < permission_deadline
                             && !entry.cancel_requested.load(Ordering::Acquire)
+                            && self.accepting.load(Ordering::Acquire)
                         {
                             thread::sleep(ACP_POLL);
                         }
+                        let lifecycle_interrupted = entry.cancel_requested.load(Ordering::Acquire)
+                            || Instant::now() >= run_deadline
+                            || !self.accepting.load(Ordering::Acquire);
+                        let response_deadline = if lifecycle_interrupted {
+                            *cancel_deadline
+                                .get_or_insert_with(|| Instant::now() + ACP_CANCEL_GRACE)
+                        } else {
+                            (Instant::now() + ACP_CANCEL_GRACE).min(run_deadline)
+                        };
                         // P1 never selects an allow/reject option. Cancelled is
                         // the only fail-closed ACP outcome emitted by WebCodex.
-                        if send_result(&mut stdin, id, json!({"outcome":{"outcome":"cancelled"}}))
-                            .is_err()
-                        {
-                            self.mark_lost(
-                                &request.run_id,
-                                &entry,
-                                "coding_agent_permission_response_uncertain",
-                            );
-                            let _ = child.terminate_tree();
+                        if !self.write_post_prompt_frame(
+                            &request.run_id,
+                            &entry,
+                            &mut child,
+                            &mut outbound,
+                            result_frame(id, json!({"outcome":{"outcome":"cancelled"}})),
+                            response_deadline,
+                            !lifecycle_interrupted,
+                            "coding_agent_permission_response_uncertain",
+                        ) {
                             return;
                         }
                         entry.update_snapshot(|snapshot| {
                             snapshot.state = CodingAgentRunState::Running
                         });
-                        if entry.cancel_requested.load(Ordering::Acquire) && !cancel_sent {
-                            if send_notification(
-                                &mut stdin,
-                                "session/cancel",
-                                json!({"sessionId":session_id}),
-                            )
-                            .is_err()
-                            {
-                                self.mark_lost(
-                                    &request.run_id,
-                                    &entry,
-                                    "coding_agent_cancel_write_uncertain",
-                                );
-                                let _ = child.terminate_tree();
+                        if (entry.cancel_requested.load(Ordering::Acquire)
+                            || Instant::now() >= run_deadline
+                            || !self.accepting.load(Ordering::Acquire))
+                            && !cancel_sent
+                        {
+                            let deadline = *cancel_deadline
+                                .get_or_insert_with(|| Instant::now() + ACP_CANCEL_GRACE);
+                            if !self.write_post_prompt_frame(
+                                &request.run_id,
+                                &entry,
+                                &mut child,
+                                &mut outbound,
+                                notification_frame(
+                                    "session/cancel",
+                                    json!({"sessionId":session_id}),
+                                ),
+                                deadline,
+                                false,
+                                "coding_agent_cancel_write_uncertain",
+                            ) {
                                 return;
                             }
                             cancel_sent = true;
-                            cancel_deadline = Some(Instant::now() + ACP_CANCEL_GRACE);
                         }
                         continue;
                     }
                     if message.get("method").is_some() {
+                        let deadline = *cancel_deadline
+                            .get_or_insert_with(|| Instant::now() + ACP_CANCEL_GRACE);
                         if let Some(id) = message.get("id").and_then(Value::as_u64) {
-                            let _ = send_error(
-                                &mut stdin,
-                                id,
-                                -32601,
-                                "unsupported ACP client request",
-                            );
+                            if !self.write_post_prompt_frame(
+                                &request.run_id,
+                                &entry,
+                                &mut child,
+                                &mut outbound,
+                                error_frame(id, -32601, "unsupported ACP client request"),
+                                deadline,
+                                true,
+                                "coding_agent_transport_lost",
+                            ) {
+                                return;
+                            }
                         }
                         if !cancel_sent {
-                            let _ = send_notification(
-                                &mut stdin,
-                                "session/cancel",
-                                json!({"sessionId":session_id}),
-                            );
+                            if !self.write_post_prompt_frame(
+                                &request.run_id,
+                                &entry,
+                                &mut child,
+                                &mut outbound,
+                                notification_frame(
+                                    "session/cancel",
+                                    json!({"sessionId":session_id}),
+                                ),
+                                deadline,
+                                false,
+                                "coding_agent_cancel_write_uncertain",
+                            ) {
+                                return;
+                            }
                             cancel_sent = true;
-                            cancel_deadline = Some(Instant::now() + ACP_CANCEL_GRACE);
                         }
                         continue;
                     }
@@ -1614,7 +1842,7 @@ impl CodingAgentManager {
                                 "prompt_error",
                                 bounded_json_summary(error),
                             );
-                            cleanup_child(&mut child, stdin);
+                            self.cleanup_run_io(&mut child, &mut outbound);
                             return;
                         }
                         let Some(result) = message.get("result").cloned() else {
@@ -1624,7 +1852,7 @@ impl CodingAgentManager {
                                 "invalid_prompt_response",
                                 "missing prompt result".to_string(),
                             );
-                            cleanup_child(&mut child, stdin);
+                            self.cleanup_run_io(&mut child, &mut outbound);
                             return;
                         };
                         let response: PromptResponse = match serde_json::from_value(result) {
@@ -1636,7 +1864,7 @@ impl CodingAgentManager {
                                     "unknown_stop_reason",
                                     "invalid or unknown ACP stopReason".to_string(),
                                 );
-                                cleanup_child(&mut child, stdin);
+                                self.cleanup_run_io(&mut child, &mut outbound);
                                 return;
                             }
                         };
@@ -1683,7 +1911,7 @@ impl CodingAgentManager {
                                 "unknown ACP stop reason".to_string(),
                             ),
                         }
-                        cleanup_child(&mut child, stdin);
+                        self.cleanup_run_io(&mut child, &mut outbound);
                         return;
                     }
                 }
@@ -1693,19 +1921,23 @@ impl CodingAgentManager {
                     | ReaderEvent::TooLarge
                     | ReaderEvent::Io,
                 ) => {
+                    self.terminate_run_io(&mut child, &mut outbound);
                     self.mark_lost(&request.run_id, &entry, "coding_agent_transport_lost");
-                    let _ = child.terminate_tree();
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if child.try_wait().ok().flatten().is_some() {
+                        outbound.close();
+                        let _ =
+                            outbound.wait_finished_until(Instant::now() + ACP_IO_CLEANUP_TIMEOUT);
+                        let _ = self.worker_threads.reap_finished();
                         self.mark_lost(&request.run_id, &entry, "coding_agent_process_exited");
                         return;
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    self.terminate_run_io(&mut child, &mut outbound);
                     self.mark_lost(&request.run_id, &entry, "coding_agent_transport_lost");
-                    let _ = child.terminate_tree();
                     return;
                 }
             }
@@ -1953,6 +2185,128 @@ fn manager_finish_setup_failure(
     manager.setup_failure(run_id, entry, code, message);
 }
 
+struct OutboundWriteRequest {
+    frame: Vec<u8>,
+    completion: mpsc::SyncSender<Result<(), String>>,
+}
+
+struct PendingOutboundWrite {
+    completion: Receiver<Result<(), String>>,
+}
+
+struct AcpOutboundWriter {
+    requests: Option<mpsc::SyncSender<OutboundWriteRequest>>,
+    finished: Arc<(Mutex<bool>, Condvar)>,
+}
+
+struct OutboundWriterFinished(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for OutboundWriterFinished {
+    fn drop(&mut self) {
+        let (finished, changed) = &*self.0;
+        let mut finished = finished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *finished = true;
+        changed.notify_all();
+    }
+}
+
+impl AcpOutboundWriter {
+    fn spawn<W: Write + Send + 'static>(
+        mut sink: W,
+        threads: &BackgroundThreads,
+    ) -> std::io::Result<Self> {
+        let (requests, receiver) = mpsc::sync_channel::<OutboundWriteRequest>(1);
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread_finished = Arc::clone(&finished);
+        let handle = thread::Builder::new()
+            .name("wc-acp-stdin".to_string())
+            .spawn(move || {
+                let _finished = OutboundWriterFinished(thread_finished);
+                while let Ok(request) = receiver.recv() {
+                    let result = sink
+                        .write_all(&request.frame)
+                        .and_then(|_| sink.flush())
+                        .map_err(|error| error.to_string());
+                    let failed = result.is_err();
+                    let _ = request.completion.send(result);
+                    if failed {
+                        break;
+                    }
+                }
+            })?;
+        threads.register(handle);
+        Ok(Self {
+            requests: Some(requests),
+            finished,
+        })
+    }
+
+    fn start_frame(&self, frame: Vec<u8>) -> Result<PendingOutboundWrite, String> {
+        let requests = self
+            .requests
+            .as_ref()
+            .ok_or_else(|| "ACP outbound writer is closed".to_string())?;
+        let (completion, receiver) = mpsc::sync_channel(1);
+        requests
+            .try_send(OutboundWriteRequest { frame, completion })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => "ACP outbound writer is busy".to_string(),
+                mpsc::TrySendError::Disconnected(_) => {
+                    "ACP outbound writer is unavailable".to_string()
+                }
+            })?;
+        Ok(PendingOutboundWrite {
+            completion: receiver,
+        })
+    }
+
+    fn close(&mut self) {
+        self.requests.take();
+    }
+
+    fn wait_finished_until(&self, deadline: Instant) -> bool {
+        let (finished, changed) = &*self.finished;
+        let mut finished = finished
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*finished {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timed_out) = changed
+                .wait_timeout(finished, remaining.min(ACP_POLL))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            finished = next;
+            if timed_out.timed_out() && Instant::now() >= deadline {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for AcpOutboundWriter {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundInterruption {
+    Cancelled,
+    Shutdown,
+    Deadline,
+}
+
+enum OutboundWriteOutcome {
+    Written,
+    Failed(String),
+    Interrupted(OutboundInterruption),
+}
+
 #[derive(Debug)]
 enum ReaderEvent {
     Message(Value),
@@ -1969,6 +2323,46 @@ fn remaining_run_budget(run_deadline: Instant) -> Option<Duration> {
 
 fn bounded_setup_wait(run_deadline: Instant) -> Option<Duration> {
     remaining_run_budget(run_deadline).map(|remaining| remaining.min(ACP_SETUP_TIMEOUT))
+}
+
+fn wait_outbound_write(
+    pending: PendingOutboundWrite,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+    accepting: Option<&AtomicBool>,
+) -> OutboundWriteOutcome {
+    loop {
+        match pending.completion.try_recv() {
+            Ok(Ok(())) => return OutboundWriteOutcome::Written,
+            Ok(Err(error)) => return OutboundWriteOutcome::Failed(error),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return OutboundWriteOutcome::Failed(
+                    "ACP outbound writer disconnected before acknowledgement".to_string(),
+                );
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return OutboundWriteOutcome::Interrupted(OutboundInterruption::Cancelled);
+        }
+        if accepting.is_some_and(|flag| !flag.load(Ordering::Acquire)) {
+            return OutboundWriteOutcome::Interrupted(OutboundInterruption::Shutdown);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return OutboundWriteOutcome::Interrupted(OutboundInterruption::Deadline);
+        }
+        match pending.completion.recv_timeout(remaining.min(ACP_POLL)) {
+            Ok(Ok(())) => return OutboundWriteOutcome::Written,
+            Ok(Err(error)) => return OutboundWriteOutcome::Failed(error),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return OutboundWriteOutcome::Failed(
+                    "ACP outbound writer disconnected before acknowledgement".to_string(),
+                );
+            }
+        }
+    }
 }
 
 fn wait_response(
@@ -2013,40 +2407,29 @@ fn wait_response(
     }
 }
 
-fn send_request(
-    stdin: &mut impl Write,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> std::io::Result<()> {
-    write_message(
-        stdin,
-        &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
-    )
+fn request_frame(id: u64, method: &str, params: Value) -> std::io::Result<Vec<u8>> {
+    frame_message(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
 }
-fn send_notification(stdin: &mut impl Write, method: &str, params: Value) -> std::io::Result<()> {
-    write_message(
-        stdin,
-        &json!({"jsonrpc":"2.0","method":method,"params":params}),
-    )
+
+fn notification_frame(method: &str, params: Value) -> std::io::Result<Vec<u8>> {
+    frame_message(&json!({"jsonrpc":"2.0","method":method,"params":params}))
 }
-fn send_result(stdin: &mut impl Write, id: u64, result: Value) -> std::io::Result<()> {
-    write_message(stdin, &json!({"jsonrpc":"2.0","id":id,"result":result}))
+
+fn result_frame(id: u64, result: Value) -> std::io::Result<Vec<u8>> {
+    frame_message(&json!({"jsonrpc":"2.0","id":id,"result":result}))
 }
-fn send_error(stdin: &mut impl Write, id: u64, code: i64, message: &str) -> std::io::Result<()> {
-    write_message(
-        stdin,
-        &json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
-    )
+
+fn error_frame(id: u64, code: i64, message: &str) -> std::io::Result<Vec<u8>> {
+    frame_message(&json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}))
 }
-fn write_message(stdin: &mut impl Write, value: &Value) -> std::io::Result<()> {
+
+fn frame_message(value: &Value) -> std::io::Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     if bytes.len() > ACP_MESSAGE_MAX_BYTES {
         return Err(std::io::Error::other("ACP message too large"));
     }
     bytes.push(b'\n');
-    stdin.write_all(&bytes)?;
-    stdin.flush()
+    Ok(bytes)
 }
 
 fn project_binding_matches(
@@ -2285,28 +2668,59 @@ fn response_error(
     )
 }
 
-fn cleanup_child(child: &mut ManagedChild, stdin: impl Write) {
-    drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if child.try_wait().ok().flatten().is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.terminate_tree();
-            let _ = child.wait();
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct BlockingWriteState {
+        entered: bool,
+        released: bool,
+    }
+
+    #[derive(Clone)]
+    struct BlockingWrite {
+        state: Arc<(Mutex<BlockingWriteState>, Condvar)>,
+    }
+
+    impl Write for BlockingWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (state, changed) = &*self.state;
+            let mut state = state.lock().unwrap();
+            state.entered = true;
+            changed.notify_all();
+            while !state.released {
+                state = changed.wait(state).unwrap();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn wait_for_blocking_write(state: &Arc<(Mutex<BlockingWriteState>, Condvar)>) {
+        let (state, changed) = &**state;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = state.lock().unwrap();
+        while !state.entered {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "writer never entered blocking sink");
+            let (next, _) = changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+        }
+    }
+
+    fn release_blocking_write(state: &Arc<(Mutex<BlockingWriteState>, Condvar)>) {
+        let (state, changed) = &**state;
+        let mut state = state.lock().unwrap();
+        state.released = true;
+        changed.notify_all();
+    }
 
     fn fake_config(executable: String, args: Vec<String>) -> AcpConfig {
         AcpConfig {
@@ -2353,7 +2767,13 @@ for line in sys.stdin:
    opts=[{'id':k,'name':k.title(),'type':'select','currentValue':config_values[k],'options':[{'value':'a','name':'A'},{'value':'b','name':'B'}]} for k in config_values]
   else:
    opts=[{'id':'mode','name':'Mode','type':'select','currentValue':'agent','options':[{'value':'agent','name':'Agent'},{'value':'read-only','name':'Read Only'}]}]
-  send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':'s1','configOptions':opts}})
+  session_id='s'*70000 if scenario=='block_cancel_write' else 's1'
+  send({'jsonrpc':'2.0','id':rid,'result':{'sessionId':session_id,'configOptions':opts}})
+  if scenario in ('block_after_session_new','block_after_session_new_tree'):
+   if scenario=='block_after_session_new_tree':
+    child=subprocess.Popen(['/bin/sh','-c','sleep 60']); log({'descendant_pid':child.pid})
+   open(os.path.join(os.path.dirname(__file__),'stdin_stopped.ready'),'w').close()
+   while True: time.sleep(1)
  elif method=='session/set_config_option':
   if scenario=='slow_configs':
    time.sleep(0.6)
@@ -2366,6 +2786,10 @@ for line in sys.stdin:
   if scenario=='crash_after_prompt': sys.exit(7)
   if scenario=='spawn_descendant':
    child=subprocess.Popen(['/bin/sh','-c','sleep 60']); log({'descendant_pid':child.pid})
+  if scenario=='block_cancel_write':
+   child=subprocess.Popen(['/bin/sh','-c','sleep 60']); log({'descendant_pid':child.pid})
+   open(os.path.join(os.path.dirname(__file__),'prompt_read.ready'),'w').close()
+   while True: time.sleep(1)
   send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s1','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'hello'}}}})
   send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s1','update':{'sessionUpdate':'agent_thought_chunk','content':{'type':'text','text':'thinking'}}}})
   send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'s1','update':{'sessionUpdate':'plan','entries':[]}}})
@@ -2459,6 +2883,54 @@ for line in sys.stdin:
         };
         start.timeout_secs = timeout_secs;
         request
+    }
+
+    #[cfg(unix)]
+    fn max_instruction_request(
+        manager: &CodingAgentManager,
+        root: &Path,
+        run: &str,
+        timeout_secs: u64,
+    ) -> CodingAgentRequest {
+        let mut request =
+            start_request_with_timeout(manager, root, run, BTreeMap::new(), timeout_secs);
+        let CodingAgentRequest::Start(start) = &mut request else {
+            unreachable!();
+        };
+        start.instruction =
+            "x".repeat(webcodex_core::coding_agent::CODING_AGENT_MAX_INSTRUCTION_BYTES);
+        let frame = request_frame(
+            3,
+            "session/prompt",
+            json!({
+                "sessionId":"s1",
+                "prompt":[{"type":"text","text":start.instruction.clone()}]
+            }),
+        )
+        .unwrap();
+        assert!(
+            frame.len() > 64 * 1024,
+            "max legal prompt frame must exceed the measured special Linux pipe capacity"
+        );
+        request
+    }
+
+    #[cfg(unix)]
+    fn wait_for_prompt_handoff(manager: &CodingAgentManager, run: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let entry = manager.runs.lock().unwrap().get(run).cloned().unwrap();
+            if *entry.prompt_dispatch.lock().unwrap()
+                == PromptDispatchGateState::PromptDispatchMayHaveOccurred
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prompt was never handed to writer"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[cfg(unix)]
@@ -2596,6 +3068,45 @@ for line in sys.stdin:
             Some(CodingAgentResponsePayload::Start { run }) => Some(run.run_id.clone()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn outbound_writer_blocking_sink_does_not_block_lifecycle_owner() {
+        let state = Arc::new((Mutex::new(BlockingWriteState::default()), Condvar::new()));
+        let threads = BackgroundThreads::default();
+        let mut writer = AcpOutboundWriter::spawn(
+            BlockingWrite {
+                state: Arc::clone(&state),
+            },
+            &threads,
+        )
+        .unwrap();
+        let pending = writer.start_frame(vec![b'x'; 1024]).unwrap();
+        wait_for_blocking_write(&state);
+
+        let cancelled = AtomicBool::new(true);
+        let outcome = wait_outbound_write(
+            pending,
+            Instant::now() + Duration::from_secs(1),
+            Some(&cancelled),
+            None,
+        );
+        assert!(matches!(
+            outcome,
+            OutboundWriteOutcome::Interrupted(OutboundInterruption::Cancelled)
+        ));
+        assert_eq!(threads.pending(), 1);
+
+        // The production owner uses ManagedChild::terminate_tree to make a blocked
+        // pipe write return. Releasing this deterministic sink models that exact
+        // post-interruption effect without relying on pipe capacity or sleeps.
+        release_blocking_write(&state);
+        writer.close();
+        assert!(writer.wait_finished_until(Instant::now() + Duration::from_secs(1)));
+        let joined = threads.join_until(Instant::now() + Duration::from_secs(1));
+        assert_eq!(joined.timed_out, 0);
+        assert_eq!(joined.panicked, 0);
+        assert_eq!(threads.pending(), 0);
     }
 
     #[test]
@@ -3185,6 +3696,256 @@ for line in sys.stdin:
                 .count(),
             0
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn blocked_max_prompt_write_respects_total_deadline_and_reaps_tree() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "block_after_session_new_tree");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_promptbackpressure01";
+        let started_at = Instant::now();
+        let started = manager.handle(max_instruction_request(&manager, &root, run, 1), &projects);
+        assert!(started.error.is_none(), "{:?}", started.error);
+        wait_for_path(&temp.path().join("stdin_stopped.ready"));
+        wait_for_prompt_handoff(&manager, run);
+        let snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert!(
+            started_at.elapsed() < Duration::from_secs(4),
+            "blocked prompt write escaped the total Run deadline"
+        );
+        assert_eq!(snapshot.state, CodingAgentRunState::Lost);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::OutcomeUnknown
+        );
+        assert_eq!(
+            *manager
+                .runs
+                .lock()
+                .unwrap()
+                .get(run)
+                .unwrap()
+                .prompt_dispatch
+                .lock()
+                .unwrap(),
+            PromptDispatchGateState::PromptDispatchMayHaveOccurred
+        );
+        let log = wire_log(&temp);
+        let startup_pid = log
+            .iter()
+            .find_map(|entry| entry.get("startup_pid").and_then(Value::as_u64))
+            .unwrap();
+        let descendant_pid = log
+            .iter()
+            .find_map(|entry| entry.get("descendant_pid").and_then(Value::as_u64))
+            .unwrap();
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(drain.panicked, 0);
+        assert_eq!(manager.worker_count(), 0);
+        #[cfg(target_os = "linux")]
+        {
+            wait_for_proc_exit(startup_pid);
+            wait_for_proc_exit(descendant_pid);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancel_returns_while_max_prompt_write_is_blocked() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "block_after_session_new_tree");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_cancelblockedprompt1";
+        let started = manager.handle(max_instruction_request(&manager, &root, run, 10), &projects);
+        assert!(started.error.is_none(), "{:?}", started.error);
+        wait_for_path(&temp.path().join("stdin_stopped.ready"));
+        wait_for_prompt_handoff(&manager, run);
+
+        let cancel_started = Instant::now();
+        let cancelled = manager.handle(
+            CodingAgentRequest::Cancel(CodingAgentCancelRequest {
+                run_id: run.to_string(),
+            }),
+            &projects,
+        );
+        assert!(
+            cancel_started.elapsed() < Duration::from_secs(1),
+            "Cancel waited for blocked ChildStdin write"
+        );
+        let cancel_snapshot = match cancelled.payload.unwrap() {
+            CodingAgentResponsePayload::Cancel { run } => run,
+            other => panic!("unexpected cancel payload: {other:?}"),
+        };
+        assert_ne!(
+            cancel_snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        let snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
+        assert_eq!(snapshot.state, CodingAgentRunState::Lost);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::OutcomeUnknown
+        );
+        let log = wire_log(&temp);
+        let startup_pid = log
+            .iter()
+            .find_map(|entry| entry.get("startup_pid").and_then(Value::as_u64))
+            .unwrap();
+        let descendant_pid = log
+            .iter()
+            .find_map(|entry| entry.get("descendant_pid").and_then(Value::as_u64))
+            .unwrap();
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(3));
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(manager.worker_count(), 0);
+        #[cfg(target_os = "linux")]
+        {
+            wait_for_proc_exit(startup_pid);
+            wait_for_proc_exit(descendant_pid);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_remains_bounded_while_max_prompt_write_is_blocked() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "block_after_session_new_tree");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_shutdownblockedprompt";
+        let started = manager.handle(max_instruction_request(&manager, &root, run, 10), &projects);
+        assert!(started.error.is_none(), "{:?}", started.error);
+        wait_for_path(&temp.path().join("stdin_stopped.ready"));
+        wait_for_prompt_handoff(&manager, run);
+
+        let stop_started = Instant::now();
+        manager.stop_accepting();
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(1),
+            "stop_accepting waited for blocked ChildStdin write"
+        );
+        let drain = manager.drain_workers_until(Instant::now() + Duration::from_secs(4));
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(drain.panicked, 0);
+        assert_eq!(manager.worker_count(), 0);
+        let snapshot = manager.runs.lock().unwrap().get(run).unwrap().snapshot();
+        assert_eq!(snapshot.state, CodingAgentRunState::Lost);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::OutcomeUnknown
+        );
+        let log = wire_log(&temp);
+        let startup_pid = log
+            .iter()
+            .find_map(|entry| entry.get("startup_pid").and_then(Value::as_u64))
+            .unwrap();
+        let descendant_pid = log
+            .iter()
+            .find_map(|entry| entry.get("descendant_pid").and_then(Value::as_u64))
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            wait_for_proc_exit(startup_pid);
+            wait_for_proc_exit(descendant_pid);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn blocked_cancel_notification_is_bounded_by_cancel_grace() {
+        let temp = TempDir::new().unwrap();
+        let (exe, args) = fake_agent(&temp, "block_cancel_write");
+        let cfg = fake_config(exe, args);
+        let projects = project_fixture(&temp);
+        let root = temp.path().join("repo");
+        let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
+        let run = "wc_agent_run_blockedcancelwrite1";
+        let started = manager.handle(
+            start_request_with_timeout(&manager, &root, run, BTreeMap::new(), 30),
+            &projects,
+        );
+        assert!(started.error.is_none(), "{:?}", started.error);
+        wait_for_path(&temp.path().join("prompt_read.ready"));
+        wait_for_snapshot(&manager, run, |snapshot| {
+            snapshot.execution_state == CodingAgentExecutionState::Started
+        });
+        assert!(
+            notification_frame("session/cancel", json!({"sessionId":"s".repeat(70_000)}),)
+                .unwrap()
+                .len()
+                > 64 * 1024,
+            "cancel backpressure fixture must exceed the measured special Linux pipe capacity"
+        );
+
+        let cancel_started = Instant::now();
+        let cancelled = manager.handle(
+            CodingAgentRequest::Cancel(CodingAgentCancelRequest {
+                run_id: run.to_string(),
+            }),
+            &projects,
+        );
+        assert!(
+            cancel_started.elapsed() < Duration::from_secs(1),
+            "Cancel waited on the later session/cancel write"
+        );
+        let cancel_snapshot = match cancelled.payload.unwrap() {
+            CodingAgentResponsePayload::Cancel { run } => run,
+            other => panic!("unexpected cancel payload: {other:?}"),
+        };
+        assert_ne!(
+            cancel_snapshot.execution_state,
+            CodingAgentExecutionState::NotStarted
+        );
+        let terminal_started = Instant::now();
+        let drain = manager.drain_workers_until(
+            Instant::now() + ACP_CANCEL_GRACE + ACP_IO_CLEANUP_TIMEOUT + Duration::from_secs(1),
+        );
+        assert_eq!(drain.timed_out, 0);
+        assert_eq!(drain.panicked, 0);
+        let snapshot = manager.runs.lock().unwrap().get(run).unwrap().snapshot();
+        assert!(
+            terminal_started.elapsed()
+                < ACP_CANCEL_GRACE + ACP_IO_CLEANUP_TIMEOUT + Duration::from_secs(1),
+            "blocked session/cancel escaped ACP_CANCEL_GRACE plus cleanup bound"
+        );
+        assert_eq!(snapshot.state, CodingAgentRunState::Lost);
+        assert_eq!(
+            snapshot.execution_state,
+            CodingAgentExecutionState::OutcomeUnknown
+        );
+        assert_eq!(
+            snapshot
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_code.as_deref()),
+            Some("coding_agent_cancel_write_uncertain")
+        );
+        let log = wire_log(&temp);
+        let startup_pid = log
+            .iter()
+            .find_map(|entry| entry.get("startup_pid").and_then(Value::as_u64))
+            .unwrap();
+        let descendant_pid = log
+            .iter()
+            .find_map(|entry| entry.get("descendant_pid").and_then(Value::as_u64))
+            .unwrap();
+        assert_eq!(manager.worker_count(), 0);
+        #[cfg(target_os = "linux")]
+        {
+            wait_for_proc_exit(startup_pid);
+            wait_for_proc_exit(descendant_pid);
+        }
     }
 
     #[test]
