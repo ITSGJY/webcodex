@@ -26,12 +26,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "summary_only",
                 schema_type("boolean", "True only for compact summary_only output."),
             ),
-            ("project", schema_type("string", "Original project input.")),
+            ("project", schema_type("string", "Full closeout original project input; omitted from summary_only.")),
             (
                 "resolved_project",
-                open_object_schema("Resolved project id, path, executor, and safe project metadata."),
+                open_object_schema("Full closeout resolved project id, path, executor, and safe project metadata; omitted from summary_only."),
             ),
-            ("session_id", schema_type("string", "Explicit task session id.")),
+            ("session_id", schema_type("string", "Full closeout explicit task session id; omitted from summary_only.")),
             (
                 "workspace_clean",
                 schema_type("boolean", "Compact summary_only workspace cleanliness verdict."),
@@ -54,7 +54,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "validation",
-                open_object_schema("Unified bounded execution evidence from dedicated validation tools and purpose-declared execution calls for validation/test/build/format/release. Preserves historical, resolved, and unresolved failures by stable identity."),
+                open_object_schema("Validation closeout evidence. Full closeout preserves bounded historical/resolved/unresolved evidence by stable identity; summary_only keeps only final status/reason, success/failure counts, resolved/unresolved failure counts, and the zero-test integrity flag."),
             ),
             (
                 "continuation_feedback",
@@ -62,15 +62,15 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "handoff_brief",
-                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It is a read-only projection over already-obtained Session, continuation, workspace, validation, Job, and guidance evidence; it is not Session replay and never restores hidden model context."),
+                handoff_brief_schema("Full-closeout deterministic task handoff for a new window, new Agent, or human receiver; omitted from summary_only. It is a read-only projection over already-obtained Session, continuation, workspace, validation, Job, and guidance evidence; it is not Session replay and never restores hidden model context."),
             ),
             (
                 "review_evidence",
-                review_evidence_schema("Ledger-derived non-cargo review evidence summary for full and summary_only outputs. Counts successful read/search/diff/workspace/hygiene inspection tools from the session ledger and exposes bounded tools for compact explainability. For docs-only or read-only audit tasks, validation.status may remain not_run while review_evidence.total is greater than zero. Does not include file contents, stdout/stderr, diff hunks, command text, tokens, secrets, or raw input payloads. Does not change validation.status or make the verdict pass."),
+                review_evidence_schema("Full-closeout ledger-derived non-cargo review evidence summary; omitted from summary_only after still participating internally in canonical task_outcome calculation. Counts successful read/search/diff/workspace/hygiene inspection tools. Does not include file contents, stdout/stderr, diff hunks, command text, tokens, secrets, or raw input payloads."),
             ),
             (
                 "permissions",
-                permission_summary_schema("Deterministic bounded permission decision summary from the session ledger. Counts high-risk auto-approved tools only; never includes stdout/stderr, env, tokens, secrets, or raw input content."),
+                permission_summary_schema("Full-closeout deterministic bounded permission decision summary from the session ledger; omitted from summary_only. Counts high-risk auto-approved tools only; never includes stdout/stderr, env, tokens, secrets, or raw input content."),
             ),
             (
                 "tool_failures",
@@ -94,7 +94,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "facts",
-                open_object_schema("Canonical closeout facts: work_performed, changed_paths, executions, validation counts, resolved/unresolved failures, workspace state, active jobs, and evidence integrity."),
+                open_object_schema("Full-closeout canonical provenance facts; omitted from summary_only after contributing to the shared canonical outcome calculation."),
             ),
             (
                 "hard_blockers",
@@ -114,7 +114,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "evidence_history",
-                evidence_history_schema("Validation evidence history status: clean, mixed_resolved, mixed_unresolved, or failed. Does not replace validation.status or validation.latest_status."),
+                evidence_history_schema("Full-closeout validation evidence-history status; omitted from summary_only, whose task_outcome and compact validation state remain decision-complete."),
             ),
             (
                 "evidence_integrity",
@@ -124,7 +124,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "informational_notes",
                 array_schema(
                     schema_type("string", "Completed-state informational note."),
-                    "Bounded completed-state facts, separate from executable suggested_next_actions.",
+                    "Full-closeout bounded completed-state facts, omitted from summary_only and separate from executable suggested_next_actions.",
                 ),
             ),
             (

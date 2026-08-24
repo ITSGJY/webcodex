@@ -187,7 +187,7 @@ pub(crate) fn finish_coding_task_input_schema() -> Value {
             },
             "summary_only": {
                 "type": "boolean",
-                "description": "When true, return compact closeout fields only: workspace_clean, hygiene_clean, jobs, permissions, tool_failures, validation, task_outcome, evidence_history, evidence_integrity, informational_notes, warnings, and suggested_next_actions. Omits show_changes payloads, handoff details, command text, stdout/stderr, tails, and excerpts."
+                "description": "When true, return the minimal decision-complete closeout only: workspace cleanliness/conflicts, hygiene state, bounded Job counts, final validation state/counts, tool-failure actionability counts, canonical task_outcome, evidence_integrity, warnings, and suggested_next_actions. Omits project/session identity, permissions, review/work/change/handoff provenance, facts/evidence history/informational notes, command text, stdout/stderr, event history, tails, excerpts, and detailed validation history."
             }
         },
         "required": ["project", "session_id"],
