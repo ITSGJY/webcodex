@@ -5,6 +5,8 @@ pub(crate) mod computer;
 pub(crate) mod config;
 pub(crate) mod detached_job;
 pub(crate) mod dispatch;
+#[cfg(windows)]
+pub(crate) mod exit_diagnostics;
 pub(crate) mod external_tools;
 pub(crate) mod files;
 pub(crate) mod lsp;
@@ -14,11 +16,10 @@ pub(crate) mod output_text;
 pub(crate) mod patches;
 pub(crate) mod persistent_shell;
 pub(crate) mod projects;
-// The remote SSH persistent-shell transport is built on Unix process groups and
-// inherited descriptors; Windows has no persistent shell yet (the local shell
-// fails closed there and `ssh_persistent_shell` is advertised false), so the
-// whole module is compiled out on non-Unix targets.
-#[cfg(unix)]
+// Remote persistent shells always run POSIX sh/bash on the SSH target. Their
+// local child ownership is platform-specific: Unix uses a private process group,
+// while Windows owns ssh.exe through ManagedChild's Job Object.
+#[cfg(any(unix, windows))]
 pub(crate) mod remote_shell;
 pub(crate) mod shell;
 pub(crate) mod shutdown;

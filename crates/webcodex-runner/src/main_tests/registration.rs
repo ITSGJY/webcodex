@@ -180,6 +180,16 @@ fn computer_register_request_announces_platform_capability_and_protocol_version(
     assert!(caps.structured_file_delete);
     assert!(caps.async_jobs);
     assert!(caps.async_shell_jobs);
+    assert_eq!(
+        caps.persistent_shell,
+        webcodex_persistent_shell::local_shell_supported(),
+        "local persistent-shell capability must match the platform transport compiled into this Runner"
+    );
+    assert_eq!(
+        caps.ssh_persistent_shell,
+        SshConnectionPool::persistent_shell_available(),
+        "SSH persistent-shell capability must match the platform backend and local OpenSSH availability"
+    );
     assert!(caps.structured_validation_argv);
     assert!(caps.structured_cargo_test_count_assertion);
     assert!(caps.structured_go_test_json);
