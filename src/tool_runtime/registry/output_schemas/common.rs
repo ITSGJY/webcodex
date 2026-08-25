@@ -1,6 +1,9 @@
 use serde_json::{json, Value};
 
-use crate::tool_runtime::sessions::EXPLORATION_TOOL_NAMES;
+use crate::tool_runtime::sessions::{
+    EXPLORATION_TOOL_NAMES, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION,
+    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON,
+};
 use crate::tool_runtime::{RECOVERY_KIND_VALUES, RECOVERY_TOOL_VALUES};
 
 pub(crate) fn schema_type(kind: &str, description: &str) -> Value {
@@ -278,6 +281,21 @@ pub(super) fn session_hint_schema() -> Value {
                 "type": "string",
                 "enum": ["low", "normal", "high"],
                 "description": "Highest priority among counted open messages."
+            },
+            "attention_required": {
+                "type": "boolean",
+                "const": true,
+                "description": "Counts-only fallback marker for open high-priority guidance requiring model-context acknowledgement; may be omitted when the same response already fully projects or ACK-suppresses the urgent guidance set."
+            },
+            "attention_reason": {
+                "type": "string",
+                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON],
+                "description": "Stable reason for the strong counts-only attention fallback; omitted for ordinary hints and when the same response already fully covers the urgent guidance set."
+            },
+            "attention_instruction": {
+                "type": "string",
+                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION],
+                "description": "Short fixed counts-only fallback instruction; never contains Session message body text and may be omitted when session_attention already fully covers the urgent guidance set."
             },
             "suggested_next_tool": {
                 "type": "string",

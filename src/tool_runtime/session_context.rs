@@ -385,6 +385,10 @@ pub(crate) fn add_session_telemetry_hint(
     if let Some(event_id) = event_id {
         output.insert("session_event_id".to_string(), Value::String(event_id));
     }
+    // This decorator is authoritative for `session_id`. A nested business
+    // recorder may already have decorated the result; do not let its inbox hint
+    // survive when an outer model-facing recorder has no current hint of its own.
+    output.remove("session_hint");
     if let Some(hint) = sessions.inbox_hint(session_id) {
         output.insert(
             "session_hint".to_string(),
@@ -602,17 +606,26 @@ impl ToolRuntime {
     }
 }
 
-pub(crate) fn add_session_attention(
-    result: &mut ToolResult,
+pub(crate) fn observe_session_attention_acks(
     sessions: &sessions::SessionStore,
     session_id: &str,
     ack_message_ids: &[String],
+) -> sessions::SessionAckObservation {
+    sessions.observe_message_acks(session_id, ack_message_ids)
+}
+
+pub(crate) fn add_session_attention_projection(
+    result: &mut ToolResult,
+    sessions: &sessions::SessionStore,
+    session_id: &str,
+    ack: &sessions::SessionAckObservation,
+    ack_requested: bool,
 ) {
-    let ack = sessions.observe_message_acks(session_id, ack_message_ids);
     let attention = sessions.ack_required_guidance(session_id, &ack.accepted_ids);
     let unsuppressed_count = attention.messages.len();
     let mut remaining_bytes = SESSION_ATTENTION_MAX_BODY_BYTES;
     let mut messages = Vec::new();
+    let mut body_truncated = false;
     for message in attention
         .messages
         .into_iter()
@@ -622,6 +635,7 @@ pub(crate) fn add_session_attention(
             break;
         }
         let (body, truncated) = bound_utf8_bytes(&message.message, remaining_bytes);
+        body_truncated |= truncated;
         remaining_bytes = remaining_bytes.saturating_sub(body.len());
         messages.push(json!({
             "message_id": message.message_id,
@@ -632,7 +646,7 @@ pub(crate) fn add_session_attention(
             "message_truncated": truncated,
         }));
     }
-    if attention.total_open_requires_ack == 0 && ack_message_ids.is_empty() {
+    if attention.total_open_requires_ack == 0 && !ack_requested {
         return;
     }
     let omitted_count = unsuppressed_count.saturating_sub(messages.len());
@@ -644,6 +658,20 @@ pub(crate) fn add_session_attention(
             map
         }
     };
+    // Strong hint fields are a counts-only fallback. Once this response has
+    // fully conveyed every unacknowledged urgent body (or the request ACK has
+    // suppressed it), keep only the ordinary inbox counts/tool suggestion.
+    // Preserve the strong fallback when any urgent body is omitted or truncated.
+    if omitted_count == 0 && !body_truncated {
+        if let Some(hint) = output
+            .get_mut("session_hint")
+            .and_then(Value::as_object_mut)
+        {
+            hint.remove("attention_required");
+            hint.remove("attention_reason");
+            hint.remove("attention_instruction");
+        }
+    }
     output.insert(
         "session_attention".to_string(),
         json!({
@@ -658,6 +686,23 @@ pub(crate) fn add_session_attention(
         }),
     );
     result.output = Value::Object(output);
+}
+
+#[cfg(test)]
+pub(crate) fn add_session_attention(
+    result: &mut ToolResult,
+    sessions: &sessions::SessionStore,
+    session_id: &str,
+    ack_message_ids: &[String],
+) {
+    let ack = observe_session_attention_acks(sessions, session_id, ack_message_ids);
+    add_session_attention_projection(
+        result,
+        sessions,
+        session_id,
+        &ack,
+        !ack_message_ids.is_empty(),
+    );
 }
 
 fn bound_utf8_bytes(value: &str, max_bytes: usize) -> (String, bool) {
