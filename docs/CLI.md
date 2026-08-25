@@ -107,12 +107,18 @@ keep their detached-process behavior when `--scope` is omitted.
 | Command | Purpose |
 | --- | --- |
 | `webcodex server init` | Initialize or update the Server env file (creates the bootstrap token) |
-| `webcodex server install` | Install the `webcodex-server` systemd service |
-| `webcodex server run` | Run `webcodex-server` in the foreground |
-| `webcodex server start` / `stop` / `restart` | Control the installed service |
-| `webcodex server status` | Check systemd, HTTP reachability, and build revisions |
-| `webcodex server logs` | Read the service journal |
-| `webcodex server uninstall` | Remove the service unit |
+| `webcodex server install` | Install the Linux systemd `webcodex.socket` + `webcodex.service` pair |
+| `webcodex server run` | Run `webcodex-server` in the foreground (direct bind) |
+| `webcodex server start` / `stop` | Start or stop socket activation and the Server process coherently |
+| `webcodex server restart` | Restart only the Server process; keep the managed listener socket active |
+| `webcodex server status` | Check authoritative socket/service state, HTTP reachability, and build revisions |
+| `webcodex server logs` | Read the Server service journal |
+| `webcodex server uninstall` | Stop, disable, and remove the managed socket/service pair |
+
+`webcodex server install --service-file /path/name.service` derives the sibling
+`/path/name.socket`. Use the same `--service-file` on `start`, `stop`, `restart`,
+`status`, `logs`, and `uninstall` to manage or inspect that custom pair; omitting
+it targets the default `webcodex.service` / `webcodex.socket` pair.
 
 ### Operations (read-only operator checks)
 

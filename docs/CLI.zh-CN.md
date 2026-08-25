@@ -98,12 +98,18 @@ detached-process 行为。
 | 命令 | 用途 |
 | --- | --- |
 | `webcodex server init` | 初始化或更新 Server env 文件（创建 bootstrap token） |
-| `webcodex server install` | 安装 `webcodex-server` 的 systemd 服务 |
-| `webcodex server run` | 前台运行 `webcodex-server` |
-| `webcodex server start` / `stop` / `restart` | 控制已安装的服务 |
-| `webcodex server status` | 检查 systemd、HTTP 可达性与构建版本 |
-| `webcodex server logs` | 读取服务日志 |
-| `webcodex server uninstall` | 移除服务单元 |
+| `webcodex server install` | 安装 Linux systemd `webcodex.socket` + `webcodex.service` pair |
+| `webcodex server run` | 前台运行 `webcodex-server`（direct bind） |
+| `webcodex server start` / `stop` | 一致地启动或停止 socket activation 与 Server process |
+| `webcodex server restart` | 只 restart Server process，保持受管 listener socket active |
+| `webcodex server status` | 检查 authoritative socket/service 状态、HTTP 可达性与构建版本 |
+| `webcodex server logs` | 读取 Server service journal |
+| `webcodex server uninstall` | stop/disable/remove 受管 socket/service pair |
+
+使用 `webcodex server install --service-file /path/name.service` 时，会派生同目录的
+`/path/name.socket`。后续 `start`、`stop`、`restart`、`status`、`logs` 和 `uninstall`
+应传入相同的 `--service-file` 来管理或检查该自定义 pair；省略时仍操作默认的
+`webcodex.service` / `webcodex.socket` pair。
 
 ### 运维（只读操作检查）
 
