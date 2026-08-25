@@ -1,11 +1,15 @@
+use super::client_handoff_service::{
+    copy_mcp_url, maybe_spawn_chatgpt_open_prompt, mcp_url, render_clipboard_status,
+    ClipboardCopyOutcome,
+};
 use super::setup_service::{
     create_private_dir, generate_project_credential, read_private_value, read_project_credential,
     write_new_private, ProjectConfig, ProjectPaths,
 };
 use super::{
-    configured_project, ensure_local_runtime_port_available, executable_name, parse_options, setup,
-    start_local_runtime, LocalRuntimeOptions, ProductError, ProjectCommandOptions,
-    ProjectShareOAuthRuntimeOptions,
+    configured_project, ensure_local_runtime_port_available, parse_options,
+    remove_npm_wrapper_network_environment, setup, start_local_runtime, LocalRuntimeOptions,
+    ProductError, ProjectCommandOptions, ProjectShareOAuthRuntimeOptions,
 };
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -42,6 +46,7 @@ pub(crate) struct ShareCommandOptions {
     pub(crate) auth: ShareAuth,
     pub(crate) oauth_redirect_uri: Option<String>,
     pub(crate) public_url: Option<String>,
+    pub(crate) copy_url: bool,
 }
 
 pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions, String> {
@@ -49,6 +54,7 @@ pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions
     let mut auth = ShareAuth::Bearer;
     let mut oauth_redirect_uri = None;
     let mut public_url = None;
+    let mut copy_url = true;
     let mut project_args = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -107,6 +113,7 @@ pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions
                     return Err("--public-url may be specified only once".to_string());
                 }
             }
+            "--no-copy-url" => copy_url = false,
             flag => project_args.push(flag.to_string()),
         }
         index += 1;
@@ -133,6 +140,7 @@ pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions
         auth,
         oauth_redirect_uri,
         public_url,
+        copy_url,
     })
 }
 
@@ -408,9 +416,11 @@ fn tunnel_runtime_error() -> ProductError {
 }
 
 pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductError> {
-    // Fail before setup/state creation when the default public-share dependency is absent.
+    // Resolve or acquire the default public-share dependency before project setup/state creation.
     let cloudflared_binary = match options.tunnel {
-        TunnelProvider::CloudflareQuick => Some(locate_cloudflared()?),
+        TunnelProvider::CloudflareQuick => {
+            Some(super::cloudflared_service::resolve_cloudflared().await?)
+        }
         TunnelProvider::None => None,
     };
     setup(&options.project)?;
@@ -498,6 +508,20 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
     };
     println!("{ready}");
 
+    let remote_client_handoff =
+        options.tunnel == TunnelProvider::CloudflareQuick || externally_managed;
+    let clipboard_outcome = if remote_client_handoff {
+        copy_mcp_url(&mcp_url(&runtime.public_url), options.copy_url).await
+    } else {
+        ClipboardCopyOutcome::Disabled
+    };
+    if let Some(status) = render_clipboard_status(clipboard_outcome) {
+        println!("\n{status}");
+    }
+    let handoff_task = remote_client_handoff
+        .then(maybe_spawn_chatgpt_open_prompt)
+        .flatten();
+
     let outcome = if let Some(tunnel) = tunnel.as_mut() {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => Ok(()),
@@ -511,6 +535,10 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         }
     };
 
+    if let Some(task) = handoff_task {
+        task.abort();
+        let _ = task.await;
+    }
     runtime.stop().await;
     if let Some(tunnel) = tunnel.as_mut() {
         tunnel.stop().await;
@@ -597,59 +625,27 @@ fn render_share_oauth_ready(
     )
 }
 
-fn locate_cloudflared() -> Result<PathBuf, ProductError> {
-    let override_bin = std::env::var_os("WEBCODEX_CLOUDFLARED_BIN").map(PathBuf::from);
-    require_cloudflared_from(override_bin.as_deref(), std::env::var_os("PATH").as_deref())
-}
-
-fn require_cloudflared_from(
-    override_bin: Option<&Path>,
-    path: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf, ProductError> {
-    locate_cloudflared_from(override_bin, path).ok_or_else(|| {
-        ProductError::new(
-            "tunnel_unavailable",
-            "cloudflared is required for the default public HTTPS share and was not found",
-            Some(
-                "Install cloudflared from Cloudflare's official downloads (https://developers.cloudflare.com/tunnel/downloads/), ensure it is on PATH, then retry; or use webcodex share --tunnel none for local-only debugging.",
-            ),
-        )
-    })
-}
-
-fn locate_cloudflared_from(
-    override_bin: Option<&Path>,
-    path: Option<&std::ffi::OsStr>,
-) -> Option<PathBuf> {
-    if let Some(binary) = override_bin {
-        return binary.is_file().then(|| binary.to_path_buf());
-    }
-    let path = path?;
-    std::env::split_paths(path)
-        .map(|directory| directory.join(executable_name("cloudflared")))
-        .find(|candidate| candidate.is_file())
-}
-
 async fn start_cloudflare_quick_with_binary(
     binary: &Path,
     local_url: &str,
     timeout: Duration,
 ) -> Result<(String, CloudflareTunnel), ProductError> {
-    let mut child = Command::new(binary)
+    let mut tunnel_command = Command::new(binary);
+    remove_npm_wrapper_network_environment(&mut tunnel_command);
+    tunnel_command
         .arg("tunnel")
         .arg("--url")
         .arg(local_url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| {
-            ProductError::new(
-                "tunnel_unavailable",
-                "cloudflared could not start",
-                Some("Check the cloudflared executable and retry webcodex share."),
-            )
-        })?;
+        .kill_on_drop(true);
+    let mut child = tunnel_command.spawn().map_err(|_| {
+        ProductError::new(
+            "tunnel_unavailable",
+            "cloudflared could not start",
+            Some("Check the cloudflared executable and retry webcodex share."),
+        )
+    })?;
     let stdout = child.stdout.take().ok_or_else(tunnel_runtime_error)?;
     let stderr = child.stderr.take().ok_or_else(tunnel_runtime_error)?;
     let recent = Arc::new(Mutex::new(VecDeque::with_capacity(TUNNEL_LOG_LINES)));
@@ -734,8 +730,57 @@ async fn drain_tunnel_readers(mut stdout_task: JoinHandle<()>, mut stderr_task: 
     }
 }
 
+fn sanitize_tunnel_log_line(line: &str) -> String {
+    line.split_whitespace()
+        .map(|token| {
+            let Some(scheme_end) = token.find("://") else {
+                return token.to_string();
+            };
+            let bytes = token.as_bytes();
+            let mut start = scheme_end;
+            while start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[start - 1], b'+' | b'-' | b'.'))
+            {
+                start -= 1;
+            }
+            let mut end = token.len();
+            while end > scheme_end + 3
+                && matches!(
+                    token.as_bytes()[end - 1],
+                    b')' | b']' | b'}' | b',' | b';' | b'.'
+                )
+            {
+                end -= 1;
+            }
+            let candidate = &token[start..end];
+            let redacted = url::Url::parse(candidate)
+                .ok()
+                .and_then(|parsed| {
+                    let host = parsed.host_str()?;
+                    let host = if host.contains(':') {
+                        format!("[{host}]")
+                    } else {
+                        host.to_string()
+                    };
+                    let port = parsed
+                        .port()
+                        .map(|port| format!(":{port}"))
+                        .unwrap_or_default();
+                    Some(format!("{}://{host}{port}/...", parsed.scheme()))
+                })
+                .unwrap_or_else(|| "[redacted URL]".to_string());
+            format!("{}{}{}", &token[..start], redacted, &token[end..])
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn record_tunnel_line(recent: &Arc<Mutex<VecDeque<String>>>, line: &str) {
-    let mut line = line.to_string();
+    // Tunnel diagnostics are model/user-facing on startup failure. Sanitize URL
+    // credentials, paths, and query strings before retaining a bounded log tail;
+    // Quick Tunnel URL discovery still parses the original unsanitized line.
+    let mut line = sanitize_tunnel_log_line(line);
     if line.len() > TUNNEL_LOG_LINE_BYTES {
         let mut end = TUNNEL_LOG_LINE_BYTES;
         while !line.is_char_boundary(end) {
@@ -800,26 +845,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_cloudflared_reports_actionable_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = require_cloudflared_from(Some(&temp.path().join("missing")), None).unwrap_err();
-        assert_eq!(error.code, "tunnel_unavailable");
-        assert!(error
-            .message
-            .contains("required for the default public HTTPS share"));
-        assert!(error.message.contains("was not found"));
-        let next_action = error.next_action.unwrap();
-        assert!(next_action.contains("https://developers.cloudflare.com/tunnel/downloads/"));
-        assert!(next_action.contains("--tunnel none"));
-    }
-
-    #[test]
     fn share_cli_defaults_to_cloudflare_and_accepts_none() {
         let default = parse_share_options(&[]).unwrap();
         assert_eq!(default.tunnel, TunnelProvider::CloudflareQuick);
         assert_eq!(default.auth, ShareAuth::Bearer);
         assert!(default.oauth_redirect_uri.is_none());
         assert!(default.public_url.is_none());
+        assert!(default.copy_url);
         let explicit =
             parse_share_options(&["--tunnel".to_string(), "cloudflare".to_string()]).unwrap();
         assert_eq!(explicit.tunnel, TunnelProvider::CloudflareQuick);
@@ -844,6 +876,8 @@ mod tests {
             "https://client.example/callback".to_string(),
         ])
         .is_err());
+        let no_copy = parse_share_options(&["--no-copy-url".to_string()]).unwrap();
+        assert!(!no_copy.copy_url);
         let stable = parse_share_options(&[
             "--tunnel".to_string(),
             "none".to_string(),
@@ -922,6 +956,23 @@ mod tests {
         assert!(output.find("MCP URL:").unwrap() < output.find("Details").unwrap());
         assert!(output.contains("fenced to this share process"));
         assert!(output.contains("externally managed"));
+    }
+
+    #[test]
+    fn tunnel_startup_diagnostics_redact_url_credentials_and_private_components() {
+        let recent = Arc::new(Mutex::new(VecDeque::new()));
+        record_tunnel_line(
+            &recent,
+            "ERR proxy=https://proxy-user:proxy-secret@proxy.example:8443/private/path?token=hidden",
+        );
+        let summary = bounded_tunnel_log_summary(&recent);
+        assert!(summary.contains("https://proxy.example:8443/..."));
+        for secret in ["proxy-user", "proxy-secret", "private/path", "token=hidden"] {
+            assert!(
+                !summary.contains(secret),
+                "tunnel diagnostic leaked {secret}"
+            );
+        }
     }
 
     #[test]

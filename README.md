@@ -14,26 +14,46 @@ Linux and macOS. Windows builds support the CLI + Runner against a remote Linux
 Server; on Windows use `webcodex connect <server-url>`. If you do not already
 have a Server, deploy one on Linux first.
 
-For the default temporary public share, install
-[`cloudflared`](https://developers.cloudflare.com/tunnel/downloads/) and make
-sure it is on `PATH`. Then:
+For the fastest Linux/macOS trial, no global install is required:
+
+```bash
+cd /path/to/your/repository
+npx --yes @yyjeqhc/webcodex
+```
+
+The npm wrapper lazily bootstraps the verified native binary set if lifecycle
+installation did not leave it behind. If you prefer a persistent CLI, install it
+once and then use bare `webcodex` inside a Git repository:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
 cd /path/to/your/repository
-webcodex share
+webcodex
 ```
 
-`share` is self-contained: it configures the current Git project, starts a local
-WebCodex Server + Runner, creates a temporary Connector credential, and opens a
-Cloudflare Quick Tunnel. You do **not** need to run `setup`, `doctor`, or `run`
-first.
+In an interactive Linux/macOS Git repository, bare `webcodex` is a convenience
+alias for the normal `webcodex share` first-run path. Scripts, non-interactive
+calls, Windows, and directories outside a Git checkout do not auto-start a
+runtime; use explicit `webcodex share` when deterministic dispatch matters.
 
-When the command reports **WebCodex ready**, keep that terminal open and use the
-values it prints:
+For the default temporary public share, WebCodex reuses `cloudflared` from
+`WEBCODEX_CLOUDFLARED_BIN` or `PATH` when available. Otherwise it downloads and
+verifies a WebCodex-managed copy automatically. When launched through the npm
+wrapper, that managed download also reuses npm's proxy, `noproxy`, CA, and
+`strict-ssl` settings; otherwise standard proxy/system trust behavior remains
+available. `share` is self-contained: it prepares the tunnel dependency when
+needed, configures the current Git project,
+starts a local WebCodex Server + Runner,
+creates a temporary Connector credential, and opens a Cloudflare Quick Tunnel.
+You do **not** need to run `setup`, `doctor`, or `run` first.
 
-1. In ChatGPT, enable **Developer Mode** and create a **custom app** using MCP.
-2. Paste the printed **MCP URL**.
+When the command reports **WebCodex ready**, keep that terminal open. For a
+public share, WebCodex best-effort copies the **MCP URL** to the clipboard; the
+credential is never copied automatically. In an interactive terminal, press
+Enter to open ChatGPT App settings, then:
+
+1. In ChatGPT, enable **Developer Mode** and go to **Settings -> Apps -> Create**.
+2. Paste the copied **MCP URL** (or copy the printed fallback URL).
 3. Choose **Access token / API key** or the equivalent Bearer-token option.
 4. Paste the printed temporary **Credential**.
 5. Run **Scan Tools**.
@@ -48,6 +68,7 @@ apps, and write/modify actions are controlled by the ChatGPT plan, workspace, an
 admin settings; WebCodex cannot widen client-side app permissions. The CLI output
 is the source of truth for the WebCodex URL, authentication type, and credential
 for that run.
+Use `webcodex share --no-copy-url` when clipboard access is undesirable.
 
 A default `share` URL and credential are temporary and stop working when the
 command exits. `webcodex share --tunnel none` is available for local-only MCP

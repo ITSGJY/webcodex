@@ -11,24 +11,40 @@ Runner 在仓库所在机器上执行文件、Git、命令与测试操作；仓�
 Windows 版本支持 CLI + Runner 连接远程 Linux Server；Windows 上请使用
 `webcodex connect <server-url>`。如果还没有 Server，需要先在 Linux 上部署一个。
 
-默认的临时公网分享依赖
-[`cloudflared`](https://developers.cloudflare.com/tunnel/downloads/)。先安装它并确保在
-`PATH` 中，然后执行：
+Linux/macOS 最快的试用路径不需要全局安装：
+
+```bash
+cd /path/to/your/repository
+npx --yes @yyjeqhc/webcodex
+```
+
+如果 npm lifecycle 没有留下 native binary，wrapper 会在第一次执行时用同一套校验与原子安装
+逻辑 lazy bootstrap。希望长期保留 CLI 时再全局安装：
 
 ```bash
 npm install -g @yyjeqhc/webcodex
 cd /path/to/your/repository
-webcodex share
+webcodex
 ```
 
-`share` 是完整入口：它会配置当前 Git 项目、启动本地 WebCodex Server + Runner、创建
-临时 Connector credential，并打开 Cloudflare Quick Tunnel。第一次使用**不需要**先运行
-`setup`、`doctor` 或 `run`。
+在 Linux/macOS 的交互式 Git 仓库中，裸 `webcodex` 等价于普通 first-run 的
+`webcodex share`。脚本/非交互调用、Windows、以及 Git checkout 之外不会自动启动 runtime；
+需要确定性分发时继续显式使用 `webcodex share`。
 
-命令显示 **WebCodex ready** 后保持终端运行，并按它输出的值配置 ChatGPT：
+默认临时公网分享会优先复用 `WEBCODEX_CLOUDFLARED_BIN` 或 `PATH` 中已有的
+`cloudflared`；如果没有，WebCodex 会自动下载并校验自己管理的副本。如果通过 npm wrapper
+启动，这次 managed 下载也会复用 npm 的 proxy、`noproxy`、CA 与 `strict-ssl` 配置；否则
+继续保留标准 proxy/系统信任配置路径。`share` 是完整入口：需要时它会先准备 tunnel 依赖，
+然后配置当前 Git 项目、启动本地
+WebCodex Server + Runner、创建临时 Connector credential，并打开 Cloudflare Quick Tunnel。
+第一次使用**不需要**先运行 `setup`、`doctor` 或 `run`。
 
-1. 在 ChatGPT 中启用 **Developer Mode**，创建基于 MCP 的 **custom app**。
-2. 填入输出的 **MCP URL**。
+命令显示 **WebCodex ready** 后保持终端运行。公网 share 会 best-effort 把 **MCP URL**
+复制到剪贴板；credential 永远不会自动复制。交互式终端还可以直接按 Enter 打开 ChatGPT
+App 设置。然后：
+
+1. 在 ChatGPT 启用 **Developer Mode**，进入 **Settings -> Apps -> Create**。
+2. 粘贴已复制的 **MCP URL**；复制失败时使用终端中照常打印的 URL。
 3. 认证选择 **Access token / API key** 或等价的 Bearer token 选项。
 4. 填入输出的临时 **Credential**。
 5. 点击 **Scan Tools**。
@@ -42,6 +58,7 @@ ChatGPT 的 UI 文案可能随 workspace 与 rollout 改变。Developer Mode、c
 write/modify action 是否可用，由 ChatGPT 套餐、workspace 与管理员设置控制；WebCodex
 不能扩大客户端侧 app 权限。当前这次运行到底该填哪个 WebCodex URL、认证类型和
 credential，以 CLI 成功输出为准。
+不希望访问剪贴板时可使用 `webcodex share --no-copy-url`。
 
 默认 `share` 的 URL 与 credential 都是临时的，命令退出后失效。仅做本地 MCP 调试时可用
 `webcodex share --tunnel none`，此模式不需要 `cloudflared`。

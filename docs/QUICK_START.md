@@ -3,36 +3,61 @@
 [English](QUICK_START.md) | [简体中文](QUICK_START.zh-CN.md)
 
 This guide gets one local Git repository into ChatGPT through MCP with the fewest
-concepts possible. On Linux/macOS the normal first-run command is `webcodex share`.
-Windows does not support the local Server runtime used by `share`; Windows users
-need an existing remote Linux Server and should use `webcodex connect <server-url>`
+concepts possible. On Linux/macOS, bare `webcodex` in an interactive Git checkout
+is the shortest first-run entry and dispatches to the normal `webcodex share`
+workflow. Windows does not support the local Server runtime used by `share`;
+Windows users need an existing remote Linux Server and should use
+`webcodex connect <server-url>`
 instead. If no Server exists yet, see [Deployment](DEPLOYMENT.md).
 
 ## Prerequisites
 
 - Node.js 18+ for the npm installer.
 - Git on `PATH` and a Git repository you can safely inspect/edit.
-- On Linux/macOS, [`cloudflared`](https://developers.cloudflare.com/tunnel/downloads/)
-  on `PATH` for the default temporary public HTTPS share.
+- No separate `cloudflared` installation is required for the default Linux/macOS
+  temporary public share. WebCodex reuses an explicit/PATH binary or downloads a
+  pinned, verified managed copy when needed.
+  Through the npm wrapper, managed acquisition also inherits npm proxy,
+  `noproxy`, CA, and `strict-ssl` settings; standard proxy/system trust remains
+  the fallback outside npm-specific configuration.
 
-Install WebCodex:
+For a one-shot trial without a global install:
+
+```bash
+cd /path/to/your/repository
+npx --yes @yyjeqhc/webcodex
+```
+
+Or install the CLI once:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
 
+The npm wrapper can lazily bootstrap the verified native binaries on first
+execution, so the npx path does not depend on npm preserving postinstall output.
 On Linux/macOS, local MCP debugging with `webcodex share --tunnel none` does not
 need `cloudflared`.
 
 ## 1. Share the repository
 
+The `npx --yes @yyjeqhc/webcodex` command above already enters this first-run
+path. If you installed the CLI globally instead, run:
+
 ```bash
 cd /path/to/your/repository
-webcodex share
+webcodex
+# explicit/script-friendly equivalent:
+# webcodex share
 ```
 
-That single command performs the project setup, starts the local Server + Runner,
-creates a temporary Connector credential, opens a Cloudflare Quick Tunnel, and
+Bare `webcodex` only auto-dispatches this way for an interactive Linux/macOS
+terminal inside a Git checkout. Non-interactive invocations and non-repository
+directories still show the normal CLI help. The explicit `share` command remains
+the deterministic entry for scripts.
+
+That single first-run path performs the project setup, starts the local Server +
+Runner, creates a temporary Connector credential, opens a Cloudflare Quick Tunnel, and
 waits for the MCP endpoint to become usable. Do not run `setup`, `doctor`, or
 `run` first unless you specifically want the manual/local workflow described
 later.
@@ -40,20 +65,25 @@ later.
 The default share is temporary. Keep the terminal open; Ctrl-C stops the local
 runtime, tunnel, URL, and temporary credential.
 
-If `cloudflared` is missing, WebCodex fails before project setup/state creation
-and tells you where to install it. Install it and retry, or use `--tunnel none`
-for local-only debugging.
+If `cloudflared` is missing, WebCodex acquires a pinned Cloudflare release into
+private user state before project setup/state creation, verifies the artifact and
+binary, and then continues. Set `WEBCODEX_CLOUDFLARED_BIN` to force a trusted
+binary, or use `--tunnel none` for local-only debugging.
 
 ## 2. Add WebCodex to ChatGPT
 
-When the terminal reports **WebCodex ready**, use the values printed under
-**What to do next**:
+When the terminal reports **WebCodex ready**, the printed values remain the
+source of truth. For a public share, WebCodex best-effort copies the MCP URL to
+the clipboard but never copies the credential automatically. In an interactive
+terminal, press Enter to open ChatGPT App settings. Then:
 
-1. In ChatGPT, enable **Developer Mode** and create a **custom app** using MCP.
-2. Set **MCP URL** to the printed `https://.../mcp` value.
+1. In ChatGPT, enable **Developer Mode** and go to **Settings -> Apps -> Create**.
+2. Paste the copied **MCP URL**, or use the printed `https://.../mcp` fallback.
 3. For the default share, choose **Access token / API key** (Bearer token).
 4. Paste the printed **Credential (this share only)**.
 5. Run **Scan Tools**.
+
+Use `webcodex share --no-copy-url` to suppress the clipboard attempt.
 
 The Console intentionally does not display that credential. If you later open
 `/console`, get connection credentials from the successful CLI output, not from
@@ -171,7 +201,7 @@ Common examples:
 
 | Symptom | Next action |
 | --- | --- |
-| `cloudflared` missing | Install it from the official Cloudflare downloads and retry, or use `share --tunnel none` locally |
+| managed `cloudflared` acquisition fails | Check network/proxy access and retry; alternatively set `WEBCODEX_CLOUDFLARED_BIN` to a trusted binary or use `share --tunnel none` locally |
 | loopback port already in use | Stop the conflicting process and retry |
 | local/manual runtime stopped | `webcodex run` |
 | Runner unavailable on an existing hosted profile | rerun `connect` or inspect `webcodex agent status --profile <profile>` |

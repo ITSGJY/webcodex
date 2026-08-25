@@ -16,12 +16,13 @@ Server API 完成。
 
 `webcodex --help` 会列出顶层命名空间。下面按命名空间说明各自的用途。
 
-在 Linux/macOS 上第一次连接 ChatGPT 时，普通用户通常只需要在仓库中运行
-`webcodex share`。它会完成项目设置、启动本地 Server 与 Runner，并暴露临时 HTTPS
-MCP endpoint。默认 Quick Tunnel 要求 `cloudflared` 位于 `PATH`；命令会在创建
-项目/share 状态之前检查这个前置条件，缺失时直接给出安装链接与下一步。Windows
-不支持这条本地 Server/share 路径，请改用 `webcodex connect <server-url>` 连接远程
-Linux Server。
+在 Linux/macOS 上第一次连接 ChatGPT 时，交互式 Git checkout 中运行裸 `webcodex`
+就是 `webcodex share` 的 convenience shortcut；显式 `share` 仍然是脚本/确定性分发入口。
+它会完成项目设置、启动本地 Server 与 Runner，并暴露临时 HTTPS
+MCP endpoint。默认 Quick Tunnel 会依次优先使用 `WEBCODEX_CLOUDFLARED_BIN`、`PATH`
+中的 `cloudflared`；两者都没有时，会在创建项目/share 状态之前自动获取固定版本、完成
+校验并使用 WebCodex 管理的副本。Windows 不支持这条本地 Server/share 路径，请改用
+`webcodex connect <server-url>` 连接远程 Linux Server。
 
 ## 命令总览
 
@@ -31,7 +32,8 @@ Linux Server。
 
 | 命令 | 用途 | 说明 |
 | --- | --- | --- |
-| `webcodex share` | 通过 HTTPS 把当前项目接入 ChatGPT/MCP | Linux/macOS 首次使用主路径；包含 setup，并启动本地 Server + Runner。Windows 不可用。默认 Quick Tunnel 需要 `cloudflared`。 |
+| `webcodex`（无子命令） | 快速交互式 first-run shortcut | 仅 Linux/macOS + stdin/stdout 为终端 + 当前目录位于 Git checkout 时自动进入 `share`；否则照常显示 help。 |
+| `webcodex share` | 通过 HTTPS 把当前项目接入 ChatGPT/MCP | Linux/macOS 首次使用主路径；包含 setup、启动本地 Server + Runner、按需自动管理经过校验的 `cloudflared`，并 best-effort 复制公网 MCP URL。Windows 不可用。 |
 | `webcodex connect <server>` | 把当前项目接入已有的 Server | 已经拥有 Server URL 时的长期路径；默认使用 hosted shared-key。 |
 | `webcodex status` | 简洁的项目 coding 就绪状态 | 简短状态；`doctor` 提供完整诊断。 |
 | `webcodex doctor` | 当前项目的只读就绪检查 | 诊断/手动工作流；输出稳定的 `next action`。 |
@@ -42,6 +44,8 @@ Linux Server。
 `webcodex share --auth oauth --oauth-redirect-uri <精确回调地址>` 使用 OAuth 2.0 Authorization Code + PKCE S256。OAuth client ID/secret 会按“项目 + 回调地址”保存在受保护的 project state 中；authorization code、access token、refresh token 与临时 Project Credential 则都被 fenced 到当前 `share` 进程。重启 `share` 会让旧 OAuth grant 失效，但不会改变 Connector 的稳定 project identity。OAuth access token 永远不能用于 Runner transport。
 
 Cloudflare Quick Tunnel 的公网 origin 仍然是临时的。如需稳定 HTTPS origin，可使用 `--tunnel none --public-url https://share.example`，并由 operator 自己把该 origin 反向代理/隧道到 loopback WebCodex Server；`--public-url` 只声明外部 origin/issuer，不会创建代理或 tunnel。
+
+公网 `share` 会 best-effort 只把 MCP URL 复制到剪贴板，绝不会自动复制临时 credential；Linux/macOS 交互式终端还会提供按 Enter 打开 ChatGPT App 设置的快捷入口。剪贴板/浏览器集成都只是 convenience，失败不会影响已经 ready 的 runtime。使用 `--no-copy-url` 可关闭剪贴板访问。
 
 `webcodex connect <server> --auth oauth --oauth-redirect-uri <精确回调地址>` 是普通 hosted connect 面向 ChatGPT 的 OAuth 路径。它继续使用 Runner 的同一个 `wck_*` shared-key 身份，并保持 direct shared-key baseline 不变：`runtime:read`、`project:read`、`project:write`、`job:run`、`computer:read`、`computer:control`。fresh OAuth client 从完整 baseline 开始，但已有受保护 client 可以合法持有更窄的 baseline subset。只有显式增加 `--oauth-computer-permissions`，client ceiling 才在**现有 baseline subset**上追加固定的 `computer:launch`、`computer:display_read`、`computer:pointer_control`、`computer:clipboard_read`、`computer:clipboard_write`；不会恢复此前缺失的 baseline scope，该 flag 本身也不会 grant optional scope。WebCodex authorize 页面只把当前合法且可用的 Additional Computer permissions 以默认未勾选 checkbox 展示，真正进入 authorization code/access/refresh grant 的只有用户选择项。Launch consent 要求本次 OAuth request 同时包含 `computer:read` 与 `computer:launch`；缺失 prerequisite 时页面会禁用，而不是由 Server 偷偷补 scope。client ceiling 真正扩大时会撤销旧 grant 并要求重新授权；普通 reconnect 不会静默扩大 baseline client。`account:manage`、`admin`、`job:detach`、任何 `agent:*` 与未来新增 scope 永远不进入 picker。授权页显示的 Runner capability 只表示当前 backend support，不保证 OS/native permission 一定成功；runtime 调用仍会实时重新检查 capability 与 native preflight。OAuth access token 仍不能用于 Agent transport。
 如需让同一个 Connector 访问 Runner-owned 本地 MCP provider，必须额外显式传 `--oauth-local-mcp`。它只把 `mcp:local` 加入该 shared-key-owned OAuth client 的 ceiling；旧 client/credential 不会因版本升级自动获得该 scope。ceiling 真正变化会撤销旧 grant 并要求重新授权。

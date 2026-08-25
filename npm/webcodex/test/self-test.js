@@ -50,7 +50,7 @@ function makeBinary(dir, name, identity = defaultIdentity()) {
   }
   fs.writeFileSync(
     file,
-    `#!/bin/sh\nif [ "\${1-}" = "--version" ]; then echo "${name} ${identity}"; exit 0; fi\nprintf '%s\\n' "$@"\nexit "\${WEBCODEX_TEST_EXIT:-0}"\n`,
+    `#!/bin/sh\nif [ "\${WEBCODEX_REQUIRE_WRAPPER_MARKER-}" = "1" ] && [ "\${WEBCODEX_NPM_WRAPPER-}" != "1" ]; then exit 24; fi\nif [ "\${1-}" = "--version" ]; then echo "${name} ${identity}"; exit 0; fi\nprintf '%s\\n' "$@"\nexit "\${WEBCODEX_TEST_EXIT:-0}"\n`,
     { mode: 0o755 }
   );
   return file;
@@ -218,6 +218,32 @@ async function main() {
   assert.strictEqual(install.MAX_UNCOMPRESSED_BYTES, 256 * 1024 * 1024);
   assert.strictEqual(install.MAX_TAR_ENTRY_BYTES, 96 * 1024 * 1024);
   assert.strictEqual(install.MAX_REDIRECTS, 5);
+  assert.strictEqual(install.MAX_CA_FILE_BYTES, 4 * 1024 * 1024);
+  const httpsNetwork = install.resolveNpmNetworkOptions("https://github.com/example", {
+    npm_config_https_proxy: "http://proxy.example:8443",
+    npm_config_noproxy: "localhost",
+    npm_config_strict_ssl: "false"
+  });
+  assert.strictEqual(httpsNetwork.proxy.href, "http://proxy.example:8443/");
+  assert.strictEqual(httpsNetwork.noProxy, "localhost");
+  assert.strictEqual(httpsNetwork.ca, undefined);
+  assert.strictEqual(httpsNetwork.rejectUnauthorized, false);
+  const httpNetwork = install.resolveNpmNetworkOptions("http://example.test", {
+    npm_config_proxy: "http://proxy.example:8080",
+    npm_config_strict_ssl: "true"
+  });
+  assert.strictEqual(httpNetwork.proxy.href, "http://proxy.example:8080/");
+  assert.strictEqual(httpNetwork.noProxy, undefined);
+  assert.strictEqual(httpNetwork.ca, undefined);
+  assert.strictEqual(httpNetwork.rejectUnauthorized, true);
+  assert.match(
+    install.sanitizeNetworkErrorMessage("connect through http://user:secret@proxy.example:8080/path?token=hidden failed"),
+    /^connect through http:\/\/proxy\.example:8080\/\.\.\. failed$/
+  );
+  assert.doesNotMatch(
+    install.sanitizeNetworkErrorMessage("failed https://github.com/release?token=hidden"),
+    /token|hidden/
+  );
   assert.strictEqual(install.resolveRedirectUrl("http://example.test/a", "https://example.test/b").protocol, "https:");
   assert.strictEqual(install.resolveRedirectUrl("http://example.test/a", "/b").protocol, "http:");
   assert.throws(() => install.resolveRedirectUrl("https://example.test/a", "http://example.test/b?token=secret"), /HTTPS downgrade/);
@@ -288,6 +314,16 @@ async function main() {
     const archive = path.join(tmp, "artifact.tar.gz");
     archiveDirectory(archiveSource, archive);
     const manifestPath = path.join(tmp, "manifest.json");
+    const caFile = path.join(tmp, "corporate-ca.pem");
+    fs.writeFileSync(caFile, "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----\n");
+    assert.strictEqual(
+      install.resolveNpmNetworkOptions("https://github.com/example", { npm_config_cafile: caFile }).ca,
+      fs.readFileSync(caFile, "utf8")
+    );
+    assert.throws(
+      () => install.resolveNpmNetworkOptions("https://github.com/example", { npm_config_cafile: path.join(tmp, "missing-ca.pem") }),
+      /npm cafile could not be read \(ENOENT\)/
+    );
     writeManifest(manifestPath, manifestFor(pathToFileURL(archive).toString(), install.sha256File(archive)));
     const downloaded = path.join(tmp, "downloaded");
     await install.installFromManifest(manifestPath, testOptions({ destinationDir: downloaded, tempDir: tmp }));
@@ -317,6 +353,61 @@ async function main() {
         downloaded, tmp, /HTTP 503/
       );
     });
+
+    {
+      let observedProxyTarget = null;
+      await withServer((req, res) => {
+        observedProxyTarget = req.url;
+        res.end("proxy-delivered");
+      }, async (proxyBase) => {
+        const proxiedDest = path.join(tmp, "proxied-download.bin");
+        await install.fetchToFile("http://origin.invalid/artifact.tar.gz?token=visible#fragment-secret", proxiedDest, {
+          label: "Proxy",
+          totalTimeoutMs: 500,
+          maxBytes: 1024,
+          environment: { npm_config_proxy: proxyBase }
+        });
+        assert.strictEqual(fs.readFileSync(proxiedDest, "utf8"), "proxy-delivered");
+        assert.match(observedProxyTarget, /token=visible/);
+        assert.doesNotMatch(observedProxyTarget, /fragment-secret/);
+        fs.rmSync(proxiedDest, { force: true });
+      });
+    }
+
+    await withServer((_req, res) => { res.end("direct-delivered"); }, async (targetBase) => {
+      await withServer((_req, res) => { res.statusCode = 502; res.end("proxy must be bypassed"); }, async (proxyBase) => {
+        const directDest = path.join(tmp, "no-proxy-download.bin");
+        await install.fetchToFile(`${targetBase}/artifact.tar.gz`, directDest, {
+          label: "No proxy",
+          totalTimeoutMs: 500,
+          maxBytes: 1024,
+          environment: { npm_config_proxy: proxyBase, npm_config_noproxy: "127.0.0.1" }
+        });
+        assert.strictEqual(fs.readFileSync(directDest, "utf8"), "direct-delivered");
+        fs.rmSync(directDest, { force: true });
+      });
+    });
+
+    {
+      const errorDest = path.join(tmp, "network-error.bin");
+      await assert.rejects(
+        () => install.fetchToFile("http://127.0.0.1:9/artifact.tar.gz?token=hidden", errorDest, {
+          label: "Artifact",
+          firstByteTimeoutMs: 500,
+          totalTimeoutMs: 1000,
+          maxBytes: 1024,
+          environment: {}
+        }),
+        (err) => {
+          assert.strictEqual(err.code, "ECONNREFUSED");
+          assert.match(err.message, /Artifact download request failed \(ECONNREFUSED\)/);
+          assert.match(err.message, /ECONNREFUSED/);
+          assert.doesNotMatch(err.message, /token|hidden|artifact\.tar\.gz/);
+          return true;
+        }
+      );
+      assert.ok(!fs.existsSync(errorDest));
+    }
 
     await withServer((_req, _res) => {}, async (base) => {
       await expectInstallFailure(
@@ -527,11 +618,193 @@ async function main() {
     // arguments, and propagate the exit code. On Windows the fixture is
     // node.exe — a real PE image — with a `-e` script that echoes the
     // forwarded arguments and exits 23; on Unix it is the sh fixture.
+    const bootstrapRoot = path.join(tmp, "wrapper-bootstrap");
+    fs.mkdirSync(bootstrapRoot, { recursive: true });
+    const bootstrapMarker = path.join(bootstrapRoot, "bootstrap-marker");
+    fs.writeFileSync(
+      path.join(bootstrapRoot, "install.js"),
+      `require("fs").writeFileSync(${JSON.stringify(bootstrapMarker)}, "ok");\n`
+    );
+    assert.strictEqual(wrapper.bootstrapNative({ packageRoot: bootstrapRoot }), true);
+    assert.strictEqual(fs.readFileSync(bootstrapMarker, "utf8"), "ok");
+
+    assert.strictEqual(wrapper.needsNpmNetworkContext([], false), true);
+    assert.strictEqual(wrapper.needsNpmNetworkContext(["share"], false), true);
+    assert.strictEqual(wrapper.needsNpmNetworkContext(["status"], false), false);
+    assert.strictEqual(wrapper.needsNpmNetworkContext(["status"], true), true);
+
+    if (process.env.npm_execpath && /npm-cli\.js$/i.test(process.env.npm_execpath)) {
+      const windowsInvocation = wrapper.npmInvocation(
+        { npm_execpath: process.env.npm_execpath },
+        { platform: "win32" }
+      );
+      assert.strictEqual(windowsInvocation.program, process.execPath);
+      assert.deepStrictEqual(windowsInvocation.prefixArgs, [process.env.npm_execpath]);
+
+      const windowsConfigRoot = path.join(tmp, "wrapper-windows-config");
+      fs.mkdirSync(windowsConfigRoot, { recursive: true });
+      const windowsUserConfig = path.join(windowsConfigRoot, ".npmrc");
+      fs.writeFileSync(
+        windowsUserConfig,
+        "https-proxy=http://windows-user:windows-secret@proxy.example:8443/\nproxy=http://windows-user:windows-secret@proxy.example:8080/\nnoproxy=localhost\nstrict-ssl=false\n"
+      );
+      const windowsHydrated = wrapper.rehydrateNpmNetworkEnvironment(
+        {
+          PATH: process.env.PATH || "",
+          HOME: windowsConfigRoot,
+          USERPROFILE: windowsConfigRoot,
+          npm_config_userconfig: windowsUserConfig
+        },
+        {
+          platform: "win32",
+          npmCliPath: process.env.npm_execpath,
+          networkHelper: path.join(__dirname, "..", "bin", "npm-network-env.js")
+        }
+      );
+      assert.match(windowsHydrated.npm_config_https_proxy, /windows-user:windows-secret@/);
+      assert.match(windowsHydrated.npm_config_proxy, /windows-user:windows-secret@/);
+      assert.strictEqual(windowsHydrated.npm_config_noproxy, "localhost");
+      assert.strictEqual(windowsHydrated.npm_config_strict_ssl, "false");
+    }
+
+    const npmInvocation = wrapper.npmInvocation(process.env, { platform: PLATFORM });
+    assert.ok(npmInvocation, "npm invocation could not be resolved");
+    if (PLATFORM === "win32") {
+      assert.strictEqual(npmInvocation.program, process.execPath);
+      assert.strictEqual(npmInvocation.prefixArgs.length, 1);
+      assert.match(npmInvocation.prefixArgs[0], /npm-cli\.js$/i);
+    } else {
+      assert.strictEqual(npmInvocation.program, "npm");
+      assert.deepStrictEqual(npmInvocation.prefixArgs, []);
+    }
+
+    if (PLATFORM !== "win32") {
+      const networkRoot = path.join(tmp, "wrapper-network");
+      const networkBin = path.join(networkRoot, "bin");
+      fs.mkdirSync(networkBin, { recursive: true });
+      const networkHelper = path.join(__dirname, "..", "bin", "npm-network-env.js");
+      const fakeNpm = path.join(networkRoot, "fake-npm");
+      const protectedProxy = "http://wrapper-user:wrapper-secret@proxy.example:8443/";
+      fs.writeFileSync(
+        fakeNpm,
+        [
+          "#!/bin/sh",
+          "if [ \"$1\" = exec ] && [ \"$2\" = --yes=false ] && [ \"$3\" = -- ]; then",
+          `  printf '%s' '${JSON.stringify({ npm_config_https_proxy: protectedProxy, npm_config_proxy: protectedProxy, npm_config_noproxy: "localhost", npm_config_cafile: "/private/ca.pem", ignored_secret: "must-not-propagate" }).replace(/'/g, "'\\''")}'`,
+          "  exit 0",
+          "fi",
+          "if [ \"$1\" = config ] && [ \"$2\" = get ]; then",
+          "  case \"$3\" in",
+          "    ca) printf '%s\\n' '-----BEGIN CERTIFICATE-----\\nwrapper-ca\\n-----END CERTIFICATE-----' ; exit 0 ;;",
+          "    strict-ssl) printf '%s\\n' false ; exit 0 ;;",
+          "  esac",
+          "fi",
+          "printf '%s\\n' 'http://leak-user:leak-secret@should-not-appear.invalid/' >&2",
+          "exit 9",
+          ""
+        ].join("\n"),
+        { mode: 0o700 }
+      );
+      const hydrated = wrapper.rehydrateNpmNetworkEnvironment(
+        { PATH: process.env.PATH || "" },
+        { packageRoot: networkRoot, npmProgram: fakeNpm, networkHelper }
+      );
+      assert.strictEqual(hydrated.npm_config_https_proxy, protectedProxy);
+      assert.strictEqual(hydrated.npm_config_proxy, protectedProxy);
+      assert.strictEqual(hydrated.npm_config_noproxy, "localhost");
+      assert.strictEqual(hydrated.npm_config_cafile, "/private/ca.pem");
+      assert.match(hydrated.npm_config_ca, /wrapper-ca/);
+      assert.strictEqual(hydrated.npm_config_strict_ssl.trim(), "false");
+      assert.strictEqual(hydrated.ignored_secret, undefined);
+
+      const inheritedProxy = "http://existing-user:existing-secret@existing.example:8080/";
+      const inherited = wrapper.rehydrateNpmNetworkEnvironment(
+        { PATH: process.env.PATH || "", npm_config_https_proxy: inheritedProxy },
+        { packageRoot: networkRoot, npmProgram: fakeNpm, networkHelper }
+      );
+      assert.strictEqual(inherited.npm_config_https_proxy, inheritedProxy);
+
+      // A lazy bootstrap needs npm's protected proxy long enough to download the
+      // native binaries, but a non-share native command must not inherit a proxy
+      // credential that was absent from the caller's original environment.
+      const scopedLazyRoot = path.join(tmp, "wrapper-lazy-network-scope");
+      fs.mkdirSync(scopedLazyRoot, { recursive: true });
+      const scopedLazyTarget = wrapper.nativePath({ packageRoot: scopedLazyRoot, platform: PLATFORM });
+      const bootstrapEnvMarker = path.join(scopedLazyRoot, "bootstrap-env");
+      const nativeEnvMarker = path.join(scopedLazyRoot, "native-env");
+      const escapedNativeMarker = nativeEnvMarker.replace(/'/g, "'\\''");
+      const scopedTargetScript = [
+        "#!/bin/sh",
+        'if [ -n "${npm_config_https_proxy-}" ]; then',
+        `  printf leaked > '${escapedNativeMarker}'`,
+        "else",
+        `  printf clean > '${escapedNativeMarker}'`,
+        "fi",
+        "exit 23",
+        ""
+      ].join("\n");
+      const scopedTargetBase64 = Buffer.from(scopedTargetScript, "utf8").toString("base64");
+      fs.writeFileSync(
+        path.join(scopedLazyRoot, "install.js"),
+        [
+          'const fs = require("fs");',
+          'const path = require("path");',
+          `const target = ${JSON.stringify(scopedLazyTarget)};`,
+          `fs.writeFileSync(${JSON.stringify(bootstrapEnvMarker)}, process.env.npm_config_https_proxy ? "hydrated" : "missing");`,
+          'fs.mkdirSync(path.dirname(target), { recursive: true });',
+          `fs.writeFileSync(target, Buffer.from(${JSON.stringify(scopedTargetBase64)}, "base64"), { mode: 0o755 });`,
+          ""
+        ].join("\n")
+      );
+      const priorExitCode = process.exitCode;
+      const scopedChild = wrapper.runNative({
+        packageRoot: scopedLazyRoot,
+        platform: PLATFORM,
+        argv: ["status"],
+        npmProgram: fakeNpm,
+        networkHelper
+      });
+      assert.ok(scopedChild, "lazy scoped native child was not started");
+      const scopedExitCode = await new Promise((resolve, reject) => {
+        scopedChild.once("error", reject);
+        scopedChild.once("exit", (code, signal) => signal ? reject(new Error(`scoped lazy child exited by ${signal}`)) : resolve(code));
+      });
+      process.exitCode = priorExitCode;
+      assert.strictEqual(scopedExitCode, 23);
+      assert.strictEqual(fs.readFileSync(bootstrapEnvMarker, "utf8"), "hydrated");
+      assert.strictEqual(fs.readFileSync(nativeEnvMarker, "utf8"), "clean");
+    }
+
+    if (PLATFORM !== "win32") {
+      const lazyRoot = path.join(tmp, "wrapper-lazy");
+      fs.mkdirSync(lazyRoot, { recursive: true });
+      const lazyTarget = wrapper.nativePath({ packageRoot: lazyRoot, platform: PLATFORM });
+      fs.writeFileSync(
+        path.join(lazyRoot, "install.js"),
+        [
+          'const fs = require("fs");',
+          'const path = require("path");',
+          `const target = ${JSON.stringify(lazyTarget)};`,
+          'fs.mkdirSync(path.dirname(target), { recursive: true });',
+          'fs.writeFileSync(target, "#!/bin/sh\\nprintf \'%s\\n\' \\\"$1\\\"\\nexit 23\\n", { mode: 0o755 });',
+          ''
+        ].join("\n")
+      );
+      const lazyProbe = childProcess.spawnSync(
+        process.execPath,
+        [path.join(__dirname, "wrapper-lazy-probe.js"), lazyRoot, "lazy-argument"],
+        { encoding: "utf8" }
+      );
+      assert.strictEqual(lazyProbe.status, 23, lazyProbe.stderr);
+      assert.strictEqual(lazyProbe.stdout.trim(), "lazy-argument");
+      assert.ok(fs.existsSync(lazyTarget));
+    }
+
     let wrapperTarget;
     let wrapperArgs;
     if (PLATFORM === "win32") {
       wrapperTarget = process.execPath;
-      wrapperArgs = ["-e", "console.log(process.argv[1]); console.log(process.argv[2]); process.exitCode = 23;", "alpha", "two words"];
+      wrapperArgs = ["-e", "if (process.env.WEBCODEX_NPM_WRAPPER !== '1') process.exit(24); console.log(process.argv[1]); console.log(process.argv[2]); process.exitCode = 23;", "alpha", "two words"];
     } else {
       wrapperTarget = makeBinary(tmp, "wrapper-target");
       wrapperArgs = ["alpha", "two words"];
@@ -539,7 +812,7 @@ async function main() {
     const probe = childProcess.spawnSync(
       process.execPath,
       [path.join(__dirname, "wrapper-probe.js"), wrapperTarget, ...wrapperArgs],
-      { encoding: "utf8" }
+      { encoding: "utf8", env: { ...process.env, WEBCODEX_REQUIRE_WRAPPER_MARKER: "1" } }
     );
     assert.strictEqual(probe.status, 23, probe.stderr);
     assert.deepStrictEqual(probe.stdout.trim().split(/\r?\n/), ["alpha", "two words"]);

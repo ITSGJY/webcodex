@@ -3,7 +3,8 @@
 [English](QUICK_START.md) | [简体中文](QUICK_START.zh-CN.md)
 
 本指南用尽可能少的概念，把一个本地 Git 仓库通过 MCP 接入 ChatGPT。在 Linux/macOS
-上，普通第一次使用的主命令是 `webcodex share`。Windows 不支持 `share` 所需的本地
+的交互式 Git checkout 中，裸 `webcodex` 是最短 first-run 入口，并会进入正常的
+`webcodex share` 工作流。Windows 不支持 `share` 所需的本地
 Server runtime；Windows 用户需要已有的远程 Linux Server，并改用
 `webcodex connect <server-url>`。如果还没有 Server，请先看[部署指南](DEPLOYMENT.zh-CN.md)。
 
@@ -11,44 +12,68 @@ Server runtime；Windows 用户需要已有的远程 Linux Server，并改用
 
 - npm installer 需要 Node.js 18+。
 - `PATH` 中有 Git，并准备一个可以安全查看/编辑的 Git 仓库。
-- Linux/macOS 的默认临时公网 HTTPS 分享需要把
-  [`cloudflared`](https://developers.cloudflare.com/tunnel/downloads/) 安装到 `PATH`。
+- Linux/macOS 默认临时公网 HTTPS 分享不再要求单独安装 `cloudflared`。WebCodex 会优先
+  复用显式指定或 `PATH` 中的 binary；没有时自动下载固定版本并校验后使用。
+  通过 npm wrapper 启动时，managed 下载还会继承 npm proxy、`noproxy`、CA 与
+  `strict-ssl` 配置；没有 npm-specific 配置时继续使用标准 proxy/系统信任路径。
 
-安装 WebCodex：
+不全局安装也可以直接试用：
+
+```bash
+cd /path/to/your/repository
+npx --yes @yyjeqhc/webcodex
+```
+
+也可以先全局安装一次：
 
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
 
-在 Linux/macOS 上只做本地 MCP 调试时，`webcodex share --tunnel none` 不需要
+npm wrapper 在第一次执行时可以 lazy bootstrap 经过校验的 native binary，因此 npx 路径
+不依赖 npm 是否保留 postinstall 产生的文件。在 Linux/macOS 上只做本地 MCP 调试时，
+`webcodex share --tunnel none` 不需要
 `cloudflared`。
 
 ## 1. 分享当前仓库
 
+前面的 `npx --yes @yyjeqhc/webcodex` 已经会直接进入这条 first-run 路径。如果选择了
+全局安装，再运行：
+
 ```bash
 cd /path/to/your/repository
-webcodex share
+webcodex
+# 显式/脚本友好的等价入口：
+# webcodex share
 ```
 
-这一条命令会完成项目设置、启动本地 Server + Runner、创建临时 Connector credential、
-打开 Cloudflare Quick Tunnel，并等待 MCP endpoint 可用。除非你明确需要后文的手动/本地
+裸 `webcodex` 只会在 Linux/macOS + 交互式终端 + Git checkout 中这样自动分发；脚本、
+非交互调用和 repo 外目录仍显示普通 CLI help。需要确定性行为时继续显式使用 `share`。
+
+这一条 first-run 路径会完成项目设置、启动本地 Server + Runner、创建临时 Connector
+credential、打开 Cloudflare Quick Tunnel，并等待 MCP endpoint 可用。除非你明确需要后文的手动/本地
 工作流，否则不要先跑 `setup`、`doctor` 或 `run`。
 
 默认 share 是临时的。保持终端运行；Ctrl-C 会停止本地 runtime 与 tunnel，同时使 URL 和
 临时 credential 失效。
 
-如果缺少 `cloudflared`，WebCodex 会在创建项目 setup/state 之前失败，并给出官方安装地址。
-安装后重试；或者仅本地调试时使用 `--tunnel none`。
+如果缺少 `cloudflared`，WebCodex 会在创建项目 setup/state 之前把固定版本下载到私有用户
+状态目录，校验 artifact 与最终 binary 后继续。可用 `WEBCODEX_CLOUDFLARED_BIN` 强制指定
+可信 binary；仅本地调试时也可以使用 `--tunnel none`。
 
 ## 2. 在 ChatGPT 中添加 WebCodex
 
-终端出现 **WebCodex ready** 后，直接按 **What to do next** 中的值填写：
+终端出现 **WebCodex ready** 后，终端中打印的值仍然是 source of truth。公网 share 会
+best-effort 把 MCP URL 复制到剪贴板，但 credential 永远不会自动复制；交互式终端可按
+Enter 打开 ChatGPT App 设置。然后：
 
-1. 在 ChatGPT 开启 **Developer Mode**，创建基于 MCP 的 **custom app**。
-2. **MCP URL** 填输出的 `https://.../mcp`。
+1. 在 ChatGPT 开启 **Developer Mode**，进入 **Settings -> Apps -> Create**。
+2. 粘贴已复制的 **MCP URL**；复制失败时使用输出的 `https://.../mcp`。
 3. 默认 share 的认证选择 **Access token / API key**（Bearer token）。
 4. 粘贴输出的 **Credential (this share only)**。
 5. 点击 **Scan Tools**。
+
+如不希望访问剪贴板，使用 `webcodex share --no-copy-url`。
 
 Console 故意不显示 credential。以后即使打开 `/console`，认证值也应来自成功的 CLI 首次
 输出，而不是浏览器页面。ChatGPT Developer Mode、custom MCP app 与 write/modify action
@@ -151,7 +176,7 @@ webcodex doctor
 
 | 现象 | 下一步 |
 | --- | --- |
-| 缺少 `cloudflared` | 从 Cloudflare 官方下载并安装后重试；仅本地调试可用 `share --tunnel none` |
+| WebCodex-managed `cloudflared` 获取失败 | 检查网络/代理后重试；也可用 `WEBCODEX_CLOUDFLARED_BIN` 指定可信 binary，或仅本地调试时用 `share --tunnel none` |
 | loopback 端口已被占用 | 停掉冲突进程后重试 |
 | 本地/手动 runtime 未运行 | `webcodex run` |
 | 已有 hosted profile 的 Runner 不可用 | 重跑 `connect` 或检查 `webcodex agent status --profile <profile>` |
