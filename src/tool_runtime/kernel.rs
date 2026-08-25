@@ -136,6 +136,20 @@ pub(crate) fn check_runtime_tool_scope(
     }
 }
 
+fn check_session_message_resolution_scope(
+    auth: Option<&AuthContext>,
+    requested: bool,
+) -> Result<(), ToolCallErrorStatus> {
+    if requested {
+        // Piggyback resolution is the same business mutation as the dedicated
+        // Session tool. Reuse its canonical scope policy so a caller cannot
+        // acquire Session-closure authority from an unrelated main tool scope.
+        check_runtime_tool_scope(auth, "resolve_session_message")
+    } else {
+        Ok(())
+    }
+}
+
 impl ToolRuntime {
     pub(crate) async fn call_tool_with_context(
         &self,
@@ -200,6 +214,32 @@ impl ToolRuntime {
             }
         }
         let recorder_ack_requested = !recorder_metadata.ack_session_message_ids.is_empty();
+        let session_message_resolution = (context.transport == ToolTransport::Mcp)
+            .then(|| recorder_metadata.session_message_resolution.clone())
+            .flatten();
+        if session_message_resolution.is_some() && context.session_id.is_none() {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "session_message_resolution requires recording_session_id".to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+            };
+        }
+        if let Err(error_status) = check_session_message_resolution_scope(
+            context.auth,
+            session_message_resolution.is_some(),
+        ) {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(error_status),
+                project: None,
+                model_ergonomics: None,
+            };
+        }
         let outer_ack_observation = context.session_id.map(|recorder_session_id| {
             session_context::observe_session_attention_acks(
                 &self.sessions,
@@ -602,6 +642,65 @@ impl ToolRuntime {
                 };
             }
         };
+        if let (Some(session_id), Some(message_resolution)) =
+            (context.session_id, session_message_resolution.as_ref())
+        {
+            let current_request_acknowledged = outer_ack_observation
+                .as_ref()
+                .is_some_and(|ack| ack.accepted_ids.contains(&message_resolution.message_id));
+            if let Err(error) = self.sessions.resolve_message_from_wrapper(
+                session_id,
+                &message_resolution.message_id,
+                message_resolution.resolution.clone(),
+                current_request_acknowledged,
+            ) {
+                let mut result = session_context::session_message_error_result(
+                    session_id,
+                    Some(&message_resolution.message_id),
+                    error,
+                );
+                super::dispatch::decorate_structured_execution_prestart_denial(
+                    &request.tool_name,
+                    &mut result,
+                    "session_message_resolution_failed",
+                );
+                let recording = self.sessions.record_model_facing_tool_call_finished(
+                    session_event,
+                    false,
+                    &result.output,
+                    result.error.as_deref(),
+                    Some("session_message_resolution_failed"),
+                );
+                super::add_session_telemetry_hint(
+                    &mut result,
+                    &self.sessions,
+                    session_id,
+                    recording.as_ref().map(|recorded| recorded.event_id.clone()),
+                );
+                if let Some(recorded) = recording.as_ref() {
+                    if session_context::add_session_context_continuity(&mut result, recorded) {
+                        self.add_session_history_recovery(&mut result, recorded, context.auth)
+                            .await;
+                    }
+                }
+                session_context::add_session_attention_projection(
+                    &mut result,
+                    &self.sessions,
+                    session_id,
+                    outer_ack_observation
+                        .as_ref()
+                        .expect("authorized outer recorder must have ACK observation"),
+                    recorder_ack_requested,
+                );
+                return ToolCallOutcome {
+                    success: false,
+                    result: Some(result),
+                    error_status: None,
+                    project: None,
+                    model_ergonomics: None,
+                };
+            }
+        }
         if let ToolCall::ImportConversationFilesToProject {
             trusted_mcp_host_file_import,
             ..
@@ -967,6 +1066,124 @@ mod tests {
         let serialized = serde_json::to_string(&summary.events).unwrap();
         assert!(serialized.contains("\"content_present\":true"));
         assert!(!serialized.contains("secret-content"));
+    }
+
+    #[tokio::test]
+    async fn piggyback_resolution_cannot_inherit_main_tool_scope() {
+        let runtime = test_runtime();
+        let auth = oauth(&["project:read"]);
+        let fingerprint = crate::tool_runtime::workflow_session_authority_fingerprint(Some(&auth))
+            .expect("OAuth test authority must have a stable identity");
+        let session = runtime
+            .sessions
+            .start_session_with_options(
+                crate::tool_runtime::sessions::SessionCreateOptions::new(
+                    None,
+                    Some("piggyback scope fence".to_string()),
+                    crate::tool_runtime::SessionMode::Normal,
+                    crate::tool_runtime::sessions::SessionGuards::default(),
+                )
+                .with_owner_authority_fingerprint(Some(fingerprint)),
+            )
+            .unwrap();
+        let message = runtime
+            .sessions
+            .post_message_with_ack(
+                crate::tool_runtime::sessions::PostSessionMessageInput {
+                    session_id: session.session_id.clone(),
+                    kind: crate::tool_runtime::sessions::SessionMessageKind::Note,
+                    message: "close only with Session mutation authority".to_string(),
+                    tags: Vec::new(),
+                    reply_to: None,
+                    priority: crate::tool_runtime::sessions::SessionMessagePriority::Normal,
+                },
+                false,
+            )
+            .unwrap();
+        let mut arguments = json!({
+            "project": "demo",
+            "path": "README.md"
+        });
+        arguments.as_object_mut().unwrap().insert(
+            crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_INTERNAL_FIELD
+                .to_string(),
+            json!({
+                "message_id": message.message_id,
+                "resolution": "handled"
+            }),
+        );
+
+        let outcome = runtime
+            .call_tool_with_context(
+                ToolCallRequest {
+                    tool_name: "read_file".to_string(),
+                    arguments,
+                },
+                ToolCallContext {
+                    transport: ToolTransport::Mcp,
+                    session_id: Some(&session.session_id),
+                    auth: Some(&auth),
+                    window: None,
+                    record_oauth_scope_denials: false,
+                    host_file_import_trust: HostFileImportTrust::Untrusted,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            outcome.error_status,
+            Some(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_RUNTIME_READ),
+                description: "missing required scope: runtime:read".to_string(),
+            })
+        );
+        assert!(outcome.result.is_none());
+        let retained = runtime
+            .sessions
+            .list_messages(
+                &session.session_id,
+                crate::tool_runtime::sessions::ListSessionMessagesFilter {
+                    message_id: Some(message.message_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].status,
+            crate::tool_runtime::sessions::SessionMessageStatus::Open,
+            "scope denial must happen before the piggyback closure mutation"
+        );
+        assert!(retained[0].resolution.is_none());
+    }
+
+    #[test]
+    fn session_message_resolution_reuses_dedicated_resolve_scope() {
+        let project_read_only = oauth(&["project:read"]);
+        assert_eq!(
+            check_runtime_tool_scope(Some(&project_read_only), "read_file"),
+            Ok(()),
+            "main project read authority must remain independent"
+        );
+        assert_eq!(
+            check_session_message_resolution_scope(Some(&project_read_only), true),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_RUNTIME_READ),
+                description: "missing required scope: runtime:read".to_string(),
+            }),
+            "piggyback resolution must not inherit the main tool scope"
+        );
+        assert_eq!(
+            check_session_message_resolution_scope(Some(&project_read_only), false),
+            Ok(()),
+            "ordinary calls without resolution keep their existing scope contract"
+        );
+        let runtime_read = oauth(&["runtime:read"]);
+        assert_eq!(
+            check_session_message_resolution_scope(Some(&runtime_read), true),
+            Ok(()),
+            "piggyback resolution must track the dedicated resolve tool policy"
+        );
     }
 
     #[test]
