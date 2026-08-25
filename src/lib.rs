@@ -38,6 +38,7 @@ mod projects;
 mod runtime_console_http;
 mod runtime_http;
 mod server_listener;
+mod server_shutdown;
 mod shell_client;
 mod startup;
 mod task_cli;
@@ -125,6 +126,23 @@ where
 /// better-reported timeouts always fire first.
 const REQUEST_HARD_TIMEOUT_SECS: u64 = 300;
 
+/// A finite request may legitimately consume the full HTTP hard timeout. Give
+/// its response and connection teardown an additional bounded window before
+/// Salvo escalates graceful shutdown to a forcible connection stop.
+const SERVER_GRACEFUL_RESPONSE_MARGIN_SECS: u64 = 15;
+
+/// Application-owned graceful Server drain deadline. This is deliberately
+/// derived from the maximum finite HTTP request lifetime instead of being an
+/// independent operational magic number.
+pub const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 =
+    REQUEST_HARD_TIMEOUT_SECS + SERVER_GRACEFUL_RESPONSE_MARGIN_SECS;
+
+/// systemd must outlive the application's own graceful/forced stop lifecycle
+/// so PID 1 does not SIGKILL the Server before WebCodex's bounded deadline.
+const SERVER_SYSTEMD_STOP_MARGIN_SECS: u64 = 15;
+pub const SERVER_SYSTEMD_TIMEOUT_STOP_SECS: u64 =
+    SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SECS + SERVER_SYSTEMD_STOP_MARGIN_SECS;
+
 pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let env_loads = load_startup_env_files().map_err(std::io::Error::other)?;
     tracing_subscriber::fmt()
@@ -193,6 +211,10 @@ only for local/trusted-network demos."
     // stored here — only the resolved user identity.
     let authorize_session_store = Arc::new(oauth_http::AuthorizeSessionStore::new());
     let shell_registry = Arc::new(ShellClientRegistry::default());
+    // Root HTTP admission consults this process-local state before any
+    // side-effecting handler can run. It closes the small race between the
+    // authoritative drain transition and Salvo consuming its stop command.
+    let shutdown_coordinator = Arc::new(server_shutdown::ShutdownCoordinator::default());
     let quic_cfg = config::QuicServerConfig::from_env();
     let connector_context =
         connector_runtime::ConnectorContext::from_env().map_err(std::io::Error::other)?;
@@ -425,6 +447,9 @@ only for local/trusted-network demos."
         .push(Router::with_path("styles.css").get(console_web::admin_styles_css));
 
     let mut router = Router::new()
+        .hoop(server_shutdown::DrainAdmission::new(
+            shutdown_coordinator.clone(),
+        ))
         // Whole-service backstop: no handler may hold an HTTP request open
         // forever. Sized well above every legitimate request — sync agent
         // waits are <= ~122s and MCP dispatch is hard-bounded at 150s — so it
@@ -536,7 +561,13 @@ only for local/trusted-network demos."
             shell_client::recovery_timeout_sweep(&sweep_registry).await;
         }
     });
-    Server::new(acceptor).serve(router).await;
+    server_shutdown::serve_until_termination(
+        Server::new(acceptor),
+        router,
+        shutdown_coordinator,
+        std::time::Duration::from_secs(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
+    )
+    .await?;
     Ok(())
 }
 
