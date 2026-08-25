@@ -61,7 +61,7 @@ export function runtimeDeviceIds(projects: any[]): string[] {
 
 export function runtimeProjectsForDevice(projects: any[], clientId: string): any[] {
   return (Array.isArray(projects) ? projects : [])
-    .filter((project) => project && project.client_id === clientId && typeof project.id === "string" && project.id)
+    .filter((project) => project && (!clientId || project.client_id === clientId) && typeof project.id === "string" && project.id)
     .slice()
     .sort((left, right) => {
       const leftName = typeof left.name === "string" && left.name ? left.name : left.id;
@@ -81,7 +81,7 @@ export function filterAndSortRuntimeProjects(projects: any[], clientId: string, 
   return runtimeProjectsForDevice(projects, clientId)
     .filter((project) => {
       if (!needle) return true;
-      return [project?.name, project?.id]
+      return [project?.name, project?.id, project?.client_id, project?.path]
         .filter((value) => typeof value === "string")
         .some((value) => String(value).toLocaleLowerCase().includes(needle));
     })
@@ -101,6 +101,13 @@ export function filterAndSortRuntimeProjects(projects: any[], clientId: string, 
     });
 }
 
+export function runtimeProjectIdentityText(project: any): string {
+  if (!project || typeof project.id !== "string" || !project.id) return "No project selected";
+  const runner = typeof project.client_id === "string" && project.client_id ? project.client_id : "unknown";
+  const path = typeof project.path === "string" && project.path ? project.path : "unavailable";
+  return "Runner: " + runner + " · Project: " + project.id + " · Workspace: " + path;
+}
+
 export function preferredRuntimeProjectSelection(
   projects: any[],
   selectedDevice: string,
@@ -114,9 +121,8 @@ export function preferredRuntimeProjectSelection(
     if (retained) return { device: retained.client_id, project: retained.id };
   }
   const devices = runtimeDeviceIds(rows);
-  const device = devices.includes(selectedDevice) ? selectedDevice : devices[0] || "";
-  const project = runtimeProjectsForDevice(rows, device)[0];
-  return { device, project: project ? project.id : "" };
+  const device = devices.includes(selectedDevice) ? selectedDevice : "";
+  return { device, project: "" };
 }
 
 export function initialRuntimeConsoleState(): any {
@@ -193,6 +199,10 @@ export function isCurrentRuntimeRunnerRequest(state: any, request: any): boolean
     request.device === state.selectedDevice && request.generation === state.runnerGeneration;
 }
 
+export function selectRuntimeRunnerFilter(state: any, device: string): void {
+  selectRuntimeProject(state, device, "");
+}
+
 export function selectRuntimeProject(state: any, device: string, project: string): any {
   if (state.selectedDevice !== device) state.runnerGeneration += 1;
   state.selectedDevice = device;
@@ -245,6 +255,17 @@ export function selectRuntimeWorkflowSession(state: any, sessionId: string): any
   state.collaboration.available = true;
   state.collaboration.phase = "idle";
   return wrapWorkflowRequest(state, selectWorkflowSession(state.workflow, sessionId));
+}
+
+export function selectRuntimeSessionLocation(
+  state: any,
+  device: string,
+  project: string,
+  sessionId: string
+): any {
+  const sessionListRequest = selectRuntimeProject(state, device, project);
+  const detailRequest = selectRuntimeWorkflowSession(state, sessionId);
+  return { sessionListRequest, detailRequest };
 }
 
 export function refreshRuntimeWorkflowSession(state: any): any {

@@ -6,6 +6,7 @@ import {
   runtimeDeviceIds,
   runtimeProjectsForDevice,
   filterAndSortRuntimeProjects,
+  runtimeProjectIdentityText,
   preferredRuntimeProjectSelection,
   beginRuntimeCredential,
   refreshRuntimeOverview,
@@ -14,10 +15,13 @@ import {
   isCurrentRuntimeProjectsRequest,
   refreshRuntimeRunner,
   isCurrentRuntimeRunnerRequest,
+  selectRuntimeRunnerFilter,
   selectRuntimeProject,
   refreshRuntimeSessionList,
   isCurrentRuntimeSessionListRequest,
   selectRuntimeWorkflowSession,
+  selectRuntimeSessionLocation,
+  refreshRuntimeWorkflowSession,
   isCurrentRuntimeWorkflowSessionRequest,
   adoptRuntimeWorkflowSessionDetail,
   runtimeCollaborationRequest,
@@ -77,7 +81,7 @@ test("server and Runner requests are fenced across credential and Runner changes
   assert.equal(isCurrentRuntimeRunnerRequest(state, runnerB), false);
 });
 
-test("runtime device and project options use authoritative client ids with stable ordering", () => {
+test("runtime home defaults to All Runners with no automatic Project selection", () => {
   const projects = [
     { id: "opaque-b", client_id: "device-b", name: "Beta" },
     { id: "agent:not-device-a:project", client_id: "device-a", name: "Zulu" },
@@ -86,8 +90,10 @@ test("runtime device and project options use authoritative client ids with stabl
   ];
   assert.deepEqual(runtimeDeviceIds(projects), ["device-a", "device-b"]);
   assert.deepEqual(runtimeProjectsForDevice(projects, "device-a").map((project) => project.id), ["opaque-a1", "opaque-a2", "agent:not-device-a:project"]);
+  assert.deepEqual(runtimeProjectsForDevice(projects, "").map((project) => project.id), ["opaque-a1", "opaque-a2", "opaque-b", "agent:not-device-a:project"]);
   assert.deepEqual(preferredRuntimeProjectSelection(projects, "device-b", "agent:not-device-a:project"), { device: "device-a", project: "agent:not-device-a:project" });
-  assert.deepEqual(preferredRuntimeProjectSelection(projects, "device-a", "missing-project"), { device: "device-a", project: "opaque-a1" });
+  assert.deepEqual(preferredRuntimeProjectSelection(projects, "device-a", "missing-project"), { device: "device-a", project: "" });
+  assert.deepEqual(preferredRuntimeProjectSelection(projects, "", ""), { device: "", project: "" });
 });
 
 test("runtime refresh preserves an authorized selected device and project", () => {
@@ -99,13 +105,13 @@ test("runtime refresh preserves an authorized selected device and project", () =
   assert.deepEqual(preferredRuntimeProjectSelection(projects, "device-z", "project-2"), { device: "device-z", project: "project-2" });
 });
 
-test("Project list filters and prioritizes running attention then recent activity", () => {
+test("Project list supports All Runners, Runner filter/search, and running attention recent ranking", () => {
   const projects = [
-    { id: "agent:r:idle", client_id: "runner", name: "Idle", sessions: { running_sessions: 0, attention: {}, latest_updated_at: 100 } },
-    { id: "agent:r:recent", client_id: "runner", name: "Recent", sessions: { running_sessions: 0, attention: {}, latest_updated_at: 400 } },
+    { id: "agent:r:idle", client_id: "runner", name: "Idle", path: "/root/git/idle", sessions: { running_sessions: 0, attention: {}, latest_updated_at: 100 } },
+    { id: "agent:r:recent", client_id: "runner", name: "Recent", path: "/root/git/webcodex-worktrees/recent", sessions: { running_sessions: 0, attention: {}, latest_updated_at: 400 } },
     { id: "agent:r:attention", client_id: "runner", name: "Needs review", sessions: { running_sessions: 0, attention: { open_guidance: 1 }, latest_updated_at: 50 } },
     { id: "agent:r:working", client_id: "runner", name: "Working", sessions: { running_sessions: 1, attention: {}, latest_updated_at: 10 } },
-    { id: "agent:other:x", client_id: "other", name: "Other" },
+    { id: "agent:other:x", client_id: "other", name: "External" },
   ];
   assert.deepEqual(
     filterAndSortRuntimeProjects(projects, "runner", "").map((project) => project.id),
@@ -118,6 +124,33 @@ test("Project list filters and prioritizes running attention then recent activit
   assert.deepEqual(
     filterAndSortRuntimeProjects(projects, "runner", "agent:r:recent").map((project) => project.id),
     ["agent:r:recent"]
+  );
+  assert.deepEqual(
+    filterAndSortRuntimeProjects(projects, "runner", "webcodex-worktrees").map((project) => project.id),
+    ["agent:r:recent"]
+  );
+  assert.deepEqual(
+    filterAndSortRuntimeProjects(projects, "", "").map((project) => project.id),
+    ["agent:r:working", "agent:r:attention", "agent:r:recent", "agent:r:idle", "agent:other:x"]
+  );
+  assert.deepEqual(
+    filterAndSortRuntimeProjects(projects, "", "OTHER").map((project) => project.id),
+    ["agent:other:x"]
+  );
+});
+
+test("Runtime Project identity preserves Linux macOS and Windows workspace paths exactly", () => {
+  assert.equal(
+    runtimeProjectIdentityText({ id: "agent:special:webcodex", client_id: "special", path: "/root/git/webcodex" }),
+    "Runner: special · Project: agent:special:webcodex · Workspace: /root/git/webcodex"
+  );
+  assert.equal(
+    runtimeProjectIdentityText({ id: "agent:mini:webcodex", client_id: "mini", path: "/Users/demo/git/webcodex" }),
+    "Runner: mini · Project: agent:mini:webcodex · Workspace: /Users/demo/git/webcodex"
+  );
+  assert.equal(
+    runtimeProjectIdentityText({ id: "agent:msi:webcodex", client_id: "msi", path: "E:\\git\\webcodex" }),
+    "Runner: msi · Project: agent:msi:webcodex · Workspace: E:\\git\\webcodex"
   );
 });
 
@@ -139,6 +172,47 @@ test("runtime workflow detail identity includes project plus session id", () => 
   assert.equal(adoptRuntimeWorkflowSessionDetail(state, detailA, { title: "late A" }), false);
   assert.equal(adoptRuntimeWorkflowSessionDetail(state, detailB, { title: "B" }), true);
   assert.equal(state.workflow.snapshot.title, "B");
+});
+
+test("Recent Session navigation atomically establishes Runner Project and Session and fences old collaboration", () => {
+  const state = initialRuntimeConsoleState();
+  beginRuntimeCredential(state);
+  selectRuntimeProject(state, "runner-a", "agent:runner-a:project-a");
+  selectRuntimeWorkflowSession(state, "wc_sess_a");
+  const oldDetail = refreshRuntimeWorkflowSession(state);
+  const oldCollaboration = runtimeCollaborationRequest(state);
+
+  const location = selectRuntimeSessionLocation(
+    state,
+    "runner-b",
+    "agent:runner-b:project-b",
+    "wc_sess_b"
+  );
+  assert.equal(state.selectedDevice, "runner-b");
+  assert.equal(state.selectedProject, "agent:runner-b:project-b");
+  assert.equal(state.workflow.selectedSessionId, "wc_sess_b");
+  assert.equal(isCurrentRuntimeSessionListRequest(state, location.sessionListRequest), true);
+  assert.equal(isCurrentRuntimeWorkflowSessionRequest(state, location.detailRequest), true);
+  assert.equal(isCurrentRuntimeWorkflowSessionRequest(state, oldDetail), false);
+  assert.equal(isCurrentRuntimeCollaborationRequest(state, oldCollaboration), false);
+  const currentCollaboration = runtimeCollaborationRequest(state);
+  assert.equal(currentCollaboration.project, "agent:runner-b:project-b");
+  assert.equal(currentCollaboration.sessionId, "wc_sess_b");
+});
+
+test("removed Project clears stale detail while preserving a still-valid Runner filter", () => {
+  const state = initialRuntimeConsoleState();
+  beginRuntimeCredential(state);
+  selectRuntimeProject(state, "runner", "agent:runner:gone");
+  const detail = selectRuntimeWorkflowSession(state, "wc_sess_gone");
+  const remaining = [{ id: "agent:runner:remaining", client_id: "runner", name: "Remaining" }];
+  const selection = preferredRuntimeProjectSelection(remaining, state.selectedDevice, state.selectedProject);
+  assert.deepEqual(selection, { device: "runner", project: "" });
+  selectRuntimeRunnerFilter(state, selection.device);
+  assert.equal(state.selectedDevice, "runner");
+  assert.equal(state.selectedProject, "");
+  assert.equal(state.workflow.selectedSessionId, "");
+  assert.equal(isCurrentRuntimeWorkflowSessionRequest(state, detail), false);
 });
 
 test("session switch invalidates old collaboration responses", () => {
@@ -224,10 +298,34 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.equal(html.includes("runtime-project-" + "select"), false);
   assert.match(html, /runtime-project-list/);
   assert.match(html, /runtime-project-search/);
+  assert.match(html, /runtime-session-workspace/);
+  assert.match(html, /workspace path/);
+  assert.match(html, /Working &amp; Recently Updated Sessions/);
+  assert.match(html, /runtime-recent-session-list/);
+  assert.match(html, /Runner Fleet/);
+  assert.match(html, /runtime-runner-list/);
+  assert.match(html, /All Runners/);
   assert.match(html, /runtime-collaboration-form/);
   assert.match(html, /runtime-message-requires-ack/);
   assert.match(css, /-webkit-line-clamp:\s*4/);
+  assert.match(css, /\.recent-session-row/);
+  assert.match(css, /\.fleet-row/);
   assert.equal(source.includes("innerHTML"), false);
+  assert.doesNotMatch(source, /api\("runner"/);
+  assert.match(source, /selectRuntimeSessionLocation/);
+  assert.match(source, /path\.textContent = String\(project\.path\)/);
+  assert.match(source, /runtimeProjectIdentityText\(selectedProjectRow\(\)\)/);
+  assert.match(source, /renderSessionWorkspaceIdentity\(\)/);
+  const recentStart = source.indexOf("function renderRecentSessions");
+  const recentEnd = source.indexOf("function selectRecentSession", recentStart);
+  const recentRender = source.slice(recentStart, recentEnd);
+  assert.match(recentRender, /workflowSessionLivenessPresentation\(session\)/);
+  assert.match(recentRender, /attentionLabel\(session\.overview\?\.attention\)/);
+  assert.match(recentRender, /updatedLabel\(session\.updated_at\)/);
+  assert.doesNotMatch(recentRender, /workflowSessionListOverviewFacts|summary-facts|validation/);
+  assert.doesNotMatch(recentRender, /\.sort\(/);
+  assert.match(source, /applyRunnerFilter\(select\.value\)/);
+  assert.match(source, /void fetchOverview\(refreshRuntimeOverview\(state\)\)/);
   assert.match(source, /body\.textContent = String\(message\?\.message \|\| ""\)/);
   assert.match(source, /action === "reload"[\s\S]*loadRetainedCollaboration/);
   assert.match(source, /action === "drain"/);
@@ -239,6 +337,22 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.doesNotMatch(source, /Delivered|Read by model|Currently acknowledged/);
   assert.match(source, /Refresh failed · showing previous data/);
   assert.match(source, /runtimeCollaborationNeedsRefreshRecovery/);
+  assert.match(source, /event\.key === "Enter" \|\| event\.key === " "/);
+  const renderProjectsStart = source.indexOf("function renderProjectSelectors");
+  const renderProjectsEnd = source.indexOf("function switchProject", renderProjectsStart);
+  const renderProjects = source.slice(renderProjectsStart, renderProjectsEnd);
+  assert.match(renderProjects, /all\.textContent = "All Runners"/);
+  assert.match(renderProjects, /switchProject\(String\(project\.client_id \|\| ""\), String\(project\.id \|\| ""\)\)/);
+  assert.match(renderProjects, /SESSION SCAN PARTIAL/);
+  assert.match(renderProjects, /Sessions projected · partial/);
+  const renderRunnersStart = source.indexOf("function renderRunnerFleet");
+  const renderRunnersEnd = source.indexOf("function renderRecentSessions", renderRunnersStart);
+  const renderRunners = source.slice(renderRunnersStart, renderRunnersEnd);
+  assert.match(renderRunners, /projects_scan_partial/);
+  assert.match(renderRunners, /Projects scanned/);
+  assert.match(renderRunners, /fleet scan partial/);
+  assert.match(renderRunners, /Session scan partial/);
+  assert.doesNotMatch(renderRunners, /visible_project_count/);
   const fetchProjectsStart = source.indexOf("async function fetchProjects");
   const fetchProjectsEnd = source.indexOf("function effectiveProjects", fetchProjectsStart);
   assert.doesNotMatch(source.slice(fetchProjectsStart, fetchProjectsEnd), /fetchOverview\(/);
@@ -254,6 +368,11 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   const refreshStart = source.indexOf("async function refreshAll");
   const refreshEnd = source.indexOf("function startAuto", refreshStart);
   assert.equal((source.slice(refreshStart, refreshEnd).match(/fetchOverview\(/g) || []).length, 1);
+  const runnerFilterStart = source.indexOf('el("runtime-device-select")?.addEventListener("change"');
+  const runnerFilterEnd = source.indexOf('el("runtime-project-search")', runnerFilterStart);
+  const runnerFilter = source.slice(runnerFilterStart, runnerFilterEnd);
+  assert.match(runnerFilter, /applyRunnerFilter\(select\.value\)/);
+  assert.doesNotMatch(runnerFilter, /switchProject|fetchRunner/);
   const bootstrapStart = source.indexOf("async function loadRetainedCollaboration");
   const bootstrapEnd = source.indexOf("async function startCollaboration", bootstrapStart);
   const bootstrap = source.slice(bootstrapStart, bootstrapEnd);
