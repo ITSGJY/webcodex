@@ -13,6 +13,22 @@ fn recoverable_write_rejection(reason: impl AsRef<str>) -> String {
     )
 }
 
+fn apply_text_edit_occurrence_capability_rejection(reason: impl AsRef<str>) -> ToolResult {
+    let reason = reason.as_ref();
+    ToolResult::err_with_output(
+        format!(
+            "Rejected before write: {reason}.\nNo files were modified.\nRetry guidance: upgrade the Runner or refine the edit to a unique exact match without occurrence."
+        ),
+        json!({
+            "state_changed": false,
+            "error_kind": "agent_capability_unavailable",
+            "failure_kind": "capability_unavailable",
+            "capability": crate::shell_protocol::SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
+            "retry_guidance": "upgrade the Runner or refine the edit to a unique exact match without occurrence"
+        }),
+    )
+}
+
 /// Maximum decoded size for whole-payload/model-facing artifact operations.
 /// These paths aggregate content or return it as base64/JSON, so they remain at
 /// 10 MiB even though data-plane upload/export paths admit larger files.
@@ -73,6 +89,12 @@ fn validate_apply_text_edit(
     validate_field("old_text", &edit.old_text)?;
     validate_field("new_text", &edit.new_text)?;
     validate_field("anchor_text", &edit.anchor_text)?;
+    if edit.occurrence == Some(0) {
+        return Err(format!(
+            "change {change_index} edit {edit_index} ({}): occurrence must be at least 1",
+            edit.kind.as_str()
+        ));
+    }
     match edit.kind {
         ApplyTextEditKind::ReplaceExact => {
             if edit
@@ -236,6 +258,8 @@ fn apply_text_edits_agent_stdout_result(stdout: &str) -> ToolResult {
             format!(
                 "Edit outcome is uncertain: {error}. Inspect the affected files before issuing another write."
             )
+        } else if obj.get("conflict_recovery").is_some_and(Value::is_object) {
+            error.to_string()
         } else {
             recoverable_write_rejection(error)
         };
@@ -290,6 +314,13 @@ pub(crate) fn apply_text_edits_to_string(
     let mut ops: Vec<(usize, usize, String, usize)> = Vec::with_capacity(edits.len());
     for (index, edit) in edits.iter().enumerate() {
         let kind = edit.kind;
+        if edit.occurrence == Some(0) {
+            return Err(edit_field_error(
+                index,
+                kind,
+                "occurrence must be at least 1",
+            ));
+        }
         let (needle, replacement): (&str, String) = match kind {
             ApplyTextEditKind::ReplaceExact => {
                 let old = edit
@@ -344,22 +375,26 @@ pub(crate) fn apply_text_edits_to_string(
             .map_err(|error| edit_field_error(index, kind, error))?
             .into_owned();
         let needle = needle.as_ref();
-        let matches = original.matches(needle).count();
-        if matches == 0 {
-            return Err(edit_match_error(index, kind, "match text was not found"));
-        }
-        if matches > 1 {
-            return Err(edit_match_error(
-                index,
-                kind,
-                &format!(
-                    "match text matched {} times; refusing ambiguous edit",
-                    matches
-                ),
-            ));
-        }
-        let start = original.find(needle).expect("unique match already counted");
-        let end = start + needle.len();
+        let (start, end) =
+            crate::apply_edits_shared::resolve_apply_text_match(original, needle, edit.occurrence)
+                .map_err(|conflict| {
+                    use crate::apply_edits_shared::ApplyTextMatchConflictKind;
+                    let message = match conflict.kind {
+                        ApplyTextMatchConflictKind::MatchNotFound => {
+                            "match text was not found".to_string()
+                        }
+                        ApplyTextMatchConflictKind::MultipleMatches => format!(
+                            "match text matched {} times; refusing ambiguous edit",
+                            conflict.match_count
+                        ),
+                        ApplyTextMatchConflictKind::OccurrenceOutOfRange => format!(
+                            "requested occurrence {} is out of range for {} exact matches",
+                            conflict.requested_occurrence.unwrap_or(0),
+                            conflict.match_count
+                        ),
+                    };
+                    edit_match_error(index, kind, &message)
+                })?;
         let (range_start, range_end) = match kind {
             ApplyTextEditKind::InsertBefore => (start, start),
             ApplyTextEditKind::InsertAfter => (end, end),
@@ -930,10 +965,15 @@ impl ToolRuntime {
                 return apply_text_edits_preflight_rejection(message);
             }
         }
+        let requires_occurrence_capability = changes
+            .iter()
+            .flat_map(|change| change.edits.iter())
+            .any(|edit| edit.occurrence.is_some());
 
         let payload = json!({
             "changes": changes,
             "dry_run": dry_run.unwrap_or(false),
+            "recovery_metadata_version": 1,
         });
         let serialized = match serde_json::to_string(&payload) {
             Ok(serialized) if serialized.len() <= MAX_APPLY_FILE_CHANGES_BYTES => serialized,
@@ -970,31 +1010,39 @@ impl ToolRuntime {
             .first()
             .map(|change| change.path.clone())
             .expect("non-empty changes validated above");
-        let (request_id, rx) = match self
-            .shell_clients
-            .enqueue_file_op(
-                ShellFileOpRequest {
-                    op: "apply_text_edits".to_string(),
-                    client_id,
-                    path: routing_path,
-                    cwd: Some(proj.path.clone()),
-                    content: Some(serialized),
-                    max_bytes: None,
-                    old_text: None,
-                    pattern: None,
-                    expected_sha256: None,
-                    expected_prefix: None,
-                    start_line: None,
-                    end_line: None,
-                    line: None,
-                    create_dirs: false,
-                    wait_timeout_secs: wait_timeout,
-                },
-                "tool_runtime".to_string(),
-            )
-            .await
-        {
+        let request = ShellFileOpRequest {
+            op: "apply_text_edits".to_string(),
+            client_id,
+            path: routing_path,
+            cwd: Some(proj.path.clone()),
+            content: Some(serialized),
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            wait_timeout_secs: wait_timeout,
+        };
+        let enqueue_result = if requires_occurrence_capability {
+            self.shell_clients
+                .enqueue_apply_text_edits_with_occurrence(request, "tool_runtime".to_string())
+                .await
+        } else {
+            self.shell_clients
+                .enqueue_file_op(request, "tool_runtime".to_string())
+                .await
+        };
+        let (request_id, rx) = match enqueue_result {
             Ok(r) => r,
+            Err(e)
+                if requires_occurrence_capability && e.starts_with("capability_unavailable:") =>
+            {
+                return apply_text_edit_occurrence_capability_rejection(e)
+            }
             Err(e) => return ToolResult::err(recoverable_write_rejection(e)),
         };
         let resp = match tokio::time::timeout(Duration::from_secs(wait_timeout + 4), rx).await {
