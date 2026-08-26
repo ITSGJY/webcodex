@@ -172,6 +172,120 @@ async fn shell_client_view_preserves_legacy_capability_wire_projection() {
     assert!(serialized.get("feature_classification").is_none());
 }
 
+#[tokio::test]
+async fn semantic_snapshot_keeps_identity_state_and_features_atomic_across_replacement() {
+    let registry = ShellClientRegistry::default();
+
+    let mut first_capabilities = wire_capabilities_with_only(None);
+    first_capabilities.file_read = true;
+    first_capabilities.structured_process_argv = true;
+    first_capabilities.lsp_read_only_navigation = true;
+    first_capabilities.computer_observe = true;
+    let mut first = runner_registration("semantic-snapshot", "inst-a", Vec::new());
+    first.capabilities = Some(first_capabilities);
+    registry.register(first).await.unwrap();
+
+    let first_snapshot = registry
+        .get_client_semantic_view("semantic-snapshot")
+        .await
+        .unwrap();
+    assert_eq!(first_snapshot.view.agent_instance_id, "inst-a");
+    assert!(first_snapshot.view.connected);
+    assert!(first_snapshot.supports(RunnerFeature::FileRead));
+    assert!(first_snapshot.supports(RunnerFeature::StructuredProcessArgv));
+    assert!(first_snapshot.supports(RunnerFeature::LspReadOnlyNavigation));
+    assert!(first_snapshot.supports(RunnerFeature::ComputerObserve));
+    assert!(!first_snapshot.supports(RunnerFeature::FileWrite));
+    assert!(!first_snapshot.supports(RunnerFeature::ComputerTextInput));
+
+    registry
+        .set_last_seen_for_test(
+            "semantic-snapshot",
+            now_ts() - CLIENT_ONLINE_WINDOW_SECS - 1,
+        )
+        .await;
+    let mut replacement_capabilities = wire_capabilities_with_only(None);
+    replacement_capabilities.file_write = true;
+    replacement_capabilities.structured_script_payload = true;
+    replacement_capabilities.lsp_call_hierarchy = true;
+    replacement_capabilities.computer_text_input = true;
+    let mut replacement = runner_registration("semantic-snapshot", "inst-b", Vec::new());
+    replacement.capabilities = Some(replacement_capabilities);
+    registry.register(replacement).await.unwrap();
+
+    let replacement_snapshot = registry
+        .get_client_semantic_view("semantic-snapshot")
+        .await
+        .unwrap();
+    assert_eq!(replacement_snapshot.view.agent_instance_id, "inst-b");
+    assert!(replacement_snapshot.view.connected);
+    assert!(!replacement_snapshot.supports(RunnerFeature::FileRead));
+    assert!(replacement_snapshot.supports(RunnerFeature::FileWrite));
+    assert!(replacement_snapshot.supports(RunnerFeature::StructuredScriptPayload));
+    assert!(replacement_snapshot.supports(RunnerFeature::LspCallHierarchy));
+    assert!(replacement_snapshot.supports(RunnerFeature::ComputerTextInput));
+
+    // The prior immutable observation remains internally coherent rather than
+    // being paired with feature truth from the replacement process.
+    assert_eq!(first_snapshot.view.agent_instance_id, "inst-a");
+    assert!(first_snapshot.supports(RunnerFeature::FileRead));
+    assert!(!first_snapshot.supports(RunnerFeature::FileWrite));
+    assert!(first_snapshot.supports(RunnerFeature::ComputerObserve));
+    assert!(!first_snapshot.supports(RunnerFeature::ComputerTextInput));
+}
+
+#[tokio::test]
+async fn project_operation_enqueue_rechecks_canonical_features_after_reregistration() {
+    let registry = ShellClientRegistry::default();
+    let mut initial_capabilities = wire_capabilities_with_only(None);
+    initial_capabilities.project_path_registration = true;
+    initial_capabilities.project_lifecycle = true;
+    let mut initial = runner_registration("project-feature-fence", "inst-a", Vec::new());
+    initial.capabilities = Some(initial_capabilities);
+    registry.register(initial).await.unwrap();
+
+    // Hold the old semantic observation to model the ToolRuntime preflight, then
+    // allow the same process to re-register without these non-sticky features.
+    let stale_preflight = registry
+        .get_client_semantic_view("project-feature-fence")
+        .await
+        .unwrap();
+    assert!(stale_preflight.supports(RunnerFeature::ProjectPathRegistration));
+    assert!(stale_preflight.supports(RunnerFeature::ProjectLifecycle));
+
+    let mut downgraded = runner_registration("project-feature-fence", "inst-a", Vec::new());
+    downgraded.capabilities = Some(wire_capabilities_with_only(None));
+    registry.register(downgraded).await.unwrap();
+
+    let path_error = registry
+        .enqueue_project_op(
+            "project-feature-fence".to_string(),
+            "resolve_or_register_project",
+            "{}".to_string(),
+            "test".to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        path_error.contains("project_path_registration"),
+        "{path_error}"
+    );
+
+    let lifecycle_error = registry
+        .enqueue_project_op(
+            "project-feature-fence".to_string(),
+            "project_lifecycle_disable",
+            "{}".to_string(),
+            "test".to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        lifecycle_error.contains("project_lifecycle"),
+        "{lifecycle_error}"
+    );
+}
+
 async fn register_structured_delete_state(
     registry: &ShellClientRegistry,
     client_id: &str,
