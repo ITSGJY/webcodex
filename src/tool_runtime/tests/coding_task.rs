@@ -1880,6 +1880,22 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
         true,
         json!({"exit_code": 0}),
     );
+    // Push the resolved validation pair beyond the default 20-event handoff
+    // display window. Canonical closeout evidence must still retain the raw
+    // failure and its later same-identity resolution.
+    for index in 0..12 {
+        record_coding_task_tool_event(
+            &fixture.runtime,
+            &fixture.session_id,
+            "read_file",
+            json!({
+                "project": fixture.project.clone(),
+                "path": format!("src/display-padding-{index}.rs")
+            }),
+            true,
+            json!({}),
+        );
+    }
 
     let result = finish_coding_task_summary_only_with_agent(
         &fixture.runtime,
@@ -1892,10 +1908,18 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     let full = finish_coding_task_with_agent(
         &fixture.runtime,
         fixture.client_id,
-        fixture.project,
-        fixture.session_id,
-        fixture.auth,
+        fixture.project.clone(),
+        fixture.session_id.clone(),
+        fixture.auth.clone(),
         false,
+    )
+    .await;
+    let handoff = session_handoff_summary_only_with_agent(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project.clone(),
+        fixture.session_id.clone(),
+        fixture.auth.clone(),
     )
     .await;
 
@@ -1913,7 +1937,17 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     );
     assert_eq!(result.output["validation"]["status"], "passed");
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(full.output["validation"]["status"], "mixed");
+    assert_eq!(full.output["validation"]["status"], "passed");
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["validation"]["status"], "passed");
+    assert_eq!(
+        handoff.output["validation"]["resolved_failures"]["count"],
+        result.output["validation"]["resolved_failure_count"]
+    );
+    assert_eq!(
+        handoff.output["validation"]["unresolved_failures"]["count"],
+        result.output["validation"]["unresolved_failure_count"]
+    );
     assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
     assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
     assert_eq!(result.output["task_outcome"]["status"], "pass");
@@ -1932,6 +1966,27 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
         "review unexpected failed tool calls before proceeding",
     );
     assert_eq!(full.output["task_outcome"], result.output["task_outcome"]);
+    for key in [
+        "expected_count",
+        "unexpected_count",
+        "historical_non_actionable_count",
+        "actionable_unexpected_count",
+        "expectation_mismatch_count",
+        "unexpected_success_count",
+    ] {
+        assert_eq!(
+            handoff.output["tool_failures"][key], result.output["tool_failures"][key],
+            "tool failure parity for {key}"
+        );
+    }
+    assert_eq!(
+        handoff.output["task_outcome"],
+        result.output["task_outcome"]
+    );
+    assert_eq!(
+        handoff.output["evidence_integrity"],
+        result.output["evidence_integrity"]
+    );
     assert!(full.output["advisories"].is_array());
     assert!(full.output["evidence_history"].is_object());
     assert!(full.output["informational_notes"].is_array());
@@ -1947,6 +2002,146 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     );
     assert_finish_uses_canonical_outcomes(&result.output);
     assert_finish_uses_canonical_outcomes(&full.output);
+}
+
+#[tokio::test]
+async fn handoff_display_limit_does_not_change_canonical_started_shell_failure_closeout() {
+    let fixture = finish_summary_fixture("coding-handoff-display-limit-started-shell").await;
+
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "run_shell",
+        json!({
+            "project": fixture.project.clone(),
+            "command": "false",
+            "purpose": "operation"
+        }),
+        false,
+        json!({
+            "failure_kind": "process_exit",
+            "exit_code": 1,
+            "state_changed": false,
+            "command_started": true,
+            "command_completed": true,
+            "execution_state": "completed"
+        }),
+    );
+    for index in 0..12 {
+        record_coding_task_tool_event(
+            &fixture.runtime,
+            &fixture.session_id,
+            "read_file",
+            json!({
+                "project": fixture.project.clone(),
+                "path": format!("src/benign-padding-{index}.rs")
+            }),
+            true,
+            json!({}),
+        );
+    }
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_check",
+        json!({"project": fixture.project.clone()}),
+        true,
+        json!({"exit_code": 0}),
+    );
+
+    let handoff_default = session_handoff_summary_only_with_agent_limit(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project.clone(),
+        fixture.session_id.clone(),
+        fixture.auth.clone(),
+        None,
+    )
+    .await;
+    let handoff_narrow = session_handoff_summary_only_with_agent_limit(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project.clone(),
+        fixture.session_id.clone(),
+        fixture.auth.clone(),
+        Some(1),
+    )
+    .await;
+    let handoff_wide = session_handoff_summary_only_with_agent_limit(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project.clone(),
+        fixture.session_id.clone(),
+        fixture.auth.clone(),
+        Some(100),
+    )
+    .await;
+    let finish = finish_coding_task_summary_only_with_agent(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project,
+        fixture.session_id,
+        fixture.auth,
+    )
+    .await;
+
+    assert!(finish.success, "{:?}", finish.error);
+    for handoff in [&handoff_default, &handoff_narrow, &handoff_wide] {
+        assert!(handoff.success, "{:?}", handoff.error);
+        for key in [
+            "expected_count",
+            "unexpected_count",
+            "historical_non_actionable_count",
+            "actionable_unexpected_count",
+            "expectation_mismatch_count",
+            "unexpected_success_count",
+        ] {
+            assert_eq!(
+                handoff.output["tool_failures"][key], finish.output["tool_failures"][key],
+                "canonical tool-failure count changed for {key}: {}",
+                handoff.output
+            );
+        }
+        assert_eq!(
+            handoff.output["validation"]["status"], finish.output["validation"]["status"],
+            "canonical validation status changed with handoff display limit"
+        );
+        assert_eq!(
+            handoff.output["task_outcome"], finish.output["task_outcome"],
+            "canonical task_outcome changed with handoff display limit"
+        );
+        assert_eq!(
+            handoff.output["evidence_integrity"], finish.output["evidence_integrity"],
+            "canonical evidence_integrity changed with handoff display limit"
+        );
+    }
+
+    assert_eq!(finish.output["tool_failures"]["unexpected_count"], 1);
+    assert_eq!(
+        finish.output["tool_failures"]["historical_non_actionable_count"],
+        0
+    );
+    assert_eq!(
+        finish.output["tool_failures"]["actionable_unexpected_count"],
+        1
+    );
+    assert_eq!(finish.output["validation"]["status"], "passed");
+    assert_eq!(finish.output["task_outcome"]["status"], "fail");
+    assert_eq!(finish.output["task_outcome"]["blocking"], true);
+    assert_eq!(finish.output["evidence_integrity"]["status"], "clean");
+    assert_reason_list_contains(
+        &finish.output["task_outcome"],
+        "blocking_reasons",
+        "unexpected_tool_failures",
+    );
+    assert_eq!(
+        handoff_default.output["verdict"],
+        handoff_narrow.output["verdict"]
+    );
+    assert_eq!(
+        handoff_default.output["verdict"],
+        handoff_wide.output["verdict"]
+    );
 }
 
 #[tokio::test]
@@ -3230,6 +3425,56 @@ async fn finish_coding_task_with_agent(
     });
     service_agent_task_until_finished(runtime, client_id, &task, "finish_coding_task summary_only")
         .await;
+    task.await.unwrap()
+}
+
+async fn session_handoff_summary_only_with_agent(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: String,
+    session_id: String,
+    auth: AuthContext,
+) -> ToolResult {
+    session_handoff_summary_only_with_agent_limit(
+        runtime, client_id, project, session_id, auth, None,
+    )
+    .await
+}
+
+async fn session_handoff_summary_only_with_agent_limit(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: String,
+    session_id: String,
+    auth: AuthContext,
+    limit: Option<usize>,
+) -> ToolResult {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::SessionHandoffSummary {
+                        session_id,
+                        project: Some(project),
+                        include_workspace: Some(true),
+                        include_checkpoints: Some(false),
+                        include_validation: Some(true),
+                        summary_only: true,
+                        limit,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    service_agent_task_until_finished(
+        runtime,
+        client_id,
+        &task,
+        "session_handoff_summary summary_only",
+    )
+    .await;
     task.await.unwrap()
 }
 
