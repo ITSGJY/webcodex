@@ -4,8 +4,7 @@ use super::sessions::{
 };
 use super::tool_audit::{session_log_arguments_for_tool_request, session_log_result_for_tool};
 use super::{
-    session_context, session_guard_denied_result, tool_disabled_result_from_definition, ToolCall,
-    ToolResult, ToolRuntime, ALLOW_CROSS_PROJECT_SESSION_FIELD,
+    session_context, tool_disabled_result_from_definition, ToolCall, ToolResult, ToolRuntime,
 };
 use crate::auth::scopes::OAuthToolScopePolicy;
 use crate::auth::AuthContext;
@@ -184,13 +183,12 @@ impl ToolRuntime {
         context: ToolCallContext<'_>,
         context_continuity_capable: bool,
     ) -> ToolCallOutcome {
-        let recorder_metadata = ToolCallRecorderMetadata::from_arguments_with_context_continuity(
-            &request.arguments,
-            context_continuity_capable,
-        );
+        let mut recorder_metadata =
+            ToolCallRecorderMetadata::from_arguments_with_context_continuity(
+                &request.arguments,
+                context_continuity_capable,
+            );
         let concrete_arguments = strip_tool_call_expectation_metadata(request.arguments.clone());
-        let allow_cross_project_session =
-            extract_bool_arg(&concrete_arguments, ALLOW_CROSS_PROJECT_SESSION_FIELD);
         // A wrapper recording_session_id is authority-bearing internal context,
         // not a ledger address. Authorize it before any lifecycle/guard lookup,
         // project mismatch computation, provenance derivation, or ledger write.
@@ -214,6 +212,14 @@ impl ToolRuntime {
             }
         }
         let recorder_ack_requested = !recorder_metadata.ack_session_message_ids.is_empty();
+        if let Some(recorder_session_id) = context.session_id {
+            recorder_metadata.recording_session_id = Some(recorder_session_id.to_string());
+            recorder_metadata.recording_session_project = self
+                .sessions
+                .session_project(recorder_session_id)
+                .expect("authorized recording Session must exist");
+            recorder_metadata.recording_session_authorized = true;
+        }
         let session_message_resolution = (context.transport == ToolTransport::Mcp)
             .then(|| recorder_metadata.session_message_resolution.clone())
             .flatten();
@@ -255,7 +261,7 @@ impl ToolRuntime {
                 // Both ends of a cross-Session collaboration relationship must
                 // be independently authorized before comparing scope. This makes
                 // None/None safe while rejecting either mixed scoped/unscoped
-                // direction and never consulting allow_cross_project_session.
+                // direction without any cross-project escape.
                 if let Err(result) = self
                     .authorize_session_target(target_session_id, &request.tool_name, context.auth)
                     .await
@@ -277,7 +283,7 @@ impl ToolRuntime {
                     .session_project(target_session_id)
                     .expect("authorized collaboration target Session must exist");
                 if recorder_project != target_project {
-                    let result = session_context::session_project_mismatch_no_escape_result(
+                    let result = session_context::session_project_mismatch_result(
                         target_session_id,
                         &request.tool_name,
                         &session_context::SessionProjectMismatch {
@@ -297,7 +303,7 @@ impl ToolRuntime {
                 }
             }
         }
-        let mut recording_session_project_mismatch = match context.session_id {
+        let recording_session_project_mismatch = match context.session_id {
             Some(session_id) => {
                 self.recording_session_project_mismatch(
                     session_id,
@@ -313,66 +319,59 @@ impl ToolRuntime {
             context.session_id,
             recording_session_project_mismatch.as_ref(),
         ) {
-            if !allow_cross_project_session
-                && session_context::session_project_mismatch_requires_escape(&request.tool_name)
-            {
-                let session_event = self.sessions.record_tool_call_started_with_metadata(
-                    Some(session_id),
-                    context.transport.into(),
-                    &request.tool_name,
-                    &session_log_arguments_for_tool_request(
-                        &request.tool_name,
-                        &concrete_arguments,
-                    ),
-                    Some(mismatch.request_project.clone()),
-                    recorder_metadata.clone(),
-                );
-                let mut result = session_context::session_project_mismatch_result(
-                    session_id,
-                    &request.tool_name,
-                    mismatch,
-                );
-                super::dispatch::decorate_structured_execution_prestart_denial(
-                    &request.tool_name,
-                    &mut result,
-                    session_context::SESSION_PROJECT_MISMATCH_KIND,
-                );
-                let recording = self.sessions.record_model_facing_tool_call_finished(
-                    session_event,
-                    false,
-                    &result.output,
-                    result.error.as_deref(),
-                    Some(session_context::SESSION_PROJECT_MISMATCH_KIND),
-                );
-                super::add_session_telemetry_hint(
-                    &mut result,
-                    &self.sessions,
-                    session_id,
-                    recording.as_ref().map(|recorded| recorded.event_id.clone()),
-                );
-                if let Some(recorded) = recording.as_ref() {
-                    if session_context::add_session_context_continuity(&mut result, recorded) {
-                        self.add_session_history_recovery(&mut result, recorded, context.auth)
-                            .await;
-                    }
+            let session_event = self.sessions.record_tool_call_started_with_metadata(
+                Some(session_id),
+                context.transport.into(),
+                &request.tool_name,
+                &session_log_arguments_for_tool_request(&request.tool_name, &concrete_arguments),
+                Some(mismatch.request_project.clone()),
+                recorder_metadata.clone(),
+            );
+            let mut result = session_context::session_project_mismatch_result(
+                session_id,
+                &request.tool_name,
+                mismatch,
+            );
+            super::dispatch::decorate_structured_execution_prestart_denial(
+                &request.tool_name,
+                &mut result,
+                session_context::SESSION_PROJECT_MISMATCH_KIND,
+            );
+            let recording = self.sessions.record_model_facing_tool_call_finished(
+                session_event,
+                false,
+                &result.output,
+                result.error.as_deref(),
+                Some(session_context::SESSION_PROJECT_MISMATCH_KIND),
+            );
+            super::add_session_telemetry_hint(
+                &mut result,
+                &self.sessions,
+                session_id,
+                recording.as_ref().map(|recorded| recorded.event_id.clone()),
+            );
+            if let Some(recorded) = recording.as_ref() {
+                if session_context::add_session_context_continuity(&mut result, recorded) {
+                    self.add_session_history_recovery(&mut result, recorded, context.auth)
+                        .await;
                 }
-                session_context::add_session_attention_projection(
-                    &mut result,
-                    &self.sessions,
-                    session_id,
-                    outer_ack_observation
-                        .as_ref()
-                        .expect("authorized outer recorder must have ACK observation"),
-                    recorder_ack_requested,
-                );
-                return ToolCallOutcome {
-                    success: false,
-                    result: Some(result),
-                    error_status: None,
-                    project: None,
-                    model_ergonomics: None,
-                };
             }
+            session_context::add_session_attention_projection(
+                &mut result,
+                &self.sessions,
+                session_id,
+                outer_ack_observation
+                    .as_ref()
+                    .expect("authorized outer recorder must have ACK observation"),
+                recorder_ack_requested,
+            );
+            return ToolCallOutcome {
+                success: false,
+                result: Some(result),
+                error_status: None,
+                project: None,
+                model_ergonomics: None,
+            };
         }
         if let Some(mut result) = tool_disabled_result_from_definition(&request.tool_name) {
             super::dispatch::decorate_structured_execution_prestart_denial(
@@ -429,131 +428,11 @@ impl ToolRuntime {
                 model_ergonomics: None,
             };
         }
-        if let Some(session_id) = context.session_id {
-            // Lifecycle denial wins before mode/guards: Closed is orthogonal to
-            // read_only and must not be confused with session_guard_denied.
-            if let Some(denial) = self
-                .sessions
-                .lifecycle_denial(session_id, &request.tool_name)
-            {
-                let session_event = self.sessions.record_tool_call_started_with_metadata(
-                    Some(session_id),
-                    context.transport.into(),
-                    &request.tool_name,
-                    &session_log_arguments_for_tool_request(
-                        &request.tool_name,
-                        &concrete_arguments,
-                    ),
-                    None,
-                    recorder_metadata.clone(),
-                );
-                let mut result = session_context::session_lifecycle_denied_result(
-                    session_id,
-                    &request.tool_name,
-                    denial,
-                );
-                super::dispatch::decorate_structured_execution_prestart_denial(
-                    &request.tool_name,
-                    &mut result,
-                    "session_lifecycle_denied",
-                );
-                let error_kind = result
-                    .output
-                    .get("error_kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("session_closed");
-                let recording = self.sessions.record_model_facing_tool_call_finished(
-                    session_event,
-                    false,
-                    &result.output,
-                    result.error.as_deref(),
-                    Some(error_kind),
-                );
-                super::add_session_telemetry_hint(
-                    &mut result,
-                    &self.sessions,
-                    session_id,
-                    recording.as_ref().map(|recorded| recorded.event_id.clone()),
-                );
-                if let Some(recorded) = recording.as_ref() {
-                    if session_context::add_session_context_continuity(&mut result, recorded) {
-                        self.add_session_history_recovery(&mut result, recorded, context.auth)
-                            .await;
-                    }
-                }
-                session_context::add_session_attention_projection(
-                    &mut result,
-                    &self.sessions,
-                    session_id,
-                    outer_ack_observation
-                        .as_ref()
-                        .expect("authorized outer recorder must have ACK observation"),
-                    recorder_ack_requested,
-                );
-                return ToolCallOutcome {
-                    success: false,
-                    result: Some(result),
-                    error_status: None,
-                    project: None,
-                    model_ergonomics: None,
-                };
-            }
-            if let Some(denial) = self.sessions.guard_denial(session_id, &request.tool_name) {
-                let session_event = self.sessions.record_tool_call_started_with_metadata(
-                    Some(session_id),
-                    context.transport.into(),
-                    &request.tool_name,
-                    &session_log_arguments_for_tool_request(
-                        &request.tool_name,
-                        &concrete_arguments,
-                    ),
-                    None,
-                    recorder_metadata.clone(),
-                );
-                let mut result =
-                    session_guard_denied_result(session_id, &request.tool_name, denial);
-                super::dispatch::decorate_structured_execution_prestart_denial(
-                    &request.tool_name,
-                    &mut result,
-                    "session_guard_denied",
-                );
-                let recording = self.sessions.record_model_facing_tool_call_finished(
-                    session_event,
-                    false,
-                    &result.output,
-                    result.error.as_deref(),
-                    Some("session_guard_denied"),
-                );
-                super::add_session_telemetry_hint(
-                    &mut result,
-                    &self.sessions,
-                    session_id,
-                    recording.as_ref().map(|recorded| recorded.event_id.clone()),
-                );
-                if let Some(recorded) = recording.as_ref() {
-                    if session_context::add_session_context_continuity(&mut result, recorded) {
-                        self.add_session_history_recovery(&mut result, recorded, context.auth)
-                            .await;
-                    }
-                }
-                session_context::add_session_attention_projection(
-                    &mut result,
-                    &self.sessions,
-                    session_id,
-                    outer_ack_observation
-                        .as_ref()
-                        .expect("authorized outer recorder must have ACK observation"),
-                    recorder_ack_requested,
-                );
-                return ToolCallOutcome {
-                    success: false,
-                    result: Some(result),
-                    error_status: None,
-                    project: None,
-                    model_ergonomics: None,
-                };
-            }
-        }
+        // The outer recording Session is provenance/context only. Its lifecycle,
+        // mode, and guards never become business execution policy. In particular,
+        // closed recorders remain valid evidence sinks (the Session store supports
+        // append-only recorder events on cold closed records). Concrete business
+        // Session lifecycle/guards are enforced later from ToolCall::session_id().
 
         if !context.record_oauth_scope_denials {
             if let Err(error_status) = check_runtime_tool_scope(context.auth, &request.tool_name) {
@@ -603,26 +482,6 @@ impl ToolRuntime {
             }
         }
 
-        // `work_on_project` can resolve its canonical project only after a
-        // Runner path registration/lookup. Preserve enough source information
-        // to reconcile an outer recording Session once dispatch returns that
-        // resolved project id; explicit `project` inputs are already handled by
-        // `recording_session_project_mismatch` above.
-        let late_work_on_project_path_mismatch = request.tool_name == "work_on_project"
-            && concrete_arguments.as_object().is_some_and(|arguments| {
-                arguments
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| !path.trim().is_empty())
-                    && arguments
-                        .get("client_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|client_id| !client_id.trim().is_empty())
-                    && !arguments
-                        .get("project")
-                        .and_then(Value::as_str)
-                        .is_some_and(|project| !project.trim().is_empty())
-            });
         let mut call = match ToolCall::from_tool_name(&request.tool_name, concrete_arguments) {
             Ok(call) => call,
             Err(message) => {
@@ -728,20 +587,16 @@ impl ToolRuntime {
         // Permission is evaluated once inside dispatch (pre-exec gate). Kernel
         // only reuses the attached decision for the outer recording session —
         // never re-evaluate (no second request id / inconsistent outcome).
-        let inherited_sandbox = context
-            .session_id
-            .and_then(|session_id| self.sessions.session_mode(session_id))
-            .filter(|mode| matches!(mode, crate::tool_runtime::SessionMode::Inspect))
-            .map(|_| crate::command_sandbox::INSPECT_SANDBOX_MODE);
+        // Do not derive an execution sandbox from the outer recorder. Dispatch
+        // derives inspect sandboxing and execution defaults exclusively from an
+        // explicit concrete business Session id.
         let mut result = self
             .dispatch_with_auth_transport_options_and_metadata_with_sandbox_recording_mode(
                 call,
                 context.auth,
                 context.transport.into(),
-                context.session_id.is_none(),
-                allow_cross_project_session,
                 recorder_metadata.clone(),
-                inherited_sandbox,
+                None,
                 context.window,
                 context.session_id.is_none(),
             )
@@ -752,44 +607,6 @@ impl ToolRuntime {
             {
                 self.sessions.record_permission_decision(start, permission);
             }
-        }
-        if recording_session_project_mismatch.is_none() && late_work_on_project_path_mismatch {
-            if let Some(recording_session_id) = context.session_id {
-                let session_project = self
-                    .sessions
-                    .session_project(recording_session_id)
-                    .flatten();
-                let request_project = result
-                    .output
-                    .get("resolved_project")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        result
-                            .output
-                            .pointer("/project_resolution/resolved_project")
-                            .and_then(Value::as_str)
-                    })
-                    .map(str::trim)
-                    .filter(|project| !project.is_empty());
-                if let (Some(session_project), Some(request_project)) =
-                    (session_project, request_project)
-                {
-                    if session_project != request_project {
-                        recording_session_project_mismatch =
-                            Some(session_context::SessionProjectMismatch {
-                                session_project,
-                                request_project: request_project.to_string(),
-                            });
-                    }
-                }
-            }
-        }
-        if let Some(mismatch) = recording_session_project_mismatch.as_ref() {
-            session_context::add_session_project_mismatch_warning(
-                &mut result,
-                mismatch,
-                allow_cross_project_session,
-            );
         }
         let session_log_result = session_log_result_for_tool(&request.tool_name, &result.output);
         let outer_recording = self.sessions.record_model_facing_tool_call_finished(
@@ -922,14 +739,6 @@ fn collaboration_target_session_id<'a>(tool_name: &str, arguments: &'a Value) ->
         .filter(|session_id| !session_id.is_empty())
 }
 
-fn extract_bool_arg(arguments: &Value, key: &str) -> bool {
-    arguments
-        .as_object()
-        .and_then(|obj| obj.get(key))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn tool_project(call: &ToolCall) -> Option<String> {
     call.project().map(str::to_string)
 }
@@ -1026,47 +835,6 @@ mod tests {
         let finished = &summary.events[1];
         assert_eq!(finished.transport, "mcp");
         assert_eq!(finished.error_kind.as_deref(), Some("invalid_arguments"));
-    }
-
-    #[tokio::test]
-    async fn tool_kernel_guard_denial_sanitizes_edit_content() {
-        let runtime = test_runtime();
-        let session = runtime.sessions.start_session_with_guards(
-            None,
-            Some("readonly".to_string()),
-            crate::tool_runtime::SessionMode::ReadOnly,
-            crate::tool_runtime::sessions::SessionGuards::default(),
-        );
-        let outcome = runtime
-            .call_tool_with_context(
-                ToolCallRequest {
-                    tool_name: "write_project_file".to_string(),
-                    arguments: json!({
-                        "project": "demo",
-                        "path": "README.md",
-                        "content": "secret-content"
-                    }),
-                },
-                ToolCallContext {
-                    transport: ToolTransport::Api,
-                    session_id: Some(&session.session_id),
-                    auth: None,
-                    window: None,
-                    record_oauth_scope_denials: true,
-                    host_file_import_trust:
-                        crate::tool_runtime::kernel::HostFileImportTrust::Untrusted,
-                },
-            )
-            .await;
-
-        assert!(!outcome.success);
-        let summary = runtime
-            .sessions
-            .summary(&session.session_id, Some(10))
-            .unwrap();
-        let serialized = serde_json::to_string(&summary.events).unwrap();
-        assert!(serialized.contains("\"content_present\":true"));
-        assert!(!serialized.contains("secret-content"));
     }
 
     #[tokio::test]
