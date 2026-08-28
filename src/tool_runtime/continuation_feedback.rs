@@ -32,9 +32,12 @@ use std::collections::BTreeSet;
 
 use super::handoff::closeout_work_projection;
 use super::sessions::{
+    canonical_tool_call_finished_events, SessionDiscussionSummary, SessionEvent, SessionMessage,
+    SessionSummary,
+};
+use super::sessions::{
     exploration_tool_kind, normalize_observed_project_path, ExplorationToolKind,
 };
-use super::sessions::{SessionDiscussionSummary, SessionEvent, SessionMessage, SessionSummary};
 use super::tool_definition::{
     runtime_tool_captures_validation_output, runtime_tool_is_git_like, runtime_tool_is_shell_like,
     runtime_tool_is_write_like,
@@ -330,10 +333,28 @@ impl ContinuationFeedback {
         // Attempt events start *after* the boundary task_instruction event.
         let attempt_start = boundary.event_index.map(|index| index + 1).unwrap_or(0);
         let attempt_events = &events[attempt_start..];
+        // Canonicalize finished evidence against the whole retained Session,
+        // not only the post-boundary slice. A concurrent request may publish its
+        // business finish just before a new task_instruction and its outer
+        // recorder finish just after it; treating the slice in isolation would
+        // recount that prior logical invocation in the new attempt.
+        let canonical_finished_ids = canonical_tool_call_finished_events(events)
+            .into_iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let semantic_attempt_events = attempt_events
+            .iter()
+            .filter(|event| {
+                event.kind != "tool_call_finished"
+                    || canonical_finished_ids.contains(event.event_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let boundary_event = boundary.event_index.map(|index| &events[index]);
 
         let attempt = build_attempt_summary(
             attempt_events,
+            &semantic_attempt_events,
             boundary_event,
             boundary.event_index,
             boundary.source,
@@ -505,6 +526,7 @@ fn resolve_attempt_boundary(
 #[allow(clippy::too_many_arguments)]
 fn build_attempt_summary(
     attempt_events: &[SessionEvent],
+    semantic_attempt_events: &[SessionEvent],
     boundary_event: Option<&SessionEvent>,
     boundary_event_index: Option<usize>,
     boundary_source: &'static str,
@@ -546,9 +568,11 @@ fn build_attempt_summary(
     };
 
     // --- activity (meaningful tool calls only) ---
-    let meaningful: Vec<&SessionEvent> = attempt_events
+    let canonical_finished = canonical_tool_call_finished_events(semantic_attempt_events);
+    let meaningful: Vec<&SessionEvent> = canonical_finished
         .iter()
-        .filter(|event| event.kind == "tool_call_finished" && is_meaningful_tool(&event.tool_name))
+        .copied()
+        .filter(|event| is_meaningful_tool(&event.tool_name))
         .collect();
     let successful_tool_calls = meaningful
         .iter()
@@ -560,15 +584,14 @@ fn build_attempt_summary(
         .count();
     // expected failures = finished tool calls flagged as expected-failure that
     // matched (the ledger's `failure_expectation_result == matched_expected_failure`).
-    let expected_failures = attempt_events
+    let expected_failures = canonical_finished
         .iter()
         .filter(|event| {
-            event.kind == "tool_call_finished"
-                && event
-                    .failure_expectation_result
-                    .as_deref()
-                    .unwrap_or("none")
-                    == "matched_expected_failure"
+            event
+                .failure_expectation_result
+                .as_deref()
+                .unwrap_or("none")
+                == "matched_expected_failure"
         })
         .count();
     // The session-wide resolved/unresolved counts span every prior attempt,
@@ -579,11 +602,11 @@ fn build_attempt_summary(
     // otherwise. The session-wide `validation` is still used for the validation
     // block's latest verdict and for the cross-attempt delta.
     let attempt_validation =
-        super::validation_events::validation_summary_from_events(attempt_events, 20);
+        super::validation_events::validation_summary_from_events(semantic_attempt_events, 20);
     let (resolved_failures, unresolved_failures) = validation_failure_counts(&attempt_validation);
 
     // --- changes (deduped, deterministic order via closeout_work_projection) ---
-    let (_, changed_paths_value) = closeout_work_projection(attempt_events);
+    let (_, changed_paths_value) = closeout_work_projection(semantic_attempt_events);
     let mut changed_paths: Vec<String> = changed_paths_value
         .as_array()
         .map(|values| {
@@ -597,7 +620,7 @@ fn build_attempt_summary(
     let total_changed_paths = changed_paths.len();
     let truncated = total_changed_paths > MAX_CHANGED_PATHS;
     changed_paths.truncate(MAX_CHANGED_PATHS);
-    let exploration = build_attempt_exploration(attempt_events, complete);
+    let exploration = build_attempt_exploration(semantic_attempt_events, complete);
 
     // --- validation (current attempt verdict, history must not pollute) ---
     let delta = validation_delta(validation);
@@ -675,9 +698,11 @@ fn build_attempt_exploration(
     let mut seen = BTreeSet::new();
     let mut observed_paths = Vec::new();
 
-    for event in attempt_events.iter().rev().filter(|event| {
-        event.kind == "tool_call_finished" && event.status.as_deref() == Some("succeeded")
-    }) {
+    for event in canonical_tool_call_finished_events(attempt_events)
+        .into_iter()
+        .rev()
+        .filter(|event| event.status.as_deref() == Some("succeeded"))
+    {
         let Some(kind) = exploration_tool_kind(&event.tool_name) else {
             continue;
         };

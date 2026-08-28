@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use super::session_context::{
     session_project_mismatch_result, unknown_session_result, SessionProjectMismatch,
 };
-use super::sessions::{SessionEvent, SessionSummary};
+use super::sessions::{canonical_tool_call_finished_events, SessionEvent, SessionSummary};
 use super::tool_audit::{
     is_structured_validation_target_identity, is_validation_execution_identity,
     structured_validation_target_identity,
@@ -243,12 +243,10 @@ impl ToolRuntime {
         let Some(project) = summary.project.as_deref() else {
             return;
         };
-        let accepted = summary
-            .events
-            .iter()
+        let accepted = canonical_tool_call_finished_events(&summary.events)
+            .into_iter()
             .filter(|event| {
-                event.kind == "tool_call_finished"
-                    && event.tool_name == "run_job"
+                event.tool_name == "run_job"
                     && event.job_id.is_some()
                     && execution_purpose(event).is_some()
                     && job_acceptance_only(event)
@@ -806,6 +804,10 @@ pub(crate) fn extract_validation_events(events: &[SessionEvent]) -> Vec<Validati
     let mut started = Vec::new();
     let mut validation_events = Vec::new();
     let mut terminal_jobs = std::collections::HashSet::new();
+    let canonical_finished_ids = canonical_tool_call_finished_events(events)
+        .into_iter()
+        .map(|event| event.event_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
 
     for event in events {
         match event.kind.as_str() {
@@ -813,6 +815,9 @@ pub(crate) fn extract_validation_events(events: &[SessionEvent]) -> Vec<Validati
                 started.push(event.clone());
             }
             "tool_call_finished" => {
+                if !canonical_finished_ids.contains(event.event_id.as_str()) {
+                    continue;
+                }
                 // A `run_job` acceptance or a promoted structured validation
                 // handoff (still queued/running) is not a terminal validation
                 // outcome. The Job's terminal status feeds the summary
@@ -1284,11 +1289,24 @@ fn matching_start(
     started: &mut Vec<SessionEvent>,
     finished: &SessionEvent,
 ) -> Option<SessionEvent> {
-    let pos = started.iter().position(|event| {
-        event.session_id == finished.session_id
-            && event.tool_name == finished.tool_name
-            && event.started_at == finished.started_at
-    })?;
+    let pos = if let Some(call_id) = finished.call_id.as_deref() {
+        // call_id is the exact pair-level correlation. In particular, a
+        // same-Session logical invocation has recorder and business starts with
+        // the same tool/timestamp but distinct call ids; falling back in that
+        // case could attach recorder input to the canonical business finish.
+        started
+            .iter()
+            .position(|event| event.call_id.as_deref() == Some(call_id))?
+    } else {
+        // Legacy ledger rows predate call_id. Preserve their conservative
+        // historical matcher without inventing correlation.
+        started.iter().position(|event| {
+            event.call_id.is_none()
+                && event.session_id == finished.session_id
+                && event.tool_name == finished.tool_name
+                && event.started_at == finished.started_at
+        })?
+    };
     Some(started.remove(pos))
 }
 
