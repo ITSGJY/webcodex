@@ -64,6 +64,7 @@ impl ToolRuntime {
         requested: &[String],
         resolved_project: Option<&ResolvedProject>,
         auth: Option<&AuthContext>,
+        memory_runtime_capable: bool,
     ) {
         if requested.is_empty() {
             return;
@@ -112,6 +113,20 @@ impl ToolRuntime {
                             Err(reason_code) => unavailable(key, reason_code),
                         }
                     }
+                    None => unavailable(key, "project_target_unavailable"),
+                },
+                "memory.bootstrap" if !memory_runtime_capable => {
+                    unavailable(key, "memory_runtime_capability_unavailable")
+                }
+                "memory.bootstrap" => match resolved_project {
+                    Some(project) => match self.memory_bootstrap_context_projection(project) {
+                        Ok(projection) => json!({
+                            "key": key,
+                            "status": "available",
+                            "projection": projection,
+                        }),
+                        Err(reason_code) => unavailable(key, reason_code),
+                    },
                     None => unavailable(key, "project_target_unavailable"),
                 },
                 "webcodex.workflow" => json!({
