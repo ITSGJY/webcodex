@@ -160,10 +160,8 @@ pub(crate) enum RouteId {
     ProjectsGitDiffSummary,
     ProjectsListFiles,
     ProjectsSearchText,
-    ProjectsApplyPatch,
-    ProjectsValidatePatch,
+    ProjectsApplyUnifiedDiff,
     ProjectsRunShell,
-    ProjectsApplyPatchChecked,
     ProjectsDeleteFiles,
     ProjectsGitRestorePaths,
     ProjectsDiscardUntracked,
@@ -439,7 +437,7 @@ mod tests {
             AdminWebStylesCss as usize + 1,
             "canonical iteration must cover every RouteId exactly once",
         );
-        assert_eq!(iter_routes().count(), 127, "R2 canonical route closure");
+        assert_eq!(iter_routes().count(), 125, "R2 canonical route closure");
         assert_eq!(lookup("GET", "/mcp").unwrap().id, McpGet);
         assert_eq!(lookup("POST", "/mcp").unwrap().id, McpPost);
     }
@@ -477,7 +475,7 @@ mod tests {
             );
             references += 1;
         }
-        assert_eq!(references, 127, "R2 production leaf RouteId closure");
+        assert_eq!(references, 125, "R2 production leaf RouteId closure");
     }
 
     #[test]
@@ -566,7 +564,7 @@ mod tests {
     #[test]
     fn audit_class_preserves_existing_http_stats_semantics() {
         for (path, class) in [
-            ("/api/projects/apply_patch", Edit),
+            ("/api/projects/apply_unified_diff", Edit),
             ("/api/projects/read_file", Context),
             ("/api/projects/run_job", Job),
             ("/api/tools/call", Command),

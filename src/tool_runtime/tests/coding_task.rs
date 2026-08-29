@@ -267,7 +267,7 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         .values()
         .map(|methods| methods.as_object().unwrap().len())
         .sum();
-    assert_eq!(operation_count, 25, "no dedicated OpenAPI operations added");
+    assert_eq!(operation_count, 23, "no dedicated OpenAPI operations added");
 
     let call = ToolCall::from_tool_name(
         "start_coding_task",
@@ -589,7 +589,7 @@ async fn start_coding_task_full_brief_has_no_binding_projection() {
         .as_array()
         .unwrap();
     assert!(contains_string(edit, "apply_text_edits"));
-    assert!(contains_string(edit, "apply_patch_checked"));
+    assert!(contains_string(edit, "apply_unified_diff"));
     assert!(contains_string(edit, "write_project_file"));
     assert!(!contains_string(edit, "replace_line_range"));
     assert!(!contains_string(edit, "insert_at_line"));
