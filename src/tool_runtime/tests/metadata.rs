@@ -1546,6 +1546,23 @@ fn runtime_status_input_schema_exposes_compact_flags() {
         .expect("runtime_status agents output description");
     assert!(agents_description.contains("stale_count"));
     assert!(!agents_description.contains("offline_count"));
+    let compact_schemas =
+        &output_schema["properties"]["output"]["properties"]["mcp_compact_schemas"];
+    assert_eq!(compact_schemas["type"], "boolean");
+    assert!(compact_schemas["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("omits outputSchema")));
+    let effective_config = &output_schema["properties"]["output"]["properties"]["effective_config"];
+    assert_eq!(effective_config["type"], "object");
+    assert_eq!(effective_config["additionalProperties"], false);
+    assert_eq!(
+        effective_config["properties"]["auth"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        effective_config["properties"]["tool_request_trace_mode"]["enum"],
+        json!(["off", "metadata", "full"])
+    );
 
     let openapi = crate::openapi::build_openapi_spec();
     let tool_call_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
@@ -2113,11 +2130,91 @@ async fn runtime_status_includes_build_metadata() {
         result.output["model_surface"],
         crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
     );
+    assert_eq!(
+        result.output["mcp_compact_schemas"],
+        crate::config::mcp_compact_schemas_enabled()
+    );
     let build = &result.output["build"];
     assert!(build.is_object());
     assert!(build.get("git_commit").is_some());
     assert!(build.get("git_dirty").is_some());
     assert!(build.get("built_at").is_some());
+}
+
+#[tokio::test]
+async fn runtime_status_preserves_allowlisted_effective_config_across_projections() {
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_ACTION_COMPACT_RESPONSES", "true");
+    env.set("WEBCODEX_SHARED_KEY_ENABLED", "true");
+    env.set("WEBCODEX_ALLOW_ANONYMOUS", "true");
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+
+    let runtime = runtime_with_info(RuntimeInfo {
+        auth_enabled: true,
+        configured_public_url: Some("https://runtime.example.com".to_string()),
+        oauth2_enabled: true,
+        oauth2_shared_key_bridge_enabled: true,
+        ..RuntimeInfo::default()
+    });
+    register_agent(
+        &runtime,
+        "effective-config-agent",
+        None,
+        ShellClientCapabilities::default(),
+    )
+    .await;
+
+    let full = runtime.dispatch(runtime_status_call()).await;
+    assert!(full.success, "{:?}", full.error);
+    let config = &full.output["effective_config"];
+    let config_object = config.as_object().expect("effective_config object");
+    assert_eq!(
+        config_object.len(),
+        3,
+        "effective_config must stay allowlisted"
+    );
+    assert_eq!(config["action_compact_responses"], true);
+    assert_eq!(config["tool_request_trace_mode"], "full");
+    let auth = config["auth"].as_object().expect("effective auth object");
+    assert_eq!(auth.len(), 4, "effective auth facts must stay allowlisted");
+    assert_eq!(auth["shared_key_enabled"], true);
+    assert_eq!(auth["anonymous_enabled"], true);
+    assert_eq!(auth["oauth2_enabled"], true);
+    assert_eq!(auth["oauth2_shared_key_bridge_enabled"], true);
+
+    let focused = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "runtime_status",
+                json!({"client_id": "effective-config-agent"}),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(focused.success, "{:?}", focused.error);
+    assert_eq!(focused.output["effective_config"], *config);
+    assert_eq!(focused.output["auth_enabled"], full.output["auth_enabled"]);
+    assert_eq!(
+        focused.output["configured_public_url"],
+        full.output["configured_public_url"]
+    );
+
+    for arguments in [
+        json!({"compact": true}),
+        json!({"summary_only": true}),
+        json!({"client_id": "effective-config-agent", "compact": true}),
+    ] {
+        let compact = runtime
+            .dispatch(ToolCall::from_tool_name("runtime_status", arguments).unwrap())
+            .await;
+        assert!(compact.success, "{:?}", compact.error);
+        assert_eq!(compact.output["effective_config"], *config);
+        assert_eq!(compact.output["auth_enabled"], full.output["auth_enabled"]);
+        assert_eq!(
+            compact.output["configured_public_url"],
+            full.output["configured_public_url"]
+        );
+    }
 }
 
 #[tokio::test]
@@ -2135,12 +2232,36 @@ async fn runtime_status_defaults_to_local_coding_surface() {
 
 #[tokio::test]
 async fn runtime_status_reports_canonical_connector_surface_when_configured() {
-    let runtime =
-        test_runtime().with_model_surface(crate::model_surface::ModelSurface::CanonicalConnector);
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_SHARED_KEY_ENABLED", "true");
+    env.set("WEBCODEX_ALLOW_ANONYMOUS", "true");
+    let runtime = runtime_with_info(RuntimeInfo {
+        auth_enabled: true,
+        oauth2_enabled: true,
+        oauth2_shared_key_bridge_enabled: true,
+        ..RuntimeInfo::default()
+    })
+    .with_model_surface(crate::model_surface::ModelSurface::CanonicalConnector);
     let full = runtime.dispatch(runtime_status_call()).await;
     assert_eq!(
         full.output["model_surface"],
         crate::model_surface::MODEL_SURFACE_CANONICAL_CONNECTOR
+    );
+    assert_eq!(
+        full.output["effective_config"]["auth"]["shared_key_enabled"],
+        false
+    );
+    assert_eq!(
+        full.output["effective_config"]["auth"]["anonymous_enabled"],
+        false
+    );
+    assert_eq!(
+        full.output["effective_config"]["auth"]["oauth2_enabled"],
+        true
+    );
+    assert_eq!(
+        full.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
+        true
     );
     let compact = runtime
         .dispatch(ToolCall::from_tool_name("runtime_status", json!({"compact": true})).unwrap())
@@ -2148,6 +2269,14 @@ async fn runtime_status_reports_canonical_connector_surface_when_configured() {
     assert_eq!(
         compact.output["model_surface"],
         crate::model_surface::MODEL_SURFACE_CANONICAL_CONNECTOR
+    );
+    assert_eq!(
+        compact.output["mcp_compact_schemas"],
+        crate::config::mcp_compact_schemas_enabled()
+    );
+    assert_eq!(
+        compact.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
+        true
     );
 }
 
@@ -2185,6 +2314,14 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
         assert!(result.success, "{:?}", result.error);
         let summary = &result.output;
         assert_eq!(summary["compact"], true, "arguments: {arguments}");
+        assert_eq!(
+            summary["mcp_compact_schemas"],
+            crate::config::mcp_compact_schemas_enabled(),
+            "arguments: {arguments}"
+        );
+        assert!(summary["effective_config"].is_object());
+        assert_eq!(summary["auth_enabled"], false);
+        assert!(summary["configured_public_url"].is_null());
         for pointer in [
             "/service",
             "/version",
@@ -2265,6 +2402,8 @@ async fn runtime_status_does_not_expose_tokens_or_secrets() {
     let info = RuntimeInfo {
         auth_enabled: true,
         configured_public_url: Some("https://example.com".to_string()),
+        oauth2_enabled: true,
+        oauth2_shared_key_bridge_enabled: true,
         quic: Some(Arc::new(std::sync::Mutex::new(
             crate::config::QuicServerConfig::default().runtime_status(),
         ))),
@@ -2331,6 +2470,8 @@ async fn runtime_status_quic_enabled_error_is_sanitized() {
         auth_enabled: false,
         configured_public_url: None,
         quic: Some(status),
+        oauth2_enabled: false,
+        oauth2_shared_key_bridge_enabled: false,
     });
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
@@ -2360,6 +2501,8 @@ async fn runtime_status_quic_started_reports_listen_and_alpn() {
         auth_enabled: false,
         configured_public_url: None,
         quic: Some(status),
+        oauth2_enabled: false,
+        oauth2_shared_key_bridge_enabled: false,
     });
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
@@ -2377,6 +2520,8 @@ async fn runtime_status_auth_enabled_reflects_runtime_info() {
     let runtime = runtime_with_info(RuntimeInfo {
         auth_enabled: false,
         configured_public_url: None,
+        oauth2_enabled: false,
+        oauth2_shared_key_bridge_enabled: false,
         quic: Some(Arc::new(std::sync::Mutex::new(
             crate::config::QuicServerConfig::default().runtime_status(),
         ))),
@@ -2389,6 +2534,8 @@ async fn runtime_status_auth_enabled_reflects_runtime_info() {
     let runtime = runtime_with_info(RuntimeInfo {
         auth_enabled: true,
         configured_public_url: Some("https://webcodex.example.com".to_string()),
+        oauth2_enabled: true,
+        oauth2_shared_key_bridge_enabled: true,
         quic: Some(Arc::new(std::sync::Mutex::new(
             crate::config::QuicServerConfig::default().runtime_status(),
         ))),
@@ -2403,28 +2550,12 @@ async fn runtime_status_auth_enabled_reflects_runtime_info() {
 }
 
 #[test]
-fn runtime_info_from_env_reads_webcodex_public_url() {
-    let _guard = crate::admin_cli::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = ["WEBCODEX_TOKEN", "WEBCODEX_PUBLIC_URL"]
-        .into_iter()
-        .map(|name| (name, std::env::var_os(name)))
-        .collect::<Vec<_>>();
-    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-    impl Drop for RestoreEnv {
-        fn drop(&mut self) {
-            for (name, value) in self.0.drain(..).rev() {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-    let _restore = RestoreEnv(previous);
-    std::env::set_var("WEBCODEX_TOKEN", "token");
-    std::env::set_var("WEBCODEX_PUBLIC_URL", "https://new.example.com");
+fn runtime_info_from_env_reads_effective_server_config() {
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_TOKEN", "token");
+    env.set("WEBCODEX_PUBLIC_URL", "https://new.example.com");
+    env.set("WEBCODEX_OAUTH2_ENABLED", "true");
+    env.set("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE", "true");
 
     let info = RuntimeInfo::from_env();
     assert!(info.auth_enabled);
@@ -2432,6 +2563,13 @@ fn runtime_info_from_env_reads_webcodex_public_url() {
         info.configured_public_url.as_deref(),
         Some("https://new.example.com")
     );
+    assert!(info.oauth2_enabled);
+    assert!(info.oauth2_shared_key_bridge_enabled);
+
+    env.set("WEBCODEX_OAUTH2_ENABLED", "false");
+    let info = RuntimeInfo::from_env();
+    assert!(!info.oauth2_enabled);
+    assert!(!info.oauth2_shared_key_bridge_enabled);
 }
 
 #[tokio::test]
