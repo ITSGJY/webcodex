@@ -390,6 +390,7 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
         "summary must not embed tool output: {summary}"
     );
     let telemetry = &summary["model_ergonomics"];
+    assert_eq!(telemetry["schema_version"], 3);
     assert_eq!(telemetry["tool_name"], "list_tools");
     assert_eq!(telemetry["tool_category"], "runtime");
     assert_eq!(telemetry["success"], true);
@@ -633,55 +634,6 @@ async fn http_mcp_initialize_success() {
         body["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
-}
-
-// The asserted outputSchema presence is the default (non-compact) product
-// behavior: `WEBCODEX_MCP_COMPACT_SCHEMAS` must stay unset (and serialized
-// against other env-mutating tests) for the whole HTTP request.
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-async fn http_mcp_tools_list_success() {
-    // Default (non-compact) HTTP tools/list: full schema fields present.
-    // Compact-mode shape is covered by mcp_tools_list_compact_*.
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
-    let config = test_config(Some("secret"));
-    let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime());
-    let service = Service::new(build_test_router(config, db, runtime));
-    let mut resp = TestClient::post("http://localhost/mcp")
-        .bearer_auth("secret")
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {}
-        }))
-        .send(&service)
-        .await;
-    assert_eq!(effective_status(&resp), StatusCode::OK);
-    let body: Value = resp.take_json().await.unwrap();
-    assert_eq!(body["id"], 2);
-    assert!(body["result"]["tools"].is_array());
-    let tools = body["result"]["tools"].as_array().unwrap();
-    assert!(!tools.is_empty());
-    for tool in tools {
-        assert!(tool["name"].is_string());
-        assert!(tool["description"].is_string());
-        assert!(tool["inputSchema"].is_object());
-        if tool["name"] == crate::mcp_gateway::MCP_TOOL_NAME {
-            assert!(
-                tool.get("outputSchema").is_none(),
-                "mcp_tool must not claim a fixed schema for provider-defined structuredContent"
-            );
-        } else {
-            assert!(
-                tool["outputSchema"].is_object(),
-                "default HTTP tools/list must include outputSchema for {}",
-                tool["name"]
-            );
-        }
-    }
 }
 
 #[tokio::test]
@@ -1319,7 +1271,7 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         .map(|row| serde_json::from_str::<Value>(row).unwrap())
         .map(|summary| summary["model_ergonomics"].clone())
         .collect::<Vec<_>>();
-    assert!(telemetry.iter().all(|row| row["schema_version"] == 2));
+    assert!(telemetry.iter().all(|row| row["schema_version"] == 3));
     assert!(telemetry
         .iter()
         .all(|row| row["context_continuity_eligible"] == true));

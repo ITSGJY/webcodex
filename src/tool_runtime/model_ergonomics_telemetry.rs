@@ -4,6 +4,7 @@
 //! latency and transports finalize the record from the exact model-facing
 //! `ToolResult` projection before attaching it to the existing Action Audit row.
 
+use super::edit_tool_telemetry::{edit_tool_surface, EditToolSurface};
 use super::tool_definition::model_visible_tool_definitions;
 use super::{ToolResult, RECOVERY_KIND_VALUES};
 use serde::Serialize;
@@ -64,6 +65,12 @@ pub(crate) struct ModelErgonomicsRecord {
     pub(crate) session_history_lost: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) finish_summary_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) edit_surface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) edit_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) edit_conflict_kind: Option<String>,
 }
 
 impl ModelErgonomicsTimer {
@@ -156,15 +163,24 @@ impl ModelErgonomicsCompletion {
         Some(self.record_from_parts(success, output, Some(serialized_result_bytes)))
     }
 
-    /// Record an invocation rejected after the kernel recognized a model-visible
-    /// tool but before any ToolResult existed. The byte field is intentionally
-    /// null rather than measuring a transport-specific error envelope.
+    /// Record an invocation after a model-visible tool identity exists but no
+    /// ToolResult is available. The byte field is intentionally null rather than
+    /// measuring a transport-specific error envelope.
     pub(crate) fn record_for_pre_result_failure(
         &self,
         error_kind: &'static str,
     ) -> ModelErgonomicsRecord {
         let mut record = self.record_from_parts(false, &Value::Null, None);
         record.error_kind = Some(error_kind.to_string());
+        // The MCP outer hard timeout fires after dispatch and explicitly leaves
+        // terminal tool state unknown. A canonical edit therefore cannot be
+        // projected as a definite rejection merely because no ToolResult was
+        // available to classify.
+        if error_kind == "dispatch_hard_timeout"
+            && record.edit_surface.as_deref() == Some("canonical")
+        {
+            record.edit_outcome = Some("uncertain".to_string());
+        }
         record
     }
 
@@ -184,8 +200,9 @@ impl ModelErgonomicsCompletion {
             )
         };
         let continuity = continuity_facts(self.context_ack_shape, output);
+        let edit = edit_facts(self.tool_name, success, output);
         ModelErgonomicsRecord {
-            schema_version: 2,
+            schema_version: 3,
             tool_name: self.tool_name,
             tool_category: self.tool_category,
             success,
@@ -203,8 +220,94 @@ impl ModelErgonomicsCompletion {
             session_recovery_truncated: continuity.recovery_truncated,
             session_history_lost: continuity.history_lost,
             finish_summary_only: self.finish_summary_only,
+            edit_surface: edit.surface,
+            edit_outcome: edit.outcome,
+            edit_conflict_kind: edit.conflict_kind,
         }
     }
+}
+
+#[derive(Debug)]
+struct EditFacts {
+    surface: Option<String>,
+    outcome: Option<String>,
+    conflict_kind: Option<String>,
+}
+
+fn edit_facts(tool_name: &str, success: bool, output: &Value) -> EditFacts {
+    let surface = edit_tool_surface(tool_name).map(|surface| surface.as_str().to_string());
+    let mut facts = EditFacts {
+        surface,
+        outcome: None,
+        conflict_kind: None,
+    };
+    match edit_tool_surface(tool_name) {
+        Some(EditToolSurface::Canonical) if tool_name == "apply_text_edits" => {
+            facts.conflict_kind = edit_conflict_kind(output);
+            facts.outcome = if success {
+                match (
+                    output.get("dry_run").and_then(Value::as_bool),
+                    output.get("changed").and_then(Value::as_bool),
+                    output.get("would_change").and_then(Value::as_bool),
+                ) {
+                    (Some(true), _, Some(true)) => Some("dry_run_would_change".to_string()),
+                    (Some(true), _, Some(false)) => Some("dry_run_no_change".to_string()),
+                    (Some(false), Some(true), _) => Some("applied".to_string()),
+                    (Some(false), Some(false), _) => Some("no_change".to_string()),
+                    _ => None,
+                }
+            } else if output.get("rollback_complete").and_then(Value::as_bool) == Some(false)
+                || output.get("changed").and_then(Value::as_bool) == Some(true)
+            {
+                Some("uncertain".to_string())
+            } else if facts.conflict_kind.is_some() {
+                Some("conflict".to_string())
+            } else {
+                Some("rejected".to_string())
+            };
+        }
+        Some(EditToolSurface::Canonical) if tool_name == "apply_patch_checked" => {
+            facts.outcome = if !success {
+                Some("rejected".to_string())
+            } else {
+                match output.get("applied").and_then(Value::as_bool) {
+                    Some(true) => Some("applied".to_string()),
+                    Some(false) => {
+                        let policy_blocked = output
+                            .pointer("/validate/policy_blocked")
+                            .and_then(Value::as_bool);
+                        let can_apply = output
+                            .pointer("/validate/can_apply")
+                            .and_then(Value::as_bool);
+                        match (policy_blocked, can_apply) {
+                            (Some(true), _) => Some("policy_blocked".to_string()),
+                            (_, Some(false)) => Some("not_applicable".to_string()),
+                            (_, Some(true)) => Some("apply_failed".to_string()),
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                }
+            };
+        }
+        _ => {}
+    }
+    facts
+}
+
+fn edit_conflict_kind(output: &Value) -> Option<String> {
+    let value = output
+        .pointer("/conflict_recovery/conflict_kind")
+        .and_then(Value::as_str)?;
+    matches!(
+        value,
+        "multiple_matches"
+            | "match_not_found"
+            | "occurrence_out_of_range"
+            | "overlapping_edits"
+            | "sha256_mismatch"
+    )
+    .then(|| value.to_string())
 }
 
 #[derive(Debug)]
@@ -435,6 +538,171 @@ mod tests {
     }
 
     #[test]
+    fn canonical_edit_pre_result_hard_timeout_is_uncertain_not_rejected() {
+        for tool in ["apply_text_edits", "apply_patch_checked"] {
+            let record = completion(tool, 0).record_for_pre_result_failure("dispatch_hard_timeout");
+            assert!(!record.success);
+            assert_eq!(record.error_kind.as_deref(), Some("dispatch_hard_timeout"));
+            assert_eq!(record.serialized_result_bytes, None);
+            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_outcome.as_deref(), Some("uncertain"));
+            assert_eq!(record.edit_conflict_kind, None);
+        }
+
+        for error_kind in ["invalid_arguments", "insufficient_scope"] {
+            let record =
+                completion("apply_text_edits", 0).record_for_pre_result_failure(error_kind);
+            assert!(!record.success);
+            assert_eq!(record.error_kind.as_deref(), Some(error_kind));
+            assert_eq!(record.serialized_result_bytes, None);
+            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_outcome.as_deref(), Some("rejected"));
+            assert_eq!(record.edit_conflict_kind, None);
+        }
+    }
+
+    #[test]
+    fn edit_outcomes_are_bounded_and_authoritative() {
+        let text_cases = [
+            (
+                true,
+                json!({"dry_run": false, "changed": true}),
+                Some("applied"),
+                None,
+            ),
+            (
+                true,
+                json!({"dry_run": true, "would_change": true}),
+                Some("dry_run_would_change"),
+                None,
+            ),
+            (
+                true,
+                json!({"dry_run": true, "would_change": false}),
+                Some("dry_run_no_change"),
+                None,
+            ),
+            (
+                true,
+                json!({"dry_run": false, "changed": false}),
+                Some("no_change"),
+                None,
+            ),
+            (
+                false,
+                json!({"conflict_recovery": {"conflict_kind": "multiple_matches"}}),
+                Some("conflict"),
+                Some("multiple_matches"),
+            ),
+            (
+                false,
+                json!({"conflict_recovery": {"conflict_kind": "sha256_mismatch"}}),
+                Some("conflict"),
+                Some("sha256_mismatch"),
+            ),
+            (
+                false,
+                json!({"rollback_complete": false, "changed": true, "conflict_recovery": {"conflict_kind": "multiple_matches"}}),
+                Some("uncertain"),
+                Some("multiple_matches"),
+            ),
+        ];
+        for (success, output, outcome, conflict_kind) in text_cases {
+            let result = if success {
+                ToolResult::ok(output)
+            } else {
+                ToolResult::err_with_output("private", output)
+            };
+            let record = completion("apply_text_edits", 0)
+                .record_for_tool_result(&result)
+                .unwrap();
+            assert_eq!(record.schema_version, 3);
+            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_outcome.as_deref(), outcome);
+            assert_eq!(record.edit_conflict_kind.as_deref(), conflict_kind);
+        }
+
+        let patch_cases = [
+            (true, json!({"applied": true}), Some("applied")),
+            (
+                true,
+                json!({"applied": false, "validate": {"can_apply": false}}),
+                Some("not_applicable"),
+            ),
+            (
+                true,
+                json!({"applied": false, "validate": {"can_apply": false, "policy_blocked": true}}),
+                Some("policy_blocked"),
+            ),
+            (
+                true,
+                json!({"applied": false, "validate": {"can_apply": true}}),
+                Some("apply_failed"),
+            ),
+            (
+                false,
+                json!({"error_kind": "policy_rejected"}),
+                Some("rejected"),
+            ),
+            (true, json!({"applied": false, "validate": {}}), None),
+        ];
+        for (success, output, outcome) in patch_cases {
+            let result = if success {
+                ToolResult::ok(output)
+            } else {
+                ToolResult::err_with_output("private", output)
+            };
+            let record = completion("apply_patch_checked", 0)
+                .record_for_tool_result(&result)
+                .unwrap();
+            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_outcome.as_deref(), outcome);
+            assert_eq!(record.edit_conflict_kind, None);
+        }
+    }
+
+    #[test]
+    fn edit_telemetry_omits_unknown_labels_and_private_content() {
+        let private = "PRIVATE /tmp/secret.rs patch-token old_text new_text";
+        let result = ToolResult::err_with_output(
+            private,
+            json!({
+                "changed": false,
+                "conflict_recovery": {"conflict_kind": private},
+                "path": private,
+                "patch": private,
+                "error": private
+            }),
+        );
+        let record = completion("apply_text_edits", 0)
+            .record_for_tool_result(&result)
+            .unwrap();
+        assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+        assert_eq!(record.edit_outcome.as_deref(), Some("rejected"));
+        assert_eq!(record.edit_conflict_kind, None);
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(!serialized.contains(private));
+
+        for tool in ["read_file", "tool_manifest"] {
+            let record = completion(tool, 0)
+                .record_for_tool_result(&ToolResult::ok(json!({"changed": true})))
+                .unwrap();
+            assert_eq!(record.edit_surface, None);
+            assert_eq!(record.edit_outcome, None);
+            assert_eq!(record.edit_conflict_kind, None);
+        }
+
+        for tool in ["write_project_file", "apply_patch"] {
+            let record = completion(tool, 0)
+                .record_for_tool_result(&ToolResult::ok(json!({"changed": true})))
+                .unwrap();
+            assert_eq!(record.edit_surface.as_deref(), Some("advanced"));
+            assert_eq!(record.edit_outcome, None);
+            assert_eq!(record.edit_conflict_kind, None);
+        }
+    }
+
+    #[test]
     fn protocol_telemetry_distinguishes_unsupported_missing_exact_and_recovery_states() {
         let unsupported = ModelErgonomicsTimer::start_with_protocol("read_file", &json!({}), false)
             .unwrap()
@@ -523,7 +791,7 @@ mod tests {
                     .finish_after(Duration::ZERO)
                     .record_for_tool_result(&ToolResult::ok(json!({"private_body": "do-not-copy"})))
                     .unwrap();
-            assert_eq!(record.schema_version, 2);
+            assert_eq!(record.schema_version, 3);
             assert_eq!(record.finish_summary_only, Some(expected));
             assert!(record.serialized_result_bytes.is_some());
             let serialized = serde_json::to_string(&record).unwrap();
