@@ -12,35 +12,31 @@ mod windows_guard {
     }
 
     #[test]
-    fn server_commands_fail_closed_on_windows() {
+    fn managed_server_lifecycle_fails_closed_on_windows() {
         for command in [
             vec!["server"],
-            vec!["server", "run"],
-            vec!["server", "start"],
-            vec!["server", "status"],
             vec!["server", "install"],
+            vec!["server", "start"],
+            vec!["server", "stop"],
+            vec!["server", "restart"],
+            vec!["server", "logs"],
+            vec!["server", "uninstall", "--confirm"],
         ] {
             let message = windows_unsupported_platform_action(&args(&command))
-                .expect("server command must be blocked on Windows");
+                .expect("managed server lifecycle must be blocked on Windows");
             assert!(
-                message.contains("Windows Server runtime is not supported"),
+                message.contains("service-managed Server lifecycle"),
                 "{command:?}: {message}"
             );
             assert!(
-                message.contains("webcodex connect"),
+                message.contains("webcodex server run"),
+                "{command:?}: {message}"
+            );
+            assert!(
+                !message.contains("Server runtime is not supported"),
                 "{command:?}: {message}"
             );
         }
-    }
-
-    #[test]
-    fn share_fails_closed_on_windows() {
-        let message = windows_unsupported_platform_action(&args(&["share"]))
-            .expect("share must be blocked on Windows");
-        assert!(
-            message.contains("Windows Server runtime is not supported"),
-            "{message}"
-        );
     }
 
     #[test]
@@ -80,6 +76,14 @@ mod windows_guard {
     #[test]
     fn supported_windows_commands_are_not_blocked() {
         for command in [
+            vec!["server", "init"],
+            vec!["server", "run"],
+            vec!["server", "run", "--env-file", "C:\\temp\\webcodex.env"],
+            vec!["server", "status"],
+            vec!["share"],
+            vec!["share", "--tunnel", "cloudflare"],
+            vec!["share", "--tunnel", "openai"],
+            vec!["share", "--tunnel", "none"],
             vec!["connect", "https://server.example.com"],
             vec!["login", "https://server.example.com", "--code", "wc_pair_x"],
             vec!["runner", "status"],

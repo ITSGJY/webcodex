@@ -9,9 +9,10 @@
 #
 #   webcodex.exe webcodex-server.exe webcodex-runner.exe
 #
-# webcodex-server.exe is packaged to keep the artifact/manifest contract
-# intact; it is NOT a statement that a long-running Windows Server runtime is
-# supported (it is not, in this release).
+# webcodex-server.exe is a supported local foreground/share runtime on Windows.
+# The three-binary package supports explicit `webcodex share` with Cloudflare,
+# OpenAI Secure MCP Tunnel, or no tunnel. Managed Windows Server service lifecycle
+# remains unsupported and is not implied by packaging these binaries.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\package_release_artifact.ps1

@@ -8,9 +8,9 @@
 
 - Node.js 18 或更新版本。
 - Git，以及一个可以让 AI 安全查看的代码仓库。
-- 一键本机 `share` 流程需要 Linux 或 macOS。
+- Linux、macOS 或 Windows x64 可直接使用完整 managed Cloudflare 本机 `share` 流程。
 
-Windows 需要连接远程 Linux WebCodex Server，不在本机运行 `share`；请从 [MCP 接入](MCP.zh-CN.md)或[部署指南](DEPLOYMENT.zh-CN.md)开始。
+Windows 已支持显式本机 `webcodex share`。固定版本 Cloudflare 没有官方 Windows ARM64 binary，因此 Windows ARM64 使用 `--tunnel cloudflare` 时需要通过 `WEBCODEX_CLOUDFLARED_BIN`/`PATH` 提供受信任 binary；managed OpenAI `tunnel-client` 与 `--tunnel none` 仍可用。
 
 ## 1. 运行 WebCodex
 
@@ -18,14 +18,14 @@ Windows 需要连接远程 Linux WebCodex Server，不在本机运行 `share`；
 
 ```bash
 cd /path/to/your/repository
-npx --yes @yyjeqhc/webcodex
+npx --yes @yyjeqhc/webcodex share
 ```
 
 第一次使用不需要提前运行 `setup`、`doctor` 或 `run`。默认的一键流程会创建一个由本次临时凭据保护的公网 HTTPS MCP 地址；关闭命令后，该地址和凭据都会失效。
 
 ## 2. 等待 `WebCodex ready`
 
-看到 **WebCodex ready** 后保持终端运行。WebCodex 会打印 MCP 客户端需要的配置，通常也会把 MCP URL 复制到剪贴板。可以直接在终端按 **Enter** 打开 ChatGPT App 设置，也可以手动进入 **Settings -> Apps -> Create**。
+看到 **WebCodex ready** 后保持终端运行。WebCodex 会打印 MCP 客户端需要的配置。Linux 与 macOS 通常会自动复制 MCP URL，并可在交互终端按 **Enter** 打开 ChatGPT App 设置；Windows 请手动复制终端中打印的 MCP URL，并进入 **Settings -> Apps -> Create**。
 
 ## 3. 在 ChatGPT 中添加 WebCodex
 

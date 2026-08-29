@@ -8,14 +8,14 @@
 
 ## 快速开始
 
-Linux 或 macOS 上准备好 Node.js 18+ 和 Git，然后进入一个仓库：
+Linux、macOS 或 Windows x64 上准备好 Node.js 18+ 和 Git，然后进入一个仓库：
 
 ```bash
 cd /path/to/your/repository
-npx --yes @yyjeqhc/webcodex
+npx --yes @yyjeqhc/webcodex share
 ```
 
-看到 **WebCodex ready** 后保持终端运行。**MCP URL** 通常已经复制到剪贴板；可以直接在终端按 **Enter** 打开 ChatGPT App 设置，也可以手动进入 **Settings -> Apps -> Create**。然后：
+看到 **WebCodex ready** 后保持终端运行。Linux 与 macOS 通常会自动复制 **MCP URL**，并可在交互终端按 **Enter** 打开 ChatGPT App 设置；Windows 请手动复制终端中打印的 **MCP URL**，并进入 **Settings -> Apps -> Create**。然后：
 
 1. 如有需要，开启 **Developer Mode** 并选择 **Create**。
 2. 粘贴已经复制的 **MCP URL**；也可以使用 WebCodex 终端中打印的地址。
@@ -78,7 +78,7 @@ WebCodex
 
 - **Linux x64/arm64** —— 支持本机 `share`、Server 和 Runner 工作流。
 - **macOS x64/arm64** —— 支持本机 `share` 和 Runner 工作流。
-- **Windows x64/arm64** —— 支持 CLI 和 Runner，连接远程 Linux Server；本版本不在 Windows 本机运行 `webcodex share`。
+- **Windows x64/arm64** —— 支持 CLI、Runner、本地前台 Server，以及显式 `webcodex share --tunnel cloudflare|openai|none`。Windows x64 可自动管理固定版本的 Cloudflare Quick Tunnel；OpenAI `tunnel-client` 在 x64/arm64 都支持 managed 获取。固定版本 Cloudflare 没有官方 Windows ARM64 artifact，因此 Windows ARM64 使用 Cloudflare 时需要提供受信任的显式/`PATH` `cloudflared`。WebCodex 托管的 Windows Server service 仍不支持。
 
 Windows 接入和长期部署见[部署指南](docs/DEPLOYMENT.zh-CN.md)与 [MCP](docs/MCP.zh-CN.md)。
 

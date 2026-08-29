@@ -14,12 +14,15 @@ mod openai_tunnel_service;
 mod setup_service;
 #[path = "project_entry_share.rs"]
 mod share_service;
+#[cfg(windows)]
+#[path = "project_entry_windows.rs"]
+mod windows_private_state;
 
 use setup_service::{
-    create_private_dir, local_readiness, read_private_value, read_project_agent_token,
-    read_project_credential, read_toml_optional, validate_agent_authentication,
-    validate_existing_registration, validate_existing_runner, validate_product_config,
-    validate_profile, ProjectConfig,
+    create_private_dir, local_readiness, prepare_runtime_private_state, read_private_value,
+    read_project_agent_token, read_project_credential, read_toml_optional,
+    validate_agent_authentication, validate_existing_registration, validate_existing_runner,
+    validate_product_config, validate_profile, ProjectConfig,
 };
 pub(crate) use setup_service::{resolve_local_task_state, setup};
 #[cfg(test)]
@@ -246,7 +249,7 @@ starting services. `run` is the explicit foreground local runtime step. Its opti
 `--console-assets-dir` enables loopback-only development assets for that run.\n\
 `--auth query-token` is a temporary share-only convenience for MCP clients that\n\
 cannot configure a Bearer header; `--auth oauth` adds project-bound OAuth.\n\
-On Windows, local Server/share runtime is unsupported; use `webcodex connect <server-url>` with a remote Linux Server.\n"
+On Windows, explicit `webcodex share` is supported. Managed Cloudflare acquisition is available on Windows x64; Windows ARM64 requires a trusted explicit/PATH cloudflared because the pinned upstream release has no official ARM64 artifact. Managed OpenAI tunnel-client supports Windows x64/arm64.\n"
 }
 
 pub(crate) fn readiness_with_probe(
@@ -650,6 +653,7 @@ pub(super) struct LocalRuntimeOptions {
     pub(super) project_share_oauth: Option<ProjectShareOAuthRuntimeOptions>,
     pub(super) child_environment_remove: Vec<&'static str>,
     pub(super) port_conflict_action: &'static str,
+    pub(super) readiness_deadline: Option<Instant>,
 }
 
 impl Default for LocalRuntimeOptions {
@@ -661,6 +665,7 @@ impl Default for LocalRuntimeOptions {
             project_share_oauth: None,
             child_environment_remove: Vec::new(),
             port_conflict_action: "Stop the conflicting process, then run webcodex run.",
+            readiness_deadline: None,
         }
     }
 }
@@ -735,7 +740,11 @@ pub(super) async fn start_local_runtime(
 ) -> Result<LocalRuntimeHandle, ProductError> {
     let console_assets_dir = resolve_console_assets_directory(options)?;
     let (config, paths) = configured_project(options)?;
+    prepare_runtime_private_state(&paths)?;
     ensure_local_runtime_port_available(config.port, runtime_options.port_conflict_action)?;
+    let readiness_deadline = runtime_options
+        .readiness_deadline
+        .unwrap_or_else(|| Instant::now() + START_TIMEOUT);
     let project_share_oauth = runtime_options.project_share_oauth.clone();
     let mcp_query_token_auth = runtime_options.mcp_query_token_auth;
     let runner_binary = locate_runner_binary().ok_or_else(|| {
@@ -840,7 +849,12 @@ pub(super) async fn start_local_runtime(
             Some("Run webcodex doctor."),
         )
     })?;
-    wait_for_server(&mut server, &local_url, &connector_key).await?;
+    if let Err(error) =
+        wait_for_server(&mut server, &local_url, &connector_key, readiness_deadline).await
+    {
+        stop_child(&mut server).await;
+        return Err(error);
+    }
 
     let runner_log = open_log(&paths.logs.join("agent.log"))?;
     let runner_error = runner_log.try_clone().map_err(io_error)?;
@@ -858,14 +872,31 @@ pub(super) async fn start_local_runtime(
         .stdout(Stdio::from(runner_log))
         .stderr(Stdio::from(runner_error))
         .kill_on_drop(true);
-    let mut runner = runner_command.spawn().map_err(|_| {
-        ProductError::new(
-            "agent_offline",
-            "the local Runner could not start",
-            Some("Run webcodex doctor."),
-        )
-    })?;
-    wait_for_ready(&mut server, &mut runner, options, &config, &connector_key).await?;
+    let mut runner = match runner_command.spawn() {
+        Ok(runner) => runner,
+        Err(_) => {
+            stop_child(&mut server).await;
+            return Err(ProductError::new(
+                "agent_offline",
+                "the local Runner could not start",
+                Some("Run webcodex doctor."),
+            ));
+        }
+    };
+    if let Err(error) = wait_for_ready(
+        &mut server,
+        &mut runner,
+        options,
+        &config,
+        &connector_key,
+        readiness_deadline,
+    )
+    .await
+    {
+        stop_child(&mut runner).await;
+        stop_child(&mut server).await;
+        return Err(error);
+    }
     Ok(LocalRuntimeHandle {
         project_name: config.project_name,
         local_url,
@@ -895,11 +926,31 @@ pub(crate) async fn start_runner(options: &ProjectCommandOptions) -> Result<(), 
     started.push_str("\nRunner: online\nCoding access: ready\n\nPress Ctrl-C to stop.");
     println!("{started}");
     let outcome = tokio::select! {
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = wait_for_local_runtime_stop_signal() => Ok(()),
         result = runtime.wait_for_exit() => result,
     };
     runtime.stop().await;
     outcome
+}
+
+#[cfg(not(windows))]
+async fn wait_for_local_runtime_stop_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(windows)]
+async fn wait_for_local_runtime_stop_signal() {
+    let mut ctrl_break = match tokio::signal::windows::ctrl_break() {
+        Ok(signal) => signal,
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = ctrl_break.recv() => {},
+    }
 }
 
 fn resolve_console_assets_directory(
@@ -1019,6 +1070,11 @@ fn open_log(path: &Path) -> Result<File, ProductError> {
         })
 }
 
+async fn stop_child(child: &mut Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 fn io_error(_: std::io::Error) -> ProductError {
     ProductError::new(
         "workspace_unavailable",
@@ -1031,6 +1087,7 @@ async fn wait_for_server(
     server: &mut Child,
     base_url: &str,
     key: &str,
+    deadline: Instant,
 ) -> Result<(), ProductError> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -1044,21 +1101,31 @@ async fn wait_for_server(
                 Some("Run webcodex doctor."),
             )
         })?;
-    let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         if server.try_wait().ok().flatten().is_some() {
             break;
         }
-        let response = client
-            .post(format!("{base_url}/api/connector/readiness"))
-            .bearer_auth(key)
-            .json(&serde_json::json!({}))
-            .send()
-            .await;
-        if response.is_ok_and(|response| response.status().is_success()) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let response = tokio::time::timeout(
+            remaining,
+            client
+                .post(format!("{base_url}/api/connector/readiness"))
+                .bearer_auth(key)
+                .json(&serde_json::json!({}))
+                .send(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        if response.is_some_and(|response| response.status().is_success()) {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        )
+        .await;
     }
     Err(ProductError::new(
         "server_unreachable",
@@ -1073,8 +1140,8 @@ async fn wait_for_ready(
     options: &ProjectCommandOptions,
     config: &ProjectConfig,
     connector_key: &str,
+    deadline: Instant,
 ) -> Result<(), ProductError> {
-    let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         if server.try_wait().ok().flatten().is_some() {
             return Err(ProductError::new(
@@ -1090,13 +1157,22 @@ async fn wait_for_ready(
                 Some("Run webcodex doctor."),
             ));
         }
-        if collect_readiness_from_remote(options, config, connector_key)
-            .await
-            .ready
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if tokio::time::timeout(
+            remaining,
+            collect_readiness_from_remote(options, config, connector_key),
+        )
+        .await
+        .is_ok_and(|readiness| readiness.ready)
         {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(150)),
+        )
+        .await;
     }
     Err(ProductError::new(
         "agent_offline",
@@ -1104,6 +1180,10 @@ async fn wait_for_ready(
         Some("Run webcodex doctor."),
     ))
 }
+
+#[cfg(all(test, windows))]
+#[path = "project_entry_windows_migration_tests.rs"]
+mod windows_migration_tests;
 
 #[cfg(test)]
 #[path = "project_entry_tests.rs"]

@@ -8,9 +8,9 @@ This page is only the shortest path from a local repository to a first successfu
 
 - Node.js 18 or newer.
 - Git and a repository you are comfortable letting an AI inspect.
-- Linux or macOS for the one-command local `share` flow.
+- Linux, macOS, or Windows x64 for the fully managed default Cloudflare `share` flow.
 
-Windows uses a remote Linux WebCodex Server instead of local `share`; start with [MCP setup](MCP.md) or [Deployment](DEPLOYMENT.md).
+Windows supports explicit local `webcodex share`. On Windows ARM64, the pinned Cloudflare release has no official ARM64 binary, so `--tunnel cloudflare` requires a trusted `WEBCODEX_CLOUDFLARED_BIN`/`PATH` binary; managed OpenAI `tunnel-client` and `--tunnel none` remain available.
 
 ## 1. Run WebCodex
 
@@ -18,14 +18,14 @@ From the repository you want the AI to use:
 
 ```bash
 cd /path/to/your/repository
-npx --yes @yyjeqhc/webcodex
+npx --yes @yyjeqhc/webcodex share
 ```
 
 You do not need to run `setup`, `doctor`, or `run` first. The default one-command flow creates a temporary public HTTPS MCP endpoint protected by that run's temporary credential; both the endpoint and credential stop working when the command exits.
 
 ## 2. Wait for `WebCodex ready`
 
-Keep that terminal open. WebCodex prints the values needed by the MCP client and normally copies the MCP URL to your clipboard. Press **Enter** in the terminal to open ChatGPT App settings; you can also open **Settings -> Apps -> Create** manually.
+Keep that terminal open. WebCodex prints the values needed by the MCP client. On Linux and macOS it normally copies the MCP URL to your clipboard and an interactive terminal can use **Enter** to open ChatGPT App settings. On Windows, copy the printed MCP URL manually and open **Settings -> Apps -> Create**.
 
 ## 3. Add WebCodex to ChatGPT
 

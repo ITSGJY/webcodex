@@ -16,13 +16,7 @@ Server API 完成。
 
 `webcodex --help` 会列出顶层命名空间。下面按命名空间说明各自的用途。
 
-在 Linux/macOS 上第一次连接 ChatGPT 时，交互式 Git checkout 中运行裸 `webcodex`
-就是 `webcodex share` 的 convenience shortcut；显式 `share` 仍然是脚本/确定性分发入口。
-它会完成项目设置、启动本地 Server 与 Runner，并暴露临时 HTTPS
-MCP endpoint。默认 Quick Tunnel 会依次优先使用 `WEBCODEX_CLOUDFLARED_BIN`、`PATH`
-中的 `cloudflared`；两者都没有时，会在创建项目/share 状态之前自动获取固定版本、完成
-校验并使用 WebCodex 管理的副本。Windows 不支持这条本地 Server/share 路径，请改用
-`webcodex connect <server-url>` 连接远程 Linux Server。
+第一次连接 ChatGPT 时，显式 `webcodex share` 已是 Linux、macOS、Windows 共同的脚本/确定性入口。交互式 Git checkout 中的裸 `webcodex` 自动进入 share 仍只属于 Linux/macOS convenience shortcut；W2 不改变 Windows 无子命令语义。`share` 会完成项目设置、启动本地 Server 与 Runner，并暴露临时 HTTPS MCP endpoint。默认 Quick Tunnel 依次使用 `WEBCODEX_CLOUDFLARED_BIN`、`PATH` 中的 `cloudflared`，否则获取固定版本 managed 副本。Windows x64 支持 managed Cloudflare；固定版本 Cloudflare 没有官方 Windows ARM64 artifact，因此 ARM64 使用 Cloudflare 时需要受信任的显式/`PATH` binary。OpenAI `tunnel-client` 的 managed 获取支持 Windows x64/arm64。
 
 ## 命令总览
 
@@ -33,7 +27,7 @@ MCP endpoint。默认 Quick Tunnel 会依次优先使用 `WEBCODEX_CLOUDFLARED_B
 | 命令 | 用途 | 说明 |
 | --- | --- | --- |
 | `webcodex`（无子命令） | 快速交互式 first-run shortcut | 仅 Linux/macOS + stdin/stdout 为终端 + 当前目录位于 Git checkout 时自动进入 `share`；否则照常显示 help。 |
-| `webcodex share` | 通过 HTTPS 把当前项目接入 ChatGPT/MCP | Linux/macOS 首次使用主路径；包含 setup、启动本地 Server + Runner、按需自动管理经过校验的 `cloudflared`，并 best-effort 复制公网 MCP URL。Windows 不可用。 |
+| `webcodex share` | 通过 HTTPS 把当前项目接入 ChatGPT/MCP | Linux/macOS/Windows 的显式首次使用主路径；包含 setup、本地 Server + Runner、`cloudflare|openai|none`、可用时的 managed tunnel 获取，以及有界前台 cleanup。 |
 | `webcodex connect <server>` | 把当前项目接入已有的 Server | 已经拥有 Server URL 时的长期路径；默认使用 hosted shared-key。 |
 | `webcodex status` | 简洁的项目 coding 就绪状态 | 简短状态；`doctor` 提供完整诊断。 |
 | `webcodex doctor` | 当前项目的只读就绪检查 | 诊断/手动工作流；输出稳定的 `next action`。 |
@@ -102,12 +96,14 @@ detached-process 行为。
 | --- | --- |
 | `webcodex server init` | 初始化或更新 Server env 文件（创建 bootstrap token） |
 | `webcodex server install` | 安装 Linux systemd `webcodex.socket` + `webcodex.service` pair |
-| `webcodex server run` | 前台运行 `webcodex-server`（direct bind） |
+| `webcodex server run [--env-file PATH]` | 前台运行 `webcodex-server`（direct bind）；`--env-file` 通过 `WEBCODEX_ENV_FILE` 精确传递路径 |
 | `webcodex server start` / `stop` | 一致地启动或停止 socket activation 与 Server process |
 | `webcodex server restart` | 只 restart Server process，保持受管 listener socket active |
 | `webcodex server status` | 检查 authoritative socket/service 状态、HTTP 可达性与构建版本 |
 | `webcodex server logs` | 读取 Server service journal |
 | `webcodex server uninstall` | stop/disable/remove 受管 socket/service pair |
+
+Windows 支持 `server init`、前台 `server run` 与显式 `share`。受管 service 生命周期（`install`、`start`、`stop`、`restart`、`logs`、`uninstall`）仍只支持 Linux。
 
 使用 `webcodex server install --service-file /path/name.service` 时，会派生同目录的
 `/path/name.socket`。后续 `start`、`stop`、`restart`、`status`、`logs` 和 `uninstall`
