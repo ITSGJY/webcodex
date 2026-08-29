@@ -241,6 +241,140 @@ pub fn is_windows_local_disk_path(path: &Path) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn windows_non_local_project_path_error(path: &Path) -> String {
+    format!(
+        "path {} is not on a local disk drive; UNC and other Windows network/device paths are not supported for projects",
+        path.to_string_lossy()
+    )
+}
+
+/// Validate the raw project path before any canonicalization or filesystem I/O.
+///
+/// On Windows an explicit local-disk prefix (`Disk` / `VerbatimDisk`) may
+/// proceed, while explicit UNC, verbatim UNC, device namespace, and other
+/// unsupported prefixes fail closed. Paths with no prefix (including relative
+/// paths) proceed to canonicalization, where the canonical path policy requires
+/// a local disk. Non-Windows platforms have no corresponding raw-prefix fence.
+pub fn validate_project_path_ingress(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        if !matches!(
+            prefix.kind(),
+            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+        ) {
+            return Err(windows_non_local_project_path_error(path));
+        }
+    }
+
+    #[cfg(not(windows))]
+    let _ = path;
+
+    Ok(())
+}
+
+/// System directories that must never become project roots through the broad
+/// `allow_cwd_anywhere` relaxation. An explicit allowed root still authorizes
+/// these paths intentionally. Windows non-local-disk paths are rejected before
+/// this list is considered, so a UNC allowed root cannot bypass that boundary.
+const DANGEROUS_PROJECT_ROOTS: &[&str] = &[
+    "/",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/var",
+    #[cfg(target_os = "macos")]
+    "/private/etc",
+    #[cfg(target_os = "macos")]
+    "/private/var",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/boot",
+    #[cfg(windows)]
+    "C:\\Windows",
+    #[cfg(windows)]
+    "C:\\Program Files",
+    #[cfg(windows)]
+    "C:\\Program Files (x86)",
+];
+
+#[cfg(windows)]
+fn is_windows_drive_root(canonical_path: &Path) -> bool {
+    let mut components = canonical_path.components();
+    matches!(
+        (components.next(), components.next()),
+        (
+            Some(std::path::Component::Prefix(_)),
+            Some(std::path::Component::RootDir)
+        ) if components.next().is_none()
+    )
+}
+
+#[cfg(not(windows))]
+fn is_windows_drive_root(_canonical_path: &Path) -> bool {
+    false
+}
+
+/// Authoritative pure path-policy check for Runner project registration.
+///
+/// `canonical_path` and `canonical_allowed_roots` must already be canonicalized
+/// by the caller. Windows non-local-disk paths always fail. Explicit local roots
+/// authorize first; otherwise `allow_cwd_anywhere` relaxes only ordinary paths,
+/// never dangerous system roots or Windows drive roots.
+pub fn validate_project_path_policy(
+    canonical_path: &Path,
+    canonical_allowed_roots: &[PathBuf],
+    allow_cwd_anywhere: bool,
+) -> Result<(), String> {
+    let path_str = canonical_path.to_string_lossy();
+
+    #[cfg(windows)]
+    if !is_windows_local_disk_path(canonical_path) {
+        return Err(windows_non_local_project_path_error(canonical_path));
+    }
+
+    if canonical_allowed_roots
+        .iter()
+        .any(|root| path_is_within(canonical_path, root))
+    {
+        return Ok(());
+    }
+
+    if !allow_cwd_anywhere {
+        return Err(format!(
+            "path {} is outside allowed_roots and allow_cwd_anywhere is false",
+            path_str
+        ));
+    }
+
+    for dangerous in DANGEROUS_PROJECT_ROOTS {
+        let dangerous_root = Path::new(dangerous);
+        let is_dangerous = if dangerous_root == Path::new("/") {
+            paths_equal(canonical_path, dangerous_root)
+        } else {
+            path_is_within(canonical_path, dangerous_root)
+        };
+        if is_dangerous {
+            return Err(format!(
+                "path {} is under a dangerous system root; register it under an explicit allowed_roots entry if intended",
+                path_str
+            ));
+        }
+    }
+
+    if is_windows_drive_root(canonical_path) {
+        return Err(format!(
+            "path {} is a Windows drive root; register it under an explicit allowed_roots entry if intended",
+            path_str
+        ));
+    }
+
+    Ok(())
+}
+
 /// Stable filesystem-independent identity string for a path, used for project
 /// id hashing and registry comparisons.
 ///
@@ -560,8 +694,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_local_disk_prefix_classification_is_grammar_based() {
-        // Local disk paths, plain and canonicalized.
+    fn windows_local_disk_prefix_classification_is_strict_for_canonical_paths() {
         for accepted in [
             r"C:\repo",
             r"c:\repo",
@@ -573,21 +706,89 @@ mod tests {
                 "{accepted} must be accepted as a local disk path"
             );
         }
-        // Everything else is fail-closed, whatever it starts with.
-        for rejected in [
+
+        for non_local_or_uncanonical in [
             r"\\server\share\repo",
             r"\\?\UNC\server\share\repo",
-            r"\\server\share",
             r"\\.\device\repo",
             r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
             r"\repo",
             r"repo",
+            ".",
         ] {
             assert!(
-                !is_windows_local_disk_path(Path::new(rejected)),
-                "{rejected} must be rejected as a non-local-disk path"
+                !is_windows_local_disk_path(Path::new(non_local_or_uncanonical)),
+                "{non_local_or_uncanonical} must not satisfy the strict canonical local-disk predicate"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_raw_project_ingress_rejects_only_explicit_non_local_prefixes() {
+        for allowed in [
+            r"C:\repo",
+            r"\\?\C:\repo",
+            ".",
+            r"repo",
+            r"some\repo",
+            r"\repo",
+        ] {
+            validate_project_path_ingress(Path::new(allowed)).unwrap_or_else(|error| {
+                panic!("{allowed} must proceed to canonicalization: {error}")
+            });
+        }
+
+        for rejected in [
+            r"\\server\share\repo",
+            r"\\?\UNC\server\share\repo",
+            r"\\.\device\repo",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
+        ] {
+            let error = validate_project_path_ingress(Path::new(rejected)).unwrap_err();
+            assert!(error.contains("not on a local disk drive"), "{error}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn project_path_policy_keeps_dangerous_roots_fail_closed_under_cwd_anywhere() {
+        let error = validate_project_path_policy(Path::new("/etc"), &[], true).unwrap_err();
+        assert!(error.contains("dangerous system root"), "{error}");
+
+        validate_project_path_policy(Path::new("/tmp/webcodex-project"), &[], true)
+            .expect("ordinary paths remain allowed by allow_cwd_anywhere");
+
+        validate_project_path_policy(Path::new("/etc"), &[PathBuf::from("/etc")], true)
+            .expect("an explicit allowed root must intentionally authorize /etc");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_path_policy_preserves_windows_local_disk_and_drive_root_fences() {
+        for non_local in [
+            r"\\server\share\repo",
+            r"\\?\UNC\server\share\repo",
+            r"\\.\device\repo",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\repo",
+        ] {
+            let error = validate_project_path_policy(
+                Path::new(non_local),
+                &[PathBuf::from(non_local)],
+                true,
+            )
+            .unwrap_err();
+            assert!(error.contains("not on a local disk drive"), "{error}");
+        }
+
+        let drive_root = Path::new(r"C:\");
+        let error = validate_project_path_policy(drive_root, &[], true).unwrap_err();
+        assert!(error.contains("Windows drive root"), "{error}");
+        validate_project_path_policy(drive_root, &[PathBuf::from(r"C:\")], true)
+            .expect("an explicit local-disk root must authorize the drive root");
+
+        validate_project_path_policy(Path::new(r"C:\Users\alice\repo"), &[], true)
+            .expect("ordinary local-disk paths remain allowed by allow_cwd_anywhere");
     }
 
     #[test]
