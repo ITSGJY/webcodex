@@ -17,8 +17,9 @@ use super::model::{
     PersistentShellEventEvidence, SessionContextRevisionAck, SessionEvent, ToolCallExpectation,
     ToolCallRecorderMetadata, ToolCallSessionMessageResolution, LOGICAL_INVOCATION_ID_PREFIX,
     LOGICAL_INVOCATION_ROLE_BUSINESS, LOGICAL_INVOCATION_ROLE_RECORDER,
-    MAX_OBSERVED_PATHS_PER_EVENT, MAX_VALIDATION_EXCERPT_CHARS, SESSION_ID_PREFIX,
-    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD,
+    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_OBSERVED_PATHS_PER_EVENT,
+    MAX_VALIDATION_EXCERPT_CHARS, SESSION_ID_PREFIX, TOOL_ASSERTION_NAME_FIELD,
+    TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD,
     TOOL_CALL_ACK_SESSION_MESSAGE_IDS_INTERNAL_FIELD, TOOL_CALL_EXPECTATION_METADATA_FIELDS,
     TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_CALL_SESSION_MESSAGE_RESOLUTION_INTERNAL_FIELD,
     TOOL_EXPECTATION_RESULT_MATCHED, TOOL_EXPECTATION_RESULT_MISMATCH,
@@ -27,7 +28,7 @@ use super::model::{
     TOOL_EXPECTED_FAILURE_KIND_FIELD,
 };
 use super::util::redact_and_bound_value;
-use super::util::{bound_summary_string, validation_excerpt};
+use super::util::{bound_summary_string, looks_like_secret_string, validation_excerpt};
 
 impl ToolCallRecorderMetadata {
     /// Allocate one trusted logical request identity at the kernel boundary.
@@ -207,6 +208,70 @@ pub(crate) fn extract_project(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+pub(crate) fn tool_supports_model_facing_assertion_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "run_process" | "run_script" | "run_shell" | "run_job"
+    )
+}
+
+pub(crate) fn safe_model_facing_assertion_name(
+    tool_name: &str,
+    assertion_name: &str,
+) -> Option<String> {
+    if !tool_supports_model_facing_assertion_name(tool_name) {
+        return None;
+    }
+    let trimmed = assertion_name.trim();
+    (!trimmed.is_empty()
+        && trimmed.chars().count() <= MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS
+        && !trimmed.chars().any(char::is_control)
+        && !looks_like_secret_string(trimmed))
+    .then(|| trimmed.to_string())
+}
+
+pub(crate) fn validate_model_facing_assertion_name(
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    if !tool_supports_model_facing_assertion_name(tool_name) {
+        return Ok(());
+    }
+    let Some(value) = arguments
+        .as_object()
+        .and_then(|object| object.get(TOOL_ASSERTION_NAME_FIELD))
+    else {
+        return Ok(());
+    };
+    let Some(value) = value.as_str() else {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': assertion_name must be a string"
+        ));
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': assertion_name must not be empty or whitespace-only"
+        ));
+    }
+    if trimmed.chars().count() > MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': assertion_name exceeds the {MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS}-character limit"
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': assertion_name must be a single-line human-readable label"
+        ));
+    }
+    if looks_like_secret_string(trimmed) {
+        return Err(format!(
+            "invalid arguments for tool '{tool_name}': assertion_name must not contain credential-like material"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn tool_call_expectation_from_arguments(arguments: &Value) -> ToolCallExpectation {
     let Some(obj) = arguments.as_object() else {
         return ToolCallExpectation::default();
@@ -233,6 +298,10 @@ pub(crate) fn tool_call_expectation_from_arguments(arguments: &Value) -> ToolCal
         expected_failure_kind,
         assertion_name,
     }
+}
+
+pub(crate) fn is_tool_call_expectation_metadata_field(field: &str) -> bool {
+    TOOL_CALL_EXPECTATION_METADATA_FIELDS.contains(&field)
 }
 
 pub(crate) fn strip_tool_call_expectation_metadata(arguments: Value) -> Value {

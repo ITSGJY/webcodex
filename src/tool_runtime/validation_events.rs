@@ -13,10 +13,13 @@ use std::collections::HashMap;
 use super::session_context::{
     session_project_mismatch_result, unknown_session_result, SessionProjectMismatch,
 };
-use super::sessions::{canonical_tool_call_finished_events, SessionEvent, SessionSummary};
+use super::sessions::{
+    canonical_tool_call_finished_events, safe_model_facing_assertion_name,
+    tool_supports_model_facing_assertion_name, SessionEvent, SessionSummary,
+};
 use super::tool_audit::{
-    is_structured_validation_target_identity, is_validation_execution_identity,
-    structured_validation_target_identity,
+    assertion_validation_identity, is_structured_validation_target_identity,
+    is_validation_execution_identity, structured_validation_target_identity,
 };
 use super::validation_parser::{
     ValidationDiagnostics, PARSER_KIND, PARSER_LIMITATIONS, PARSER_VERSION,
@@ -41,6 +44,8 @@ pub(crate) struct ValidationEvent {
     pub(crate) tool_name: String,
     pub(crate) execution_source: String,
     pub(crate) identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) assertion_name: Option<String>,
     pub(crate) purpose: String,
     pub(crate) validation_kind: String,
     pub(crate) success: bool,
@@ -218,7 +223,7 @@ impl ToolRuntime {
             )
             .unwrap_or_else(|| summary.clone());
         let mut events = refreshed.events.clone();
-        self.append_terminal_run_job_validation_events(&refreshed, &mut events, auth)
+        self.append_terminal_generic_job_validation_events(&refreshed, &mut events, auth)
             .await;
         events.sort_by_key(|event| {
             (
@@ -229,12 +234,12 @@ impl ToolRuntime {
         validation_summary_from_events(&events, limit)
     }
 
-    /// Preserve the pre-existing `run_job(purpose=validation|test|build|format|release)`
-    /// projection without mixing those generic Jobs into the durable structured-validation
-    /// marker ledger. Structured validation Jobs carry explicit validation metadata and are
-    /// materialized above; ordinary run_job evidence remains a read-time projection from the
-    /// retained acceptance event plus the authoritative terminal Job state.
-    async fn append_terminal_run_job_validation_events(
+    /// Preserve generic `run_job` and promoted `run_shell` validation evidence without mixing
+    /// those shell Jobs into the durable structured-validation marker ledger. Structured
+    /// validation Jobs carry explicit validation metadata and are materialized above; these
+    /// generic executions remain a read-time projection from the retained acceptance event plus
+    /// the authoritative terminal Job state.
+    async fn append_terminal_generic_job_validation_events(
         &self,
         summary: &SessionSummary,
         events: &mut Vec<SessionEvent>,
@@ -246,7 +251,7 @@ impl ToolRuntime {
         let accepted = canonical_tool_call_finished_events(&summary.events)
             .into_iter()
             .filter(|event| {
-                event.tool_name == "run_job"
+                matches!(event.tool_name.as_str(), "run_job" | "run_shell")
                     && event.job_id.is_some()
                     && execution_purpose(event).is_some()
                     && job_acceptance_only(event)
@@ -269,7 +274,7 @@ impl ToolRuntime {
             {
                 continue;
             }
-            // A run_job carrying structured validation metadata belongs to the durable
+            // A generic execution carrying structured validation metadata belongs to the durable
             // materialization path and must not be synthesized a second time here.
             if status
                 .output
@@ -336,7 +341,10 @@ impl ToolRuntime {
                 .cloned()
                 .unwrap_or(Value::Null);
             observed.validation_output_summary =
-                super::sessions::execution_output_summary_for_tool_result("run_job", &output);
+                super::sessions::execution_output_summary_for_tool_result(
+                    &observed.tool_name,
+                    &output,
+                );
             if observed.validation_output_summary.is_some() {
                 events.push(observed);
             }
@@ -448,52 +456,63 @@ impl ToolRuntime {
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or(status_name);
-            let (tool_name, validation_target_id, validation_tool, validation_passed) =
-                if let Some(validation) = validation {
-                    let Some(tool_name) = validation
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .filter(|tool| validation_adapter_for_tool(tool).is_some())
-                    else {
-                        continue;
-                    };
-                    let Some(identity) = validation
-                        .get("validation_target_id")
-                        .and_then(Value::as_str)
-                        .filter(|value| is_structured_validation_target_identity(value))
-                    else {
-                        continue;
-                    };
-                    (
-                        tool_name,
-                        identity,
-                        Some(tool_name),
-                        validation.get("passed").and_then(Value::as_bool),
-                    )
-                } else {
-                    let Some(metadata) = structured_execution else {
-                        continue;
-                    };
-                    let Some(source) = metadata
-                        .get("execution_source")
-                        .and_then(Value::as_str)
-                        .filter(|source| matches!(*source, "run_process" | "run_script"))
-                    else {
-                        continue;
-                    };
-                    let Some(identity) = metadata
-                        .get("validation_identity")
-                        .and_then(Value::as_str)
-                        .filter(|identity| is_validation_execution_identity(identity))
-                    else {
-                        continue;
-                    };
-                    let validation_tool = metadata
-                        .get("validation_tool")
-                        .and_then(Value::as_str)
-                        .filter(|tool| validation_adapter_for_tool(tool).is_some());
-                    (source, identity, validation_tool, None)
+            let (
+                tool_name,
+                validation_target_id,
+                validation_tool,
+                validation_passed,
+                assertion_name,
+            ) = if let Some(validation) = validation {
+                let Some(tool_name) = validation
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .filter(|tool| validation_adapter_for_tool(tool).is_some())
+                else {
+                    continue;
                 };
+                let Some(identity) = validation
+                    .get("validation_target_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| is_structured_validation_target_identity(value))
+                else {
+                    continue;
+                };
+                (
+                    tool_name,
+                    identity,
+                    Some(tool_name),
+                    validation.get("passed").and_then(Value::as_bool),
+                    None,
+                )
+            } else {
+                let Some(metadata) = structured_execution else {
+                    continue;
+                };
+                let Some(source) = metadata
+                    .get("execution_source")
+                    .and_then(Value::as_str)
+                    .filter(|source| matches!(*source, "run_process" | "run_script"))
+                else {
+                    continue;
+                };
+                let Some(identity) = metadata
+                    .get("validation_identity")
+                    .and_then(Value::as_str)
+                    .filter(|identity| is_validation_execution_identity(identity))
+                else {
+                    continue;
+                };
+                let validation_tool = metadata
+                    .get("validation_tool")
+                    .and_then(Value::as_str)
+                    .filter(|tool| validation_adapter_for_tool(tool).is_some());
+                let assertion_name = metadata
+                    .get("assertion_name")
+                    .and_then(Value::as_str)
+                    .and_then(|value| safe_model_facing_assertion_name(source, value))
+                    .filter(|value| assertion_validation_identity(value) == identity);
+                (source, identity, validation_tool, None, assertion_name)
+            };
             let log = self
                 .job_log_for_auth(job_id.to_string(), None, Some(200), auth, None, None)
                 .await;
@@ -582,6 +601,7 @@ impl ToolRuntime {
                 tool_name,
                 Some(project.to_string()),
                 validation_target_id,
+                assertion_name.as_deref(),
                 terminal_status,
                 status.output.get("exit_code").and_then(Value::as_i64),
                 validation_passed,
@@ -734,11 +754,10 @@ fn classify_validation_failures(
     // Sessions can explicitly record cross-project tool calls, so a successful
     // validation in project B must never resolve a same-shaped failure from
     // project A merely because cwd/package/filter/features match.
-    let mut latest_success_by_identity = HashMap::<(Option<String>, String), usize>::new();
+    let mut latest_success_by_identity = HashMap::<(Option<String>, String, String), usize>::new();
     for (index, event) in events.iter().enumerate() {
         if event.success && validation_event_decides_historical_failure_status(event) {
-            latest_success_by_identity
-                .insert((event.project.clone(), event.identity.clone()), index);
+            latest_success_by_identity.insert(validation_reconciliation_key(event), index);
         }
     }
     let mut resolved = Vec::new();
@@ -748,7 +767,7 @@ fn classify_validation_failures(
             continue;
         }
         let is_resolved = latest_success_by_identity
-            .get(&(event.project.clone(), event.identity.clone()))
+            .get(&validation_reconciliation_key(event))
             .is_some_and(|success_index| *success_index > index);
         event.unresolved_failure = !is_resolved;
         if is_resolved {
@@ -775,12 +794,46 @@ fn classify_validation_failures(
     )
 }
 
+fn validation_reconciliation_key(event: &ValidationEvent) -> (Option<String>, String, String) {
+    let assertion_domain = if event.identity.starts_with("assertion:") {
+        if tool_supports_model_facing_assertion_name(&event.tool_name) {
+            // P1 intentionally keeps one assertion namespace across the four
+            // public generic execution tools so a logical check can move between
+            // run_process/run_script/run_shell/run_job after a fix.
+            "generic_execution".to_string()
+        } else {
+            // Hidden recorder assertion metadata predates the public P1 contract.
+            // Preserve same-tool internal reconciliation without allowing a
+            // generic model-facing assertion (or another structured tool) to
+            // become proof for this tool's validation failure.
+            format!("tool:{}", event.tool_name)
+        }
+    } else {
+        // Non-assertion identities already carry their existing command/target
+        // domain and keep the exact pre-P1 reconciliation semantics.
+        String::new()
+    };
+    (
+        event.project.clone(),
+        event.identity.clone(),
+        assertion_domain,
+    )
+}
+
 fn validation_event_decides_historical_failure_status(event: &ValidationEvent) -> bool {
     !cargo_test_zero_tests_success(event) && !cargo_test_unproven_execution_success(event)
 }
 
+// `validation_kind = test` is only an intent/category for generic execution.
+// Only an actual first-class structured test tool opts into count/zero-test proof.
+fn structured_test_requires_execution_proof(event: &ValidationEvent) -> bool {
+    validation_adapter_for_tool(&event.tool_name).is_some_and(|adapter| {
+        adapter.validation_kind() == "test" && adapter.reports_test_run_metadata()
+    })
+}
+
 fn cargo_test_unproven_execution_success(event: &ValidationEvent) -> bool {
-    event.validation_kind == "test"
+    structured_test_requires_execution_proof(event)
         && event.success
         && (event.tests_run_count.is_none() || event.zero_tests_run.is_none())
 }
@@ -987,6 +1040,7 @@ fn validation_event_from_finished(
         command_summary.as_deref(),
         &finished.tool_name,
     );
+    let assertion_name = public_validation_assertion_name(started, finished, &identity);
     let (
         stdout_evidence,
         stderr_evidence,
@@ -1019,6 +1073,7 @@ fn validation_event_from_finished(
         tool_name: finished.tool_name.clone(),
         execution_source: finished.tool_name.clone(),
         identity,
+        assertion_name,
         purpose,
         validation_kind,
         success,
@@ -1125,6 +1180,29 @@ fn execution_string(
         .map(str::to_string)
 }
 
+fn public_validation_assertion_name(
+    started: Option<&SessionEvent>,
+    finished: &SessionEvent,
+    identity: &str,
+) -> Option<String> {
+    for raw in [
+        started.and_then(|event| event.assertion_name.as_deref()),
+        finished.assertion_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(assertion_name) = safe_model_facing_assertion_name(&finished.tool_name, raw)
+        else {
+            continue;
+        };
+        if assertion_validation_identity(&assertion_name) == identity {
+            return Some(assertion_name);
+        }
+    }
+    None
+}
+
 fn execution_identity(
     started: Option<&SessionEvent>,
     finished: &SessionEvent,
@@ -1137,7 +1215,7 @@ fn execution_identity(
         .or(finished.assertion_name.as_deref())
         .filter(|value| !value.is_empty())
     {
-        return format!("assertion:{assertion}");
+        return assertion_validation_identity(assertion);
     }
     if let Some(identity) = started
         .and_then(|event| event.input_summary.as_ref())
@@ -1511,7 +1589,9 @@ fn validation_test_run_metadata(
 }
 
 fn cargo_test_zero_tests_success(event: &ValidationEvent) -> bool {
-    event.validation_kind == "test" && event.success && event.zero_tests_run == Some(true)
+    structured_test_requires_execution_proof(event)
+        && event.success
+        && event.zero_tests_run == Some(true)
 }
 
 fn to_value(summary: ValidationSummary) -> Value {

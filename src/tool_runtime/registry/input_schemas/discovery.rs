@@ -2,7 +2,9 @@ use serde_json::{json, Value};
 
 use super::super::super::tool_spec::ToolSpec;
 use super::common::object_schema;
-use crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD;
+use crate::tool_runtime::sessions::{
+    is_tool_call_expectation_metadata_field, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+};
 use crate::tool_runtime::tool_definition::runtime_tool_extra_accepted_flattened_args;
 
 pub(crate) fn list_tools_input_schema() -> Value {
@@ -218,6 +220,13 @@ pub(crate) fn accepted_flattened_args_for_spec(spec: &ToolSpec) -> Vec<String> {
     }
     push_unique_flattened_arg(&mut names, TOOL_CALL_RECORDING_SESSION_ID_FIELD);
     names
+}
+
+pub(crate) fn generic_tool_call_flattened_args_for_spec(spec: &ToolSpec) -> Vec<String> {
+    accepted_flattened_args_for_spec(spec)
+        .into_iter()
+        .filter(|field| !is_tool_call_expectation_metadata_field(field))
+        .collect()
 }
 
 fn push_unique_flattened_arg(names: &mut Vec<String>, field: &str) {

@@ -1147,6 +1147,7 @@ impl ToolRuntime {
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
         let search_projection = SearchModelProjection::capture(&call);
         let batch_budget_projection = BatchResponseBudgetProjection::capture(&call);
+        let validation_assertion_name = recorder_metadata.expectation.assertion_name.as_deref();
         let tool_name = call.tool_name();
         let trusted_recording_session_id = recorder_metadata
             .recording_session_authorized
@@ -1163,6 +1164,7 @@ impl ToolRuntime {
                 transport,
                 execution_sandbox,
                 ssh_resource.as_deref(),
+                validation_assertion_name,
                 project_resolution,
                 trusted_recording_session_id,
                 trusted_recording_session_project,
@@ -1280,6 +1282,7 @@ impl ToolRuntime {
         transport: sessions::SessionTransport,
         execution_sandbox: Option<&'static str>,
         ssh_resource: Option<&str>,
+        validation_assertion_name: Option<&str>,
         project_resolution: Option<Result<ResolvedProject, ProjectResolverError>>,
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
@@ -1394,8 +1397,14 @@ impl ToolRuntime {
             | ToolCall::RunDetachedProcess { .. }
             | ToolCall::RunScript { .. }
             | ToolCall::RunShell { .. }) => {
-                self.dispatch_shell_tool(call, execution_sandbox, ssh_resource, auth)
-                    .await
+                self.dispatch_shell_tool(
+                    call,
+                    execution_sandbox,
+                    ssh_resource,
+                    validation_assertion_name,
+                    auth,
+                )
+                .await
             }
 
             call @ (ToolCall::OpenSessionShell { .. }
