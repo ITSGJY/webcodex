@@ -481,7 +481,7 @@ pub(crate) fn build_openapi_spec() -> Value {
                 "post": operation_with_examples(
                     "searchProjectText",
                     "Search project text",
-                    "Read-only bounded text search inside an agent-registered project. Each match carries a project-relative path, 1-based line number, and a preview line. Optional context_before/context_after add bounded 1-based context lines. Sensitive/build dirs (.git, target, node_modules) are excluded.",
+                    "Read-only bounded project-text search. Regex is the default; prefer pattern_mode=literal for identifiers, snippets, paths, and other exact text. Results use project-relative paths and 1-based line numbers; optional context is bounded and sensitive/build directories are excluded.",
                     "SearchProjectTextRequest",
                     "ToolResult",
                     json!({
@@ -1646,7 +1646,13 @@ fn schemas() -> Value {
                 },
                 "pattern": {
                     "type": "string",
-                    "description": "Text pattern to search for."
+                    "description": "Search pattern. Interpreted as a regular expression by default. For identifiers, source snippets, paths, and other exact text, prefer pattern_mode=literal; use regex when regex syntax is intentional."
+                },
+                "pattern_mode": {
+                    "type": "string",
+                    "enum": ["regex", "literal"],
+                    "default": "regex",
+                    "description": "Pattern interpretation: regex (default, backward compatible) or literal. Prefer literal unless regex syntax is intentional."
                 },
                 "session_id": {
                     "type": "string",

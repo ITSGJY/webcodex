@@ -1484,6 +1484,55 @@ fn host_ripgrep_available() -> bool {
 }
 
 #[cfg(unix)]
+fn symlink_host_command(command: &str, bin: &std::path::Path) {
+    let found = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command}"))
+        .output()
+        .unwrap();
+    assert!(found.status.success(), "host must provide {command}");
+    let target = String::from_utf8(found.stdout).unwrap();
+    let target = target.trim();
+    assert!(!target.is_empty(), "host must provide {command}");
+    std::os::unix::fs::symlink(target, bin.join(command)).unwrap();
+}
+
+#[cfg(unix)]
+fn run_search_with_path(
+    bin: &std::path::Path,
+    root: &std::path::Path,
+    options: &SearchOptions,
+) -> ToolResult {
+    let command = format!(
+        "PATH={}; export PATH\n{}",
+        shell_escape_simple(&bin.to_string_lossy()),
+        search_project_text_command(options)
+    );
+    let (exit_code, stdout, stderr, _) = run_command_sync(&command, root, 10);
+    assert_eq!(exit_code, 0, "stderr: {stderr}");
+    let result = search_project_text_output("demo", options, &stdout, Some(exit_code), &stderr);
+    assert!(result.success, "{:?}", result.error);
+    result
+}
+
+#[cfg(unix)]
+fn logical_search_matches(result: &ToolResult) -> Vec<(u64, String)> {
+    let mut matches = result.output["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|item| {
+            (
+                item["line"].as_u64().expect("match line"),
+                item["preview"].as_str().expect("match preview").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+}
+
+#[cfg(unix)]
 #[test]
 fn search_project_text_command_prefers_rg_backend_when_available() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1567,6 +1616,131 @@ fn search_project_text_command_falls_back_to_grep_without_rg() {
     assert_eq!(result.output["matches"][0]["path"], "src/lib.rs");
     assert_eq!(result.output["matches"][0]["line"], 3);
     assert_eq!(result.output["matches"][0]["preview"], "needle from grep");
+}
+
+#[cfg(unix)]
+#[test]
+fn search_project_text_basic_regex_semantics_match_rg_and_grep_fallback() {
+    if !host_ripgrep_available() {
+        eprintln!("skipping regex backend-parity test: rg is unavailable");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let rg_bin = tmp.path().join("rg-bin");
+    let grep_bin = tmp.path().join("grep-bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&rg_bin).unwrap();
+    std::fs::create_dir_all(&grep_bin).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("sample.txt"),
+        "foo\nbar\nbaz\naaaa\na+\n(foo)\nfoo|bar\nRuntimeInfo {\n",
+    )
+    .unwrap();
+
+    for command in ["rg", "grep", "head"] {
+        symlink_host_command(command, &rg_bin);
+    }
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &grep_bin);
+    }
+
+    let cases = [
+        (
+            "foo|bar",
+            vec![(1, "foo"), (2, "bar"), (6, "(foo)"), (7, "foo|bar")],
+        ),
+        (
+            "a+",
+            vec![
+                (2, "bar"),
+                (3, "baz"),
+                (4, "aaaa"),
+                (5, "a+"),
+                (7, "foo|bar"),
+            ],
+        ),
+        ("(foo)", vec![(1, "foo"), (6, "(foo)"), (7, "foo|bar")]),
+        ("baz", vec![(3, "baz")]),
+    ];
+
+    for (pattern, expected) in cases {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                limit: Some(20),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Regex),
+        )
+        .unwrap();
+        let command = search_project_text_command(&options);
+        assert!(command.contains("grep -rnI --null -E"), "{command}");
+        assert!(!command.contains("grep -rnI --null -F"), "{command}");
+
+        let rg = run_search_with_path(&rg_bin, &root, &options);
+        let grep = run_search_with_path(&grep_bin, &root, &options);
+        assert_eq!(rg.output["backend"], "rg", "pattern {pattern}");
+        assert_eq!(grep.output["backend"], "grep", "pattern {pattern}");
+        assert_eq!(
+            logical_search_matches(&rg),
+            logical_search_matches(&grep),
+            "pattern {pattern} must have backend-independent logical matches"
+        );
+        let expected = expected
+            .into_iter()
+            .map(|(line, preview)| (line, preview.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(logical_search_matches(&grep), expected, "pattern {pattern}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn search_project_text_grep_fallback_keeps_literal_patterns_literal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("sample.txt"),
+        "foo\nbar\nbaz\naaaa\na+\n(foo)\nfoo|bar\nRuntimeInfo {\n",
+    )
+    .unwrap();
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &bin);
+    }
+
+    let cases = [
+        ("foo|bar", 7, "foo|bar"),
+        ("a+", 5, "a+"),
+        ("(foo)", 6, "(foo)"),
+        ("RuntimeInfo {", 8, "RuntimeInfo {"),
+    ];
+    for (pattern, line, preview) in cases {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                limit: Some(20),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Literal),
+        )
+        .unwrap();
+        let command = search_project_text_command(&options);
+        assert!(command.contains("grep -rnI --null -F"), "{command}");
+        assert!(!command.contains("grep -rnI --null -E"), "{command}");
+
+        let result = run_search_with_path(&bin, &root, &options);
+        assert_eq!(result.output["backend"], "grep", "pattern {pattern}");
+        assert_eq!(
+            logical_search_matches(&result),
+            vec![(line, preview.to_string())],
+            "literal pattern {pattern}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -1678,6 +1852,7 @@ fn search_call(project: String, request: SearchRequest) -> ToolCall {
     ToolCall::SearchProjectText {
         project,
         pattern: request.pattern,
+        pattern_mode: None,
         session_id: None,
         path: request.path,
         limit: request.limit,
@@ -3601,6 +3776,7 @@ async fn search_project_text_no_matches_returns_empty_matches() {
                     ToolCall::SearchProjectText {
                         project,
                         pattern: "absent_needle".to_string(),
+                        pattern_mode: None,
                         session_id: None,
                         path: None,
                         limit: Some(5),
@@ -3657,6 +3833,7 @@ async fn search_project_text_excludes_sensitive_and_build_dirs() {
                     ToolCall::SearchProjectText {
                         project,
                         pattern: "KEEP_SEARCH_NEEDLE".to_string(),
+                        pattern_mode: None,
                         session_id: None,
                         path: None,
                         limit: Some(10),
@@ -3924,6 +4101,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
             ToolCall::SearchProjectText {
                 project: project.clone(),
                 pattern: "needle".to_string(),
+                pattern_mode: None,
                 session_id: None,
                 path: Some("/etc".to_string()),
                 limit: None,
@@ -3941,6 +4119,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
             ToolCall::SearchProjectText {
                 project,
                 pattern: "needle".to_string(),
+                pattern_mode: None,
                 session_id: None,
                 path: Some("../outside".to_string()),
                 limit: None,
@@ -3992,6 +4171,7 @@ async fn search_project_text_requires_shell_capability() {
             ToolCall::SearchProjectText {
                 project: agent_test_project_id("oe"),
                 pattern: "fn".to_string(),
+                pattern_mode: None,
                 session_id: None,
                 path: None,
                 limit: None,
@@ -4037,6 +4217,7 @@ async fn search_project_text_context_does_not_enqueue_python_helper() {
                         path: None,
                         limit: Some(5),
                         context_before: Some(1),
+                        pattern_mode: None,
                         context_after: Some(1),
                         include_globs: None,
                         exclude_globs: None,
@@ -4121,6 +4302,7 @@ async fn search_project_text_rejects_empty_pattern() {
             ToolCall::SearchProjectText {
                 project: agent_test_project_id("oe"),
                 pattern: "   ".to_string(),
+                pattern_mode: None,
                 session_id: None,
                 path: None,
                 limit: None,
