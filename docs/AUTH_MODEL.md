@@ -138,6 +138,18 @@ workflow. For example, a GPT Action that inspects and edits projects may need
 or close Workflow Session collaboration state. `runtime:read` alone remains
 observation-only for that collaboration state.
 
+Managed user discovery is owner-scoped. A normal PAT or managed OAuth token for
+`alice` can discover only Runners, projects, Jobs, and derived runtime metadata
+owned by `alice`, including several devices registered to that same username.
+Bootstrap/admin callers retain their existing global visibility. Shared-key and
+Project Credential callers remain isolated by their existing authorization
+groups rather than by managed usernames.
+
+Local saved identities are also selected explicitly at logout time. If one
+Server has several saved usernames on the same machine, `webcodex logout
+<server-url>` is ambiguous and removes nothing; use `--user USER` for one
+identity or `--all` for every saved identity on that exact Server URL.
+
 ## `wc_agent_xxx` (Runner token)
 
 `wc_agent_xxx` is a Runner token generated locally by the user; the server
