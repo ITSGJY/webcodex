@@ -123,15 +123,28 @@ fn communication_store_unavailable() -> ToolResult {
     .with_recovery(RecoveryKind::UserAction, None)
 }
 
+fn communication_recovery_kind(
+    error_kind: &str,
+    store_failure_recovery: RecoveryKind,
+) -> RecoveryKind {
+    match error_kind {
+        "communication_store_unavailable" => store_failure_recovery,
+        "agent_profile_changed" => RecoveryKind::Reobserve,
+        "endpoint_expired"
+        | "endpoint_detached"
+        | "endpoint_not_active"
+        | "endpoint_generation_stale"
+        | "wake_endpoint_fence_mismatch"
+        | "wake_claim_stale" => RecoveryKind::Reconcile,
+        _ => RecoveryKind::FixInput,
+    }
+}
+
 fn communication_error(
     error: CommunicationStoreError,
     store_failure_recovery: RecoveryKind,
 ) -> ToolResult {
-    let recovery = match error.code() {
-        "communication_store_unavailable" => store_failure_recovery,
-        "agent_profile_changed" => RecoveryKind::Reobserve,
-        _ => RecoveryKind::FixInput,
-    };
+    let recovery = communication_recovery_kind(error.code(), store_failure_recovery);
     ToolResult::err_with_output(
         error.message(),
         json!({
@@ -257,7 +270,6 @@ impl ToolRuntime {
         host: String,
         client_attachment_id: Option<String>,
         wake_capable: bool,
-        controller_generation: Option<String>,
         idempotency_key: String,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
@@ -274,12 +286,30 @@ impl ToolRuntime {
                 host,
                 client_attachment_id,
                 wake_capable,
-                controller_generation,
                 idempotency_key,
             },
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
+        }
+    }
+
+    pub(crate) fn renew_agent_endpoint(
+        &self,
+        auth: Option<&AuthContext>,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return communication_store_unavailable();
+        };
+        match db.renew_agent_endpoint(&principal, &endpoint_id, expected_controller_generation) {
+            Ok(result) => serialized_success(result),
+            Err(error) => communication_error(error, RecoveryKind::Reconcile),
         }
     }
 
@@ -474,12 +504,65 @@ impl ToolRuntime {
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn consume_agent_wake(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        wake_id: String,
+        consume_token: String,
+    ) -> ToolResult {
+        let principal = match communication_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return communication_store_unavailable();
+        };
+        match db.consume_agent_wake(
+            &principal,
+            &agent_id,
+            &endpoint_id,
+            expected_controller_generation,
+            &wake_id,
+            &consume_token,
+        ) {
+            Ok(result) => serialized_success(result),
+            Err(error) => communication_error(error, RecoveryKind::RetrySame),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::shared_key_context;
+
+    #[test]
+    fn stale_endpoint_and_wake_fences_require_reconciliation() {
+        for error_kind in [
+            "endpoint_expired",
+            "endpoint_detached",
+            "endpoint_not_active",
+            "endpoint_generation_stale",
+            "wake_endpoint_fence_mismatch",
+            "wake_claim_stale",
+        ] {
+            assert_eq!(
+                communication_recovery_kind(error_kind, RecoveryKind::RetrySame),
+                RecoveryKind::Reconcile,
+                "{error_kind}"
+            );
+        }
+
+        assert_eq!(
+            communication_recovery_kind("wake_consume_token_mismatch", RecoveryKind::RetrySame),
+            RecoveryKind::FixInput
+        );
+    }
 
     #[test]
     fn durable_principal_ignores_rotating_api_key_identity() {
