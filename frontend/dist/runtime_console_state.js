@@ -30,6 +30,21 @@ const RUNTIME_COLLABORATION_MUTABLE_KINDS = new Set(["note", "guidance", "questi
 export function runtimeCollaborationMessageCanMutate(message) {
     return !!message && message.status === "open" && RUNTIME_COLLABORATION_MUTABLE_KINDS.has(String(message.kind || ""));
 }
+export function runtimeCollaborationMessageSides(messages, locallyAuthoredMessageIds = new Set()) {
+    const sides = new Map();
+    for (const message of Array.isArray(messages) ? messages : []) {
+        const id = typeof message?.message_id === "string" ? message.message_id : "";
+        if (!id)
+            continue;
+        const side = message?.author_session_id
+            ? "incoming"
+            : locallyAuthoredMessageIds.has(id)
+                ? "outgoing"
+                : "neutral";
+        sides.set(id, side);
+    }
+    return sides;
+}
 function collaborationMessageById(state, messageId) {
     return (Array.isArray(state?.collaboration?.messages) ? state.collaboration.messages : [])
         .find((message) => String(message?.message_id || "") === messageId) || null;
@@ -210,13 +225,13 @@ export function refreshRuntimeOverview(state) {
 export function isCurrentRuntimeOverviewRequest(state, request) {
     return !!request && request.credentialGeneration === state.credentialGeneration && request.generation === state.overviewGeneration;
 }
-export function refreshRuntimeProjects(state, query = "") {
+export function refreshRuntimeProjects(state, query = "", clientId = state.selectedDevice) {
     state.projectsGeneration += 1;
     return {
         credentialGeneration: state.credentialGeneration,
         projectGeneration: state.projectGeneration,
         generation: state.projectsGeneration,
-        clientId: String(state.selectedDevice || ""),
+        clientId: String(clientId || ""),
         query: String(query || "").trim(),
     };
 }
