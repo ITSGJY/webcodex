@@ -1,7 +1,7 @@
 use super::AgentCapability::{GitOrShell, Shell, StructuredProcess};
 use super::ToolVisibility::ModelVisible;
 use super::{
-    def, git_like, model_spec, no_context_continuity, ToolDefinition, TOOL_CATEGORY_CLEANUP,
+    context_recovery_only, def, git_like, model_spec, ToolDefinition, TOOL_CATEGORY_CLEANUP,
 };
 use crate::tool_runtime::metadata::{
     ToolPathHint::{None as NoPath, PathList},
@@ -13,7 +13,7 @@ use crate::tool_runtime::registry::input_schemas::{
     git_restore_paths_input_schema, workspace_hygiene_check_input_schema,
 };
 
-pub(super) const DEFINITIONS: &[ToolDefinition] = &[no_context_continuity(model_spec(
+pub(super) const DEFINITIONS: &[ToolDefinition] = &[context_recovery_only(model_spec(
     def(
         "workspace_hygiene_check",
         ModelVisible,

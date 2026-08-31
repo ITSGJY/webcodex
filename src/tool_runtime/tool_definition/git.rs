@@ -1,7 +1,7 @@
 use super::AgentCapability::GitOrShell;
 use super::ToolVisibility::ModelVisible;
 use super::{
-    change_summary_like, def, git_like, model_spec, no_context_continuity, ToolDefinition,
+    change_summary_like, context_recovery_only, def, git_like, model_spec, ToolDefinition,
     TOOL_CATEGORY_GIT,
 };
 use crate::tool_runtime::metadata::{
@@ -14,7 +14,7 @@ use crate::tool_runtime::registry::input_schemas::{
 };
 
 pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
-    no_context_continuity(change_summary_like(git_like(model_spec(
+    context_recovery_only(change_summary_like(git_like(model_spec(
         def(
             "git_diff_summary",
             ModelVisible,
@@ -36,7 +36,7 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
         "Read-only git diff summary for a project: `git status --porcelain`, `git diff --stat`, and a parsed changed-file list. Does not modify the worktree.",
         git_diff_summary_input_schema,
     )))),
-    no_context_continuity(change_summary_like(git_like(model_spec(
+    context_recovery_only(change_summary_like(git_like(model_spec(
         def(
             "git_review_summary",
             ModelVisible,
@@ -58,7 +58,7 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
         "Deterministic bounded committed-range review map. Use before targeted git_diff_hunks/read_file during branch or PR review. Does not judge correctness and never mutates the repository.",
         git_review_summary_input_schema,
     )))),
-    no_context_continuity(change_summary_like(git_like(model_spec(
+    context_recovery_only(change_summary_like(git_like(model_spec(
         def(
             "show_changes",
             ModelVisible,
@@ -83,7 +83,7 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
 ];
 
 pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
-    no_context_continuity(git_like(model_spec(
+    context_recovery_only(git_like(model_spec(
         def(
             "git_status",
             ModelVisible,
@@ -105,7 +105,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
         "Run git status --porcelain for a project.",
         git_status_input_schema,
     ))),
-    no_context_continuity(git_like(model_spec(
+    context_recovery_only(git_like(model_spec(
         def(
             "git_diff",
             ModelVisible,
@@ -127,7 +127,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
         "Run git diff for a project, optionally scoped to paths.",
         git_diff_input_schema,
     ))),
-    no_context_continuity(change_summary_like(git_like(model_spec(
+    context_recovery_only(change_summary_like(git_like(model_spec(
         def(
             "git_diff_hunks",
             ModelVisible,
@@ -149,7 +149,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
         "Targeted/paged diff review for worktree/cached or exact base/head ranges, with paths and scope-bound opaque continuation. Replay scope and paging inputs unchanged. Continuation pages later records; hunk_line_limit needs a fresh call with larger max_hunk_lines and/or narrower paths. Read-only.",
         git_diff_hunks_input_schema,
     )))),
-    no_context_continuity(git_like(model_spec(
+    context_recovery_only(git_like(model_spec(
         def(
             "git_log",
             ModelVisible,

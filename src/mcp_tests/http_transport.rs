@@ -1138,9 +1138,14 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     .await;
     assert_eq!(status, StatusCode::OK, "{cached_read_body}");
     let cached_read = stateless_tool_output(&cached_read_body);
-    assert!(cached_read.get("session_context_revision").is_none());
-    assert!(cached_read.get("session_continuity").is_none());
-    assert!(cached_read.get("session_recovery").is_none());
+    assert_eq!(cached_read["session_context_revision"], 0);
+    assert_eq!(cached_read["session_continuity"]["status"], "invalid");
+    assert_eq!(cached_read["session_continuity"]["ack_revision"], 999);
+    assert!(cached_read["session_recovery"]["model_facing_events"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(cached_read["session_recovery"]["current_handoff"].is_object());
     assert_eq!(runtime.sessions.context_revision(&session_id), Some(0));
 
     let mut exact_args =
@@ -1173,9 +1178,10 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{second_cached_read_body}");
-    assert!(stateless_tool_output(&second_cached_read_body)
-        .get("session_context_revision")
-        .is_none());
+    let second_cached_read = stateless_tool_output(&second_cached_read_body);
+    assert_eq!(second_cached_read["session_context_revision"], 1);
+    assert!(second_cached_read.get("session_continuity").is_none());
+    assert!(second_cached_read.get("session_recovery").is_none());
     assert_eq!(runtime.sessions.context_revision(&session_id), Some(1));
 
     let mut stale_args =

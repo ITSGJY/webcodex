@@ -4793,7 +4793,7 @@ fn raw_model_facing_events_do_not_consume_context_revisions() {
         assert!(!observed.checkpoint_advanced, "{tool}");
         assert_eq!(
             observed.ack_session_context_revision,
-            SessionContextRevisionAck::Unsupported,
+            SessionContextRevisionAck::Revision(0),
             "{tool}"
         );
     }
@@ -5286,7 +5286,7 @@ fn simultaneous_no_checkpoint_results_leave_revision_unchanged() {
         assert!(!recorded.checkpoint_advanced);
         assert_eq!(
             recorded.ack_session_context_revision,
-            SessionContextRevisionAck::Unsupported
+            SessionContextRevisionAck::Revision(1)
         );
     }
     assert_eq!(store.context_revision(&session.session_id), Some(1));
@@ -5433,7 +5433,7 @@ fn batch_budget_preserves_recorder_overlay_for_no_ack_read_batch() {
         assert!(!recorded.checkpoint_advanced);
         assert_eq!(
             recorded.ack_session_context_revision,
-            SessionContextRevisionAck::Unsupported
+            SessionContextRevisionAck::Revision(1)
         );
         assert!(recorded.recovery_events.is_empty());
 
@@ -5445,16 +5445,13 @@ fn batch_budget_preserves_recorder_overlay_for_no_ack_read_batch() {
             Some(recorded.event_id.clone()),
         );
         assert!(
-            !super::super::session_context::add_session_context_continuity(
-                &mut response,
-                &recorded,
-            )
+            super::super::session_context::add_session_context_continuity(&mut response, &recorded,)
         );
         super::super::read_files::apply_model_facing_output_budget(&mut response, None);
         super::super::dispatch::sparsify_complete_read_success("read_files", &mut response);
         assert_eq!(response.output["session_recorded"], true);
         assert_eq!(response.output["session_id"], session.session_id);
-        assert!(response.output.get("session_context_revision").is_none());
+        assert_eq!(response.output["session_context_revision"], 1);
         assert!(response.output.get("session_continuity").is_none());
         assert!(response.output.get("session_recovery").is_none());
         assert!(

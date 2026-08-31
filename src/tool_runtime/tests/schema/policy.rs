@@ -10,10 +10,10 @@ fn tool_definitions_are_context_continuity_ssot() {
     use crate::tool_runtime::tool_policy::lookup_tool_definition;
 
     for (name, accepts_ack, advances_checkpoint) in [
-        ("read_files", false, false),
-        ("search_project_texts", false, false),
-        ("tool_manifest", false, false),
-        ("show_changes", false, false),
+        ("read_files", true, false),
+        ("search_project_texts", true, false),
+        ("tool_manifest", true, false),
+        ("show_changes", true, false),
         ("work_on_project", true, false),
         ("apply_text_edits", true, true),
         ("run_process", true, true),

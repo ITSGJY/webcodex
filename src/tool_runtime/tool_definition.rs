@@ -331,11 +331,6 @@ impl ToolContextContinuityPolicy {
         checkpoint: ContextCheckpointPolicy::OnModelFacingResult,
     };
 
-    pub(crate) const NONE: Self = Self {
-        accepts_context_ack: false,
-        checkpoint: ContextCheckpointPolicy::Never,
-    };
-
     pub(crate) const RECOVERY_ONLY: Self = Self {
         accepts_context_ack: true,
         checkpoint: ContextCheckpointPolicy::Never,
@@ -494,10 +489,6 @@ const fn context_continuity(
     }
 }
 
-const fn no_context_continuity(definition: ToolDefinition) -> ToolDefinition {
-    context_continuity(definition, ToolContextContinuityPolicy::NONE)
-}
-
 const fn context_recovery_only(definition: ToolDefinition) -> ToolDefinition {
     context_continuity(definition, ToolContextContinuityPolicy::RECOVERY_ONLY)
 }
@@ -576,7 +567,7 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     edits::DEFINITIONS,
 ];
 
-const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[no_context_continuity(model_spec(
+const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_recovery_only(model_spec(
     def(
         "list_tools",
         ModelVisible,

@@ -1,6 +1,6 @@
 use super::ToolVisibility::ModelVisible;
 use super::{
-    def, model_spec, no_context_continuity, ToolDefinition, TOOL_CATEGORY_PROJECT,
+    context_recovery_only, def, model_spec, ToolDefinition, TOOL_CATEGORY_PROJECT,
     TOOL_CATEGORY_RUNTIME,
 };
 use crate::tool_runtime::metadata::{
@@ -15,7 +15,7 @@ use crate::tool_runtime::registry::input_schemas::{
 };
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "list_projects",
             ModelVisible,
@@ -103,7 +103,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         "Create a directory on one Runner and register it as a Project. Use this for a new workspace; existing directories belong on the registration path.",
         create_project_input_schema,
     ),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "list_agents",
             ModelVisible,
@@ -125,7 +125,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         "List caller-visible Runners; use exact client_id/client_ids if known, summary_only + include_projects=false for health. Full mode includes shared Job concurrency and host_context advisory metadata; never authority.",
         list_agents_input_schema,
     )),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "runtime_status",
             ModelVisible,
@@ -147,7 +147,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         "Read runtime status; pass exact client_id for one Runner deployment/source alignment, omit for fleet-wide. Reports shared Job concurrency; global mode includes bounded host_context advisory metadata, never authority.",
         runtime_status_input_schema,
     )),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "tool_manifest",
             ModelVisible,

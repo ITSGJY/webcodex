@@ -1,7 +1,7 @@
 use super::AgentCapability::{FileRead, Shell};
 use super::ToolVisibility::ModelVisible;
 use super::{
-    def, model_spec, no_context_continuity, ToolDefinition, TOOL_CATEGORY_FILE,
+    context_recovery_only, def, model_spec, ToolDefinition, TOOL_CATEGORY_FILE,
     TOOL_CATEGORY_PROJECT,
 };
 use crate::tool_runtime::metadata::{
@@ -16,7 +16,7 @@ use crate::tool_runtime::registry::input_schemas::{
 };
 
 pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "project_overview",
             ModelVisible,
@@ -38,7 +38,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
         "Deterministic, bounded, metadata-only overview of an unfamiliar project: conventional project types, manifests, key files, roots, and direct children. Reads no file contents, uses no LLM, and is not semantic/LSP analysis; use read_file for contents.",
         project_overview_input_schema,
     )),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "list_project_files",
             ModelVisible,
@@ -60,7 +60,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
         "List files in an agent-registered project directory (bounded, read-only). Returns project-relative paths plus a file/dir kind. Routed to the owning registered agent; the server never reads the agent project path directly.",
         list_project_files_input_schema,
     )),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "list_project_tracked_files",
             ModelVisible,
@@ -84,7 +84,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
         "Default discovery tool: what files does this project contain? Lists Git-tracked paths in one bounded call, so ignored directories like .venv and target never appear. Supports globs, a scope, and paging; a project too large to list file by file rolls up to the deepest directory depth that fits.",
         list_project_tracked_files_input_schema,
     )),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "search_project_text",
             ModelVisible,
@@ -106,7 +106,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
         "Default inspect/search tool for project text. Uses rg-first with grep fallback. Regex is default; prefer pattern_mode=literal for exact identifiers, snippets, and paths. Supports matches/files_with_matches/count and context. Structured output reports backend, truncated, and failure metadata.",
         search_project_text_input_schema,
     )),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "search_project_texts",
             ModelVisible,
@@ -131,7 +131,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
 ];
 
 pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "read_file",
             ModelVisible,
@@ -153,7 +153,7 @@ pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
         "Default inspect tool for targeted source reading. Bounded UTF-8 range read with full-file sha256 and a continuation cursor (next_start_line); line numbers only change text. Oversized ranges fail range_too_large: shrink limit or narrow the range.",
         read_file_input_schema,
     )),
-    no_context_continuity(model_spec(
+    context_recovery_only(model_spec(
         def(
             "read_files",
             ModelVisible,
