@@ -202,7 +202,7 @@ async fn coding_task_semantic_navigation_available_is_recommended_and_bounded() 
         .as_str()
         .unwrap()
         .starts_with("wc_sess_"));
-    assert_eq!(result.output["startup_verdict"]["status"], "warn");
+    assert_eq!(result.output["startup_verdict"]["status"], "pass");
     assert!(!result.output["warnings"]
         .as_array()
         .unwrap()
@@ -240,7 +240,7 @@ async fn coding_task_semantic_navigation_crashed_does_not_lower_startup_verdict(
     assert_eq!(semantic["status"], "crashed");
     assert_eq!(semantic["available"], true);
     assert_eq!(semantic["reason_code"], "server_crashed");
-    assert_eq!(result.output["startup_verdict"]["status"], "warn");
+    assert_eq!(result.output["startup_verdict"]["status"], "pass");
 }
 
 #[tokio::test]
@@ -286,42 +286,6 @@ async fn coding_task_semantic_navigation_non_rust_agent_is_not_applicable() {
     assert_eq!(semantic["status"], "not_applicable");
     assert_eq!(semantic["reason_code"], "rust_not_detected");
     assert_eq!(semantic["available"], false);
-}
-
-#[tokio::test]
-async fn coding_task_semantic_navigation_legacy_agent_is_not_enqueued() {
-    let runtime = test_runtime();
-    let temp = tempfile::tempdir().unwrap();
-    seed_clean_repo(temp.path());
-    let project =
-        register_semantic_agent(&runtime, "legacy-agent", "demo", temp.path(), false).await;
-    let task = spawn_start(&runtime, project, SessionMode::Normal);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !task.is_finished() {
-        assert!(
-            Instant::now() < deadline,
-            "legacy-agent startup did not finish within the 10-second test deadline"
-        );
-        if let Some(request) = probe_patch_agent_request(&runtime, "legacy-agent").await {
-            assert_ne!(
-                request.kind, AGENT_LSP_REQUEST_KIND,
-                "legacy agent must not receive an LSP probe"
-            );
-            complete_agent_request_by_running_locally(&runtime, "legacy-agent", request).await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-    let result = task.await.unwrap();
-    assert!(result.success, "{result:?}");
-    let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic["status"], "agent_capability_unavailable");
-    assert_eq!(semantic["reason_code"], "lsp_capability_not_advertised");
-    assert_eq!(semantic["available"], false);
-    assert_eq!(semantic["capability"], Value::Null);
-    assert!(probe_patch_agent_request(&runtime, "legacy-agent")
-        .await
-        .is_none());
 }
 
 #[tokio::test]
@@ -521,12 +485,6 @@ fn coding_task_semantic_navigation_output_schema_is_explicit_and_surface_counts_
         known_tool_names().count(),
         "visible runtime tool count + hidden tools must cover every known tool"
     );
-    let start = crate::tool_runtime::start_coding_task_compatibility_spec();
-    assert!(start.input_schema["properties"]
-        .as_object()
-        .unwrap()
-        .get("include_semantic_navigation")
-        .is_none());
     let schema = crate::tool_runtime::registry::output_schema_for_tool("start_coding_task");
     let standard = schema["properties"]["output"]["oneOf"]
         .as_array()

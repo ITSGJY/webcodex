@@ -201,7 +201,12 @@ async fn http_agent_tokens_create_user_creates_for_self() {
                 .push(Router::with_path("agent-tokens/create").post(agent_tokens_create)),
         );
     let service = Service::new(router);
-    let alice_token = mint_user_token(&service, "alice", vec!["runtime:read".to_string()]).await;
+    let alice_token = mint_user_token(
+        &service,
+        "alice",
+        vec!["runtime:read".to_string(), "account:manage".to_string()],
+    )
+    .await;
     let mut resp = TestClient::post("http://localhost/api/agent-tokens/create")
         .bearer_auth(&alice_token)
         .json(&json!({"username": "alice", "client_id": "alice-laptop"}))
@@ -229,7 +234,12 @@ async fn http_agent_tokens_create_user_cannot_create_for_other() {
                 .push(Router::with_path("agent-tokens/create").post(agent_tokens_create)),
         );
     let service = Service::new(router);
-    let alice_token = mint_user_token(&service, "alice", vec!["runtime:read".to_string()]).await;
+    let alice_token = mint_user_token(
+        &service,
+        "alice",
+        vec!["runtime:read".to_string(), "account:manage".to_string()],
+    )
+    .await;
     let resp = TestClient::post("http://localhost/api/agent-tokens/create")
         .bearer_auth(&alice_token)
         .json(&json!({"username": "bob", "client_id": "bob-laptop"}))
@@ -397,7 +407,12 @@ async fn http_agent_tokens_register_hash_accepts_user_token_for_self() {
                 ),
         );
     let service = Service::new(router);
-    let alice_token = mint_user_token(&service, "alice", vec!["runtime:read".to_string()]).await;
+    let alice_token = mint_user_token(
+        &service,
+        "alice",
+        vec!["runtime:read".to_string(), "account:manage".to_string()],
+    )
+    .await;
     let agent_token = crate::auth::generate_agent_token();
     let resp = TestClient::post("http://localhost/api/agent-tokens/register_hash")
         .bearer_auth(&alice_token)
@@ -524,6 +539,7 @@ async fn http_agent_tokens_register_hash_enforces_transport_and_client_id_bindin
             "client_id": "alice-laptop",
             "agent_instance_id": "inst-1",
             "agent_protocol_version": "polling-v1",
+            "capabilities": crate::test_support::current_runner_capabilities(crate::shell_protocol::ShellClientCapabilities::default()),
             "owner": "alice",
         }))
         .send(&service)
@@ -540,6 +556,7 @@ async fn http_agent_tokens_register_hash_enforces_transport_and_client_id_bindin
             "client_id": "other-laptop",
             "agent_instance_id": "inst-2",
             "agent_protocol_version": "polling-v1",
+            "capabilities": crate::test_support::current_runner_capabilities(crate::shell_protocol::ShellClientCapabilities::default()),
             "owner": "alice",
         }))
         .send(&service)
@@ -761,7 +778,12 @@ async fn http_agent_tokens_revoke_user_cannot_revoke_others() {
         .unwrap()
         .to_string();
     // alice mints a user token and tries to revoke bob's agent token.
-    let alice_token = mint_user_token(&service, "alice", vec!["runtime:read".to_string()]).await;
+    let alice_token = mint_user_token(
+        &service,
+        "alice",
+        vec!["runtime:read".to_string(), "account:manage".to_string()],
+    )
+    .await;
     let resp = TestClient::post("http://localhost/api/agent-tokens/revoke")
         .bearer_auth(&alice_token)
         .json(&json!({"username": "alice", "token_id": bob_token_id}))

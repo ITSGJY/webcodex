@@ -55,37 +55,32 @@ The Runner authenticates with its agent token (or the direct shared key in
 hosted quick-start mode). The token is a Runner transport credential only; it
 is not used for MCP, REST, or GPT Actions.
 
-For WebSocket, the first-party Runner uses `Authorization: Bearer <token>`.
-The Server still accepts the deprecated `/api/agents/ws?token=...` form only
-for the compatibility contract documented by v0.1.0; do not put new
-credentials in URLs. This fallback can be removed when that legacy transport
-support window is explicitly retired. Polling uses the bearer header. QUIC
-keeps its credential in the transport-specific v1 first-register frame while
-the shared agent envelope remains credential-free.
+WebSocket and polling authenticate the first-party Runner with
+`Authorization: Bearer <token>`; query-string Runner credentials are not
+accepted. QUIC keeps its credential in the transport-specific v1 first-register
+frame while the shared agent envelope remains credential-free.
 
-### Rolling Server/Runner compatibility
+### Server/Runner compatibility
 
-The guaranteed rolling-upgrade window is **current development Server/Runner ↔
-the latest stable Server/Runner release**. "Latest stable" means the project's
-most recent non-prerelease versioned Server/Runner release; when this contract
-was introduced that release is v0.3.8 (`477c1f754e8b5c7d9f0e8b1c073487532a749101`).
-Older releases are best-effort unless a compatibility surface is explicitly
-retained.
+WebCodex does not guarantee rolling compatibility with v0.3.9 or older
+Server/Runner binaries. Post-v0.3.9 changes may intentionally retire old wire or
+authentication compatibility, so upgrade the first-party Server and Runner
+together when crossing those changes. A compatibility surface is supported only
+when the current contract explicitly retains it.
+
+Current first-party Runner registration is generation-2-only:
+`capabilities.agent_protocol_generation` must be exactly `2`. A missing value,
+generation `1`, or an unknown generation fails closed before the Runner record is
+accepted. The 22 generation-2 baseline capability booleans are protocol facts;
+omitting or contradicting one rejects registration rather than degrading it to
+unavailable. RegistrationRequired additive capabilities remain explicit and
+fail closed as unavailable when omitted.
 
 Agent protocol labels such as `polling-v1`, `websocket-v1`, `quic-v1` and their
-`v2` inventory variants are rolling-compatibility ingress adapters, not claims
-of independent canonical protocol generations. Registration still fails closed:
-`agent_protocol_version` must be present and supported. Official v0.1.0
-first-party Runners already sent the v1 labels, so pre-release omission is not
-part of the supported window. Additive capability fields remain fail-closed when
-an older peer omits them (normally `false`/unavailable), and project-inventory
-paging is not sent to an older Server until support is explicitly signalled.
-
-The deprecated `/api/agents/ws?token=...` handshake is a separately documented
-historical exception because v0.1.0 published it; the first-party Runner uses
-`Authorization: Bearer` and the exception remains only until that legacy window
-is explicitly retired. Any future removal or intentional break in rolling
-Server/Runner compatibility must be called out in the applicable release notes.
+`v2` inventory variants remain current ingress semantics. They select project
+inventory strategy and do not select an older protocol generation or promise to
+accept an arbitrary older release binary. `agent_protocol_version` must still be
+present and supported.
 
 QUIC upgrade note: `[quic].keepalive_interval_secs` now actively configures
 Quinn transport keepalive. The default remains 20 seconds and the accepted
@@ -132,13 +127,14 @@ allow_cwd_anywhere = false
 allowed_roots = ["/root/git"]
 ```
 
-### Temporary projects
+### Temporary-project root
 
-Set `temporary_projects_root` in `agent.toml` to let `start_coding_task`
-create a project from a `client_id` instead of an existing `project`. The
-Runner creates only a new direct child of that root and persists a normal
-`projects.d` record with `kind = "managed_temporary"`. The root must already
-exist and must be allowed by the policy. There is no automatic expiration.
+`temporary_projects_root` remains the bounded root used by WebCodex's internal
+managed-temporary startup primitive. The retired `start_coding_task` wire/API
+entry no longer exposes managed-temporary creation directly. For current
+external workflows, register an existing directory with `work_on_project` path
+input / `register_project`, or create one explicitly with `create_project`. The
+configured root must already exist and be allowed by policy.
 
 ### Registering projects at runtime
 
