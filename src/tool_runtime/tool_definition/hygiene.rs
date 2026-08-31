@@ -1,6 +1,8 @@
 use super::AgentCapability::{GitOrShell, Shell, StructuredProcess};
 use super::ToolVisibility::ModelVisible;
-use super::{def, git_like, model_spec, ToolDefinition, TOOL_CATEGORY_CLEANUP};
+use super::{
+    context_recovery_only, def, git_like, model_spec, ToolDefinition, TOOL_CATEGORY_CLEANUP,
+};
 use crate::tool_runtime::metadata::{
     ToolPathHint::{None as NoPath, PathList},
     ToolRisk::{ProjectWrite, Read},
@@ -11,7 +13,7 @@ use crate::tool_runtime::registry::input_schemas::{
     git_restore_paths_input_schema, workspace_hygiene_check_input_schema,
 };
 
-pub(super) const DEFINITIONS: &[ToolDefinition] = &[model_spec(
+pub(super) const DEFINITIONS: &[ToolDefinition] = &[context_recovery_only(model_spec(
     def(
         "workspace_hygiene_check",
         ModelVisible,
@@ -32,7 +34,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[model_spec(
     ),
     "Default pre-final workspace hygiene review; read-only. Detects dirty worktree, untracked temp/smoke files, cache dirs, secret-like names, and large untracked files before validation or handoff. Never reads file contents.",
     workspace_hygiene_check_input_schema,
-)];
+))];
 
 pub(super) const CLEANUP_DEFINITIONS: &[ToolDefinition] = &[
     model_spec(

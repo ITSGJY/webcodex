@@ -869,7 +869,7 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
     assert!(missing_ack.output.get("context_projection").is_none());
     assert!(!missing_ack.output.to_string().contains(private_summary));
 
-    let behind = list_files_with_session_context(
+    let exact = list_files_with_session_context(
         &runtime,
         "memory-ack",
         &project_id,
@@ -878,10 +878,11 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
         Vec::new(),
     )
     .await;
-    assert!(behind.success);
-    assert!(behind.output.get("session_recovery").is_some());
-    assert!(behind.output.get("context_projection").is_none());
-    assert!(!behind.output.to_string().contains(private_summary));
+    assert!(exact.success);
+    assert_eq!(exact.output["session_context_revision"], 0);
+    assert!(exact.output.get("session_recovery").is_none());
+    assert!(exact.output.get("context_projection").is_none());
+    assert!(!exact.output.to_string().contains(private_summary));
 
     let explicit = list_files_with_session_context(
         &runtime,

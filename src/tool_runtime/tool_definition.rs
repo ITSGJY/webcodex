@@ -48,17 +48,18 @@ pub use super::tool_policy::is_known_tool_name;
 #[cfg(test)]
 pub(crate) use super::tool_policy::{
     is_model_hidden_tool_name, known_tool_names, model_hidden_tool_names,
-    runtime_tool_requires_explicit_business_session,
+    runtime_tool_context_continuity_policy, runtime_tool_requires_explicit_business_session,
 };
 pub(crate) use super::tool_policy::{
     is_model_visible_tool_name, lookup_tool_definition, model_visible_tool_definitions,
-    model_visible_tool_names_csv, runtime_tool_agent_capability, runtime_tool_approval_policy,
-    runtime_tool_captures_validation_output, runtime_tool_category, runtime_tool_disabled_message,
-    runtime_tool_effect_annotations, runtime_tool_extra_accepted_flattened_args,
-    runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
-    runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_metadata,
-    runtime_tool_permission_risk, runtime_tool_requires_permission,
-    runtime_tool_session_risk_class,
+    model_visible_tool_names_csv, runtime_tool_accepts_context_ack,
+    runtime_tool_advances_context_checkpoint, runtime_tool_agent_capability,
+    runtime_tool_approval_policy, runtime_tool_captures_validation_output, runtime_tool_category,
+    runtime_tool_disabled_message, runtime_tool_effect_annotations,
+    runtime_tool_extra_accepted_flattened_args, runtime_tool_is_change_summary_like,
+    runtime_tool_is_git_like, runtime_tool_is_read_like, runtime_tool_is_shell_like,
+    runtime_tool_is_write_like, runtime_tool_metadata, runtime_tool_permission_risk,
+    runtime_tool_requires_permission, runtime_tool_session_risk_class,
 };
 use crate::shell_protocol::{
     SHELL_CLIENT_CAPABILITY_ASYNC_JOBS, SHELL_CLIENT_CAPABILITY_ASYNC_SHELL_JOBS,
@@ -313,7 +314,39 @@ pub(crate) struct ToolEffectAnnotations {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextCheckpointPolicy {
+    Never,
+    OnModelFacingResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolContextContinuityPolicy {
+    pub(crate) accepts_context_ack: bool,
+    pub(crate) checkpoint: ContextCheckpointPolicy,
+}
+
+impl ToolContextContinuityPolicy {
+    pub(crate) const CONSERVATIVE: Self = Self {
+        accepts_context_ack: true,
+        checkpoint: ContextCheckpointPolicy::OnModelFacingResult,
+    };
+
+    pub(crate) const RECOVERY_ONLY: Self = Self {
+        accepts_context_ack: true,
+        checkpoint: ContextCheckpointPolicy::Never,
+    };
+
+    pub(crate) const fn advances_context_checkpoint(self) -> bool {
+        matches!(
+            self.checkpoint,
+            ContextCheckpointPolicy::OnModelFacingResult
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ToolDefinitionPolicy {
+    pub(crate) context_continuity: ToolContextContinuityPolicy,
     pub(crate) change_summary_like: bool,
     pub(crate) captures_validation_output: bool,
     pub(crate) disabled_message: Option<&'static str>,
@@ -327,6 +360,7 @@ pub(crate) struct ToolDefinitionPolicy {
 
 impl ToolDefinitionPolicy {
     const DEFAULT: Self = Self {
+        context_continuity: ToolContextContinuityPolicy::CONSERVATIVE,
         change_summary_like: false,
         captures_validation_output: false,
         disabled_message: None,
@@ -442,6 +476,23 @@ bool_policy_modifier!(change_summary_like, change_summary_like);
 
 bool_policy_modifier!(git_like, git_like);
 
+const fn context_continuity(
+    definition: ToolDefinition,
+    context_continuity: ToolContextContinuityPolicy,
+) -> ToolDefinition {
+    ToolDefinition {
+        policy: ToolDefinitionPolicy {
+            context_continuity,
+            ..definition.policy
+        },
+        ..definition
+    }
+}
+
+const fn context_recovery_only(definition: ToolDefinition) -> ToolDefinition {
+    context_continuity(definition, ToolContextContinuityPolicy::RECOVERY_ONLY)
+}
+
 const fn extra_accepted_flattened_args(
     definition: ToolDefinition,
     fields: &'static [&'static str],
@@ -516,7 +567,7 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     edits::DEFINITIONS,
 ];
 
-const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[model_spec(
+const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_recovery_only(model_spec(
     def(
         "list_tools",
         ModelVisible,
@@ -537,4 +588,4 @@ const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[model_spec(
     ),
     "List runtime tools. Full output includes schemas and may be large; use summary_only with category, features, or limit for bounded GPT Action discovery.",
     list_tools_input_schema,
-)];
+))];

@@ -17,7 +17,9 @@ use crate::tool_runtime::kernel::{
 use crate::tool_runtime::model_ergonomics_telemetry::{
     ModelErgonomicsRecord, ModelErgonomicsTimer,
 };
-use crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES;
+use crate::tool_runtime::tool_definition::{
+    runtime_tool_accepts_context_ack, LOCAL_CODING_TOOL_NAMES,
+};
 #[cfg(test)]
 use crate::tool_runtime::ToolResult;
 use crate::tool_runtime::{registered_tool_specs, ToolRuntime, ToolSpec};
@@ -370,6 +372,10 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
         return;
     };
     for tool in tools {
+        let accepts_context_ack = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(runtime_tool_accepts_context_ack);
         let Some(properties) = tool
             .pointer_mut("/inputSchema/properties")
             .and_then(Value::as_object_mut)
@@ -432,15 +438,17 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
                     "description": format!("Request bounded context material after this tool's main effect/observation; keys are open-ended and currently include {}. This sidecar grants no authority and cannot make requested guidance a retroactive precondition of the current effect. Recover missing project or Memory guidance on a read/observation call before any later dependent mutation.", crate::tool_runtime::context_projection::context_material_keys_csv())
                 }),
             );
-            properties.insert(
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
-                    .to_string(),
-                json!({
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Echo the latest Session context revision retained by the model; omit it when unknown. A known behind revision may receive bounded delta recovery; missing, invalid, future, lost-history, or truncated recovery gets a compact current Session handoff. Recovery is nonblocking."
-                }),
-            );
+            if accepts_context_ack {
+                properties.insert(
+                    crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
+                        .to_string(),
+                    json!({
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Echo the latest Session context revision retained by the model; omit it when unknown. A known behind revision may receive bounded delta recovery; missing, invalid, future, lost-history, or truncated recovery gets a compact current Session handoff. Recovery is nonblocking."
+                    }),
+                );
+            }
             add_stateless_context_projection_output_schema(tool);
         }
     }
@@ -1320,11 +1328,11 @@ pub(super) async fn handle_call(
             );
         }
     }
-    let context_continuity_capable =
+    let context_continuity_surface_capable =
         stateless_2026 && runtime.model_surface().supports_operator_extensions();
-    // The sidecar is surface-scoped like the ACK today, but it is a
-    // separate caller-explicit protocol and must not participate in
-    // revision continuity bookkeeping.
+    let context_continuity_capable =
+        context_continuity_surface_capable && runtime_tool_accepts_context_ack(&params.name);
+    // context_request remains surface-scoped and independent from ACK policy.
     let context_sidecar_capable =
         stateless_2026 && runtime.model_surface().supports_operator_extensions();
     let skill_runtime_capable =
@@ -1366,21 +1374,25 @@ pub(super) async fn handle_call(
             );
         }
     }
-    if context_continuity_capable {
+    if context_continuity_surface_capable {
         if let Some(arguments) = params.arguments.as_object_mut() {
             arguments.remove(
                 crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD,
             );
         }
+        // Tolerate cached old schemas: strip the public wrapper from every
+        // operator request, but preserve it as proof only for ACK-capable tools.
         let context_revision = strip_stateless_ack_session_context_revision(&mut params.arguments);
-        if let (Some(arguments), Some(context_revision)) =
-            (params.arguments.as_object_mut(), context_revision)
-        {
-            arguments.insert(
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD
-                    .to_string(),
-                context_revision,
-            );
+        if context_continuity_capable {
+            if let (Some(arguments), Some(context_revision)) =
+                (params.arguments.as_object_mut(), context_revision)
+            {
+                arguments.insert(
+                    crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD
+                        .to_string(),
+                    context_revision,
+                );
+            }
         }
     }
     if let Some(lc) = lifecycle.as_deref() {

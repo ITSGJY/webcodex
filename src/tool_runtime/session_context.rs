@@ -410,6 +410,11 @@ pub(crate) fn add_session_context_continuity(
     result: &mut ToolResult,
     recorded: &sessions::RecordedModelFacingToolCall,
 ) -> bool {
+    debug_assert_eq!(
+        recorded.checkpoint_advanced,
+        recorded.context_revision > recorded.pre_response_context_revision,
+        "checkpoint allocation must match the recorded pre-response watermark"
+    );
     if matches!(
         recorded.ack_session_context_revision,
         sessions::SessionContextRevisionAck::Unsupported
@@ -428,7 +433,7 @@ pub(crate) fn add_session_context_continuity(
         "session_context_revision".to_string(),
         Value::from(recorded.context_revision),
     );
-    let pre_response_context_revision = recorded.context_revision.saturating_sub(1);
+    let pre_response_context_revision = recorded.pre_response_context_revision;
     let (status, ack_revision, needs_recovery, events_after_ack) = match recorded
         .ack_session_context_revision
     {
@@ -457,13 +462,7 @@ pub(crate) fn add_session_context_continuity(
         sessions::SessionContextRevisionAck::Unacknowledged => ("unacknowledged", None, true, None),
         sessions::SessionContextRevisionAck::Invalid => ("invalid", None, true, None),
     };
-    let suppress_fresh_empty_recovery = matches!(
-        recorded.ack_session_context_revision,
-        sessions::SessionContextRevisionAck::Unacknowledged
-    ) && pre_response_context_revision == 0
-        && recorded.recovery_events.is_empty()
-        && !recorded.history_lost;
-    if needs_recovery && !suppress_fresh_empty_recovery {
+    if needs_recovery {
         let total_retained = recorded.recovery_events.len();
         let events = bounded_model_facing_recovery_events(recorded);
         let omitted_count = total_retained.saturating_sub(events.len());

@@ -359,10 +359,81 @@ async fn adaptive_runtime_requires_gateway_for_long_tail_and_preserves_dispatch(
 }
 
 #[tokio::test]
+async fn adaptive_runtime_gateway_uses_long_tail_target_checkpoint_policy_once() {
+    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let gateway_session = runtime.sessions.start_session(
+        Some("missing-project".to_string()),
+        Some("gateway checkpoint parity".to_string()),
+    );
+
+    let gateway_read = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7221)),
+            mcp_2026_params(json!({
+                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {
+                    "tool": "read_file",
+                    "arguments": {
+                        "project": "missing-project",
+                        "path": "src/lib.rs"
+                    },
+                    "recording_session_id": gateway_session.session_id,
+                    "ack_session_context_revision": 999
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(gateway_read, McpOutcome::Ok(_)));
+    assert_eq!(
+        runtime
+            .sessions
+            .context_revision(&gateway_session.session_id),
+        Some(0),
+        "gateway read must inherit the long-tail target no-checkpoint policy"
+    );
+
+    let gateway_script = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7222)),
+            mcp_2026_params(json!({
+                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {
+                    "tool": "run_script",
+                    "arguments": {
+                        "project": "missing-project",
+                        "language": "bash",
+                        "script": "exit 0"
+                    },
+                    "recording_session_id": gateway_session.session_id,
+                    "ack_session_context_revision": 0
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(gateway_script, McpOutcome::Ok(_)));
+    assert_eq!(
+        runtime
+            .sessions
+            .context_revision(&gateway_session.session_id),
+        Some(1),
+        "one checkpoint-capable gateway invocation must allocate exactly one revision"
+    );
+}
+
+#[tokio::test]
 async fn adaptive_runtime_gateway_rejects_recursive_and_unknown_targets() {
     let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
     for target in [
         crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        "read_files",
         "work_on_project",
         "start_coding_task",
         "not_a_real_webcodex_tool",
@@ -383,7 +454,12 @@ async fn adaptive_runtime_gateway_rejects_recursive_and_unknown_targets() {
         match outcome {
             McpOutcome::BadRequest(value) => {
                 assert_eq!(value["error"]["code"], -32602);
-                assert!(value["error"]["message"].as_str().unwrap().contains(target));
+                assert_eq!(
+                    value["error"]["message"],
+                    format!(
+                        "tool '{target}' is not available through the adaptive runtime gateway"
+                    )
+                );
             }
             other => panic!("target {target} must fail closed, got {other:?}"),
         }

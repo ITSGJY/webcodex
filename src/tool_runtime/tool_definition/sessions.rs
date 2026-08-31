@@ -1,8 +1,9 @@
 use super::AgentCapability::{GitOrShell, OwnerOnly};
 use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
-    def, extra_accepted_flattened_args, model_spec, requires_explicit_business_session,
-    ToolDefinition, TOOL_CATEGORY_SESSION, TOOL_CATEGORY_VALIDATION,
+    context_recovery_only, def, extra_accepted_flattened_args, model_spec,
+    requires_explicit_business_session, ToolDefinition, TOOL_CATEGORY_SESSION,
+    TOOL_CATEGORY_VALIDATION,
 };
 use crate::tool_runtime::metadata::{
     ToolPathHint::None as NoPath, ToolRisk::Read, PROJECT_READ, PROJECT_WRITE, RUNTIME_READ,
@@ -58,7 +59,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ),
         &["session_id"],
     ),
-    model_spec(
+    context_recovery_only(model_spec(
         def(
             "work_on_project",
             ModelVisible,
@@ -79,7 +80,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ),
         "Canonical model entry for ordinary coding/review via an existing project or Runner path; Git not required. Supports exact Session continuation and returns compact workflow plus project instructions.",
         work_on_project_input_schema,
-    ),
+    )),
     requires_explicit_business_session(model_spec(
         def(
             "finish_coding_task",

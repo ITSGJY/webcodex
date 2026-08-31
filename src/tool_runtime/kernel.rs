@@ -240,10 +240,12 @@ impl ToolRuntime {
         context: ToolCallContext<'_>,
         capabilities: ToolProtocolCapabilities,
     ) -> ToolCallOutcome {
+        let context_continuity_capable = capabilities.context_continuity
+            && super::tool_definition::runtime_tool_accepts_context_ack(&request.tool_name);
         let telemetry = ModelErgonomicsTimer::start_with_protocol(
             &request.tool_name,
             &request.arguments,
-            capabilities.context_continuity,
+            context_continuity_capable,
         );
         let mut outcome = self
             .call_tool_with_context_inner(request, context, capabilities)
@@ -258,10 +260,12 @@ impl ToolRuntime {
         context: ToolCallContext<'_>,
         capabilities: ToolProtocolCapabilities,
     ) -> ToolCallOutcome {
+        let context_continuity_capable = capabilities.context_continuity
+            && super::tool_definition::runtime_tool_accepts_context_ack(&request.tool_name);
         let mut recorder_metadata =
             ToolCallRecorderMetadata::from_arguments_with_context_continuity(
                 &request.arguments,
-                capabilities.context_continuity,
+                context_continuity_capable,
             );
         // One trusted identity per real kernel request. The outer recorder and
         // inner business ledger pairs inherit it, but it never affects execution.

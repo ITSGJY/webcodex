@@ -3,6 +3,9 @@
 //! All durable session-map mutations flow through `SessionStoreInner` helpers.
 //! Callers outside this module use `SessionStore` methods only.
 use super::super::permissions::PermissionDecision;
+use super::super::tool_definition::{
+    runtime_tool_accepts_context_ack, runtime_tool_advances_context_checkpoint,
+};
 use super::super::tool_inputs::SessionMode;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -1194,7 +1197,11 @@ impl SessionStore {
         let diff_review_like = diff_review_like_for_tool(tool_name, arguments);
         let input_summary = Some(session_input_summary_for_tool(tool_name, arguments));
         let expectation = metadata.expectation;
-        let ack_session_context_revision = metadata.ack_session_context_revision;
+        let ack_session_context_revision = if runtime_tool_accepts_context_ack(tool_name) {
+            metadata.ack_session_context_revision
+        } else {
+            SessionContextRevisionAck::Unsupported
+        };
         let start = ToolCallStart {
             event_id: event_id.clone(),
             call_id: call_id.clone(),
@@ -1219,6 +1226,7 @@ impl SessionStore {
             permission: None,
             expectation: expectation.clone(),
             pre_call_context_revision,
+            advances_context_checkpoint: runtime_tool_advances_context_checkpoint(tool_name),
             ack_session_context_revision,
         };
         self.push_event(SessionEvent {
@@ -1353,6 +1361,7 @@ impl SessionStore {
         mut event: SessionEvent,
         pre_call_context_revision: u64,
         ack_session_context_revision: SessionContextRevisionAck,
+        advances_context_checkpoint: bool,
     ) -> Option<RecordedModelFacingToolCall> {
         let session_id = event.session_id.clone();
         let outcome = {
@@ -1374,13 +1383,15 @@ impl SessionStore {
             if record.context_revision < pre_call_context_revision {
                 return None;
             }
-            let next_revision = record.context_revision.checked_add(1)?;
-            // A call may have started at revision N while another model-facing
-            // call completes before this result is recorded. The response for
-            // this result must recover those intervening completions before it
-            // exposes its own newer revision, otherwise a caller could ACK the
-            // newer revision without ever seeing a complete context prefix.
-            let pre_response_context_revision = next_revision.saturating_sub(1);
+            // Recover only the checkpoint prefix that existed immediately before
+            // this result. Non-checkpoint model-facing events stay in the ledger
+            // without consuming a context revision.
+            let pre_response_context_revision = record.context_revision;
+            let context_revision = if advances_context_checkpoint {
+                pre_response_context_revision.checked_add(1)?
+            } else {
+                pre_response_context_revision
+            };
             let recovery_start = match ack_session_context_revision {
                 SessionContextRevisionAck::Revision(revision)
                     if revision <= pre_call_context_revision =>
@@ -1412,9 +1423,11 @@ impl SessionStore {
                 _ => 0,
             };
             let history_lost = expected_recovery_count > recovery_events.len() as u64;
-            event.context_revision = Some(next_revision);
+            event.context_revision = advances_context_checkpoint.then_some(context_revision);
             let event_id = event.event_id.clone();
-            record.context_revision = next_revision;
+            if advances_context_checkpoint {
+                record.context_revision = context_revision;
+            }
             record.updated_at = record.updated_at.max(event.timestamp);
             record.events.push_back(Arc::new(event));
             record.events_observed = record.events_observed.saturating_add(1);
@@ -1424,7 +1437,9 @@ impl SessionStore {
             let outcome = RecordedModelFacingToolCall {
                 event_id,
                 session_id: session_id.clone(),
-                context_revision: next_revision,
+                context_revision,
+                pre_response_context_revision,
+                checkpoint_advanced: advances_context_checkpoint,
                 pre_call_context_revision,
                 ack_session_context_revision,
                 recovery_events,
@@ -1453,15 +1468,15 @@ impl SessionStore {
         error: Option<&str>,
         error_kind: Option<&str>,
     ) -> Option<String> {
-        let (event, _, _) =
+        let (event, _, _, _) =
             Self::tool_call_finished_event(start, success, output, error, error_kind)?;
         let event_id = event.event_id.clone();
         self.push_event(event);
         Some(event_id)
     }
 
-    /// Append a finished model-facing ToolResult and atomically allocate its next
-    /// Session-local context revision with the corresponding event annotation.
+    /// Append a finished model-facing ToolResult and atomically advance the
+    /// Session-local context revision only for a ToolDefinition checkpoint.
     pub(crate) fn record_model_facing_tool_call_finished(
         &self,
         start: Option<ToolCallStart>,
@@ -1470,12 +1485,17 @@ impl SessionStore {
         error: Option<&str>,
         error_kind: Option<&str>,
     ) -> Option<RecordedModelFacingToolCall> {
-        let (event, pre_call_context_revision, ack_session_context_revision) =
-            Self::tool_call_finished_event(start, success, output, error, error_kind)?;
+        let (
+            event,
+            pre_call_context_revision,
+            ack_session_context_revision,
+            advances_context_checkpoint,
+        ) = Self::tool_call_finished_event(start, success, output, error, error_kind)?;
         self.push_model_facing_event(
             event,
             pre_call_context_revision,
             ack_session_context_revision,
+            advances_context_checkpoint,
         )
     }
 
@@ -1485,10 +1505,11 @@ impl SessionStore {
         output: &Value,
         error: Option<&str>,
         error_kind: Option<&str>,
-    ) -> Option<(SessionEvent, u64, SessionContextRevisionAck)> {
+    ) -> Option<(SessionEvent, u64, SessionContextRevisionAck, bool)> {
         let start = start?;
         let pre_call_context_revision = start.pre_call_context_revision;
         let ack_session_context_revision = start.ack_session_context_revision;
+        let advances_context_checkpoint = start.advances_context_checkpoint;
         let finished_at = now_ts();
         let duration_ms = start
             .started_instant
@@ -1600,6 +1621,7 @@ impl SessionStore {
             event,
             pre_call_context_revision,
             ack_session_context_revision,
+            advances_context_checkpoint,
         ))
     }
 
