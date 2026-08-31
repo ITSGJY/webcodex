@@ -118,7 +118,9 @@ fn adaptive_runtime_gateway_tool_spec() -> ToolSpec {
 }
 
 fn adaptive_runtime_gateway_target_allowed(target: &str, stateless_2026: bool) -> bool {
-    if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
+    if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+        || ADAPTIVE_RUNTIME_CORE_TOOL_NAMES.contains(&target)
+    {
         return false;
     }
     if target == crate::mcp_gateway::MCP_TOOL_NAME {
