@@ -1376,14 +1376,33 @@ async fn audit_and_exploration_intents_exclude_shell_and_jobs() {
                 );
             }
             for tool in result.output["tools"].as_array().unwrap() {
+                let name = tool["name"].as_str().unwrap();
+                assert_ne!(
+                    tool["risk"], "project_write",
+                    "audit intent must exclude Project mutation: {tool:?}"
+                );
+                assert_ne!(
+                    tool["risk"], "job_run",
+                    "audit intent must exclude command/Job execution: {tool:?}"
+                );
                 assert_eq!(
-                    tool["risk"], "read_only",
-                    "audit intent must exclude project_write/job_run tools: {tool:?}"
+                    tool["approval"], "none",
+                    "audit intent must not introduce standard interactive approval: {tool:?}"
                 );
                 assert_eq!(
                     tool["shell_like"], false,
                     "audit intent must exclude shell-like tools: {tool:?}"
                 );
+                if name == "work_on_project" {
+                    assert_eq!(tool["effect"], "mutate");
+                    assert_eq!(tool["risk"], "workflow_manage");
+                } else {
+                    assert_eq!(
+                        tool["effect"], "observe",
+                        "only work_on_project may mutate bounded Workflow state in audit intent: {tool:?}"
+                    );
+                    assert_eq!(tool["read_only"], true, "{name}");
+                }
             }
         }
     }
@@ -1661,6 +1680,27 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert_eq!(contract["input_schema"]["type"], "object");
     assert!(contract["input_schema"]["properties"]["package"].is_object());
     assert!(contract["annotations"].is_object());
+    let specs = registered_tool_specs();
+    let manifest_spec = spec_named(&specs, "tool_manifest");
+    let contract_schema =
+        &manifest_spec.output_schema["properties"]["output"]["properties"]["contract"]["anyOf"][0];
+    let contract_schema_properties = contract_schema["properties"].as_object().unwrap();
+    for key in contract.as_object().unwrap().keys() {
+        assert!(
+            contract_schema_properties.contains_key(key),
+            "tool_manifest exact contract runtime key {key} is missing from output_schema"
+        );
+    }
+    for key in ["effect", "risk", "approval", "idempotency"] {
+        assert!(
+            contract_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|required| required == key),
+            "tool_manifest exact contract output_schema must require {key}"
+        );
+    }
     assert_eq!(contract["availability"], "direct");
     assert!(contract["gateway_tool"].is_null());
     assert!(contract.get("output_schema").is_none());
@@ -1668,6 +1708,67 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert_eq!(result.output["tools"][0]["availability"], "direct");
     assert!(result.output["tools"][0]["gateway_tool"].is_null());
     assert!(result.output["tools"][0].get("input_schema").is_none());
+}
+
+#[tokio::test]
+async fn tool_manifest_projects_canonical_semantic_contracts() {
+    let runtime = test_runtime();
+    for (tool_name, effect, risk, approval, idempotency, read_only) in [
+        (
+            "read_file",
+            "observe",
+            "read_only",
+            "none",
+            "pure_read",
+            true,
+        ),
+        (
+            "close_session",
+            "mutate",
+            "session_collaborate",
+            "none",
+            "desired_state",
+            false,
+        ),
+        (
+            "coding_agent_start",
+            "execute",
+            "job_run",
+            "standard",
+            "keyed",
+            false,
+        ),
+        (
+            "coding_agent_cancel",
+            "mutate",
+            "run_control",
+            "inherit_from_start",
+            "desired_state",
+            false,
+        ),
+    ] {
+        let result = runtime
+            .dispatch(ToolCall::ToolManifest {
+                tool_name: Some(tool_name.to_string()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(result.success, "{tool_name}: {:?}", result.error);
+        let contract = &result.output["contract"];
+        assert_eq!(contract["effect"], effect, "{tool_name}");
+        assert_eq!(contract["risk"], risk, "{tool_name}");
+        assert_eq!(contract["approval"], approval, "{tool_name}");
+        assert_eq!(contract["idempotency"], idempotency, "{tool_name}");
+        let compact = &result.output["tools"][0];
+        assert_eq!(compact["effect"], effect, "{tool_name}");
+        assert_eq!(compact["risk"], risk, "{tool_name}");
+        assert_eq!(compact["approval"], approval, "{tool_name}");
+        assert_eq!(compact["idempotency"], idempotency, "{tool_name}");
+        assert_eq!(compact["read_only"], read_only, "{tool_name}");
+    }
 }
 
 #[tokio::test]
