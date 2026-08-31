@@ -32,13 +32,29 @@ selective-unit-tests = []
 unit-auth = ["selective-unit-tests"]
 unit-connector-runtime = ["selective-unit-tests"]
 unit-db = ["selective-unit-tests"]
-# MCP contract fixtures reuse the Connector test façade.
-unit-mcp = ["selective-unit-tests", "unit-connector-runtime"]
+unit-mcp = ["selective-unit-tests"]
 unit-oauth-http = ["selective-unit-tests"]
 unit-openapi = ["selective-unit-tests"]
 unit-runtime-http = ["selective-unit-tests"]
 unit-shell-client = ["selective-unit-tests"]
-unit-tool-runtime = ["selective-unit-tests"]
+# Tool Runtime is large enough to benefit from coarse sub-domain selectors.
+# The umbrella keeps the existing behavior by enabling every Tool Runtime lane.
+unit-tool-runtime = [
+    "unit-tool-runtime-files",
+    "unit-tool-runtime-git",
+    "unit-tool-runtime-jobs",
+    "unit-tool-runtime-sessions",
+    "unit-tool-runtime-validation",
+    "unit-tool-runtime-contracts",
+    "unit-tool-runtime-workflow",
+]
+unit-tool-runtime-files = ["selective-unit-tests"]
+unit-tool-runtime-git = ["selective-unit-tests"]
+unit-tool-runtime-jobs = ["selective-unit-tests"]
+unit-tool-runtime-sessions = ["selective-unit-tests"]
+unit-tool-runtime-validation = ["selective-unit-tests"]
+unit-tool-runtime-contracts = ["selective-unit-tests"]
+unit-tool-runtime-workflow = ["selective-unit-tests"]
 
 [[bin]]
 name = "webcodex-server"

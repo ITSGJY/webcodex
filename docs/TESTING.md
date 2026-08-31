@@ -40,18 +40,22 @@ bash scripts/cargo_fast.sh test -p webcodex --lib \
 # Type-check the OAuth HTTP domain without producing the test executable.
 cargo check -p webcodex --tests --features unit-oauth-http
 
-# Generate a focused MCP test binary. MCP intentionally includes Connector
-# Runtime fixtures because its project-connector contracts reuse that façade.
+# Generate a focused MCP test binary. Shared project fixtures live in the
+# crate-level test support, so this lane does not compile Connector tests.
 bash scripts/cargo_fast.sh test -p webcodex --lib \
   --features unit-mcp --no-run
 ```
 
-Available selectors are `unit-auth`, `unit-connector-runtime`, `unit-db`,
-`unit-mcp`, `unit-oauth-http`, `unit-openapi`, `unit-runtime-http`,
-`unit-shell-client`, and `unit-tool-runtime`. These selectors are additive; use
-one unless the change intentionally crosses domains. Small inline and currently
-unclassified tests remain compiled in selective mode, so the feature is a safe
-focused-build lane rather than a claim of perfect domain isolation.
+Available top-level selectors are `unit-auth`, `unit-connector-runtime`,
+`unit-db`, `unit-mcp`, `unit-oauth-http`, `unit-openapi`, `unit-runtime-http`,
+`unit-shell-client`, and `unit-tool-runtime`. Tool Runtime also exposes coarse
+sub-selectors for `files`, `git`, `jobs`, `sessions`, `validation`, `contracts`,
+and `workflow`, for example `--features unit-tool-runtime-git`. The existing
+`unit-tool-runtime` selector remains an umbrella that enables every Tool Runtime
+sub-domain. Selectors are additive; use one unless the change intentionally
+crosses domains. Small inline and currently unclassified tests remain compiled
+in selective mode, so the feature is a safe focused-build lane rather than a
+claim of perfect domain isolation.
 
 The canonical full suite and CI must continue to run without a selector:
 

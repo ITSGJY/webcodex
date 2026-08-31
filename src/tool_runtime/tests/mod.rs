@@ -2,52 +2,80 @@
 
 mod support;
 
-mod apply_text_edits;
-mod assignment_fence;
-mod checkpoint;
-mod coding_task;
-mod coding_task_semantic_navigation;
-mod collaboration;
-mod context_projection;
-mod continuation_feedback;
-mod dispatch;
-mod edit_tool_telemetry;
-mod execution_context;
-mod files;
-mod files_helpers;
-mod git;
-mod handoff;
-mod handoff_brief;
-mod hygiene;
-mod jobs;
-mod lsp;
-mod memory;
-mod metadata;
-mod observe_jobs;
-mod permission_gate;
-mod process;
-mod read_files;
-mod reconnect;
-mod schema;
-mod script;
-mod search_project_texts;
-mod session_shells;
-mod sessions;
-mod sessions_git;
-mod sessions_guards;
-mod sessions_instructions;
-mod sessions_resolver;
-mod skills;
-mod startup_brief;
-mod sync_timeout;
-mod targeted_inventory;
-mod tool_call;
-mod trusted_smoke;
-mod unified_diff;
-mod validation_events;
-mod validation_handoff;
-mod validation_identity;
-mod validation_parser;
-mod validation_profile;
-mod validation_summary;
-mod work_on_project;
+macro_rules! selected_test_modules {
+    ($feature:literal => [$($module:ident),+ $(,)?]) => {
+        $(
+            #[cfg(any(
+                not(feature = "selective-unit-tests"),
+                feature = $feature,
+            ))]
+            mod $module;
+        )+
+    };
+}
+
+selected_test_modules!("unit-tool-runtime-files" => [
+    apply_text_edits,
+    checkpoint,
+    files,
+    files_helpers,
+    read_files,
+    search_project_texts,
+    unified_diff,
+]);
+
+selected_test_modules!("unit-tool-runtime-git" => [git, hygiene, sessions_git]);
+
+selected_test_modules!("unit-tool-runtime-jobs" => [
+    jobs,
+    observe_jobs,
+    process,
+    reconnect,
+    script,
+    session_shells,
+    sync_timeout,
+    targeted_inventory,
+]);
+
+selected_test_modules!("unit-tool-runtime-sessions" => [
+    assignment_fence,
+    collaboration,
+    context_projection,
+    continuation_feedback,
+    execution_context,
+    sessions,
+    sessions_guards,
+    sessions_instructions,
+    sessions_resolver,
+]);
+
+selected_test_modules!("unit-tool-runtime-validation" => [
+    validation_events,
+    validation_handoff,
+    validation_identity,
+    validation_parser,
+    validation_profile,
+    validation_summary,
+]);
+
+selected_test_modules!("unit-tool-runtime-contracts" => [
+    dispatch,
+    edit_tool_telemetry,
+    metadata,
+    permission_gate,
+    schema,
+    tool_call,
+]);
+
+selected_test_modules!("unit-tool-runtime-workflow" => [
+    coding_task,
+    coding_task_semantic_navigation,
+    handoff,
+    handoff_brief,
+    lsp,
+    memory,
+    skills,
+    startup_brief,
+    trusted_smoke,
+    work_on_project,
+]);

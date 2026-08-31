@@ -170,7 +170,7 @@ async fn http_project_connector_lists_and_dispatches_only_canonical_capabilities
     let config = test_config(Some("secret"));
     let (tmp, db) = test_db();
     let project = tmp.path().join("connector-project");
-    crate::connector_runtime::tests::init_repo(&project);
+    crate::test_support::init_git_repo(&project);
     let user_token = "webcodex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::CanonicalConnector));
     let service = Service::new(build_connector_test_router(config, db, runtime, &project));
@@ -471,7 +471,7 @@ async fn http_project_connector_2026_uses_explicit_task_ids_without_transport_wi
     let config = test_config(Some("secret"));
     let (tmp, db) = test_db();
     let project = tmp.path().join("connector-2026-project");
-    crate::connector_runtime::tests::init_repo(&project);
+    crate::test_support::init_git_repo(&project);
     let user_token = "webcodex_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::CanonicalConnector));
     let service = Service::new(build_connector_test_router(config, db, runtime, &project));
@@ -588,7 +588,7 @@ async fn http_project_connector_2026_tasks_poll_durable_execution_across_reopen(
     let (tmp, db) = test_db();
     let db_path = tmp.path().join("test.db");
     let project = tmp.path().join("connector-2026-task-project");
-    crate::connector_runtime::tests::init_repo(&project);
+    crate::test_support::init_git_repo(&project);
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::CanonicalConnector));
     let service = Service::new(build_connector_test_router(
         config,
@@ -789,7 +789,7 @@ async fn http_project_connector_2026_tasks_reject_unmaterialized_execution_ids()
     let config = test_config(Some("secret"));
     let (tmp, db) = test_db();
     let project = tmp.path().join("connector-2026-unmaterialized-task");
-    crate::connector_runtime::tests::init_repo(&project);
+    crate::test_support::init_git_repo(&project);
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::CanonicalConnector));
     let service = Service::new(build_connector_test_router(
         config,
@@ -860,7 +860,7 @@ async fn http_project_connector_2026_tasks_cancel_reuses_execution_cancellation(
     let config = test_config(Some("secret"));
     let (tmp, db) = test_db();
     let project = tmp.path().join("connector-2026-task-cancel");
-    crate::connector_runtime::tests::init_repo(&project);
+    crate::test_support::init_git_repo(&project);
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::CanonicalConnector));
     let service = Service::new(build_connector_test_router(
         config,

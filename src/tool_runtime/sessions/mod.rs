@@ -19,22 +19,34 @@ mod util;
 
 #[cfg(all(
     test,
-    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-tool-runtime-sessions",
+    ),
 ))]
 mod assignment_tests;
 #[cfg(all(
     test,
-    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-tool-runtime-sessions",
+    ),
 ))]
 mod collaboration_tests;
 #[cfg(all(
     test,
-    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-tool-runtime-sessions",
+    ),
 ))]
 mod message_mutation_tests;
 #[cfg(all(
     test,
-    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-tool-runtime-sessions",
+    ),
 ))]
 mod tests;
 

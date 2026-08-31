@@ -172,6 +172,15 @@ pub(crate) fn tool_disabled_result_from_definition(tool_name: &str) -> Option<To
 
 #[cfg(all(
     test,
-    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-tool-runtime-files",
+        feature = "unit-tool-runtime-git",
+        feature = "unit-tool-runtime-jobs",
+        feature = "unit-tool-runtime-sessions",
+        feature = "unit-tool-runtime-validation",
+        feature = "unit-tool-runtime-contracts",
+        feature = "unit-tool-runtime-workflow",
+    ),
 ))]
 mod tests;

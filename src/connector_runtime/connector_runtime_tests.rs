@@ -13,6 +13,7 @@ use crate::shell_protocol::{
     ShellAgentPollRequest, ShellAgentProjectSummary, ShellAgentResultRequest,
     ShellAgentShellRequest, ShellClientCapabilities, ShellClientRegisterRequest,
 };
+use crate::test_support::init_git_repo as init_repo;
 
 pub(super) const PROJECT_GRANT_ID: &str = "wc_pgrant_1111111111111111";
 pub(super) const PROJECT_SUBJECT_ID: &str = "project:wc_pgrant_1111111111111111";
@@ -185,41 +186,6 @@ async fn complete_lsp_request(
         })
         .await
         .unwrap();
-}
-
-pub(crate) fn init_repo(project: &Path) {
-    std::fs::create_dir(project).unwrap();
-    let run = |args: &[&str]| {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    run(&["init", "-q"]);
-    std::fs::write(project.join("README.md"), "fixture\n").unwrap();
-    std::fs::write(
-        project.join("Cargo.toml"),
-        "[package]\nname = \"connector-fixture\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
-    run(&["add", "README.md", "Cargo.toml"]);
-    run(&[
-        "-c",
-        "user.name=WebCodex Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "commit",
-        "-qm",
-        "initial",
-    ]);
 }
 
 pub(crate) fn auth(user_id: &str) -> AuthContext {

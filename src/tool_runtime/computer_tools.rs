@@ -3514,7 +3514,10 @@ fn validate_snapshot(
 
 #[cfg(all(
     test,
-    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-tool-runtime-workflow",
+    ),
 ))]
 #[path = "computer_tools_tests.rs"]
 mod tests;

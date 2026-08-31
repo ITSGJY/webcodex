@@ -160,7 +160,7 @@ async fn fixture_built(
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let state = temp.path().join("state");
-    tests::init_repo(&project);
+    crate::test_support::init_git_repo(&project);
     let registry = Arc::new(ShellClientRegistry::default());
     let owner = tests::auth("u1");
     registry

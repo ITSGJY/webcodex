@@ -5,7 +5,7 @@
 //! each carried a byte-identical copy of. Compiled only under `cfg(test)`
 //! (see the `mod test_support` declaration in `main.rs`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Panic-safe process-global environment mutation guard for server tests.
@@ -96,6 +96,43 @@ pub(crate) fn test_db() -> (tempfile::TempDir, Arc<crate::Database>) {
     let tmp = tempfile::tempdir().unwrap();
     let db = crate::Database::open(&tmp.path().join("test.db")).unwrap();
     (tmp, Arc::new(db))
+}
+
+/// Create a minimal committed Git repository for tests that need a project
+/// workspace but do not otherwise depend on another subsystem's test façade.
+pub(crate) fn init_git_repo(project: &Path) {
+    std::fs::create_dir(project).unwrap();
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    std::fs::write(project.join("README.md"), "fixture\n").unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"connector-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    run(&["add", "README.md", "Cargo.toml"]);
+    run(&[
+        "-c",
+        "user.name=WebCodex Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "initial",
+    ]);
 }
 
 /// Upgrade a server-test Runner capability fixture to the current registration
