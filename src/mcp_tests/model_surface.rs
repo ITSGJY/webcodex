@@ -265,8 +265,13 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
     );
     for long_tail in [
         "list_tools",
+        "list_projects",
+        "project_overview",
         "read_file",
+        "run_script",
         "run_shell",
+        "validation_summary",
+        "git_status",
         "goto_definition",
         "computer_list_windows",
         "post_session_message",
@@ -383,6 +388,63 @@ async fn adaptive_runtime_gateway_rejects_recursive_and_unknown_targets() {
             other => panic!("target {target} must fail closed, got {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn adaptive_runtime_tool_manifest_describes_one_long_tail_contract_without_expanding_surface()
+{
+    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let described = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(724)),
+            mcp_2026_params(json!({
+                "name": "tool_manifest",
+                "arguments": {
+                    "tool_name": "run_script",
+                    "include_recommended_flows": false,
+                    "include_risk_summary": false
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = described else {
+        panic!("adaptive tool_manifest exact contract must succeed");
+    };
+    let output = &value["result"]["structuredContent"]["output"];
+    assert_eq!(output["tool_name"], "run_script");
+    assert_eq!(output["contract"]["name"], "run_script");
+    assert_eq!(output["contract"]["availability"], "gateway");
+    assert_eq!(
+        output["contract"]["gateway_tool"],
+        crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(output["tools"][0]["availability"], "gateway");
+    assert_eq!(
+        output["tools"][0]["gateway_tool"],
+        crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(output["contract"]["input_schema"]["type"], "object");
+    assert!(output["contract"]["input_schema"]["properties"]["script"].is_object());
+    assert!(output["contract"].get("output_schema").is_none());
+
+    let listed = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(725)), mcp_2026_params(json!({}))),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(listed) = listed else {
+        panic!("adaptive tools/list must remain available");
+    };
+    assert!(!listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "run_script"));
 }
 
 #[tokio::test]
@@ -616,6 +678,7 @@ async fn local_coding_list_manifest_and_catalog_are_identical() {
         .collect();
     let manifest = runtime
         .dispatch(crate::tool_runtime::ToolCall::ToolManifest {
+            tool_name: None,
             category: None,
             intent: Some("coding".to_string()),
             include_recommended_flows: false,

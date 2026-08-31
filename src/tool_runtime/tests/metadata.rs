@@ -1640,10 +1640,11 @@ fn project_overview_metadata_schema_and_flattened_args_are_read_only() {
 }
 
 #[tokio::test]
-async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
+async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            tool_name: None,
             category: None,
             intent: None,
             include_recommended_flows: true,
@@ -1687,6 +1688,20 @@ async fn tool_manifest_reports_accepted_flattened_args_without_schemas() {
             }
         }
     }
+
+    let exact = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("run_script".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(exact.success, "{:?}", exact.error);
+    assert_eq!(exact.output["contract"]["name"], "run_script");
+    assert_eq!(exact.output["contract"]["input_schema"]["type"], "object");
+    assert!(exact.output["contract"].get("output_schema").is_none());
 
     let accepted = |name: &str| -> Vec<String> {
         tools
@@ -1803,6 +1818,7 @@ async fn tool_manifest_model_fields_and_hidden_start_compatibility_stay_separate
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            tool_name: None,
             category: None,
             intent: None,
             include_recommended_flows: false,
@@ -1953,6 +1969,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            tool_name: None,
             category: None,
             intent: None,
             include_recommended_flows: true,

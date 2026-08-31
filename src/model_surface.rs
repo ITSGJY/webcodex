@@ -14,7 +14,7 @@
 //!   falls through to another surface.
 
 use crate::connector_runtime::ConnectorContext;
-use crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES;
+use crate::tool_runtime::tool_definition::{is_model_visible_tool_name, LOCAL_CODING_TOOL_NAMES};
 use crate::tool_runtime::{registered_tool_specs, ToolSpec};
 
 pub(crate) const MODEL_SURFACE_LOCAL_CODING: &str = "local_coding";
@@ -27,26 +27,26 @@ pub(crate) const MCP_MODEL_SURFACE_LOCAL_CODING_V1: &str = "local-coding-v1";
 pub(crate) const MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1: &str = "adaptive-runtime-v1";
 pub(crate) const MCP_MODEL_SURFACE_FULL_OPERATOR_V1: &str = "full-operator-v1";
 
+pub(crate) const ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME: &str = "call_runtime_tool";
+pub(crate) const TOOL_SURFACE_AVAILABILITY_DIRECT: &str = "direct";
+pub(crate) const TOOL_SURFACE_AVAILABILITY_GATEWAY: &str = "gateway";
+pub(crate) const TOOL_SURFACE_AVAILABILITY_UNAVAILABLE: &str = "unavailable";
+
 /// Small typed surface for hosts that can discover a long-tail runtime gateway lazily.
 /// Keep high-frequency coding operations direct; advanced domains remain reachable
 /// through the adaptive MCP gateway without expanding their schemas into tools/list.
 pub(crate) const ADAPTIVE_RUNTIME_CORE_TOOL_NAMES: &[&str] = &[
     "work_on_project",
-    "list_projects",
     "runtime_status",
     "tool_manifest",
-    "project_overview",
     "search_project_texts",
     "read_files",
     "apply_text_edits",
     "run_process",
-    "run_script",
     "observe_jobs",
     "cargo_check",
     "cargo_test",
     "go_test",
-    "validation_summary",
-    "git_status",
     "git_review_summary",
     "show_changes",
     "workspace_hygiene_check",
@@ -75,6 +75,41 @@ impl ModelSurface {
     /// surface even though their individual schemas are hidden behind one gateway.
     pub(crate) fn supports_operator_extensions(self) -> bool {
         matches!(self, Self::AdaptiveRuntime | Self::FullOperatorRuntime)
+    }
+
+    /// Model-surface routing for one registered model-visible runtime tool.
+    /// This does not grant OAuth scope, project authority, feature availability,
+    /// or permission; those remain enforced by the selected tool at invocation.
+    pub(crate) fn runtime_tool_invocation_route(
+        self,
+        tool_name: &str,
+    ) -> (&'static str, Option<&'static str>) {
+        if !is_model_visible_tool_name(tool_name) {
+            return (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None);
+        }
+        match self {
+            Self::LocalCoding => {
+                if LOCAL_CODING_TOOL_NAMES.contains(&tool_name) {
+                    (TOOL_SURFACE_AVAILABILITY_DIRECT, None)
+                } else {
+                    (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None)
+                }
+            }
+            Self::AdaptiveRuntime => {
+                if ADAPTIVE_RUNTIME_CORE_TOOL_NAMES.contains(&tool_name) {
+                    (TOOL_SURFACE_AVAILABILITY_DIRECT, None)
+                } else {
+                    (
+                        TOOL_SURFACE_AVAILABILITY_GATEWAY,
+                        Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
+                    )
+                }
+            }
+            Self::FullOperatorRuntime => (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+            // canonical_connector uses its own capability names rather than raw
+            // runtime-tool names, so runtime contracts are not directly invokable.
+            Self::CanonicalConnector => (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None),
+        }
     }
 }
 
@@ -181,7 +216,7 @@ mod tests {
     fn adaptive_runtime_core_is_small_unique_and_fully_registered() {
         assert_eq!(
             ADAPTIVE_RUNTIME_CORE_TOOL_NAMES.len(),
-            20,
+            15,
             "adaptive core size is an intentional model-admission budget"
         );
         let mut seen = std::collections::HashSet::new();
