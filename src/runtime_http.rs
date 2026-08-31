@@ -541,6 +541,9 @@ pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Resp
     render_result(res, &audit, "runtime_status", None, result);
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-runtime-http",),
+))]
 #[path = "runtime_http_tests.rs"]
 mod tests;

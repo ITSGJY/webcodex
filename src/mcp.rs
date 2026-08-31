@@ -966,6 +966,6 @@ fn scope_forbidden(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-mcp"),))]
 #[path = "mcp_tests.rs"]
 mod tests;

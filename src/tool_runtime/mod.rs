@@ -170,5 +170,8 @@ pub(crate) fn tool_disabled_result_from_definition(tool_name: &str) -> Option<To
         .map(|message| tool_disabled_result(tool_name, message))
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+))]
 mod tests;

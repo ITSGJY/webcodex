@@ -416,7 +416,13 @@ async fn result_reject(req: &mut Request, depot: &mut Depot, res: &mut Response)
     decide(req, depot, res, false).await;
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-connector-runtime",
+    ),
+))]
 mod tests {
     use super::*;
     use crate::tool_runtime::activity::{ActivityRecord, ActivityScope};
