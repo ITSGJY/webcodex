@@ -95,30 +95,30 @@ impl Database {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-db"),))]
 #[path = "db/agent_wake_tests.rs"]
 mod agent_wake_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-db"),))]
 #[path = "db/agent_wake_recovery_tests.rs"]
 mod agent_wake_recovery_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-db"),))]
 #[path = "db/communication_tests.rs"]
 mod communication_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-db"),))]
 #[path = "db/continuation_delivery_tests.rs"]
 mod continuation_delivery_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-db"),))]
 #[path = "db/execution_intent_tests.rs"]
 mod execution_intent_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-db"),))]
 #[path = "db/memory_tests.rs"]
 mod memory_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "selective-unit-tests"), feature = "unit-db"),))]
 #[path = "db_tests.rs"]
 mod tests;

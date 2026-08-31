@@ -3512,6 +3512,9 @@ fn validate_snapshot(
     ToolResult::ok(output)
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+))]
 #[path = "computer_tools_tests.rs"]
 mod tests;

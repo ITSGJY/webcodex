@@ -286,5 +286,8 @@ fn bootstrap_context() -> AuthContext {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-auth"),
+))]
 mod tests;

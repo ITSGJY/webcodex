@@ -17,13 +17,25 @@ mod query;
 mod store;
 mod util;
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+))]
 mod assignment_tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+))]
 mod collaboration_tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+))]
 mod message_mutation_tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-tool-runtime",),
+))]
 mod tests;
 
 // Re-exports keep `crate::tool_runtime::sessions::{...}` stable for callers.

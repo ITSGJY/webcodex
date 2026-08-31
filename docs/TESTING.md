@@ -25,6 +25,44 @@ tests with different cost profiles sharing the same default lane.
 | real-process job recovery failure/non-reconciliation harness | Cover the failure and non-reconciliation paths the happy-path reconciliation harness omits, using `WEBCODEX_JOB_RECOVERY_GRACE_SECS=10` (clamped, above the 5s floor) so the deadline is bounded without waiting the 120s default. Scenario C: kill the runner only (server stays up), let the job enter `recovering`, and assert the non-request-triggered recovery-timeout sweep transitions it to `lost` with `runner_recovery_deadline_exceeded`, `ended_at` set once, one list record, stop-on-lost stable, and the command never re-executes. Scenario D: instance B replaces instance A (same client_id, new `agent_instance_id`); A's job becomes `lost` with `runner_instance_replaced`, B starts its own new job, A's late update is rejected, first `ended_at`/reason preserved. Scenario E: a generation-2 Runner registered with `WEBCODEX_RUNNER_DISABLE_JOB_STATE_RECONCILIATION=1` (no capability, no inventory) dispatches a job and, on disconnect, deterministically fences it to `lost` with `runner_disconnected_without_reconciliation` (never `recovering`); after a server restart the lost job has no durable record and a same-client new no-reconciliation instance cannot revive it. Scenario F: a long job across three server restarts keeps the same `job_id`, runs the command once, keeps `last_update_seq`/log cursors non-regressing and markers non-duplicating, and reaches a terminal `stopped` that survives a third restart with `ended_at` unchanged by terminal inventory replay. | Local processes, temp dirs/ports/tokens, and a temp project; no production services or QUIC certs. | `bash scripts/e2e_job_recovery_failures_ws.sh` |
 | security auth matrix | Cover OAuth, scope policy, shared-key behavior, token classes, read-only session guards, and denied mutations. | No external identity provider by default; use local fixtures and synthetic tokens. | `cargo test -p webcodex --lib oauth -- --nocapture`; `cargo test -p webcodex --lib scope -- --nocapture`; `cargo test -p webcodex --lib metadata -- --nocapture` |
 
+## Compile-time Unit-Test Selection
+
+A test-name filter is applied only after Cargo has generated the root test
+binary, so it does not shorten compilation. For focused local work, the root
+package exposes opt-in domain features that omit other large, dedicated test
+module trees before rustc sees them:
+
+```bash
+# Compile and run the Tool Runtime domain plus small/unclassified root tests.
+bash scripts/cargo_fast.sh test -p webcodex --lib \
+  --features unit-tool-runtime tool_runtime
+
+# Type-check the OAuth HTTP domain without producing the test executable.
+cargo check -p webcodex --tests --features unit-oauth-http
+
+# Generate a focused MCP test binary. MCP intentionally includes Connector
+# Runtime fixtures because its project-connector contracts reuse that façade.
+bash scripts/cargo_fast.sh test -p webcodex --lib \
+  --features unit-mcp --no-run
+```
+
+Available selectors are `unit-auth`, `unit-connector-runtime`, `unit-db`,
+`unit-mcp`, `unit-oauth-http`, `unit-openapi`, `unit-runtime-http`,
+`unit-shell-client`, and `unit-tool-runtime`. These selectors are additive; use
+one unless the change intentionally crosses domains. Small inline and currently
+unclassified tests remain compiled in selective mode, so the feature is a safe
+focused-build lane rather than a claim of perfect domain isolation.
+
+The canonical full suite and CI must continue to run without a selector:
+
+```bash
+bash scripts/cargo_fast.sh test -p webcodex --lib
+```
+
+With no `unit-*` feature, every test module is compiled exactly as before.
+`--all-features` also compiles every selected domain because all selectors are
+enabled together.
+
 ## CI Mapping
 
 The lanes above define test semantics; workflows decide when to run them.

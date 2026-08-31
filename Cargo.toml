@@ -23,6 +23,23 @@ version.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[features]
+# Local-development selectors for the largest dedicated unit-test trees. The
+# default build enables none of these features and therefore compiles every
+# unit test exactly as before. Enabling any `unit-*` feature opts into selective
+# mode for faster focused edit loops.
+selective-unit-tests = []
+unit-auth = ["selective-unit-tests"]
+unit-connector-runtime = ["selective-unit-tests"]
+unit-db = ["selective-unit-tests"]
+# MCP contract fixtures reuse the Connector test façade.
+unit-mcp = ["selective-unit-tests", "unit-connector-runtime"]
+unit-oauth-http = ["selective-unit-tests"]
+unit-openapi = ["selective-unit-tests"]
+unit-runtime-http = ["selective-unit-tests"]
+unit-shell-client = ["selective-unit-tests"]
+unit-tool-runtime = ["selective-unit-tests"]
+
 [[bin]]
 name = "webcodex-server"
 path = "src/bin/webcodex-server.rs"

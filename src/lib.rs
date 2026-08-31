@@ -1,4 +1,8 @@
 #![recursion_limit = "512"]
+#![cfg_attr(
+    all(test, feature = "selective-unit-tests"),
+    allow(dead_code, unused_imports)
+)]
 
 use crate::route_metadata::RouteId;
 use salvo::cors::Cors;

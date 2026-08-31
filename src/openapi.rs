@@ -2001,10 +2001,16 @@ fn insert_tool_call_request_reserved_properties(schemas: &mut Value) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-openapi"),
+))]
 #[path = "openapi_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-openapi"),
+))]
 #[path = "openapi_patch_description_tests.rs"]
 mod patch_description_tests;

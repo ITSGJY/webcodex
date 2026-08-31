@@ -6,12 +6,30 @@
 //! executor project id or workflow-session state.
 
 mod context;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-connector-runtime",
+    ),
+))]
 mod continuation_delivery_tests;
 mod execution;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-connector-runtime",
+    ),
+))]
 pub(crate) mod execution_tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-connector-runtime",
+    ),
+))]
 mod host_tests;
 pub(crate) mod http;
 mod projections;
@@ -3839,6 +3857,12 @@ fn code_navigation_tool_call(input: &CodeNavigateInput) -> Result<(&'static str,
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        not(feature = "selective-unit-tests"),
+        feature = "unit-connector-runtime",
+    ),
+))]
 #[path = "connector_runtime_tests.rs"]
 pub(crate) mod tests;

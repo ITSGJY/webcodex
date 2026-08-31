@@ -34,7 +34,10 @@ mod project_inventory;
 mod projects;
 mod protocol;
 mod reconciliation;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-shell-client",),
+))]
 mod reconciliation_tests;
 mod requests;
 mod state;
@@ -1407,6 +1410,9 @@ pub async fn shell_jobs_list(req: &mut Request, depot: &mut Depot, res: &mut Res
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-shell-client",),
+))]
 #[path = "mod_tests.rs"]
 mod tests;

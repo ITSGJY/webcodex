@@ -89,5 +89,8 @@ const MAX_OAUTH_TOKEN_FORM_BYTES: usize = 16 * 1024;
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(not(feature = "selective-unit-tests"), feature = "unit-oauth-http",),
+))]
 mod tests;
