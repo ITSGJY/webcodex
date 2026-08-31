@@ -22,6 +22,7 @@ use crate::shell_protocol::{
     shell_computer_request_payload_max_bytes, PersistentShellRequest, PersistentShellResult,
     ShellAgentShellRequest, ShellFileOpRequest, ShellJobContext, ShellProcessArgv, ShellRunRequest,
     ShellRunResponse, ShellScriptPayload, RAW_SHELL_COMMAND_MAX_BYTES,
+    SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
     SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
     SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
     SHELL_CLIENT_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA, SHELL_CLIENT_CAPABILITY_FILE_READ,
@@ -286,6 +287,38 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
     }
 }
 
+fn apply_text_edits_capability_requirements(body: &ShellFileOpRequest) -> (bool, bool) {
+    if body.op != "apply_text_edits" {
+        return (false, false);
+    }
+    let Some(content) = body.content.as_deref() else {
+        return (false, false);
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
+        // Invalid JSON cannot become a valid Runner mutation. Preserve the
+        // existing generic-ingress behavior and let the Runner reject it.
+        return (false, false);
+    };
+    let Some(changes) = payload.get("changes").and_then(serde_json::Value::as_array) else {
+        return (false, false);
+    };
+
+    let mut requires_occurrence = false;
+    let mut requires_line_scope = false;
+    for edit in changes
+        .iter()
+        .filter_map(|change| change.get("edits").and_then(serde_json::Value::as_array))
+        .flatten()
+    {
+        requires_occurrence |= edit.get("occurrence").is_some_and(|value| !value.is_null());
+        requires_line_scope |= edit.get("line_scope").is_some_and(|value| !value.is_null());
+        if requires_occurrence && requires_line_scope {
+            break;
+        }
+    }
+    (requires_occurrence, requires_line_scope)
+}
+
 impl ShellClientRegistry {
     pub async fn enqueue_file_op(
         &self,
@@ -301,6 +334,13 @@ impl ShellClientRegistry {
                 "{} is internal-only; generic file-op enqueue is forbidden",
                 body.op
             ));
+        }
+        let (requires_occurrence, requires_line_scope) =
+            apply_text_edits_capability_requirements(&body);
+        if requires_line_scope {
+            return self
+                .enqueue_apply_text_edits_with_line_scope(body, requested_by, requires_occurrence)
+                .await;
         }
         self.enqueue_validated_file_op(body, requested_by).await
     }
@@ -428,6 +468,90 @@ impl ShellClientRegistry {
         if !client
             .runner_features
             .supports(RunnerFeature::ApplyTextEditOccurrence)
+        {
+            return Err(format!(
+                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
+                body.client_id
+            ));
+        }
+        enqueue_pending_request_locked(
+            &mut inner,
+            &body.client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
+        notify_client_locked(&inner, &body.client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue an apply_text_edits request containing at least one line_scope.
+    /// The additive line-scope capability (and occurrence capability when the
+    /// same payload also uses occurrence) is checked under the same registry
+    /// lock as pending admission so an older/replacement Runner can never
+    /// receive a safety fence it could silently ignore.
+    pub(crate) async fn enqueue_apply_text_edits_with_line_scope(
+        &self,
+        body: ShellFileOpRequest,
+        requested_by: String,
+        requires_occurrence: bool,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_file_request(&body)?;
+        if body.op != "apply_text_edits" {
+            return Err(format!(
+                "line-scoped edit enqueue only accepts op=apply_text_edits (got {})",
+                body.op
+            ));
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = ShellAgentShellRequest {
+            request_id: request_id.clone(),
+            client_id: body.client_id.clone(),
+            kind: "file_apply_text_edits".to_string(),
+            job_id: None,
+            cwd: body.cwd.clone().map(|cwd| cwd.trim().to_string()),
+            path: Some(body.path.trim().to_string()),
+            content: body.content.clone(),
+            max_bytes: body.max_bytes,
+            expected_sha256: body.expected_sha256.clone(),
+            expected_prefix: body.expected_prefix.clone(),
+            start_line: body.start_line,
+            end_line: body.end_line,
+            create_dirs: body.create_dirs,
+            command: String::new(),
+            process: None,
+            script: None,
+            stdin: None,
+            timeout_secs: 30,
+            requested_by,
+            created_at: now_ts(),
+            validation: None,
+            lsp: None,
+            sandbox: None,
+            job_context: None,
+            mcp_gateway: None,
+            coding_agent: None,
+            persistent_shell: None,
+        };
+        let mut inner = self.inner.lock().await;
+        let Some(client) = inner.clients.get(&body.client_id) else {
+            return Err(format!("unknown shell client: {}", body.client_id));
+        };
+        if !client
+            .runner_features
+            .supports(RunnerFeature::ApplyTextEditLineScope)
+        {
+            return Err(format!(
+                "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE}",
+                body.client_id
+            ));
+        }
+        if requires_occurrence
+            && !client
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditOccurrence)
         {
             return Err(format!(
                 "capability_unavailable: agent client {} does not support {SHELL_CLIENT_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
