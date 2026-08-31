@@ -1122,192 +1122,134 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         .unwrap()
         .to_string();
 
-    let first_args = with_mcp_recording_session(json!({}), &session_id);
-    let (status, first_body) =
-        stateless_2026_tool_call(&service, "secret", 228, "list_tools", first_args, None).await;
-    assert_eq!(status, StatusCode::OK, "{first_body}");
-    let first = stateless_tool_output(&first_body);
-    assert_eq!(first["session_context_revision"], 1);
-    assert!(first.get("session_continuity").is_none());
-    assert!(first.get("session_recovery").is_none());
+    let mut cached_read_args = with_mcp_recording_session(json!({}), &session_id);
+    cached_read_args.as_object_mut().unwrap().insert(
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
+        json!(999),
+    );
+    let (status, cached_read_body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        228,
+        "list_tools",
+        cached_read_args,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cached_read_body}");
+    let cached_read = stateless_tool_output(&cached_read_body);
+    assert!(cached_read.get("session_context_revision").is_none());
+    assert!(cached_read.get("session_continuity").is_none());
+    assert!(cached_read.get("session_recovery").is_none());
+    assert_eq!(runtime.sessions.context_revision(&session_id), Some(0));
 
-    let mut exact_args = with_mcp_recording_session(json!({}), &session_id);
+    let mut exact_args =
+        with_mcp_recording_session(json!({"title": "context checkpoint exact"}), &session_id);
     exact_args.as_object_mut().unwrap().insert(
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(1),
+        json!(0),
     );
     let (status, exact_body) =
-        stateless_2026_tool_call(&service, "secret", 229, "list_tools", exact_args, None).await;
+        stateless_2026_tool_call(&service, "secret", 229, "start_session", exact_args, None).await;
     assert_eq!(status, StatusCode::OK, "{exact_body}");
     let exact = stateless_tool_output(&exact_body);
-    assert_eq!(exact["session_context_revision"], 2);
+    assert_eq!(exact["session_context_revision"], 1);
     assert!(exact.get("session_continuity").is_none());
     assert!(exact.get("session_recovery").is_none());
+    assert_eq!(runtime.sessions.context_revision(&session_id), Some(1));
 
-    let mut stale_args = with_mcp_recording_session(json!({}), &session_id);
-    stale_args.as_object_mut().unwrap().insert(
+    let mut second_cached_read_args = with_mcp_recording_session(json!({}), &session_id);
+    second_cached_read_args.as_object_mut().unwrap().insert(
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
         json!(1),
     );
+    let (status, second_cached_read_body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        230,
+        "list_tools",
+        second_cached_read_args,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second_cached_read_body}");
+    assert!(stateless_tool_output(&second_cached_read_body)
+        .get("session_context_revision")
+        .is_none());
+    assert_eq!(runtime.sessions.context_revision(&session_id), Some(1));
+
+    let mut stale_args =
+        with_mcp_recording_session(json!({"title": "context checkpoint stale"}), &session_id);
+    stale_args.as_object_mut().unwrap().insert(
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
+        json!(0),
+    );
     let (status, stale_body) =
-        stateless_2026_tool_call(&service, "secret", 230, "list_tools", stale_args, None).await;
+        stateless_2026_tool_call(&service, "secret", 231, "start_session", stale_args, None).await;
     assert_eq!(status, StatusCode::OK, "{stale_body}");
     let stale = stateless_tool_output(&stale_body);
-    assert_eq!(stale["session_context_revision"], 3);
+    assert_eq!(stale["session_context_revision"], 2);
     assert_eq!(stale["session_continuity"]["status"], "behind");
-    assert_eq!(stale["session_continuity"]["ack_revision"], 1);
-    assert_eq!(stale["session_continuity"]["pre_call_revision"], 2);
+    assert_eq!(stale["session_continuity"]["ack_revision"], 0);
+    assert_eq!(stale["session_continuity"]["pre_call_revision"], 1);
     assert_eq!(
         stale["session_recovery"]["model_facing_events"][0]["context_revision"],
-        2
+        1
     );
+    assert_eq!(runtime.sessions.context_revision(&session_id), Some(2));
 
-    let mut recovered_args = with_mcp_recording_session(json!({}), &session_id);
-    recovered_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(3),
-    );
-    let (status, recovered_body) =
-        stateless_2026_tool_call(&service, "secret", 231, "list_tools", recovered_args, None).await;
-    assert_eq!(status, StatusCode::OK, "{recovered_body}");
-    let recovered = stateless_tool_output(&recovered_body);
-    assert_eq!(recovered["session_context_revision"], 4);
-    assert!(recovered.get("session_recovery").is_none());
-
-    let mut invalid_args = with_mcp_recording_session(json!({}), &session_id);
-    invalid_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!("not-a-revision"),
-    );
-    let (status, invalid_body) =
-        stateless_2026_tool_call(&service, "secret", 232, "list_tools", invalid_args, None).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "invalid ACK must not block tool: {invalid_body}"
-    );
-    let invalid = stateless_tool_output(&invalid_body);
-    assert_eq!(invalid["session_context_revision"], 5);
-    assert_eq!(invalid["session_continuity"]["status"], "invalid");
-    assert!(invalid["session_continuity"]
-        .get("events_after_ack")
-        .is_none());
-    assert!(invalid["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(invalid["session_recovery"]["current_handoff"].is_object());
-    assert_eq!(invalid["session_recovery"]["history_lost"], false);
-
-    let mut future_args = with_mcp_recording_session(json!({}), &session_id);
+    let mut future_args =
+        with_mcp_recording_session(json!({"title": "context checkpoint future"}), &session_id);
     future_args.as_object_mut().unwrap().insert(
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
         json!(999),
     );
     let (status, future_body) =
-        stateless_2026_tool_call(&service, "secret", 233, "list_tools", future_args, None).await;
+        stateless_2026_tool_call(&service, "secret", 232, "start_session", future_args, None).await;
     assert_eq!(status, StatusCode::OK, "{future_body}");
     let future = stateless_tool_output(&future_body);
-    assert_eq!(future["session_context_revision"], 6);
+    assert_eq!(future["session_context_revision"], 3);
     assert_eq!(future["session_continuity"]["status"], "invalid");
     assert_eq!(future["session_continuity"]["ack_revision"], 999);
-    assert!(future["session_continuity"]
-        .get("events_after_ack")
-        .is_none());
     assert!(future["session_recovery"]["model_facing_events"]
         .as_array()
         .unwrap()
         .is_empty());
     assert!(future["session_recovery"]["current_handoff"].is_object());
 
-    let omitted_args = with_mcp_recording_session(json!({}), &session_id);
-    let (status, omitted_body) =
-        stateless_2026_tool_call(&service, "secret", 234, "list_tools", omitted_args, None).await;
-    assert_eq!(status, StatusCode::OK, "{omitted_body}");
-    let omitted = stateless_tool_output(&omitted_body);
-    assert_eq!(omitted["session_context_revision"], 7);
-    assert_eq!(omitted["session_continuity"]["status"], "unacknowledged");
-    assert!(omitted["session_continuity"]
-        .get("events_after_ack")
-        .is_none());
-    assert!(omitted["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(omitted["session_recovery"]["current_handoff"].is_object());
+    let missing_args =
+        with_mcp_recording_session(json!({"title": "context checkpoint missing"}), &session_id);
+    let (status, missing_body) =
+        stateless_2026_tool_call(&service, "secret", 233, "start_session", missing_args, None)
+            .await;
+    assert_eq!(status, StatusCode::OK, "{missing_body}");
+    let missing = stateless_tool_output(&missing_body);
+    assert_eq!(missing["session_context_revision"], 4);
+    assert_eq!(missing["session_continuity"]["status"], "unacknowledged");
+    assert!(missing["session_recovery"]["current_handoff"].is_object());
 
-    let mut after_missing_args = with_mcp_recording_session(json!({}), &session_id);
+    let mut after_missing_args = with_mcp_recording_session(
+        json!({"title": "context checkpoint after missing"}),
+        &session_id,
+    );
     after_missing_args.as_object_mut().unwrap().insert(
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD.to_string(),
-        json!(7),
+        json!(4),
     );
     let (status, after_missing_body) = stateless_2026_tool_call(
         &service,
         "secret",
-        235,
-        "list_tools",
+        234,
+        "start_session",
         after_missing_args,
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{after_missing_body}");
     let after_missing = stateless_tool_output(&after_missing_body);
-    assert_eq!(after_missing["session_context_revision"], 8);
+    assert_eq!(after_missing["session_context_revision"], 5);
     assert!(after_missing.get("session_continuity").is_none());
     assert!(after_missing.get("session_recovery").is_none());
-
-    let telemetry_rows = {
-        let conn = db.conn_for_tests();
-        let mut statement = conn
-            .prepare(
-                "SELECT summary_json FROM action_events WHERE endpoint = '/mcp' AND operation = 'list_tools' ORDER BY rowid",
-            )
-            .unwrap();
-        statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    };
-    let telemetry = telemetry_rows
-        .iter()
-        .map(|row| serde_json::from_str::<Value>(row).unwrap())
-        .map(|summary| summary["model_ergonomics"].clone())
-        .collect::<Vec<_>>();
-    assert!(telemetry.iter().all(|row| row["schema_version"] == 3));
-    assert!(telemetry
-        .iter()
-        .all(|row| row["context_continuity_eligible"] == true));
-    assert_eq!(telemetry[0]["context_ack_present"], false);
-    assert_eq!(telemetry[0]["context_continuity_status"], "unacknowledged");
-    assert_eq!(telemetry[0]["session_recovery_event_count"], 0);
-    assert_eq!(telemetry[1]["context_ack_present"], true);
-    assert_eq!(telemetry[1]["context_continuity_status"], "exact");
-    assert_eq!(telemetry[2]["context_continuity_status"], "behind");
-    assert!(
-        telemetry[2]["session_recovery_event_count"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
-    assert_eq!(telemetry[4]["context_ack_present"], true);
-    assert_eq!(telemetry[4]["context_continuity_status"], "invalid");
-    assert_eq!(telemetry[4]["session_recovery_event_count"], 0);
-    assert_eq!(telemetry[4]["session_history_lost"], false);
-    assert_eq!(telemetry[5]["context_ack_present"], true);
-    assert_eq!(telemetry[5]["context_continuity_status"], "invalid");
-    assert_eq!(telemetry[5]["session_recovery_event_count"], 0);
-    assert_eq!(telemetry[6]["context_ack_present"], false);
-    assert_eq!(telemetry[6]["context_continuity_status"], "unacknowledged");
-    assert_eq!(telemetry[6]["session_recovery_event_count"], 0);
-    assert_eq!(telemetry[7]["context_continuity_status"], "exact");
-    assert!(telemetry
-        .iter()
-        .all(|row| row["serialized_result_bytes"].is_u64()));
-    let serialized_telemetry = serde_json::to_string(&telemetry).unwrap();
-    assert!(!serialized_telemetry.contains(&session_id));
-    assert!(!serialized_telemetry.contains("ack_revision"));
-    assert!(!serialized_telemetry.contains("model_facing_events"));
 
     let audit = serde_json::to_string(
         &runtime

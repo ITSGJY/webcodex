@@ -586,6 +586,51 @@ fn stateless_workflow_recorder_metadata_does_not_expand_connector_or_generic_too
 
     let mut full = mcp_tools_list_payload_with_compact(ModelSurface::FullOperatorRuntime, false);
     add_stateless_workflow_recorder_metadata(&mut full, ModelSurface::FullOperatorRuntime);
+    for name in [
+        "read_files",
+        "search_project_texts",
+        "tool_manifest",
+        "show_changes",
+    ] {
+        let tool = full["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} schema"));
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        assert!(
+            !properties.contains_key(
+                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
+            ),
+            "{name} must not advertise checkpoint ACK"
+        );
+        assert!(properties.contains_key(
+            crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
+        ));
+        assert!(properties
+            .contains_key(crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD));
+        assert!(properties
+            .contains_key(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD));
+        assert!(properties.contains_key(
+            crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD
+        ));
+    }
+    for name in ["work_on_project", "apply_text_edits", "run_process"] {
+        let tool = full["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name} schema"));
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        assert!(properties.contains_key(
+            crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
+        ));
+        assert!(properties.contains_key(
+            crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
+        ));
+    }
     for tool in full["tools"].as_array().unwrap() {
         if tool["name"] != "work_on_project" {
             let serialized = serde_json::to_string(tool).unwrap();
@@ -850,6 +895,34 @@ fn stateless_context_revision_ack_is_request_scoped_and_removed_before_parsing()
         recorder.ack_session_context_revision,
         crate::tool_runtime::sessions::SessionContextRevisionAck::Invalid
     );
+}
+
+#[test]
+fn stale_cached_context_revision_ack_is_ignored_for_no_ack_tool() {
+    let mut arguments = json!({
+        "project": "proj",
+        "items": [{"path": "src/lib.rs"}],
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 41,
+    });
+    let discarded = strip_stateless_ack_session_context_revision(&mut arguments).unwrap();
+    assert_eq!(discarded, json!(41));
+    assert!(arguments
+        .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD)
+        .is_none());
+
+    let accepts_ack =
+        crate::tool_runtime::tool_definition::runtime_tool_accepts_context_ack("read_files");
+    assert!(!accepts_ack);
+    let recorder = crate::tool_runtime::sessions::ToolCallRecorderMetadata::
+        from_arguments_with_context_continuity(&arguments, accepts_ack);
+    assert_eq!(
+        recorder.ack_session_context_revision,
+        crate::tool_runtime::sessions::SessionContextRevisionAck::Unsupported
+    );
+
+    let concrete = crate::tool_runtime::sessions::strip_tool_call_expectation_metadata(arguments);
+    crate::tool_runtime::ToolCall::from_tool_name("read_files", concrete)
+        .expect("cached ACK must be stripped before concrete read_files parsing");
 }
 
 #[test]
@@ -1778,7 +1851,11 @@ async fn mcp_tools_call_records_event_with_recording_session_id() {
         .unwrap();
     assert_eq!(finished.transport, "mcp");
     assert_eq!(finished.status.as_deref(), Some("succeeded"));
-    assert_eq!(finished.context_revision, Some(1));
+    assert_eq!(finished.context_revision, None);
+    assert_eq!(
+        runtime.sessions.context_revision(&session.session_id),
+        Some(0)
+    );
     assert_eq!(finished.risk_class, "read_only");
 }
 

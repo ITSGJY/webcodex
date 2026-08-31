@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn tool_definitions_are_context_continuity_ssot() {
+    use crate::tool_runtime::metadata::ToolEffect;
+    use crate::tool_runtime::tool_definition::{
+        runtime_tool_accepts_context_ack, runtime_tool_advances_context_checkpoint,
+        runtime_tool_context_continuity_policy,
+    };
+    use crate::tool_runtime::tool_policy::lookup_tool_definition;
+
+    for (name, accepts_ack, advances_checkpoint) in [
+        ("read_files", false, false),
+        ("search_project_texts", false, false),
+        ("tool_manifest", false, false),
+        ("show_changes", false, false),
+        ("work_on_project", true, false),
+        ("apply_text_edits", true, true),
+        ("run_process", true, true),
+        ("observe_jobs", true, true),
+    ] {
+        let definition =
+            lookup_tool_definition(name).unwrap_or_else(|| panic!("missing definition for {name}"));
+        let direct = definition.context_continuity_policy();
+        assert_eq!(
+            runtime_tool_context_continuity_policy(name),
+            direct,
+            "{name}"
+        );
+        assert_eq!(direct.accepts_context_ack, accepts_ack, "{name}");
+        assert_eq!(
+            direct.advances_context_checkpoint(),
+            advances_checkpoint,
+            "{name}"
+        );
+        assert_eq!(
+            runtime_tool_accepts_context_ack(name),
+            accepts_ack,
+            "{name}"
+        );
+        assert_eq!(
+            runtime_tool_advances_context_checkpoint(name),
+            advances_checkpoint,
+            "{name}"
+        );
+    }
+
+    assert_eq!(
+        lookup_tool_definition("work_on_project")
+            .unwrap()
+            .metadata()
+            .effect,
+        ToolEffect::Mutate
+    );
+    assert_eq!(
+        lookup_tool_definition("show_changes")
+            .unwrap()
+            .metadata()
+            .effect,
+        ToolEffect::Observe
+    );
+    assert_eq!(
+        lookup_tool_definition("observe_jobs")
+            .unwrap()
+            .metadata()
+            .effect,
+        ToolEffect::Observe
+    );
+    assert!(!runtime_tool_advances_context_checkpoint("show_changes"));
+    assert!(runtime_tool_advances_context_checkpoint("observe_jobs"));
+
+    assert!(runtime_tool_accepts_context_ack("unknown_open_world_tool"));
+    assert!(runtime_tool_advances_context_checkpoint(
+        "unknown_open_world_tool"
+    ));
+}
+
+#[test]
 fn tool_definitions_drive_session_and_permission_policy() {
     use crate::tool_runtime::metadata::{
         ToolApprovalPolicy, ToolAuthorityPolicy, ToolEffect, ToolIdempotency, ToolRisk,

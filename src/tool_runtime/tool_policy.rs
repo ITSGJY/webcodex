@@ -4,9 +4,10 @@ use super::metadata::{
     tool_metadata, ToolApprovalPolicy, ToolEffect, ToolMetadata, ToolPathHint, ToolRisk,
 };
 use super::tool_definition::{
-    tool_definitions, AgentCapability, ToolDefinition, ToolEffectAnnotations,
-    PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH,
-    PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
+    tool_definitions, AgentCapability, ToolContextContinuityPolicy, ToolDefinition,
+    ToolEffectAnnotations, PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE,
+    PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION,
+    PERMISSION_RISK_WRITE,
 };
 
 impl ToolDefinition {
@@ -56,6 +57,10 @@ impl ToolDefinition {
 
     pub(crate) fn captures_validation_output(self) -> bool {
         self.policy.captures_validation_output
+    }
+
+    pub(crate) fn context_continuity_policy(self) -> ToolContextContinuityPolicy {
+        self.policy.context_continuity
     }
 
     #[cfg(test)]
@@ -163,6 +168,25 @@ pub(crate) fn runtime_tool_metadata(name: &str) -> ToolMetadata {
         Ok(definition) => definition.metadata(),
         Err(metadata) => metadata,
     }
+}
+
+fn tool_context_continuity_policy(name: &str) -> ToolContextContinuityPolicy {
+    lookup_tool_definition(name)
+        .map(|definition| definition.context_continuity_policy())
+        .unwrap_or(ToolContextContinuityPolicy::CONSERVATIVE)
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_tool_context_continuity_policy(name: &str) -> ToolContextContinuityPolicy {
+    tool_context_continuity_policy(name)
+}
+
+pub(crate) fn runtime_tool_accepts_context_ack(name: &str) -> bool {
+    tool_context_continuity_policy(name).accepts_context_ack
+}
+
+pub(crate) fn runtime_tool_advances_context_checkpoint(name: &str) -> bool {
+    tool_context_continuity_policy(name).advances_context_checkpoint()
 }
 
 pub(crate) fn runtime_tool_effect_annotations(name: &str) -> ToolEffectAnnotations {

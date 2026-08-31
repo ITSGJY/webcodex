@@ -679,6 +679,7 @@ pub(crate) struct ToolCallStart {
     pub(crate) permission: Option<PermissionDecision>,
     pub(crate) expectation: ToolCallExpectation,
     pub(crate) pre_call_context_revision: u64,
+    pub(crate) advances_context_checkpoint: bool,
     pub(crate) ack_session_context_revision: SessionContextRevisionAck,
 }
 
@@ -719,9 +720,9 @@ pub(crate) struct ToolCallRecorderMetadata {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum SessionContextRevisionAck {
-    /// The current request surface does not expose the context-continuity ACK
-    /// protocol. Model-facing history still advances its durable watermark,
-    /// but the response must preserve the legacy surface contract.
+    /// The current tool/surface does not accept the context-continuity ACK
+    /// protocol. Checkpoint advancement is a separate ToolDefinition policy and
+    /// may still advance the cross-surface watermark.
     #[default]
     Unsupported,
     Unacknowledged,
@@ -734,6 +735,11 @@ pub(crate) struct RecordedModelFacingToolCall {
     pub(crate) event_id: String,
     pub(crate) session_id: String,
     pub(crate) context_revision: u64,
+    /// Session checkpoint watermark immediately before the current model-facing
+    /// result was recorded. This must not be inferred from `context_revision - 1`
+    /// because continuity-aware recovery calls may not advance a checkpoint.
+    pub(crate) pre_response_context_revision: u64,
+    pub(crate) checkpoint_advanced: bool,
     pub(crate) pre_call_context_revision: u64,
     pub(crate) ack_session_context_revision: SessionContextRevisionAck,
     /// Retained model-facing results strictly after a caller's explicitly proven
@@ -818,8 +824,9 @@ pub(crate) struct SessionEvent {
     pub(crate) logical_invocation_role: Option<String>,
     pub(crate) session_id: String,
     pub(crate) kind: String,
-    /// Model-facing context revision assigned atomically with a finished
-    /// ToolResult. Started/background/system events leave this unset.
+    /// Model-facing context checkpoint revision assigned atomically only when the
+    /// finished ToolResult advances model knowledge. Non-checkpoint results and
+    /// started/background/system events leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) context_revision: Option<u64>,
     /// Closed, bounded consequence projection used only for model-context

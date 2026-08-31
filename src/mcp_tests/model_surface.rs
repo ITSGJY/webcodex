@@ -359,6 +359,133 @@ async fn adaptive_runtime_requires_gateway_for_long_tail_and_preserves_dispatch(
 }
 
 #[tokio::test]
+async fn adaptive_runtime_gateway_uses_target_checkpoint_policy_once() {
+    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let direct_session = runtime.sessions.start_session(
+        Some("missing-project".to_string()),
+        Some("direct checkpoint parity".to_string()),
+    );
+    let gateway_session = runtime.sessions.start_session(
+        Some("missing-project".to_string()),
+        Some("gateway checkpoint parity".to_string()),
+    );
+
+    let direct_read = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7221)),
+            mcp_2026_params(json!({
+                "name": "read_files",
+                "arguments": {
+                    "project": "missing-project",
+                    "items": [{"path": "src/lib.rs"}],
+                    "recording_session_id": direct_session.session_id,
+                    "ack_session_context_revision": 999
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(direct_read, McpOutcome::Ok(_)));
+    assert_eq!(
+        runtime
+            .sessions
+            .context_revision(&direct_session.session_id),
+        Some(0),
+        "direct no-checkpoint read must not consume a revision"
+    );
+
+    let gateway_read = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7222)),
+            mcp_2026_params(json!({
+                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {
+                    "tool": "read_files",
+                    "arguments": {
+                        "project": "missing-project",
+                        "items": [{"path": "src/lib.rs"}]
+                    },
+                    "recording_session_id": gateway_session.session_id,
+                    "ack_session_context_revision": 999
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(gateway_read, McpOutcome::Ok(_)));
+    assert_eq!(
+        runtime
+            .sessions
+            .context_revision(&gateway_session.session_id),
+        Some(0),
+        "gateway read must inherit the target no-checkpoint policy"
+    );
+
+    let direct_edit = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7223)),
+            mcp_2026_params(json!({
+                "name": "apply_text_edits",
+                "arguments": {
+                    "project": "missing-project",
+                    "changes": [{"kind": "create", "path": "x.txt", "content": "x"}],
+                    "recording_session_id": direct_session.session_id,
+                    "ack_session_context_revision": 0
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(direct_edit, McpOutcome::Ok(_)));
+    assert_eq!(
+        runtime
+            .sessions
+            .context_revision(&direct_session.session_id),
+        Some(1),
+        "direct edit result is one checkpoint even when business validation fails"
+    );
+
+    let gateway_edit = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7224)),
+            mcp_2026_params(json!({
+                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {
+                    "tool": "apply_text_edits",
+                    "arguments": {
+                        "project": "missing-project",
+                        "changes": [{"kind": "create", "path": "x.txt", "content": "x"}]
+                    },
+                    "recording_session_id": gateway_session.session_id,
+                    "ack_session_context_revision": 0
+                }
+            })),
+        ),
+        None,
+    )
+    .await;
+    assert!(matches!(gateway_edit, McpOutcome::Ok(_)));
+    assert_eq!(
+        runtime
+            .sessions
+            .context_revision(&gateway_session.session_id),
+        Some(1),
+        "one gateway logical invocation must not allocate outer and inner checkpoints"
+    );
+}
+
+#[tokio::test]
 async fn adaptive_runtime_gateway_rejects_recursive_and_unknown_targets() {
     let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
     for target in [
