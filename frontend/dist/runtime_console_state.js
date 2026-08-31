@@ -2,12 +2,61 @@ import { initialWorkflowSessionState, selectWorkflowSession, refreshWorkflowSess
 function compareText(left, right) {
     return left < right ? -1 : left > right ? 1 : 0;
 }
+export class RuntimeCommunicationRefreshCoordinator {
+    constructor(runRefresh) {
+        this.runRefresh = runRefresh;
+        this.generation = 0;
+        this.inFlight = null;
+    }
+    refresh(includeData = true) {
+        const generation = this.generation;
+        const current = this.inFlight;
+        if (current && current.generation === generation) {
+            if (!includeData || current.includeData)
+                return current.promise;
+            return current.promise.then(() => this.generation === generation ? this.refresh(true) : false, () => this.generation === generation ? this.refresh(true) : false);
+        }
+        const promise = Promise.resolve().then(() => this.runRefresh(includeData));
+        const started = { includeData, generation, promise };
+        this.inFlight = started;
+        const clear = () => {
+            if (this.inFlight === started)
+                this.inFlight = null;
+        };
+        void promise.then(clear, clear);
+        return promise;
+    }
+    reset() {
+        this.generation += 1;
+        this.inFlight = null;
+    }
+}
 export function runtimeCommunicationTranscriptAfterSeq(lastSeq, limit = 100) {
     const normalizedLastSeq = typeof lastSeq === "number" && Number.isSafeInteger(lastSeq)
         ? Math.max(0, lastSeq)
         : 0;
     const normalizedLimit = Number.isSafeInteger(limit) && limit > 0 ? limit : 100;
     return Math.max(0, normalizedLastSeq - normalizedLimit);
+}
+export function runtimeWorkflowSessionSummaryRevision(session) {
+    if (!session)
+        return "";
+    return JSON.stringify([
+        String(session.session_id || ""),
+        String(session.title || ""),
+        String(session.lifecycle || ""),
+        String(session.mode || ""),
+        typeof session.updated_at === "number" ? session.updated_at : null,
+        !!session.running_call,
+        typeof session.running_jobs === "number" ? session.running_jobs : null,
+        session.running_jobs_complete === true,
+        session.current_activity ?? null,
+        session.last_activity ?? null,
+        session.overview ?? null,
+    ]);
+}
+export function runtimeWorkflowSessionSummaryChanged(previous, next) {
+    return runtimeWorkflowSessionSummaryRevision(previous) !== runtimeWorkflowSessionSummaryRevision(next);
 }
 function emptyCollaborationState() {
     return {
