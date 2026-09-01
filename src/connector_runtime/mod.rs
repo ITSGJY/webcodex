@@ -72,7 +72,6 @@ use crate::project_context::{
 };
 use crate::shell_client::RunnerFeature;
 use crate::shell_protocol::{
-    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_GO_TEST_JSON,
     SHELL_CLIENT_CAPABILITY_STRUCTURED_VALIDATION_ARGV,
 };
@@ -869,6 +868,18 @@ impl ConnectorRuntime {
         window: Option<&ClientWindow>,
         now: i64,
     ) -> ConnectorCallOutcome {
+        if arguments.get("mode").and_then(Value::as_str) == Some("inspect") {
+            return ConnectorCallOutcome::error(
+                400,
+                "inspect_mode_retired",
+                "inspect mode was retired before v0.4 and is no longer executable",
+                false,
+                true,
+                Some("Use read_only for analysis, or normal for writable work, command execution, and validation."),
+                None,
+                true,
+            );
+        }
         let input: TaskStartInput = match parse_input("task_start", arguments) {
             Ok(input) => input,
             Err(outcome) => return outcome,
@@ -933,6 +944,12 @@ impl ConnectorRuntime {
                 Err(error) => return store_error_outcome(error, None),
             };
             if let Some(task) = existing {
+                if task.mode == "inspect" {
+                    return Self::retired_inspect_task_outcome(&task);
+                }
+                if let Some(outcome) = Self::invalid_mode_transition_outcome(&task, mode) {
+                    return outcome;
+                }
                 let refresh =
                     compare_project_context(Some(&existing_context.fingerprint), &fingerprint);
                 if task.task_status == "active" && task.run_status == "running" {
@@ -1131,19 +1148,23 @@ impl ConnectorRuntime {
         .await
         {
             Ok(Ok(prepared)) => prepared,
-            Ok(Err(message)) => {
-                let guidance = if message.contains("workspace slot is occupied") {
+            Ok(Err(error)) => {
+                let guidance = if error.reason_code == "writable_slot_occupied" {
                     "Finish, resume, or reject the task occupying the writable slot."
                 } else {
-                    "Resolve the Git/workspace issue, then retry the instruction."
+                    "Resolve the reported Git/private-state issue; normal mode never falls back to the target checkout."
                 };
-                return Err(ConnectorCallOutcome::error(
+                return Err(ConnectorCallOutcome::error_with_data(
                     409,
                     "workspace_preparation_failed",
-                    self.sanitize_executor_string(&message),
+                    error.message,
                     false,
                     true,
                     Some(guidance),
+                    json!({
+                        "stage": error.stage,
+                        "reason_code": error.reason_code,
+                    }),
                     None,
                     false,
                 ));
@@ -1180,23 +1201,26 @@ impl ConnectorRuntime {
                 let cleanup = self
                     .workspace
                     .discard_prepared(&self.context.executor_root, &prepared);
-                let message = registration
-                    .error
-                    .as_deref()
-                    .map(|message| self.sanitize_executor_string(message))
-                    .unwrap_or_else(|| {
-                        "executor could not register the isolated workspace".to_string()
-                    });
+                if let Some(error) = registration.error.as_deref() {
+                    tracing::warn!(
+                        error = %self.sanitize_executor_string(error),
+                        "temporary Runner project registration failed"
+                    );
+                }
                 if let Some(cleanup) = cleanup {
                     tracing::warn!(cleanup = %cleanup, "failed to fully clean rejected workspace preparation");
                 }
-                return Err(ConnectorCallOutcome::error(
-                    400,
-                    "workspace_registration_failed",
-                    message,
+                return Err(ConnectorCallOutcome::error_with_data(
+                    409,
+                    "workspace_preparation_failed",
+                    "the isolated writable workspace could not be registered with the Runner",
                     false,
                     true,
-                    Some("Inspect the executor policy and retry the instruction."),
+                    Some("Resolve the Runner project-registration policy, then retry; the target checkout was not used as a writable fallback."),
+                    json!({
+                        "stage": "runner_project_registration",
+                        "reason_code": "runner_project_registration_failed",
+                    }),
                     None,
                     false,
                 ));
@@ -1218,6 +1242,12 @@ impl ConnectorRuntime {
         now: i64,
     ) -> ConnectorCallOutcome {
         let event_cursor_before = task.event_cursor;
+        if task.mode == "inspect" {
+            return Self::retired_inspect_task_outcome(&task);
+        }
+        if let Some(outcome) = Self::invalid_mode_transition_outcome(&task, mode) {
+            return outcome;
+        }
         let prepared = if mode == "normal" && !task.isolated {
             match self
                 .prepare_connector_workspace(&task.task_id, &task.run_id, false, auth)
@@ -1994,9 +2024,6 @@ impl ConnectorRuntime {
             Ok(task) => task,
             Err(outcome) => return outcome,
         };
-        if let Err(outcome) = self.ensure_inspect_sandbox(&task, auth).await {
-            return outcome;
-        }
         let resolved = match resolve_validation_recipe(
             Path::new(&task.execution_root),
             input.cwd.as_deref(),
@@ -2022,15 +2049,13 @@ impl ConnectorRuntime {
         let shared_cargo_target = std::path::Path::new(&self.context.runs_root)
             .parent()
             .map(|state| state.join("cache/cargo-target"));
-        if task.mode != "inspect" {
-            if let Some(shared_cargo_target) = shared_cargo_target {
-                for step in &mut validation_steps {
-                    if step.program == "cargo" {
-                        step.env.push((
-                            "CARGO_TARGET_DIR".to_string(),
-                            shared_cargo_target.to_string_lossy().to_string(),
-                        ));
-                    }
+        if let Some(shared_cargo_target) = shared_cargo_target {
+            for step in &mut validation_steps {
+                if step.program == "cargo" {
+                    step.env.push((
+                        "CARGO_TARGET_DIR".to_string(),
+                        shared_cargo_target.to_string_lossy().to_string(),
+                    ));
                 }
             }
         }
@@ -2160,8 +2185,6 @@ impl ConnectorRuntime {
                     timeout_secs,
                     auth.clone(),
                     validation_steps,
-                    (task.mode == "inspect")
-                        .then(|| crate::command_sandbox::INSPECT_SANDBOX_MODE.to_string()),
                 )
                 .await,
             &task,
@@ -2212,9 +2235,6 @@ impl ConnectorRuntime {
                 Ok(task) => task,
                 Err(outcome) => return outcome,
             };
-        if let Err(outcome) = self.ensure_inspect_sandbox(&task, auth).await {
-            return outcome;
-        }
         let timeout_secs = input.timeout_secs.unwrap_or(120);
         let request_sha256 =
             command_request_hash(&task, &input.command, input.cwd.as_deref(), timeout_secs);
@@ -2361,8 +2381,6 @@ impl ConnectorRuntime {
                     timeout_secs,
                     auth.clone(),
                     Vec::new(),
-                    (task.mode == "inspect")
-                        .then(|| crate::command_sandbox::INSPECT_SANDBOX_MODE.to_string()),
                 )
                 .await,
             &task,
@@ -2690,6 +2708,9 @@ impl ConnectorRuntime {
             Ok(task) => task,
             Err(outcome) => return outcome,
         };
+        if task.mode == "inspect" {
+            return Self::retired_inspect_task_outcome(&task);
+        }
         let context_lock = window.map(|window| self.context_lock(subject_id, window.key()));
         let _context_guard = match context_lock.as_ref() {
             Some(lock) => Some(lock.lock().await),
@@ -2942,6 +2963,12 @@ impl ConnectorRuntime {
             Ok(task) => task,
             Err(outcome) => return outcome,
         };
+        if visible_task.mode == "inspect" {
+            return Self::retired_inspect_task_outcome(&visible_task);
+        }
+        if let Some(outcome) = Self::invalid_task_workspace_outcome(&visible_task) {
+            return outcome;
+        }
         let blocker = match self.db.connector_finish_blocker(&input.task_id) {
             Ok(blocker) => blocker,
             Err(error) => return store_error_outcome(error, Some(&visible_task)),
@@ -2981,11 +3008,11 @@ impl ConnectorRuntime {
             Ok(execution) => execution,
             Err(error) => return store_error_outcome(error, Some(&task)),
         };
-        if task.mode == "normal" && check_execution.is_none() {
+        if task.isolated && check_execution.is_none() {
             return ConnectorCallOutcome::error_for_task(
                 409,
                 "checks_required",
-                "a normal coding result must run structured checks before task_finish",
+                "an isolated writable coding result must run structured checks before task_finish",
                 false,
                 true,
                 Some("Call checks_run with a new operation_id, then retry task_finish."),
@@ -3187,12 +3214,84 @@ impl ConnectorRuntime {
         }
     }
 
+    fn retired_inspect_task_outcome(task: &ConnectorTaskSnapshot) -> ConnectorCallOutcome {
+        ConnectorCallOutcome::error_for_task(
+            409,
+            "inspect_mode_retired",
+            "this pre-0.4 inspect task can no longer execute",
+            false,
+            true,
+            Some("Reject or clean up this legacy task, then start a new read_only task for analysis or a new normal task for writable work."),
+            task,
+            Value::Null,
+        )
+    }
+
+    fn invalid_mode_transition_outcome(
+        task: &ConnectorTaskSnapshot,
+        requested_mode: &str,
+    ) -> Option<ConnectorCallOutcome> {
+        (task.mode == "normal" && requested_mode == "read_only").then(|| {
+            ConnectorCallOutcome::error_for_task(
+                409,
+                "mode_transition_invalid",
+                "a writable normal task cannot transition to read_only",
+                false,
+                true,
+                Some("Finish or reject the current writable task, then start a new read_only task for analysis."),
+                task,
+                json!({
+                    "previous_mode": task.mode,
+                    "requested_mode": requested_mode,
+                }),
+            )
+        })
+    }
+
+    fn invalid_task_workspace_outcome(
+        task: &ConnectorTaskSnapshot,
+    ) -> Option<ConnectorCallOutcome> {
+        let message = match task.mode.as_str() {
+            "normal"
+                if !task.isolated
+                    || task.execution_root == task.target_root
+                    || task.baseline_commit.as_deref().is_none_or(str::is_empty)
+                    || task.baseline_tree.as_deref().is_none_or(str::is_empty) =>
+            {
+                "normal task has an invalid isolated writable-workspace state"
+            }
+            "read_only" if task.isolated || task.execution_root != task.target_root => {
+                "read_only task has an invalid workspace state"
+            }
+            "normal" | "read_only" | "inspect" => return None,
+            _ => "task mode is not part of the canonical Connector execution contract",
+        };
+        Some(ConnectorCallOutcome::error_for_task(
+            409,
+            "task_state_invalid",
+            message,
+            false,
+            true,
+            Some("Reject or clean up this inconsistent task, then start a new normal or read_only task."),
+            task,
+            json!({
+                "mode": task.mode,
+                "isolated": task.isolated,
+            }),
+        ))
+    }
+
     fn active_task(
         &self,
         task_id: &str,
         subject_id: &str,
     ) -> Result<ConnectorTaskSnapshot, ConnectorCallOutcome> {
         let task = self.task(task_id, subject_id)?;
+        if task.mode != "inspect" {
+            if let Some(outcome) = Self::invalid_task_workspace_outcome(&task) {
+                return Err(outcome);
+            }
+        }
         if task.run_status == "interrupted" {
             return Err(ConnectorCallOutcome::error_for_task(
                 409,
@@ -3230,37 +3329,25 @@ impl ConnectorRuntime {
         now: i64,
     ) -> Result<ConnectorTaskSnapshot, ConnectorCallOutcome> {
         let task = self.active_task(task_id, subject_id)?;
-        if task.mode == "read_only" || task.mode == "inspect" {
-            let denied = task.mode.as_str();
+        if task.mode == "inspect" {
+            return Err(Self::retired_inspect_task_outcome(&task));
+        }
+        if task.mode == "read_only" {
             let cursor = self.record_event(
                 &task,
                 capability,
-                json!({ "ok": false, "denied": denied }),
+                json!({ "ok": false, "denied": "read_only" }),
                 now,
             );
-            let cursor = cursor.unwrap_or(task.event_cursor);
-            let (code, message, guidance) = if task.mode == "inspect" {
-                (
-                    "inspect_task",
-                    format!("{capability} is unavailable because inspect blocks structured writes"),
-                    "Start a normal task only when local project mutation is intended.",
-                )
-            } else {
-                (
-                    "read_only_task",
-                    format!("{capability} is unavailable because this task is read_only"),
-                    "Start a normal task only after the user authorizes changes or execution.",
-                )
-            };
             return Err(ConnectorCallOutcome::error_for_task_at(
                 403,
-                code,
-                message,
+                "read_only_task",
+                format!("{capability} is unavailable because this task is read_only"),
                 false,
                 true,
-                Some(guidance),
+                Some("Start a normal task only after the user authorizes changes or execution."),
                 &task,
-                cursor,
+                cursor.unwrap_or(task.event_cursor),
                 Value::Null,
             ));
         }
@@ -3275,6 +3362,9 @@ impl ConnectorRuntime {
         now: i64,
     ) -> Result<ConnectorTaskSnapshot, ConnectorCallOutcome> {
         let task = self.active_task(task_id, subject_id)?;
+        if task.mode == "inspect" {
+            return Err(Self::retired_inspect_task_outcome(&task));
+        }
         if task.mode == "read_only" {
             let cursor = self.record_event(
                 &task,
@@ -3288,56 +3378,13 @@ impl ConnectorRuntime {
                 format!("{capability} is unavailable because this task is read_only"),
                 false,
                 true,
-                Some("Start an inspect task for landlocked checks, or a normal task for writes."),
+                Some("Start a normal task only after the user authorizes command execution."),
                 &task,
                 cursor.unwrap_or(task.event_cursor),
                 Value::Null,
             ));
         }
         Ok(task)
-    }
-
-    async fn ensure_inspect_sandbox(
-        &self,
-        task: &ConnectorTaskSnapshot,
-        auth: &AuthContext,
-    ) -> Result<(), ConnectorCallOutcome> {
-        if task.mode != "inspect" {
-            return Ok(());
-        }
-        let client_id = task
-            .execution_executor_ref
-            .strip_prefix("agent:")
-            .and_then(|rest| rest.split_once(':'))
-            .map(|(client_id, _)| client_id);
-        let supported = match client_id {
-            Some(client_id) => self
-                .tools
-                .shell_clients
-                .client_supports_for_auth(
-                    client_id,
-                    SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS,
-                    Some(auth),
-                )
-                .await
-                .unwrap_or(false),
-            None => false,
-        };
-        if supported {
-            return Ok(());
-        }
-        Err(ConnectorCallOutcome::error_for_task(
-            409,
-            "inspect_sandbox_unavailable",
-            "inspect execution requires a connected Linux runner with Landlock ABI v3",
-            false,
-            true,
-            Some("Upgrade or move the runner to a supported Linux host; inspect never falls back to ordinary shell."),
-            task,
-            json!({
-                "required_capability": SHELL_CLIENT_CAPABILITY_SANDBOX_INSPECT_COMMANDS
-            }),
-        ))
     }
 
     /// Attach human guidance to a model-facing capability response.
