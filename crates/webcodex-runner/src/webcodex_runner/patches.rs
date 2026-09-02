@@ -331,7 +331,9 @@ use crate::apply_edits_shared::{
     MAX_APPLY_TEXT_EDITS as APPLY_TEXT_EDITS_MAX_EDITS,
     MAX_APPLY_TEXT_EDIT_FIELD_BYTES as APPLY_TEXT_EDITS_MAX_FIELD_BYTES,
 };
-use crate::apply_patch_shared::{derive_codex_patch_update, parse_codex_patch, CodexPatchHunk};
+use crate::apply_patch_shared::{
+    derive_codex_patch_update_with_matches, parse_codex_patch, CodexPatchChunkMatch, CodexPatchHunk,
+};
 
 #[derive(Debug, Deserialize)]
 struct ApplyTextEditsPayload {
@@ -348,6 +350,8 @@ struct ApplyPatchPayload {
     patch: String,
     #[serde(default)]
     dry_run: Option<bool>,
+    #[serde(default)]
+    strict_matching: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -695,7 +699,7 @@ fn edit_conflict_retry_guidance(recovery: Option<&serde_json::Value>) -> &'stati
             "use the intended global occurrence with a line_scope that fully contains it, or correct either fence; reuse the same expected_sha256 unless the file changed."
         }
         Some("reread_or_refine_match") => {
-            "reread this file or refine the exact match; if you reread, retry with the newly observed expected_sha256."
+            "for model-generated contextual changes, prefer apply_patch; otherwise reread this file or refine the exact match, then retry apply_text_edits with the newly observed expected_sha256."
         }
         Some("refine_edit_batch") => {
             "refine the edit batch so exact edit ranges no longer overlap; reuse the same expected_sha256 unless you reread or observe a changed file."
@@ -1214,6 +1218,37 @@ fn apply_patch_conflict(
     )
 }
 
+fn apply_patch_strict_match_rejection(
+    index: usize,
+    path: &str,
+    matched: &CodexPatchChunkMatch,
+    start: Instant,
+) -> CommandResult {
+    line_edit_stdout(
+        serde_json::json!({
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error_kind": "strict_match_rejected",
+            "change_index": index,
+            "path": path,
+            "chunk_index": matched.chunk_index,
+            "match_mode": matched.match_mode.map(|mode| mode.as_str()),
+            "match_source": matched.match_source.as_str(),
+            "matched_start_line": matched.matched_start_line,
+            "candidate_count": matched.candidate_count,
+            "strict_match": false,
+            "recovery_action": "refine_patch_or_relax_strict_matching",
+            "retry_guidance": "add exact unique context and retry strict_matching=true; use strict_matching=false only when ordinary Codex fuzzy/first-match positioning is acceptable",
+            "error": format!(
+                "Rejected strict Codex patch before write: {path} chunk {} was not positioned by exact unique matching. No files were modified.",
+                matched.chunk_index
+            ),
+        }),
+        start,
+    )
+}
+
 pub(crate) fn handle_apply_patch_file_request(
     policy: &RunnerPolicy,
     request: &ShellAgentShellRequest,
@@ -1252,6 +1287,7 @@ pub(crate) fn handle_apply_patch_file_request(
         }
     };
     let dry_run = payload.dry_run.unwrap_or(false);
+    let strict_matching = payload.strict_matching.unwrap_or(false);
     let mut touched = HashSet::new();
     let mut plans = Vec::with_capacity(patch.hunks.len());
 
@@ -1355,11 +1391,24 @@ pub(crate) fn handle_apply_patch_file_request(
                         )
                     }
                 };
-                let replacement = if chunks.is_empty() {
-                    original.clone()
+                let (replacement, chunk_matches) = if chunks.is_empty() {
+                    (original.clone(), Vec::new())
                 } else {
-                    match derive_codex_patch_update(&original, path, chunks) {
-                        Ok(content) => content,
+                    match derive_codex_patch_update_with_matches(&original, path, chunks) {
+                        Ok(update) => {
+                            if strict_matching {
+                                if let Some(matched) = update
+                                    .chunk_matches
+                                    .iter()
+                                    .find(|matched| !matched.strict_match)
+                                {
+                                    return apply_patch_strict_match_rejection(
+                                        index, path, matched, start,
+                                    );
+                                }
+                            }
+                            (update.content, update.chunk_matches)
+                        }
                         Err(error) => {
                             return apply_patch_conflict(
                                 index,
@@ -1384,14 +1433,20 @@ pub(crate) fn handle_apply_patch_file_request(
                 }
                 let edit_summaries = chunks
                     .iter()
+                    .zip(chunk_matches.iter())
                     .enumerate()
-                    .map(|(chunk_index, chunk)| {
+                    .map(|(chunk_index, (chunk, chunk_match))| {
                         serde_json::json!({
                             "chunk_index": chunk_index,
                             "change_context_present": chunk.change_context.is_some(),
                             "old_line_count": chunk.old_lines.len(),
                             "new_line_count": chunk.new_lines.len(),
                             "end_of_file": chunk.is_end_of_file,
+                            "match_mode": chunk_match.match_mode.map(|mode| mode.as_str()),
+                            "match_source": chunk_match.match_source.as_str(),
+                            "matched_start_line": chunk_match.matched_start_line,
+                            "candidate_count": chunk_match.candidate_count,
+                            "strict_match": chunk_match.strict_match,
                         })
                     })
                     .collect::<Vec<_>>();

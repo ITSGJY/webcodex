@@ -1,6 +1,22 @@
 use super::*;
 
 fn apply_patch_request(cwd: &Path, patch: &str, dry_run: bool) -> ShellAgentShellRequest {
+    apply_patch_request_with_strict(cwd, patch, dry_run, false)
+}
+
+fn apply_patch_request_with_strict(
+    cwd: &Path,
+    patch: &str,
+    dry_run: bool,
+    strict_matching: bool,
+) -> ShellAgentShellRequest {
+    let mut payload = serde_json::json!({
+        "patch": patch,
+        "dry_run": dry_run,
+    });
+    if strict_matching {
+        payload["strict_matching"] = serde_json::json!(true);
+    }
     ShellAgentShellRequest {
         request_id: "req-apply-patch".to_string(),
         client_id: "agent-1".to_string(),
@@ -8,13 +24,7 @@ fn apply_patch_request(cwd: &Path, patch: &str, dry_run: bool) -> ShellAgentShel
         job_id: None,
         cwd: Some(cwd.to_string_lossy().to_string()),
         path: Some("routing-placeholder".to_string()),
-        content: Some(
-            serde_json::json!({
-                "patch": patch,
-                "dry_run": dry_run,
-            })
-            .to_string(),
-        ),
+        content: Some(payload.to_string()),
         max_bytes: None,
         expected_sha256: None,
         expected_prefix: None,
@@ -35,6 +45,100 @@ fn apply_patch_request(cwd: &Path, patch: &str, dry_run: bool) -> ShellAgentShel
         coding_agent: None,
         persistent_shell: None,
     }
+}
+
+#[test]
+fn file_apply_patch_strict_matching_accepts_exact_unique_and_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::write(tmp.path().join("exact.txt"), "old\n").unwrap();
+    std::fs::write(tmp.path().join("append.txt"), "head\n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: exact.txt\n-old\n+new\n*** Update File: append.txt\n+tail\n*** End Patch";
+
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_patch_request_with_strict(tmp.path(), patch, false, true),
+    ));
+
+    assert_eq!(out["changed"], true);
+    assert_eq!(out["execution_state"], "completed");
+    assert_eq!(out["files"][0]["edits"][0]["strict_match"], true);
+    assert_eq!(out["files"][1]["edits"][0]["strict_match"], true);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("exact.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("append.txt")).unwrap(),
+        "head\ntail\n"
+    );
+}
+
+#[test]
+fn file_apply_patch_strict_matching_rejects_fuzzy_and_ambiguous_before_write() {
+    for (original, patch, expected_mode, expected_candidates) in [
+        (
+            " old \n",
+            "*** Begin Patch\n*** Update File: target.txt\n-old\n+new\n*** End Patch",
+            "trim",
+            1,
+        ),
+        (
+            "dup\nmiddle\ndup\n",
+            "*** Begin Patch\n*** Update File: target.txt\n-dup\n+new\n*** End Patch",
+            "exact",
+            2,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = project_policy(tmp.path());
+        std::fs::write(tmp.path().join("target.txt"), original).unwrap();
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_patch_request_with_strict(tmp.path(), patch, false, true),
+        ));
+        assert_eq!(out["error_kind"], "strict_match_rejected");
+        assert_eq!(out["state_changed"], false);
+        assert_eq!(out["execution_state"], "not_started");
+        assert_eq!(out["match_mode"], expected_mode);
+        assert_eq!(out["candidate_count"], expected_candidates);
+        assert_eq!(out["strict_match"], false);
+        assert_eq!(
+            out["recovery_action"],
+            "refine_patch_or_relax_strict_matching"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+            original
+        );
+    }
+}
+
+#[test]
+fn file_apply_patch_strict_matching_rejects_later_risk_before_any_batch_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::write(tmp.path().join("safe.txt"), "old\n").unwrap();
+    std::fs::write(tmp.path().join("risky.txt"), " fuzzy \n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: safe.txt\n-old\n+new\n*** Update File: risky.txt\n-fuzzy\n+changed\n*** End Patch";
+
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_patch_request_with_strict(tmp.path(), patch, false, true),
+    ));
+
+    assert_eq!(out["error_kind"], "strict_match_rejected");
+    assert_eq!(out["change_index"], 1);
+    assert_eq!(out["path"], "risky.txt");
+    assert_eq!(out["state_changed"], false);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("safe.txt")).unwrap(),
+        "old\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("risky.txt")).unwrap(),
+        " fuzzy \n"
+    );
 }
 
 #[test]
@@ -88,9 +192,75 @@ fn file_apply_patch_dry_run_reports_plan_without_writing() {
     assert_eq!(out["changed"], false);
     assert_eq!(out["state_changed"], false);
     assert_eq!(out["would_change"], true);
+    let edit = &out["files"][0]["edits"][0];
+    assert_eq!(edit["match_mode"], "exact");
+    assert_eq!(edit["match_source"], "old_lines");
+    assert_eq!(edit["matched_start_line"], 1);
+    assert_eq!(edit["candidate_count"], 1);
+    assert_eq!(edit["strict_match"], true);
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
         "old\n"
+    );
+}
+
+#[test]
+fn file_apply_patch_reports_fuzzy_and_append_match_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::write(tmp.path().join("trim-end.txt"), "alpha  \n").unwrap();
+    std::fs::write(tmp.path().join("trim.txt"), "  beta  \n").unwrap();
+    std::fs::write(tmp.path().join("append.txt"), "head\n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: trim-end.txt\n-alpha\n+ALPHA\n*** Update File: trim.txt\n-beta\n+BETA\n*** Update File: append.txt\n+tail\n*** End Patch";
+
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_patch_request(tmp.path(), patch, true),
+    ));
+
+    let trim_end = &out["files"][0]["edits"][0];
+    assert_eq!(trim_end["match_mode"], "trim_end");
+    assert_eq!(trim_end["match_source"], "old_lines");
+    assert_eq!(trim_end["matched_start_line"], 1);
+    assert_eq!(trim_end["candidate_count"], 1);
+    assert_eq!(trim_end["strict_match"], false);
+
+    let trim = &out["files"][1]["edits"][0];
+    assert_eq!(trim["match_mode"], "trim");
+    assert_eq!(trim["match_source"], "old_lines");
+    assert_eq!(trim["matched_start_line"], 1);
+    assert_eq!(trim["candidate_count"], 1);
+    assert_eq!(trim["strict_match"], false);
+
+    let append = &out["files"][2]["edits"][0];
+    assert!(append["match_mode"].is_null());
+    assert_eq!(append["match_source"], "append");
+    assert_eq!(append["matched_start_line"], 2);
+    assert!(append["candidate_count"].is_null());
+    assert_eq!(append["strict_match"], true);
+}
+
+#[test]
+fn file_apply_patch_reports_ambiguous_candidate_count_without_changing_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::write(tmp.path().join("target.txt"), "dup\nmiddle\ndup\n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: target.txt\n-dup\n+changed\n*** End Patch";
+
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_patch_request(tmp.path(), patch, true),
+    ));
+
+    let edit = &out["files"][0]["edits"][0];
+    assert_eq!(edit["match_mode"], "exact");
+    assert_eq!(edit["match_source"], "old_lines");
+    assert_eq!(edit["matched_start_line"], 1);
+    assert_eq!(edit["candidate_count"], 2);
+    assert_eq!(edit["strict_match"], false);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("target.txt")).unwrap(),
+        "dup\nmiddle\ndup\n"
     );
 }
 

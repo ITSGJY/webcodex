@@ -88,18 +88,43 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    // Canonical transactional edit path.
+    // Primary model-generated edit path.
+    let apply_patch_desc = desc("apply_patch");
+    for phrase in [
+        "primary model edit path",
+        "contextual/multi-file codex patches",
+        "transactional",
+        "sha rechecks",
+        "rollback",
+        "dry_run",
+        "strict_match",
+        "strict_matching=true",
+        "exact-unique positioning",
+        "apply_text_edits",
+        "small exact edits",
+        "external diffs",
+    ] {
+        assert!(
+            apply_patch_desc.contains(phrase),
+            "apply_patch description should mention {phrase}: {apply_patch_desc}"
+        );
+    }
+
+    // Small exact guarded-edit fallback.
     let apply_text_edits_desc = desc("apply_text_edits");
     for phrase in [
-        "canonical transactional file-change",
-        "preferred for ordinary local",
+        "precision fallback",
+        "small exact guarded file changes",
         "current worktree",
-        "not head",
-        "edit/create/delete/rename",
-        "whole batch",
-        "prefer over whole-file",
-        "dry_run",
-        "per-file hashes",
+        "transactional",
+        "sha-guarded",
+        "unique by default",
+        "occurrence",
+        "line_scope",
+        "prefer apply_patch",
+        "contextual",
+        "multi-hunk",
+        "multi-file",
     ] {
         assert!(
             apply_text_edits_desc.contains(phrase),
@@ -107,12 +132,14 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    // Canonical complex unified-diff path owns its own preflight and recovery semantics.
+    // Raw/external unified-diff path owns its own preflight and recovery semantics.
     let unified_diff_desc = desc("apply_unified_diff");
     for phrase in [
-        "canonical complex/multi-file",
-        "raw unified-diff mutation",
-        "prefer apply_text_edits",
+        "external raw unified-diff mutation path",
+        "prefer apply_patch",
+        "model-generated changes",
+        "apply_text_edits",
+        "small exact guarded edits",
         "bounded preflight",
         "never needs a separate validation call",
         "standard unified diff",
@@ -127,9 +154,12 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     let write_file_desc = desc("write_project_file");
     for phrase in [
         "create new files",
-        "whole-file",
+        "whole-file rewrites",
+        "prefer apply_patch",
+        "model-generated changes",
+        "apply_text_edits",
+        "small exact guarded edits",
         "inspect current content",
-        "prefer apply_text_edits",
         "expected_sha256",
     ] {
         assert!(
@@ -258,10 +288,52 @@ fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
         );
     }
     let codex_patch = &spec_named(&specs, "apply_patch").input_schema["properties"];
-    for field in ["project", "patch", "dry_run"] {
+    for field in ["project", "patch", "dry_run", "strict_matching"] {
         assert!(
             codex_patch.get(field).is_some(),
             "apply_patch must keep field {field}"
+        );
+    }
+    let patch_spec = spec_named(&specs, "apply_patch");
+    let patch_files = &patch_spec.output_schema["properties"]["output"]["properties"]["files"];
+    assert_eq!(patch_files["type"], "array");
+    let file_properties = patch_files["items"]["properties"]
+        .as_object()
+        .expect("apply_patch file summary properties");
+    for field in [
+        "index",
+        "kind",
+        "path",
+        "to_path",
+        "old_sha256",
+        "new_sha256",
+        "changed",
+        "would_change",
+        "edits",
+    ] {
+        assert!(
+            file_properties.contains_key(field),
+            "apply_patch file summary must expose {field}"
+        );
+    }
+    let edit_properties = file_properties["edits"]["items"]["properties"]
+        .as_object()
+        .expect("apply_patch edit summary properties");
+    for field in [
+        "chunk_index",
+        "change_context_present",
+        "old_line_count",
+        "new_line_count",
+        "end_of_file",
+        "match_mode",
+        "match_source",
+        "matched_start_line",
+        "candidate_count",
+        "strict_match",
+    ] {
+        assert!(
+            edit_properties.contains_key(field),
+            "apply_patch edit summary must expose {field}"
         );
     }
     let unified_diff = &spec_named(&specs, "apply_unified_diff").input_schema["properties"];

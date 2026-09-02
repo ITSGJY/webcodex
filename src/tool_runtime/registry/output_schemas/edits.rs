@@ -3,6 +3,87 @@ use serde_json::Value;
 use super::common::{array_schema, nullable_schema, schema_type, wrapped_output_schema};
 use serde_json::json;
 
+fn apply_patch_edit_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "chunk_index": {"type": "integer", "minimum": 0},
+            "change_context_present": {"type": "boolean"},
+            "old_line_count": {"type": "integer", "minimum": 0},
+            "new_line_count": {"type": "integer", "minimum": 0},
+            "end_of_file": {"type": "boolean"},
+            "match_mode": {
+                "description": "Current-Runner positioning mode. Absent on legacy apply_patch success admitted under the legacy response contract; null for unanchored append.",
+                "anyOf": [
+                    {"type": "string", "enum": ["exact", "trim_end", "trim"]},
+                    {"type": "null"}
+                ]
+            },
+            "match_source": {
+                "type": "string",
+                "enum": ["old_lines", "change_context", "append"],
+                "description": "Current-Runner positioning source. Absent on legacy apply_patch success."
+            },
+            "matched_start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Current-Runner 1-based matched/insertion line. Absent on legacy apply_patch success."
+            },
+            "candidate_count": {
+                "description": "Current-Runner candidate count in the selected match tier. Absent on legacy apply_patch success; null for unanchored append.",
+                "anyOf": [
+                    {"type": "integer", "minimum": 1},
+                    {"type": "null"}
+                ]
+            },
+            "strict_match": {
+                "type": "boolean",
+                "description": "Current-Runner exact-and-unique positioning fact. Absent on legacy apply_patch success."
+            }
+        },
+        "required": [
+            "chunk_index", "change_context_present", "old_line_count", "new_line_count",
+            "end_of_file"
+        ]
+    })
+}
+
+fn apply_patch_file_summary_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": crate::apply_patch_shared::MAX_CODEX_PATCH_FILE_CHANGES,
+        "description": "Validated per-file patch-plan summaries. Current Runners expose bounded update/rename match metadata; legacy apply_patch Runners may omit only those additive match fields. Never file content.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "index": {"type": "integer", "minimum": 0},
+                "kind": {"type": "string", "enum": ["create", "edit", "delete", "rename"]},
+                "path": {"type": "string", "minLength": 1},
+                "to_path": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+                "old_sha256": {"anyOf": [
+                    {"type": "string", "pattern": "^[a-f0-9]{64}$"}, {"type": "null"}
+                ]},
+                "new_sha256": {"anyOf": [
+                    {"type": "string", "pattern": "^[a-f0-9]{64}$"}, {"type": "null"}
+                ]},
+                "changed": {"type": "boolean"},
+                "would_change": {"type": "boolean"},
+                "edits": {
+                    "type": "array",
+                    "maxItems": crate::apply_patch_shared::MAX_CODEX_PATCH_CHUNKS_PER_FILE,
+                    "items": apply_patch_edit_summary_schema()
+                }
+            },
+            "required": [
+                "index", "kind", "path", "to_path", "old_sha256", "new_sha256",
+                "changed", "would_change", "edits"
+            ]
+        }
+    })
+}
+
 fn edit_conflict_recovery_schema() -> Value {
     json!({
         "type": "object",
@@ -149,13 +230,13 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("applied_count", schema_type("integer", "Number of parsed file operations in the patch.")),
             ("changed", schema_type("boolean", "Whether the worktree was confirmed changed by this request.")),
             ("would_change", schema_type("boolean", "Whether the fully preflighted patch plan would change the worktree.")),
-            ("files", schema_type("array", "Per-file bounded summaries containing operation kind, paths, effect state, and old/new sha256 values; never file content.")),
+            ("files", apply_patch_file_summary_schema()),
             ("changed_paths", schema_type("array", "Validated project-relative source and destination paths touched by the patch plan.")),
             ("state_changed", nullable_schema("boolean", "True or false for a trustworthy patch effect; null when a dispatched mutation may have completed but its result is unavailable or invalid.")),
             ("execution_state", json!({"type":"string","enum":["not_started","completed","outcome_unknown"],"description":"Transactional patch mutation effect state."})),
             ("error_kind", nullable_schema("string", "Stable parse, preflight, conflict, capability, transaction, or uncertainty classification.")),
             ("failure_kind", nullable_schema("string", "not_started, capability_unavailable, or outcome_unknown for delivery/admission failures.")),
-            ("recovery_action", nullable_schema("string", "Bounded next action such as regenerate_patch, reread_or_regenerate_patch, upgrade_or_reconnect_runner, or inspect_workspace_before_retry.")),
+            ("recovery_action", nullable_schema("string", "Bounded next action such as regenerate_patch, reread_or_regenerate_patch, refine_patch_or_relax_strict_matching, upgrade_or_reconnect_runner, or inspect_workspace_before_retry.")),
             ("rollback_complete", nullable_schema("boolean", "Whether a failed transactional apply fully restored all earlier changes.")),
             ("change_index", nullable_schema("integer", "Zero-based failed file-operation index when known.")),
             ("kind", nullable_schema("string", "Failed patch file-operation kind when known.")),
