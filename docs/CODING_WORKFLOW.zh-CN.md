@@ -2,156 +2,109 @@
 
 [English](CODING_WORKFLOW.md) | [简体中文](CODING_WORKFLOW.zh-CN.md)
 
-本文面向普通 WebCodex 用户，以及正在使用 WebCodex 的 coding agent。它说明如何
-bootstrap coding task、选择模型行为、做验证，以及如何理解 closeout evidence；它不是
-开发 WebCodex 本身时使用的 contributor architecture 文档。
+本文面向普通 WebCodex coding/review 工作，只说明模型真正需要遵循的流程，不展开内部 continuity、audit 或 transport 协议。
 
-## 唯一的 canonical mental model
+## 普通循环
 
-`work_on_project` 是普通 coding/review 的 **canonical model bootstrap**。它建立或延续
-project-scoped Workflow Session evidence，并返回有界 workflow guidance 与 project-local
-instructions；它不是 role selector。
-
-- 普通 coding bootstrap 优先用 `work_on_project`；它的 task `instruction` 正是描述模型
-  应该做什么的自然位置。
-- `include_project_instructions=true`（默认）始终投影当前适用的有界 repository
-  instruction 正文；即使精确续用同一个 Workflow Session 且 repository delta status 为
-  `reused`，正文仍会返回。只有 caller 当前模型上下文已保留这些 instructions 时才应传
-  false；WebCodex 仍会重新观察文件并更新 Workflow Session instruction metadata。
-- `include_workflow_guidance=true`（默认）始终投影 canonical 内置 coding workflow。
-  只有 caller 当前模型上下文已保留该 guidance 时才应传 false。该 flag 只控制
-  model-facing projection，不改变 Workflow Session state、authority、role selection 或
-  execution semantics。
-- WebCodex 不会从 `wc_sess_*` Workflow Session、MCP/HTTP transport identity、client
-  window、credential、project 或 Server process lifetime 推断当前模型上下文是否仍保留
-  静态内容。Workflow Session 只表示业务 continuity，同一个 Session 可以被多个独立模型
-  上下文 resume；只有 caller-explicit 的 include flags 才能省略静态 model-facing 内容。
-- `work_on_project` 的成功输出默认采用 sparse projection。省略的默认 section 表示：没有
-  Session execution defaults、普通已有 project 的解析没有特殊事件、repository overview
-  按设计未请求、readiness 为 pass/non-blocking、没有值得报告的 Job，或 blockers/warnings
-  为空。Instruction source 始终保留 path/fingerprint identity；false/null/empty 的正文投影
-  字段会省略。真实 warning、blocker、truncation、非默认 project resolution 和值得报告的
-  Job state 仍会显式返回。
-- `work_on_project` 是唯一 canonical 的外部 coding bootstrap / continuation 入口。
-  `start_coding_task` 这一旧 wire/API tool name 已退休，调用会 fail closed 并提示改用
-  `work_on_project`；其 advanced startup fields 不再构成公共兼容面。内部仍保留
-  `StartCodingTask` primitive，仅作为 canonical workflow 的共享实现细节。
-- behavioral role 由 **task instruction** 显式选择。实现任务明确写使用
-  `implementation_owner` guidance；独立评审明确写使用 `independent_review` guidance。
-- 返回的 role guidance 永远只是 model guidance。它不会创建 authority、permission、
-  Session mode 或 capability。认证、项目访问、tool policy 与 runtime guard 仍独立决定
-  实际 authority。
-
-不存在 `role` wire field，也不存在 durable Session role state。同一个 Session 可以延续，
-而后续 pass 的 task instruction 可以要求模型采用不同的 behavioral role。
-
-WebCodex 还有 project-bound Connector surface，它的入口是 `task_start`。使用该 surface
-时应遵循它自己的 task workflow；原则仍相同：bootstrap state 与 behavioral guidance 都
-不是 execution authority。
-
-## 可直接复制的 prompt
-
-实现：
+日常 WebCodex coding loop 应该保持很小：
 
 ```text
-使用 WebCodex bootstrap 或继续这个 coding task。本次实现使用 implementation_owner
-guidance。沿现有架构实现 <任务>，运行聚焦的 structured validation，并审查最终 diff。
+work_on_project
+→ inspect / search / read
+→ edit
+→ focused validation
+→ review changes
+→ finish_coding_task
+```
+
+`work_on_project` 是普通 coding/review 的 canonical bootstrap。把当前任务 instruction 交给它，然后遵循连接到的 Server 返回的 project instructions 与 tool surface。
+默认情况下，它还会返回一个很小且有界的 `extensions` selection catalog：Skill metadata 来自 canonical 的 project / Runner-configured `skills.roots` / Runner-managed Skill Store 三类来源；Plugin metadata 只包含 configured working directory 与当前 Project root 匹配、且已 ready/committed 的 provider。该 metadata 不授予任何 authority，也不会自动读取 Skill body 或创建 Plugin binding；模型选择后仍需使用 `skill_read_file`，或走 `plugin_tool describe -> call`。只有当前模型上下文仍明确保留这些 discovery metadata 时，才应设置 `include_extension_catalog=false`。
+
+## 开始或继续任务
+
+新任务和显式 continuation 都使用 `work_on_project`。WebCodex 会保留有界 Workflow Session evidence，让 validation、review 与 handoff 可以指向同一轮工作，但 Workflow Session 不是认证凭据，也不会扩大 project authority。
+
+普通使用不需要理解 WebCodex 内部的 continuity/audit field；这些属于 implementation/maintainer contract。
+
+内置工作流为所有任务提供默认 guidance，不要求先指定角色：核对目标和适用规则、保留已有工作、完成已授权的实现、按改动范围验证、观察已有 Job 而不重复执行，以及如实报告证据。只使用当前暴露的 schema 支持的工具与协议字段。
+
+Behavioral role 在默认原则上增加侧重点，写在 task instruction 里即可，例如实现任务：
+
+```text
+使用 implementation_owner guidance。实现 <任务>，运行聚焦 validation，
+并审查最终 diff。
 ```
 
 独立评审：
 
 ```text
-使用 WebCodex bootstrap 或继续这个 coding task。本轮使用 independent_review guidance。
-独立评审 <改动或 commit>，只修复具体发现，并运行聚焦 regression validation，最后说明
-该改动是否可接受。
+使用 independent_review guidance。独立评审 <改动或 commit>，
+报告有文件/行号证据和影响说明的具体发现，不修改文件。
 ```
 
-role 名称应写在 instruction 文本中，不要在 `work_on_project` 上寻找 role 参数。
+如果也希望修复，明确补充“修复具体发现，并运行聚焦回归验证”。单独指定评审角色不代表授权修改。
+
+Guidance 通过工具结果交给客户端，不是客户端的 system prompt，也不会授予执行权限。Host 指令、用户任务、适用项目规则、认证和运行时安全策略仍然有效。返回 guidance 不等于模型已经读取、记住或遵守；只有当前模型上下文仍保留内容时才应关闭其返回。
+
+## 编辑前先检查
+
+能够表达任务时，优先使用 structured project search/read，而不是 shell。只读取理解当前改动所需的文件和范围，并保留 workspace 中已经存在的无关工作。
+
+Bootstrap 只读取固定的几个指令入口，不会扫描所有子目录规则。修改某个路径前，需要检查适用的子目录指令，并补读相关缺失或被截断的规则内容。
+
+做 branch/PR review 时，先使用当前 Server 提供的有界 review/change-summary 工具，再按需要缩小到具体文件或 diff hunks。
+
+## 编辑
+
+模型生成的普通编辑，在 `read_files` 已经拿到当前文件内容和 SHA 时，canonical/default 路径是 `apply_text_edits`。现有文件把读取结果中的 SHA 作为 `expected_sha256`；exact selector 默认要求唯一，需要显式消歧时再使用 `line_scope`/`occurrence`。即使一次修改很多行，默认路径仍然不变；“改动行数多”本身不是选择 `apply_patch` 的理由。只有当 contextual patch 明显更自然、large/multi-hunk rewrite 用 guarded exact edit 表达明显笨重，或 patch-style context 本身更清楚地表达修改关系时，才使用 `apply_patch`。对于 repetitive code，每个 patch chunk 都必须带稳定且唯一的 surrounding context，优先使用 containing function / impl / type / test / module；不要只拿重复出现的单行或短片段作为 mutation anchor。默认 `matching_mode=unique` 仍要求唯一 mutation target。只有明确需要 stale-context/concurrency fence 时才使用 `matching_mode=exact_unique`。输入本身已经是标准 unified diff 时才使用 `apply_unified_diff`。
+
+Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重新读取当前源码，并基于最新状态重新生成原本的编辑。
+
+遇到 `matching_mode_rejected` 时，保持 matching guard，不要切换到 `first_match`。先重新读取当前源码；如果已经有 current source + SHA，而且原本修改很容易表达成 exact edit，优先转为 `apply_text_edits`。如果 patch 形式仍明显更合适，则消费返回的有界 `recovery.action=read_files` / `recovery.items`，并保留原请求的 patch guard：原来是 `matching_mode=unique` 时，补充稳定且唯一的上下文后仍以 `unique` 重试；原来是 `exact_unique` 时，基于 exact current source 重新生成并继续使用 `exact_unique`。不要降级明确的 stale-context/concurrency fence。
+
+对于确定性的 `context_mismatch`，同样消费有界 `read_files` recovery，并基于 current source 重新生成 patch；不要盲目重复相同 patch。若结果是 `outcome_unknown`，先检查 workspace，再决定是否允许任何写入重试。
+
+具体 matching metadata 与 transactional protocol 属于维护 WebCodex 本身时才需要的细节，应以 tool contract/tests 为准。
+
+## Validation
+
+能使用 `cargo_test`、`cargo_check`、`go_test` 等 structured validation 时优先使用它们。先运行能够发现当前回归的最小检查，只有实际受影响的边界需要时才扩大范围。
+
+如果一个确定需要执行的 validation 很可能明显超过 synchronous grace，同时还有真正独立的 read-only inspection，可以显式设置较短的 `sync_wait_secs`（通常可用 `1`），让已经启动的 validation 以**同一个 execution** 尽早 handoff 为 Job。随后只继续独立的源码读取、搜索、diff/architecture inspection 或 review，再观察该 Job；不要为了“并行”额外启动 CPU-heavy validation。如果运行中的 validation 所覆盖源码随后发生 mutation，那么其结果只能算 stale/cache-warmup evidence，不能证明 final workspace；最终源码仍需重新运行 task-appropriate validation。
+
+如果某次 test invocation 必须证明“测试确实执行了”，使用 `require_tests: true` 或 `min_tests: N`。它们是本次调用的 evidence assertion，不会自动变成 Workflow Session 的持久要求。如果 validator execution 成功，但请求的 test 数量未满足或无法证明，closeout 会把这次调用保留为 evidence gap，而不是代码/测试 correctness failure。否则，exit-zero 但合法运行零个 test 只是 execution result，并不能证明 test coverage。
+
+只有 structured validation 无法表达检查时，才使用 shell/process escape hatch。
+
+## Review 与 closeout
+
+编辑和 validation 之后，必须检查真实 workspace/diff。Tests 通过不能替代 diff review；反过来，diff 看起来合理也不能替代行为变化所需的 focused validation。
+
+`finish_coding_task` 返回有界 closeout evidence。把它当成 advisory summary，不要把它当成“任务已经正确完成”的 authority。最终工程判断仍由模型完成并向用户报告。
+
+## 长时间运行的工作
+
+命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。观察该 Job，不要再启动一个副本。Tool 返回的 recovery/continuation hint 只是下一次显式调用的 guidance；WebCodex 不会对不确定 effect 做隐藏 retry。
 
 ## 手动多窗口协作
 
-需要把一个有界独立子任务交给另一个窗口时，coordinator `C` 与 worker `W` 始终保持
-**不同的** Workflow Session。coordinator 在 `C` 发布 `todo`；`W` 调用
-`get_session_assignment(session_id=C, message_id=<todo_id>)`，从同一次原子读取取得 exact
-todo、全部 retained direct replies（受上限约束）和 opaque `assignment_fence`。所有工具调用、
-validation 与 review evidence 都保留在 `W`；完成时调用 `complete_session_message`，同时传入
-exact `session_id=C`、`message_id`、caller `completion_key` 与原样的
-`expected_assignment_fence`，原子创建 bounded answer 并 resolve todo。`author_session_id` 只来自
-已经独立授权的 explicit `recording_session_id=W`；没有 recorder 时保持为空，不从 window、
-credential、project 或 legacy `mcp-session-id` 推断，caller 也不能伪造该 provenance。
+多窗口协作属于高级 maintainer workflow，不是普通 coding loop。独立 writer 应使用不同 worktree/Project，并保持各自 Workflow Session 分离；使用当前 Server 返回的 assignment/completion 工具，不要复制另一个窗口的 execution history。
 
-`list_session_messages(message_id=...)` / `reply_to=...` 仍用于通用浏览和结果读取，不是
-executable todo 的 assignment source。若 completion 返回 `assignment_stale`，必须重新评估
-返回的 current assignment 后才能使用其中 durable fresh fence；history-loss / oversize 不是
-blind retry 信号。`observe_session_messages` 只是可选的 generic delta observation，不属于上述
-happy path。coordinator 随后重新观察权威的 project/Git/artifact state。worker execution history 不会复制到
-`C`，知道 Session/message id 也不会获得 authority。任何 recording Session 都必须先通过
-统一 Session authorization，才能参与 ledger/lifecycle/provenance。project-scoped Session
-既要求当前 stored project authorization，也要求 creation-time immutable canonical authority-group
-fingerprint；project-less Session 使用同一内部 durable fence。direct shared-key 与对应 OAuth
-shared-key bridge 会归一到同一 authority group。跨 Session collaboration 还要求双方 stored
-project scope 完全一致，因此 scoped/unscoped 两个方向都不能作为 project boundary bridge。
-message board 只是 collaboration metadata，不是 claim、lease、filesystem/worktree/branch lock。并发写应使用独立 Git
-worktree 与 WebCodex Project。此流程不增加自动 worker spawning、scheduler、共享
-transcript、隐式跨 Session authority 或 cross-owner delegation。
+精确的 concurrency、retry、provenance 与 cross-Session authorization 规则见 [Manual Multi-Window Collaboration](agent/manual-window-collaboration.md)。对应 protocol field 有意不放在普通工作流里。
 
-详细的 coordinator/implementation、implementation/reviewer、并行 worktree 与 cross-host
-示例，以及 uncertain-result retry/idempotency 语义见
-[Manual Multi-Window Collaboration](agent/manual-window-collaboration.md)。
+## 如何判断是否有效
 
-## 已被 dogfood 证明重要的习惯
+运行时测试可以证明 guidance 的返回一致、有界、符合 schema，且不会变成执行权限。`scripts/eval_coding_loop.sh` 检查的是脚本化工具循环，没有运行模型，不能衡量模型是否遵守提示词。
 
-**修复后复用 validation identity。** structured validation 使用 `assertion_name` 时，同一个
-logical validation 在修复后重跑，应复用原 `assertion_name`。这样 validation ledger 才能把
-它表达成同一个已解决 assertion，而不是两个互不相关的检查。
+要衡量行为收益，应固定模型、工具、参数与任务样本，对比有无 guidance 的多次运行。样本至少包括小型修复、只读评审、已有无关改动、子目录规则，以及结果不确定的长时间操作。先比较正确性与任务范围保持，再比较不必要的询问、重复执行、验证质量、工具调用和 token 成本。不能从 schema 测试通过推断模型成功率提升。
 
-**把 guarded edit 冲突视为 zero-write failure。** SHA 或 edit anchor stale 时会 fail closed。
-重新读取当前文件，确认新的精确内容，再用 fresh guard 重试原本的编辑。不要为了让编辑
-成功而削弱 guard。
+## 内部协议细节
 
-**把 `apply_patch` 作为模型生成编辑的默认路径。** 小型、精确且带 SHA guard 的修改使用
-`apply_text_edits`；只有输入本身已经是 raw unified diff 时才使用 `apply_unified_diff`。
-普通 `apply_patch` 保留 Codex-compatible 的 `exact` → `trim_end` → `trim` 匹配顺序。
-每个 update chunk 都返回 bounded positioning metadata：`match_mode`、`match_source`、
-`matched_start_line`、`candidate_count` 和 `strict_match`。只有该 chunk 用于定位的所有
-文本匹配都 exact 且 unique 时，`strict_match=true`。没有 anchor 的 append 不执行文本匹配，
-但仍然 strict-safe；它返回 `match_source=append`，且 `match_mode` / `candidate_count` 为 null。
-Server-first 滚动升级期间，旧版 `apply_patch` Runner 可以只缺省这些新增 match 字段；
-Server 会在请求 admission 时绑定 legacy response contract，同时继续校验原有 transactional
-success 字段，不会在 result 返回后根据当前 Runner 状态重新猜测版本。
+开发 WebCodex 本身时，直接阅读 maintainer contract，而不是继续扩充这份普通用户指南：
 
-当要求所有需要定位的 chunk 在任何文件写入前都满足 exact-and-unique 规则时，设置
-`strict_matching=true`。该模式要求 Runner 显式支持 `apply_patch_strict_matching` capability，
-并会拒绝 fuzzy 或 ambiguous placement，而不是静默降级。Server 会用自己解析的 patch
-校验 Runner 的 success match metadata；success metadata 缺失或互相矛盾时返回
-`outcome_unknown`，不会把它当成 clean success。
+- [Session model](agent/session-model.md) —— Workflow Session continuity、message 与 evidence 语义。
+- [Authority model](agent/permission-model.md) —— execution authority 与 hard-safety layering。
+- [Job reliability and concurrency](agent/job-reliability-and-concurrency.md) —— Job recovery/observation contract。
+- [Architecture decisions](agent/architecture-decisions.md) —— 当前长期有效的实现决策。
 
-**优先 structured validation。** 当 `cargo_test`、`go_test` 或其他 structured validation
-能够表达目标检查时，优先使用它们；只有结构化 surface 无法覆盖时才用 shell。结构化
-结果能给 Session ledger 更安全的 evidence，而不必解析任意 command text。
-
-当 focused `cargo_test` 必须证明测试确实运行过时，使用 `require_tests: true` 要求至少一个
-test，或使用 `min_tests: N` 声明更大的 bounded minimum；两者同时存在时取更严格的要求。
-两者都省略时，exit code 为零但运行零个 test 的 invocation 仍保持 execution success，并
-返回 `tests_run_count: 0` 与 `zero_tests_run: true`。显式 count assertion 只有在完整 parser
-evidence 能证明达到 minimum 时才通过；evidence 缺失或被截断时 validation contract 会失败，
-但不会改写真实 process exit code。count assertion 不能与 `no_run: true` 同时使用。
-
-**把 closeout 当 evidence，不当 completion authority。** `finish_coding_task` 返回 recorded
-Session evidence 的 deterministic advisory snapshot；按请求可包含 validation、workspace、
-jobs 与 tool history。它不决定任务已经完成，不替代直接的 diff/test review，也不替代最后
-面向用户的 acceptance 判断。
-
-## broader runtime 的典型循环
-
-```text
-work_on_project
-→ inspect/search/read
-→ guarded edits
-→ structured focused validation
-→ review diff/workspace
-→ finish_coding_task
-```
-
-始终遵循当前 Server 实际暴露的 tool surface 与返回的 project instructions。workflow
-guidance 用来帮助模型组织本轮工作，但绝不会扩大调用方的实际权限。
+普通 coding client 不应为了完成日常仓库任务而必须理解这些内部文档。

@@ -1,10 +1,10 @@
 use super::RouteAuth;
 use super::RouteAuth::{AuthMiddleware, HandlerManaged};
 use super::{
-    route, AuditClass::*, OpenApiVisibility::*, RouteId::*, RouteMethod::*, RouteSpec,
+    route, AuditClass::*, RouteId::*, RouteMethod::*, RouteOpenApiProjection::*, RouteSpec,
     RouteSurface::*,
 };
-use crate::auth::scopes::{OAuthRouteScopePolicy::*, SCOPE_RUNTIME_READ};
+use webcodex_core::authority::{OAuthRouteScopePolicy::*, SCOPE_RUNTIME_READ};
 
 pub(super) const PUBLIC_ROUTES: &[RouteSpec] = &[
     route(

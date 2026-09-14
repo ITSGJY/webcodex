@@ -1,5 +1,5 @@
 use super::*;
-use crate::shell_protocol::ShellCommandExecutionState;
+use crate::runner_protocol::ShellCommandExecutionState;
 use std::sync::{Arc, OnceLock};
 
 #[cfg(windows)]
@@ -50,6 +50,18 @@ fn process_argv_helper() -> PathBuf {
         .clone()
 }
 
+fn create_fake_native_executable(path: &Path) {
+    #[cfg(windows)]
+    std::fs::copy(process_argv_helper(), path).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 fn run_direct_process(
     cwd: &Path,
     executable: &Path,
@@ -57,12 +69,12 @@ fn run_direct_process(
     stdin: Option<&str>,
     timeout_secs: u64,
 ) -> ShellCommandResult {
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     run_process_with_profiles_and_execution_state(
         1,
         &unrestricted_policy(),
         &ShellConfig::default(),
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.to_string_lossy().as_ref()),
         &executable.to_string_lossy(),
@@ -81,12 +93,12 @@ fn run_direct_script(
     stdin: Option<&str>,
     timeout_secs: u64,
 ) -> ShellCommandResult {
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     run_script_with_profiles_and_execution_state(
         1,
         &unrestricted_policy(),
         &ShellConfig::default(),
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.to_string_lossy().as_ref()),
         &ShellScriptPayload {
@@ -184,7 +196,7 @@ fn internal_posix_interpreter_rejects_wsl_only_bash() {
 #[test]
 fn internal_posix_runtime_uses_git_bash_stdin_with_powershell_configured() {
     let cwd = tempfile::tempdir().unwrap();
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let git_root = root.path().join("Git");
     let git_cmd = git_root.join("cmd");
@@ -208,7 +220,7 @@ fn internal_posix_runtime_uses_git_bash_stdin_with_powershell_configured() {
         1,
         &unrestricted_policy(),
         &shell,
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         script,
@@ -231,7 +243,7 @@ fn internal_posix_runtime_ignores_configured_shell_on_posix_hosts() {
     use std::os::unix::fs::PermissionsExt;
 
     let cwd = tempfile::tempdir().unwrap();
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("configured-shell-ran");
     let configured_shell = cwd.path().join("configured-shell");
     std::fs::write(
@@ -250,7 +262,7 @@ fn internal_posix_runtime_ignores_configured_shell_on_posix_hosts() {
         1,
         &unrestricted_policy(),
         &shell,
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         script,
@@ -628,6 +640,22 @@ fn structured_process_supports_empty_args_and_bounded_stdin() {
     assert_eq!(with_stdin.result.stdout.as_deref(), Some(stdin));
 }
 
+#[cfg(windows)]
+#[test]
+fn structured_process_without_stdin_receives_eof_instead_of_runner_parent_lease() {
+    let cwd = tempfile::tempdir().unwrap();
+    let helper = process_argv_helper();
+    let result = run_direct_process(cwd.path(), &helper, &["stdin".to_string()], None, 2);
+    assert_eq!(
+        result.execution_state,
+        ShellCommandExecutionState::Completed,
+        "{:?}",
+        result.result
+    );
+    assert_eq!(result.result.exit_code, Some(0));
+    assert_eq!(result.result.stdout.as_deref(), Some(""));
+}
+
 #[test]
 fn structured_process_preserves_large_literal_argv_without_shell_parsing() {
     let cwd = tempfile::tempdir().unwrap();
@@ -635,7 +663,8 @@ fn structured_process_preserves_large_literal_argv_without_shell_parsing() {
     let args = vec!["argv".to_string(), "a".repeat(4_500), "b".repeat(4_500)];
     assert!(args.iter().map(String::len).sum::<usize>() > 8_000);
     assert!(
-        args.iter().map(String::len).sum::<usize>() < crate::shell_protocol::PROCESS_ARGV_MAX_BYTES
+        args.iter().map(String::len).sum::<usize>()
+            < crate::runner_protocol::PROCESS_ARGV_MAX_BYTES
     );
 
     let result = run_direct_process(cwd.path(), &helper, &args, None, 10);
@@ -653,14 +682,14 @@ fn structured_process_preserves_large_literal_argv_without_shell_parsing() {
 #[test]
 fn structured_process_continuously_drains_large_stdout_and_stderr() {
     let cwd = tempfile::tempdir().unwrap();
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     let mut policy = unrestricted_policy();
     policy.max_output_bytes = 16 * 1024;
     let result = run_process_with_profiles_and_execution_state(
         1,
         &policy,
         &ShellConfig::default(),
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         &process_argv_helper().to_string_lossy(),
@@ -701,7 +730,7 @@ fn structured_process_continuously_drains_large_stdout_and_stderr() {
 #[test]
 fn structured_script_continuously_drains_large_stdout_and_stderr() {
     let cwd = tempfile::tempdir().unwrap();
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     let mut policy = unrestricted_policy();
     policy.max_output_bytes = 16 * 1024;
     let stdout_payload = "x".repeat(4096);
@@ -724,7 +753,7 @@ fn structured_script_continuously_drains_large_stdout_and_stderr() {
         1,
         &policy,
         &ShellConfig::default(),
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         &ShellScriptPayload {
@@ -1031,7 +1060,7 @@ fn structured_script_stdin_nonzero_and_timeout_preserve_lifecycle() {
 fn missing_script_interpreter_is_prestart_and_does_not_run_script() {
     let cwd = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("marker");
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     let mut shell = ShellConfig {
         program: "custom-shell".to_string(),
         ..Default::default()
@@ -1041,7 +1070,7 @@ fn missing_script_interpreter_is_prestart_and_does_not_run_script() {
         1,
         &unrestricted_policy(),
         &shell,
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         &ShellScriptPayload {
@@ -1067,6 +1096,182 @@ fn missing_script_interpreter_is_prestart_and_does_not_run_script() {
     assert!(!marker.exists());
 }
 
+#[test]
+fn missing_javascript_interpreter_is_prestart_and_does_not_run_script() {
+    let cwd = tempfile::tempdir().unwrap();
+    let marker = cwd.path().join("marker");
+    let project_registry_dir = tempfile::tempdir().unwrap();
+    let mut shell = ShellConfig {
+        program: "custom-shell".to_string(),
+        ..Default::default()
+    };
+    shell.env.insert("PATH".to_string(), String::new());
+    let result = run_script_with_profiles_and_execution_state(
+        1,
+        &unrestricted_policy(),
+        &shell,
+        project_registry_dir.path(),
+        &PreparedShellProfileCache::default(),
+        Some(cwd.path().to_string_lossy().as_ref()),
+        &ShellScriptPayload {
+            language: ShellScriptLanguage::Javascript,
+            script: "import { writeFileSync } from 'node:fs'; writeFileSync('marker', 'ran');"
+                .to_string(),
+            args: Vec::new(),
+        },
+        None,
+        10,
+        None,
+    );
+    assert_eq!(
+        result.execution_state,
+        ShellCommandExecutionState::NotStarted
+    );
+    assert!(result.result.exit_code.is_none());
+    let error = result.result.error.as_deref().unwrap_or_default();
+    assert!(error.contains("interpreter_unavailable"), "{error}");
+    assert!(error.contains("JavaScript/Node"), "{error}");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn missing_typescript_interpreter_is_prestart_and_does_not_run_script() {
+    let cwd = tempfile::tempdir().unwrap();
+    let marker = cwd.path().join("marker");
+    let project_registry_dir = tempfile::tempdir().unwrap();
+    let mut shell = ShellConfig {
+        program: "custom-shell".to_string(),
+        ..Default::default()
+    };
+    shell.env.insert("PATH".to_string(), String::new());
+    let result = run_script_with_profiles_and_execution_state(
+        1,
+        &unrestricted_policy(),
+        &shell,
+        project_registry_dir.path(),
+        &PreparedShellProfileCache::default(),
+        Some(cwd.path().to_string_lossy().as_ref()),
+        &ShellScriptPayload {
+            language: ShellScriptLanguage::Typescript,
+            script: "const marker: string = 'ran';\nvoid marker;".to_string(),
+            args: Vec::new(),
+        },
+        None,
+        10,
+        None,
+    );
+    assert_eq!(
+        result.execution_state,
+        ShellCommandExecutionState::NotStarted
+    );
+    assert!(result.result.exit_code.is_none());
+    let error = result.result.error.as_deref().unwrap_or_default();
+    assert!(error.contains("interpreter_unavailable"), "{error}");
+    assert!(error.contains("TypeScript/Node"), "{error}");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn javascript_interpreter_resolves_node_from_prepared_profile_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = temp
+        .path()
+        .join(format!("node{}", std::env::consts::EXE_SUFFIX));
+    create_fake_native_executable(&node);
+    let profile = PreparedShellProfile {
+        profile_name: "js-test".to_string(),
+        program: "bash".to_string(),
+        args: Vec::new(),
+        dialect: ShellDialect::Posix,
+        env_snapshot: std::collections::HashMap::from([(
+            "PATH".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        )]),
+    };
+
+    let resolved = configured_script_interpreter(
+        &ShellConfig::default(),
+        Some(&profile),
+        ShellScriptLanguage::Javascript,
+    )
+    .unwrap();
+    assert_eq!(PathBuf::from(resolved), node);
+}
+
+#[test]
+fn typescript_interpreter_resolves_the_same_node_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = temp
+        .path()
+        .join(format!("node{}", std::env::consts::EXE_SUFFIX));
+    create_fake_native_executable(&node);
+    let profile = PreparedShellProfile {
+        profile_name: "ts-test".to_string(),
+        program: "bash".to_string(),
+        args: Vec::new(),
+        dialect: ShellDialect::Posix,
+        env_snapshot: std::collections::HashMap::from([(
+            "PATH".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        )]),
+    };
+    let resolved = configured_script_interpreter(
+        &ShellConfig::default(),
+        Some(&profile),
+        ShellScriptLanguage::Typescript,
+    )
+    .unwrap();
+    assert_eq!(PathBuf::from(resolved), node);
+}
+
+#[test]
+fn javascript_interpreter_accepts_configured_node_executable() {
+    let temp = tempfile::tempdir().unwrap();
+    let node = temp
+        .path()
+        .join(format!("node{}", std::env::consts::EXE_SUFFIX));
+    create_fake_native_executable(&node);
+    let mut shell = ShellConfig {
+        program: node.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    shell.env.insert("PATH".to_string(), String::new());
+
+    let resolved =
+        configured_script_interpreter(&shell, None, ShellScriptLanguage::Javascript).unwrap();
+    assert_eq!(PathBuf::from(resolved), node);
+}
+
+#[test]
+fn node_script_languages_do_not_fallback_to_alternate_runtimes() {
+    let temp = tempfile::tempdir().unwrap();
+    for runtime in ["bun", "deno", "tsx", "npx", "npm"] {
+        create_fake_native_executable(
+            &temp
+                .path()
+                .join(format!("{runtime}{}", std::env::consts::EXE_SUFFIX)),
+        );
+    }
+    let mut shell = ShellConfig {
+        program: "custom-shell".to_string(),
+        ..Default::default()
+    };
+    shell.env.insert(
+        "PATH".to_string(),
+        temp.path().to_string_lossy().into_owned(),
+    );
+
+    for (language, runtime_name) in [
+        (ShellScriptLanguage::Javascript, "JavaScript/Node"),
+        (ShellScriptLanguage::Typescript, "TypeScript/Node"),
+    ] {
+        let error = configured_script_interpreter(&shell, None, language).unwrap_err();
+        assert!(error.contains("interpreter_unavailable"), "{error}");
+        assert!(error.contains(runtime_name), "{error}");
+        assert!(!error.contains(temp.path().to_string_lossy().as_ref()));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn arbitrary_configured_shell_is_not_treated_as_a_script_language() {
@@ -1081,7 +1286,7 @@ fn arbitrary_configured_shell_is_not_treated_as_a_script_language() {
     )
     .unwrap();
     std::fs::set_permissions(&custom_shell, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     let mut shell = ShellConfig {
         program: custom_shell.to_string_lossy().into_owned(),
         ..Default::default()
@@ -1091,7 +1296,7 @@ fn arbitrary_configured_shell_is_not_treated_as_a_script_language() {
         1,
         &unrestricted_policy(),
         &shell,
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         &ShellScriptPayload {
@@ -1127,7 +1332,11 @@ fn sh_and_bash_plans_pass_a_script_file_without_command_text_mode() {
         (ShellScriptLanguage::Sh, "sh"),
         (ShellScriptLanguage::Bash, "bash"),
     ] {
-        let command = build_script_command(interpreter, language, script_path, &script_args);
+        let plan = ScriptRuntimePlan {
+            program: OsString::from(interpreter),
+            prefix_args: fixed_script_prefix_args(language),
+        };
+        let command = build_script_command(&plan, script_path, &script_args);
         assert_eq!(command.get_program(), OsStr::new(interpreter));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -1144,6 +1353,138 @@ fn sh_and_bash_plans_pass_a_script_file_without_command_text_mode() {
 }
 
 #[test]
+fn javascript_plan_uses_mjs_file_and_native_literal_argv() {
+    use std::ffi::OsStr;
+
+    let script_path = Path::new("/runner/scratch/payload.mjs");
+    let args = vec![
+        "two words".to_string(),
+        "$(literal)".to_string(),
+        "; literal".to_string(),
+    ];
+    let plan = ScriptRuntimePlan {
+        program: OsString::from("node"),
+        prefix_args: fixed_script_prefix_args(ShellScriptLanguage::Javascript),
+    };
+    let command = build_script_command(&plan, script_path, &args);
+    assert_eq!(command.get_program(), OsStr::new("node"));
+    let actual = command.get_args().collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            script_path.as_os_str(),
+            OsStr::new("two words"),
+            OsStr::new("$(literal)"),
+            OsStr::new("; literal")
+        ]
+    );
+    for forbidden in ["-e", "-p", "-c", "-Command"] {
+        assert!(!actual.iter().any(|arg| *arg == OsStr::new(forbidden)));
+    }
+}
+
+#[test]
+fn typescript_node_versions_select_only_runner_owned_strip_flag_when_required() {
+    assert!(parse_node_version(b"v22.12.0\n").is_some());
+    assert_eq!(
+        typescript_node_probe_error("profile prepare stopped during runner shutdown".to_string()),
+        "TypeScript runtime probe stopped during runner shutdown; command was not started"
+    );
+    assert!(
+        typescript_node_probe_error("profile prepare timed out after 2 seconds".to_string())
+            .starts_with("interpreter_unavailable:"),
+        "a bounded capability-probe failure must remain a pre-start runtime availability failure"
+    );
+    for version in [
+        NodeVersion {
+            major: 22,
+            minor: 6,
+            patch: 0,
+        },
+        NodeVersion {
+            major: 22,
+            minor: 12,
+            patch: 0,
+        },
+        NodeVersion {
+            major: 22,
+            minor: 17,
+            patch: 9,
+        },
+        NodeVersion {
+            major: 23,
+            minor: 5,
+            patch: 0,
+        },
+    ] {
+        assert_eq!(
+            typescript_node_prefix_args(version).unwrap(),
+            vec![OsString::from("--experimental-strip-types")]
+        );
+    }
+    for version in [
+        NodeVersion {
+            major: 22,
+            minor: 18,
+            patch: 0,
+        },
+        NodeVersion {
+            major: 23,
+            minor: 6,
+            patch: 0,
+        },
+        NodeVersion {
+            major: 24,
+            minor: 0,
+            patch: 0,
+        },
+        NodeVersion {
+            major: 26,
+            minor: 0,
+            patch: 0,
+        },
+    ] {
+        assert!(typescript_node_prefix_args(version).unwrap().is_empty());
+    }
+    let error = typescript_node_prefix_args(NodeVersion {
+        major: 22,
+        minor: 5,
+        patch: 9,
+    })
+    .unwrap_err();
+    assert!(error.contains("Node.js 22.6.0 or newer"), "{error}");
+    assert!(error.contains("command was not started"), "{error}");
+    assert!(parse_node_version(b"not-node").is_none());
+}
+
+#[test]
+fn typescript_plan_uses_mts_native_argv_and_runner_owned_prefix() {
+    use std::ffi::OsStr;
+
+    let script_path = Path::new("/runner/scratch/payload.mts");
+    let user_args = vec![
+        "two words".to_string(),
+        "--experimental-transform-types".to_string(),
+    ];
+    let plan = ScriptRuntimePlan {
+        program: OsString::from("node"),
+        prefix_args: vec![OsString::from("--experimental-strip-types")],
+    };
+    let command = build_script_command(&plan, script_path, &user_args);
+    assert_eq!(command.get_program(), OsStr::new("node"));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            OsStr::new("--experimental-strip-types"),
+            script_path.as_os_str(),
+            OsStr::new("two words"),
+            OsStr::new("--experimental-transform-types")
+        ]
+    );
+    assert!(!command.get_args().any(|arg| arg == OsStr::new("-e")));
+}
+
+#[test]
 fn powershell_plan_uses_ps1_file_and_never_command_text_mode() {
     use std::ffi::OsStr;
 
@@ -1154,7 +1495,11 @@ fn powershell_plan_uses_ps1_file_and_never_command_text_mode() {
         "$(literal)".to_string(),
         "; literal".to_string(),
     ];
-    let command = build_script_command("pwsh", ShellScriptLanguage::Powershell, script_path, &args);
+    let plan = ScriptRuntimePlan {
+        program: OsString::from("pwsh"),
+        prefix_args: fixed_script_prefix_args(ShellScriptLanguage::Powershell),
+    };
+    let command = build_script_command(&plan, script_path, &args);
     assert_eq!(command.get_program(), OsStr::new("pwsh"));
     let actual = command.get_args().collect::<Vec<_>>();
     let mut expected = vec![OsStr::new("-NoProfile"), OsStr::new("-NonInteractive")];
@@ -1177,6 +1522,144 @@ fn powershell_plan_uses_ps1_file_and_never_command_text_mode() {
 }
 
 #[test]
+fn javascript_temp_file_uses_mjs_and_exact_script_bytes() {
+    let payload = ShellScriptPayload {
+        language: ShellScriptLanguage::Javascript,
+        script: "import { readFile } from 'node:fs/promises';\nawait Promise.resolve(readFile);"
+            .to_string(),
+        args: Vec::new(),
+    };
+    let (temporary_path, _original, absolute) = create_temporary_script(&payload).unwrap();
+    assert_eq!(
+        absolute.extension().and_then(|ext| ext.to_str()),
+        Some("mjs")
+    );
+    assert_eq!(std::fs::read(&absolute).unwrap(), payload.script.as_bytes());
+    temporary_path.close().unwrap();
+}
+
+#[test]
+fn typescript_temp_file_uses_mts_and_exact_script_bytes() {
+    let payload = ShellScriptPayload {
+        language: ShellScriptLanguage::Typescript,
+        script: "interface Item { value: string }\nconst item: Item = { value: 'ok' };\nconsole.log(item.value);\n".to_string(),
+        args: Vec::new(),
+    };
+    let (temporary_path, _original, absolute) = create_temporary_script(&payload).unwrap();
+    assert_eq!(
+        absolute.extension().and_then(|ext| ext.to_str()),
+        Some("mts")
+    );
+    assert_eq!(std::fs::read(&absolute).unwrap(), payload.script.as_bytes());
+    temporary_path.close().unwrap();
+}
+
+#[test]
+#[cfg(feature = "runner-real-process-tests")]
+#[ignore = "manual real-process smoke: requires compatible Node.js on PATH"]
+fn runner_real_process_node_script_runtime_preserves_argv_stdin_and_cwd() {
+    let cwd = tempfile::tempdir().unwrap();
+    let args = vec![
+        "two words".to_string(),
+        "$(literal); 雪".to_string(),
+        "--experimental-transform-types".to_string(),
+    ];
+    for (language, prelude) in [
+        (
+            ShellScriptLanguage::Javascript,
+            "const payload = { value: process.argv[2] ?? '' };",
+        ),
+        (
+            ShellScriptLanguage::Typescript,
+            r#"
+interface Payload { value: string }
+function identity<T>(value: T): T { return value; }
+const payload: Payload = identity<Payload>({ value: process.argv[2] ?? '' });
+"#,
+        ),
+    ] {
+        let script = format!(
+            "import {{ readFileSync }} from 'node:fs';\n{prelude}\n\
+             const input = await Promise.resolve(readFileSync(0, 'utf8'));\n\
+             console.log(JSON.stringify({{ value: payload.value, args: process.argv.slice(2), input, cwd: process.cwd() }}));"
+        );
+        let result = run_direct_script(
+            cwd.path(),
+            language,
+            script,
+            args.clone(),
+            Some("stdin-value\n"),
+            30,
+        );
+        assert_eq!(
+            result.execution_state,
+            ShellCommandExecutionState::Completed
+        );
+        assert_eq!(result.result.exit_code, Some(0), "{:?}", result.result);
+        let output: serde_json::Value =
+            serde_json::from_str(result.result.stdout.as_deref().unwrap()).unwrap();
+        assert_eq!(output["value"], "two words");
+        assert_eq!(output["args"], serde_json::json!(args));
+        assert_eq!(output["input"], "stdin-value\n");
+        assert_eq!(
+            Path::new(output["cwd"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            cwd.path().canonicalize().unwrap()
+        );
+    }
+}
+
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
+#[test]
+#[ignore = "real-process stdin isolation: runs an isolated test process with a fake Node runtime"]
+fn runner_real_process_typescript_probe_receives_eof_instead_of_runner_stdin() {
+    const FIXTURE_ENV: &str = "WEBCODEX_TEST_TYPESCRIPT_PROBE_FIXTURE";
+    if let Some(fixture) = std::env::var_os(FIXTURE_ENV) {
+        let root = PathBuf::from(fixture);
+        let mut shell = ShellConfig {
+            program: root.join("node").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        shell.env.insert("PATH".to_string(), String::new());
+        configured_script_runtime_plan(&shell, None, ShellScriptLanguage::Typescript, &root, None)
+            .expect("the version probe must receive EOF, not the Runner's inherited input");
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let node = root.path().join("node");
+    std::fs::write(
+        &node,
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 8\nif IFS= read -r line; then exit 9; fi\nprintf 'v22.18.0\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let input = root.path().join("runner-input");
+    std::fs::write(&input, "parent-only input\n").unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg(format!(
+            "{}::runner_real_process_typescript_probe_receives_eof_instead_of_runner_stdin",
+            module_path!().split_once("::").unwrap().1
+        ))
+        .args(["--ignored", "--nocapture"])
+        .env(FIXTURE_ENV, root.path())
+        .stdin(std::fs::File::open(input).unwrap());
+    let (status, stdout, stderr) = run_prepare_command(command, Duration::from_secs(10), None)
+        .expect("isolated probe regression test must finish within its deadline");
+    assert!(String::from_utf8_lossy(&stdout).contains("running 1 test"));
+    assert!(
+        status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
 fn phase_f_powershell_temp_file_uses_utf8_bom_without_script_preamble() {
     let payload = ShellScriptPayload {
         language: ShellScriptLanguage::Powershell,
@@ -1192,7 +1675,7 @@ fn phase_f_powershell_temp_file_uses_utf8_bom_without_script_preamble() {
 #[test]
 fn powershell_runtime_executes_from_file_when_available() {
     let cwd = tempfile::tempdir().unwrap();
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     if configured_script_interpreter(
         &ShellConfig::default(),
         None,
@@ -1206,7 +1689,7 @@ fn powershell_runtime_executes_from_file_when_available() {
         1,
         &unrestricted_policy(),
         &ShellConfig::default(),
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         &ShellScriptPayload {
@@ -1296,14 +1779,14 @@ fn phase_f_windows_native_oem_stdout_stderr_use_active_oem_page() {
         .contains('\u{fffd}'));
 
     let bounded_expected_path = cwd.path().join("bounded-expected.txt");
-    let projects_dir = tempfile::tempdir().unwrap();
+    let project_registry_dir = tempfile::tempdir().unwrap();
     let mut policy = unrestricted_policy();
     policy.max_output_bytes = 64;
     let bounded = run_process_with_profiles_and_execution_state(
         1,
         &policy,
         &ShellConfig::default(),
-        projects_dir.path(),
+        project_registry_dir.path(),
         &PreparedShellProfileCache::default(),
         Some(cwd.path().to_string_lossy().as_ref()),
         &process_argv_helper().to_string_lossy(),
@@ -1415,7 +1898,7 @@ fn phase_f_windows_timeout_retains_unicode_and_runs_child_once() {
 
 #[cfg(windows)]
 #[test]
-fn windows_run_process_accepts_only_native_resolution() {
+fn windows_run_process_preserves_native_argv_and_rejects_unsafe_batch_argv() {
     let temp = tempfile::tempdir().unwrap();
     let native = temp.path().join("native.exe");
     std::fs::write(&native, b"MZ").unwrap();
@@ -1447,17 +1930,22 @@ fn windows_run_process_accepts_only_native_resolution() {
         format!("@echo off\r\ncopy nul \"{}\"\r\n", marker.display()),
     )
     .unwrap();
+    let shell = ShellConfig {
+        env: HashMap::from([("PATH".into(), temp.path().to_string_lossy().into_owned())]),
+        ..ShellConfig::default()
+    };
+    let resolved =
+        configured_process_command(&shell, None, "script", &["test".into()], Some(temp.path()))
+            .unwrap();
+    assert!(Path::new(resolved.get_program()).ends_with("cmd.exe"));
     let batch_result = run_direct_process(temp.path(), &batch, &args, None, 10);
     assert_eq!(
         batch_result.execution_state,
         ShellCommandExecutionState::NotStarted
     );
     let batch_error = batch_result.result.error.as_deref().unwrap_or_default();
-    assert!(
-        batch_error.contains("unsupported_executable_type"),
-        "{batch_error}"
-    );
-    assert!(batch_error.contains("run_shell"), "{batch_error}");
+    assert!(batch_error.contains("invalid_arguments"), "{batch_error}");
+    assert!(batch_error.contains("native runtime"), "{batch_error}");
     assert!(
         !marker.exists(),
         "run_process must reject Batch before child spawn"
@@ -1476,4 +1964,121 @@ fn windows_run_process_accepts_only_native_resolution() {
         .as_deref()
         .unwrap_or_default()
         .contains("unsupported Windows extension"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_batch_shim_forwards_supported_argv_to_native_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let batch = temp.path().join("package shim.cmd");
+    std::fs::write(
+        &batch,
+        format!(
+            "@echo off\r\n\"{}\" %*\r\n",
+            process_argv_helper().display()
+        ),
+    )
+    .unwrap();
+    let args = ["argv", "space value", "&", "|", "(value)", ""].map(String::from);
+    let result = run_direct_process(temp.path(), &batch, &args, None, 10);
+    assert_eq!(result.result.exit_code, Some(0), "{:?}", result.result);
+    let expected = args[1..]
+        .iter()
+        .map(|arg| format!("{}:{arg}\n", arg.len()))
+        .collect::<String>();
+    assert_eq!(result.result.stdout.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn execution_environment_inherits_path_filters_credentials_and_honors_overrides() {
+    let _lock = crate::tests::test_env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("runner-toolchain");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(marker.clone()).chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap();
+    let _env = crate::tests::EnvGuard::new()
+        .set("PATH", path)
+        .set("WEBCODEX_TOKEN", "test-secret");
+    let shell = ShellConfig::default();
+    let env = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+    assert_eq!(
+        env_lookup(&env, "PATH").cloned(),
+        std::env::var("PATH").ok()
+    );
+    assert!(std::env::split_paths(env_lookup(&env, "PATH").unwrap()).any(|path| path == marker));
+    assert!(!env.contains_key("WEBCODEX_TOKEN"));
+    let shell = ShellConfig {
+        environment_mode: ShellEnvironmentMode::Isolated,
+        env: HashMap::from([
+            ("PATH".into(), "shell-path".into()),
+            ("WEBCODEX_TOKEN".into(), "test-secret".into()),
+        ]),
+        ..ShellConfig::default()
+    };
+    let profile = ShellProfileConfig {
+        env: std::collections::BTreeMap::from([("PATH".into(), "profile-path".into())]),
+        ..ShellProfileConfig::default()
+    };
+    let env = base_shell_env(&shell, &profile).unwrap();
+    assert_eq!(
+        env_lookup(&env, "PATH").map(String::as_str),
+        Some("profile-path")
+    );
+    assert!(!env.contains_key("WEBCODEX_TOKEN"));
+    assert!(!env.contains_key("HOME"));
+    let provider = PreparedExecutionEnvironment::prepare(
+        1,
+        &shell,
+        None,
+        Path::new("."),
+        &PreparedShellProfileCache::default(),
+        None,
+    )
+    .unwrap();
+    assert!(!provider.env_snapshot.contains_key("WEBCODEX_TOKEN"));
+}
+
+#[test]
+fn isolated_environment_is_explicit_and_does_not_inherit_user_path() {
+    let shell: ShellConfig = toml::from_str("environment_mode = 'isolated'").unwrap();
+    assert_eq!(shell.environment_mode, ShellEnvironmentMode::Isolated);
+    let env = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+    assert!(!env.contains_key("HOME"));
+    assert!(!env.contains_key("USERPROFILE"));
+    #[cfg(not(windows))]
+    assert_eq!(
+        env_lookup(&env, "PATH").map(String::as_str),
+        Some("/usr/bin:/bin")
+    );
+    assert!(toml::from_str::<ShellConfig>("environment_mode = 'unknown'").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn default_shell_preserves_non_unicode_environment_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let _lock = crate::tests::test_env_lock();
+    let _env = crate::tests::EnvGuard::new().set(
+        "WEBCODEX_OPAQUE_TOOLCHAIN_ENV",
+        OsString::from_vec(vec![0xff]),
+    );
+    let shell = ShellConfig::default();
+    configured_process_command(&shell, None, "true", &[], None).unwrap();
+    let snapshot = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+    assert!(
+        !snapshot.contains_key("WEBCODEX_OPAQUE_TOOLCHAIN_ENV"),
+        "String-backed prepared environments must ignore inherited values they cannot represent instead of panicking"
+    );
+    PreparedExecutionEnvironment::prepare(
+        1,
+        &shell,
+        None,
+        Path::new("."),
+        &PreparedShellProfileCache::default(),
+        None,
+    )
+    .unwrap();
 }

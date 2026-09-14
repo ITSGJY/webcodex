@@ -4,7 +4,7 @@ use super::*;
 fn register_project_rejects_path_outside_allowed_roots() {
     let allowed = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let projects_dir = allowed.path().join("projects.d");
+    let project_registry_dir = allowed.path().join("project-registry");
     let policy = project_policy(allowed.path());
     let req = project_request(
         "register_project",
@@ -15,9 +15,9 @@ fn register_project_rejects_path_outside_allowed_roots() {
         }),
     );
 
-    let err = project_err(handle_project_op(&policy, &projects_dir, &req));
+    let err = project_err(handle_project_op(&policy, &project_registry_dir, &req));
     assert_eq!(err, "path_outside_allowed_roots");
-    assert!(!projects_dir.join("outside.toml").exists());
+    assert!(!project_registry_dir.join("outside.toml").exists());
 }
 
 #[test]
@@ -63,10 +63,10 @@ fn load_config_defaults_empty_allowed_roots_to_home() {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(home) = home {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("agent.toml");
+        let path = tmp.path().join("runner.toml");
         std::fs::write(
             &path,
-            "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nprojects_dir = \"projects.d\"\n",
+            "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nproject_registry_dir = \"project-registry\"\n",
         )
         .unwrap();
         let cfg = load_config(&path).unwrap();
@@ -80,7 +80,7 @@ fn load_config_defaults_empty_allowed_roots_to_home() {
 
 #[test]
 fn runner_config_defaults_allow_cwd_anywhere_to_false() {
-    let base = "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nprojects_dir = \"projects.d\"\n";
+    let base = "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nproject_registry_dir = \"project-registry\"\n";
 
     // This is a serde/default-policy invariant, not a per-user path test. Parse
     // the fixture directly so it cannot observe ambient HOME/USERPROFILE.
@@ -125,13 +125,42 @@ fn default_policy_denies_paths_outside_allowed_roots() {
 }
 
 #[test]
+fn configured_skill_storage_does_not_expand_generic_file_authority() {
+    let project = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    let project_root = project.path().canonicalize().unwrap();
+    let skill_root = skills.path().canonicalize().unwrap();
+    let outside_file = skill_root.join("outside.txt");
+    std::fs::write(&outside_file, "must stay outside project authority").unwrap();
+
+    let config = RunnerConfig {
+        policy: RunnerPolicy {
+            allowed_roots: vec![project_root.clone()],
+            ..RunnerPolicy::default()
+        },
+        skills: crate::webcodex_runner::config::SkillsConfig {
+            roots: vec![skill_root.clone()],
+        },
+        ..test_config(project_root)
+    };
+    assert_eq!(config.skills.roots, vec![skill_root]);
+    let error = resolve_requested_path(
+        &config.policy,
+        None,
+        outside_file.to_string_lossy().as_ref(),
+    )
+    .expect_err("configured Skill roots must not grant generic file authority");
+    assert!(error.contains("outside allowed_roots"), "{error}");
+}
+
+#[test]
 fn load_config_explicit_allowed_roots_override_home_default() {
     let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("agent.toml");
+    let path = tmp.path().join("runner.toml");
     std::fs::write(
             &path,
-            "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nprojects_dir = \"projects.d\"\n[policy]\nallowed_roots = [\"/root/git\"]\n",
+            "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nproject_registry_dir = \"project-registry\"\n[policy]\nallowed_roots = [\"/root/git\"]\n",
         )
         .unwrap();
     let cfg = load_config(&path).unwrap();
@@ -152,10 +181,10 @@ fn load_config_empty_roots_without_home_and_no_cwd_anywhere_errors() {
         .remove("USERPROFILE")
         .remove("APPDATA");
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("agent.toml");
+    let path = tmp.path().join("runner.toml");
     std::fs::write(
         &path,
-        "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nprojects_dir = \"projects.d\"\n\
+        "server_url = \"http://x\"\ntoken = \"t\"\nclient_id = \"c\"\nproject_registry_dir = \"project-registry\"\n\
              [policy]\nallow_cwd_anywhere = false\n",
     )
     .unwrap();

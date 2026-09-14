@@ -3,13 +3,13 @@
 //! Four separate predicates used to encode this, one per surface (search,
 //! search globs, artifacts, edits). They disagreed in ways that mattered: the
 //! edit path did not stop `*.pem`/`*.key`, the artifact path did not stop
-//! `*.key`/`agent.toml`, and the search paths were case-sensitive, so a file
+//! Runner config files, and the search paths were case-sensitive, so a file
 //! literally named `.ENV` was excluded from one surface but not another.
 //!
 //! The policy is split along the two distinct jobs those predicates were doing:
 //!
 //! - [`is_secret_path`] — content that must not be read or written through the
-//!   tool surface at all (credentials, keys, agent configuration).
+//!   tool surface at all (credentials, keys, agent configuration, Git control data).
 //! - [`is_bulk_excluded_path`] — high-volume, low-signal trees that search and
 //!   listing skip for noise and cost reasons. These are *not* secret;
 //!   `read_file` of a specific path inside them stays allowed.
@@ -17,24 +17,30 @@
 //! Both match on whole path components and are case-insensitive, so `.ENV` and
 //! `ID_RSA.PEM` cannot slip past on a case-preserving filesystem.
 
-/// Exact component names whose entire subtree holds credentials.
-const SECRET_COMPONENTS: &[&str] = &["secrets", "tokens", "projects.d"];
+/// Credential trees and Git integrity-sensitive control data.
+const SECRET_COMPONENTS: &[&str] = &[
+    ".git",
+    "secrets",
+    "tokens",
+    "project-registry",
+    "projects.d",
+];
 
-/// Component prefixes that mark a credential or agent-config file.
+/// Component prefixes that mark a credential or Runner-config file.
 ///
 /// `.env` as a prefix also covers `.env.local`, `.env.production`, and the
-/// like. `agent.toml`/`webcodex.env` as prefixes cover editor and backup
-/// suffixes (`agent.toml.swp`).
-const SECRET_PREFIXES: &[&str] = &[".env", "agent.toml", "webcodex.env"];
+/// like. Runner config names and `webcodex.env` are prefixes so editor and
+/// backup suffixes (`runner.toml.swp`, `agent.toml.bak`) remain protected.
+const SECRET_PREFIXES: &[&str] = &[".env", "runner.toml", "agent.toml", "webcodex.env"];
 
 /// Component suffixes that mark key material or a credential backup.
 const SECRET_SUFFIXES: &[&str] = &[".pem", ".key", ".env", ".toml.bak"];
 
 /// High-volume trees that search and listing skip. Not secret.
-const BULK_COMPONENTS: &[&str] = &[".git", "target", "node_modules"];
+const BULK_COMPONENTS: &[&str] = &["target", "node_modules"];
 
-/// True when any component of `path` names credentials, key material, or agent
-/// configuration. Deny both reads and writes for these.
+/// True when any component names credentials, key material, Runner configuration
+/// or Git integrity-sensitive control data. Deny both reads and writes for these.
 pub fn is_secret_path(path: &str) -> bool {
     path_components(path).any(|component| {
         SECRET_COMPONENTS.contains(&component.as_str())
@@ -105,11 +111,16 @@ mod tests {
     #[test]
     fn secret_paths_cover_every_rule_the_four_predicates_had_between_them() {
         for path in [
+            ".git/config",
+            ".git/HEAD",
             // exact credential directories
             "secrets/key.txt",
             "tokens/agent",
+            "project-registry/demo.toml",
             "projects.d/demo.toml",
-            // agent configuration
+            // Runner configuration, canonical and legacy
+            "runner.toml",
+            "config/runner.toml",
             "agent.toml",
             "config/agent.toml",
             "webcodex.env",
@@ -121,6 +132,7 @@ mod tests {
             "certs/server.pem",
             "certs/server.key",
             // credential backups
+            "runner.toml.bak",
             "agent.toml.bak",
             "deploy.env",
         ] {
@@ -132,7 +144,13 @@ mod tests {
     fn secret_matching_is_case_insensitive() {
         // The search predicates used to be case-sensitive, so a file named
         // `.ENV` was protected on some surfaces and exposed on others.
-        for path in [".ENV", "Certs/Server.PEM", "SECRETS/token", "Agent.TOML"] {
+        for path in [
+            ".ENV",
+            "Certs/Server.PEM",
+            "SECRETS/token",
+            "Runner.TOML",
+            "Agent.TOML",
+        ] {
             assert!(is_secret_path(path), "expected secret: {path}");
         }
     }
@@ -155,7 +173,7 @@ mod tests {
     fn bulk_trees_are_skipped_but_not_secret() {
         // Reading a specific file inside these stays allowed; only bulk
         // operations skip them.
-        for path in [".git/config", "target/debug/app", "node_modules/pkg/i.js"] {
+        for path in ["target/debug/app", "node_modules/pkg/i.js"] {
             assert!(is_bulk_excluded_path(path), "expected bulk: {path}");
             assert!(!is_secret_path(path), "must not be secret: {path}");
             assert!(is_bulk_skipped_path(path));
@@ -178,11 +196,15 @@ mod tests {
             "**/.env.*",
             "agent.toml",
             "**/agent.toml",
+            "runner.toml",
+            "**/runner.toml",
             "*.pem",
             "**/*.pem",
             "*.key",
             "**/*.KEY",
             "secrets/**",
+            "project-registry/**",
+            "projects.d/**",
             "./**/.env",
         ] {
             assert!(

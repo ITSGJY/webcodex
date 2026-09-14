@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::ShellClientCapabilities;
+use crate::runner_protocol::RunnerCapabilities;
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use serde_json::json;
 use std::fs;
@@ -13,8 +13,8 @@ async fn runtime_with_two_agent_projects(
     root_b: &Path,
 ) -> (ToolRuntime, String, String) {
     let runtime = test_runtime();
-    let alpha = register_agent_project_at_path(&runtime, "alpha-client", "alpha", root_a).await;
-    let bravo = register_agent_project_at_path(&runtime, "bravo-client", "bravo", root_b).await;
+    let alpha = register_runner_project_at_path(&runtime, "alpha-client", "alpha", root_a).await;
+    let bravo = register_runner_project_at_path(&runtime, "bravo-client", "bravo", root_b).await;
     (runtime, alpha, bravo)
 }
 
@@ -38,13 +38,16 @@ async fn unknown_session_id_fails_before_execution_or_mutation() {
     let runtime = runtime_with_project(root, "demo");
 
     let read = runtime
-        .dispatch(ToolCall::ReadFile {
+        .dispatch(ToolCall::ReadFiles {
             project: "demo".to_string(),
-            path: "README.md".to_string(),
+            items: vec![crate::tool_runtime::ReadFilesItem {
+                path: "README.md".to_string(),
+                start_line: None,
+                limit: None,
+            }],
             session_id: Some("wc_sess_missing".to_string()),
-            start_line: None,
-            limit: None,
             with_line_numbers: None,
+            max_result_bytes: None,
         })
         .await;
     assert!(!read.success);
@@ -94,13 +97,16 @@ async fn same_project_session_records_without_project_mismatch_warning() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: alpha,
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -125,7 +131,7 @@ async fn same_project_session_records_without_project_mismatch_warning() {
         .sessions
         .summary(&session.session_id, Some(20))
         .unwrap();
-    let event = latest_finished_event(&summary, "read_file");
+    let event = latest_finished_event(&summary, "read_files");
     assert!(event.warning_kind.is_none());
 }
 
@@ -143,13 +149,16 @@ async fn read_only_cross_project_session_is_blocked_before_execution() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: bravo.clone(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                }],
                 session_id: Some(session.session_id.clone()),
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&auth),
         )
@@ -229,7 +238,7 @@ async fn read_only_recording_session_does_not_guard_same_project_write() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "guard-recorder", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "guard-recorder", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let recorder = runtime.sessions.start_session_with_guards(
         Some(project.clone()),
@@ -308,7 +317,8 @@ async fn closed_recording_session_remains_provenance_only_for_business_write() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "guard-closed-recorder", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "guard-closed-recorder", "demo", tmp.path())
+            .await;
     let auth = auth_context(None, true);
     let recorder = runtime
         .sessions
@@ -467,13 +477,13 @@ async fn start_session_mode_effective_guards_matrix() {
 }
 
 #[tokio::test]
-async fn read_only_session_allows_read_file_and_records_success() {
+async fn read_only_session_allows_read_files_and_records_success() {
     let runtime = runtime_with_agent_project("guard-read");
     register_agent(
         &runtime,
         "guard-read",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -495,20 +505,23 @@ async fn read_only_session_allows_read_file_and_records_success() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(&runtime, "guard-read", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "guard-read", "inst").await;
     assert_eq!(req.kind, "file_read");
     complete_patch_agent_request(
         &runtime,
@@ -522,7 +535,9 @@ async fn read_only_session_allows_read_file_and_records_success() {
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_recorded"], true);
+    assert!(result.output.get("session_recorded").is_none());
+    assert!(result.output.get("session_event_id").is_none());
+    assert!(result.output.get("session_id").is_none());
     assert!(result.output.get("permission").is_none());
     let summary = runtime
         .sessions
@@ -531,10 +546,10 @@ async fn read_only_session_allows_read_file_and_records_success() {
     assert_eq!(summary.counts.succeeded, 1);
     assert_eq!(summary.counts.read_like, 1);
     assert_eq!(
-        finished_event(&summary, "read_file").status.as_deref(),
+        finished_event(&summary, "read_files").status.as_deref(),
         Some("succeeded")
     );
-    assert!(finished_event(&summary, "read_file").permission.is_none());
+    assert!(finished_event(&summary, "read_files").permission.is_none());
 
     let handoff = runtime
         .dispatch(ToolCall::SessionHandoffSummary {
@@ -591,8 +606,9 @@ async fn read_only_session_rejects_write_project_file_before_mutation() {
     assert_eq!(result.output["guard"], "deny_write_tools");
     assert_eq!(result.output["mode"], "read_only");
     assert!(result.output.get("permission").is_none());
-    assert_eq!(result.output["session_recorded"], true);
-    assert!(result.output["session_event_id"].as_str().is_some());
+    assert!(result.output.get("session_recorded").is_none());
+    assert!(result.output.get("session_event_id").is_none());
+    assert_eq!(result.output["session_id"], session.session_id);
     assert_eq!(result.output["session_hint"]["has_open_messages"], true);
     assert_eq!(result.output["session_hint"]["open_counts"]["risk"], 1);
     assert_eq!(result.output["session_hint"]["highest_priority"], "high");
@@ -630,7 +646,7 @@ async fn read_only_session_rejects_all_artifact_upload_tools_without_base64_leak
         &runtime,
         "guard-artifact-upload",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -688,7 +704,18 @@ async fn read_only_session_rejects_all_artifact_upload_tools_without_base64_leak
         assert_eq!(result.output["error_kind"], "session_guard_denied");
         assert_eq!(result.output["guard"], "deny_write_tools");
         assert_eq!(result.output["mode"], "read_only");
-        assert_eq!(result.output["session_recorded"], true);
+        assert!(
+            result.output.get("session_recorded").is_none(),
+            "{tool_name}"
+        );
+        assert!(
+            result.output.get("session_event_id").is_none(),
+            "{tool_name}"
+        );
+        assert_eq!(
+            result.output["session_id"], session.session_id,
+            "{tool_name}"
+        );
     }
     assert!(
         probe_patch_agent_request(&runtime, "guard-artifact-upload")
@@ -746,7 +773,7 @@ async fn read_only_session_rejects_run_shell_before_agent_enqueue() {
         &runtime,
         "guard-shell",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             file_write: true,
             ..Default::default()
@@ -782,7 +809,9 @@ async fn read_only_session_rejects_run_shell_before_agent_enqueue() {
     assert_eq!(result.output["guard"], "deny_shell_tools");
     assert_eq!(result.output["command_started"], false);
     assert!(result.output.get("permission").is_none());
-    assert_eq!(result.output["session_recorded"], true);
+    assert!(result.output.get("session_recorded").is_none());
+    assert!(result.output.get("session_event_id").is_none());
+    assert_eq!(result.output["session_id"], session.session_id);
     assert!(
         probe_patch_agent_request(&runtime, "guard-shell")
             .await
@@ -807,7 +836,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
         &runtime,
         "guard-write-only",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             shell: true,
             ..Default::default()
@@ -850,20 +879,23 @@ async fn deny_write_only_allows_read_and_shell_tools() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(&runtime, "guard-write-only", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "guard-write-only", "inst").await;
     complete_patch_agent_request(
         &runtime,
         "guard-write-only",
@@ -909,7 +941,7 @@ async fn deny_shell_only_allows_write_tools() {
         &runtime,
         "guard-shell-only",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             file_write: true,
             ..Default::default()
@@ -984,7 +1016,7 @@ async fn deny_shell_only_allows_write_tools() {
 fn project_tool_schemas_include_optional_session_id() {
     let specs = registered_tool_specs();
     // `start_session` is ModelHidden (the model coding line is covered by
-    // `start_coding_task`): it has no public ToolSpec, so its guard schema is
+    // `work_on_project`): it has no public ToolSpec, so its guard schema is
     // verified directly from the output schema builder rather than via
     // `spec_named`, keeping the session guard-field contract asserted at the
     // implementation level.
@@ -1024,7 +1056,7 @@ fn project_tool_schemas_include_optional_session_id() {
             .is_some()
     );
     for name in [
-        "read_file",
+        "read_files",
         "run_shell",
         "write_project_file",
         "git_status",
@@ -1051,16 +1083,7 @@ fn project_tool_schemas_include_optional_session_id() {
             "{name} schema must not require session_id"
         );
     }
-    for name in ["read_file", "run_shell", "write_project_file"] {
-        let spec = spec_named(&specs, name);
-        assert!(spec.output_schema["properties"]["output"]["properties"]
-            .get("session_recorded")
-            .is_some());
-        assert!(spec.output_schema["properties"]["output"]["properties"]
-            .get("session_event_id")
-            .is_some());
-        let session_hint =
-            &spec.output_schema["properties"]["output"]["properties"]["session_hint"];
+    let assert_session_hint_contract = |session_hint: &serde_json::Value| {
         assert_eq!(session_hint["type"], "object");
         assert_eq!(
             session_hint["properties"]["suggested_next_tool"]["enum"],
@@ -1089,5 +1112,28 @@ fn project_tool_schemas_include_optional_session_id() {
                 .iter()
                 .any(|field| field == optional));
         }
+    };
+
+    let read_files = spec_named(&specs, "read_files");
+    let read_files_outputs = read_files.output_schema["properties"]["output"]["anyOf"][0]["anyOf"]
+        .as_array()
+        .expect("read_files success output variants");
+    for output in read_files_outputs {
+        let properties = output["properties"]
+            .as_object()
+            .expect("read_files output properties");
+        for recorder_only in ["session_recorded", "session_event_id", "session_id"] {
+            assert!(properties.get(recorder_only).is_none());
+        }
+        assert_session_hint_contract(&output["properties"]["session_hint"]);
+    }
+
+    for name in ["run_shell", "write_project_file"] {
+        let spec = spec_named(&specs, name);
+        let properties = &spec.output_schema["properties"]["output"]["properties"];
+        assert!(properties.get("session_recorded").is_none());
+        assert!(properties.get("session_event_id").is_none());
+        assert!(properties.get("session_id").is_none());
+        assert_session_hint_contract(&properties["session_hint"]);
     }
 }

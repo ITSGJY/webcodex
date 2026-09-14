@@ -606,18 +606,20 @@ impl ToolRuntime {
                 "wait_secs requires after_observation_token",
             );
         }
-        if wait_secs.is_some_and(|wait_secs| !(1..=60).contains(&wait_secs)) {
+        if wait_secs == Some(0) {
             return invalid_session_message_observation_request(
                 &session_id,
-                "wait_secs must be in 1..=60",
+                "wait_secs must be at least 1",
             );
         }
-        if limit.is_some_and(|limit| !(1..=sessions::MAX_MESSAGE_LIST_LIMIT).contains(&limit)) {
+        if limit == Some(0) {
             return invalid_session_message_observation_request(
                 &session_id,
-                "limit must be in 1..=100",
+                "limit must be at least 1",
             );
         }
+        let wait_secs = wait_secs.map(|wait_secs| wait_secs.min(60));
+        let limit = limit.map(|limit| limit.min(sessions::MAX_MESSAGE_LIST_LIMIT));
         match self
             .sessions
             .observe_messages(
@@ -633,6 +635,10 @@ impl ToolRuntime {
                 "session_id": session_id,
                 "messages": observation.messages,
                 "observation_token": observation.observation_token,
+                "continuation_semantics": super::ContinuationSemantics::new(
+                    super::ContinuationKind::Observe,
+                    super::ContinuationCarrier::ObservationToken,
+                ).to_value(),
                 "changed": observation.changed,
                 "wait_outcome": observation.wait_outcome,
                 "waited_ms": observation.waited_ms,
@@ -762,7 +768,7 @@ fn invalid_session_message_observation_request(session_id: &str, message: &str) 
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn session_message_observation_error_result(
@@ -785,7 +791,7 @@ fn session_message_observation_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
         sessions::SessionMessageObservationError::InvalidObservationState => {
             ToolResult::err_with_output(
                 "invalid_message_observation_state",
@@ -795,7 +801,7 @@ fn session_message_observation_error_result(
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::NoAction, None)
+            .with_recovery(RecoveryKind::NoAction)
         }
     }
 }

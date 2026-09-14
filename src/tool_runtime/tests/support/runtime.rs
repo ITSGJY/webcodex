@@ -1,5 +1,5 @@
 use crate::projects::ProjectConfig;
-use crate::shell_client::ShellClientRegistry;
+use crate::runner_http::RunnerRegistry;
 use crate::tool_runtime::{RuntimeInfo, ToolRuntime, ToolSpec};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -9,7 +9,7 @@ pub(in crate::tool_runtime::tests) const SAMPLE_PROJECT: &str = "agent:oe:privat
 pub(in crate::tool_runtime::tests) const UNIT_TOOL_FIXTURES: &[&str] = &[
     "list_tools",
     "list_projects",
-    "list_agents",
+    "list_runners",
     "runtime_status",
 ];
 
@@ -51,17 +51,23 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         .collect();
     // Conditional project-source schemas cannot express one representative
     // source through the top-level `required` array. Keep fixtures aligned with
-    // each tool's metadata contract: start_coding_task may create/resolve its
-    // project, while work_on_project is always project-scoped.
+    // each tool's metadata contract.
     match spec.name.as_str() {
-        "start_coding_task" => {
-            args.insert("client_id".to_string(), json!("oe"));
-        }
         "work_on_project" => {
             args.insert("project".to_string(), json!(SAMPLE_PROJECT));
         }
+        "update_goal" => {
+            args.insert("expected_revision".to_string(), json!(1));
+        }
         "observe_jobs" => {
             args.insert("items".to_string(), json!([{"job_id": "job_123"}]));
+        }
+        "plugin_tool" => {
+            args.insert("action".to_string(), json!("list"));
+        }
+        "ssh_resource" => {
+            args.insert("action".to_string(), json!("list"));
+            args.insert("runner".to_string(), json!("runner-a"));
         }
         _ => {}
     }
@@ -86,8 +92,11 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "text" => json!("// hi\n"),
         "content" => json!("fn main() {}\n"),
         "instruction" => json!("implement the requested change"),
+        "objective" => json!("Preserve durable high-level intent without execution authority."),
         "title" => json!("Durable agent work"),
-        "include_project_instructions" | "include_workflow_guidance" => json!(false),
+        "include_project_instructions"
+        | "include_workflow_guidance"
+        | "include_extension_catalog" => json!(false),
         "content_base64" => json!("AA=="),
         "openaiFileIdRefs" => json!([{
             "download_url": "https://files.oaiusercontent.com/test",
@@ -112,9 +121,15 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "agent_id" => json!(format!("wc_dagent_{}", "a".repeat(32))),
         "assignee_agent_id" => json!(format!("wc_dagent_{}", "a".repeat(32))),
         "task_id" => json!(format!("wc_agent_task_{}", "1".repeat(32))),
+        "wait_id" => json!(format!("wc_agent_wait_{}", "6".repeat(32))),
+        "events" => json!([{
+            "kind": "agent_task_terminal",
+            "task_id": format!("wc_agent_task_{}", "1".repeat(32))
+        }]),
+        "goal_id" => json!(format!("wc_goal_{}", "0".repeat(32))),
         "attempt_id" => json!(format!("wc_agent_task_attempt_{}", "2".repeat(32))),
         "attempt_fence" => json!(format!("wc_agent_task_fence_{}", "3".repeat(32))),
-        "attempt_controller_generation" => json!(1),
+        "attempt_controller_generation" | "expected_generation" => json!(1),
         "outcome" => json!("succeeded"),
         "agent_ids" => json!([format!("wc_dagent_{}", "a".repeat(32))]),
         "endpoint_id" => json!(format!("wc_endpoint_{}", "b".repeat(32))),
@@ -129,7 +144,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "provider_id" => json!("codex"),
         "run_id" => json!("wc_agent_run_sample_1234"),
         "shell_id" => json!("wc_shell_123"),
-        "session_id" => json!("wc_sess_existing"),
+        "session_id" => json!(format!("wc_sess_{}", "1".repeat(32))),
         "checkpoint_id" => json!("wc_ckpt_1234"),
         "confirm" => json!(true),
         "client_id" => json!("oe"),
@@ -144,6 +159,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "id" => json!("private-drop"),
         "base_commit" => json!("a".repeat(40)),
         "head_commit" => json!("b".repeat(40)),
+        "expected_head" => json!("a".repeat(40)),
         "expected_revision" => json!(format!("sha256:{}", "a".repeat(64))),
         "name" => json!("Private Drop"),
         "kind" => json!("note"),
@@ -155,18 +171,6 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "execution_context" => json!({}),
         other => panic!("missing sample value for required field {other}"),
     }
-}
-
-pub(in crate::tool_runtime::tests) fn sample_tool_args_with_session(name: &str) -> Value {
-    let mut args = sample_tool_args(name);
-    let obj = args
-        .as_object_mut()
-        .unwrap_or_else(|| panic!("{name} does not accept object arguments"));
-    obj.insert(
-        "session_id".to_string(),
-        Value::String("wc_sess_accessor".to_string()),
-    );
-    args
 }
 
 /// Helper: fetch a ToolSpec by name from the runtime.
@@ -214,6 +218,7 @@ pub(in crate::tool_runtime::tests) fn seed_model_facing_recovery_events(
                 ack_session_context_revision: SessionContextRevisionAck::Revision(revision),
                 ..Default::default()
             },
+            crate::tool_runtime::sessions::session_tool_contract("run_process"),
         );
         let evidence = format!("event-{index:02}-{}", "x".repeat(760));
         let recorded = runtime
@@ -274,6 +279,7 @@ pub(in crate::tool_runtime::tests) fn seed_large_changed_path_recovery_events(
                 ack_session_context_revision: SessionContextRevisionAck::Revision(revision),
                 ..Default::default()
             },
+            crate::tool_runtime::sessions::session_tool_contract("delete_project_files"),
         );
         let recorded = runtime
             .sessions
@@ -304,11 +310,11 @@ pub(in crate::tool_runtime::tests) fn runtime_with_project(
 ) -> ToolRuntime {
     let _ = (root, project_id);
     ToolRuntime::new(
-        Arc::new(ShellClientRegistry::default()),
+        Arc::new(RunnerRegistry::default()),
         Arc::new(RuntimeInfo::default()),
     )
 }
 
 pub(in crate::tool_runtime::tests) fn runtime_with_info(info: RuntimeInfo) -> ToolRuntime {
-    ToolRuntime::new(Arc::new(ShellClientRegistry::default()), Arc::new(info))
+    ToolRuntime::new(Arc::new(RunnerRegistry::default()), Arc::new(info))
 }

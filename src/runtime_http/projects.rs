@@ -7,7 +7,7 @@ use serde_json::Value;
 
 /// `POST /api/projects/register` — thin REST wrapper over
 /// `ToolCall::RegisterProject`. Mutation with side effects; registers an
-/// existing directory as a WebCodex project on the selected agent. Dedicated
+/// existing directory as a WebCodex project on the selected Runner. Dedicated
 /// GPT Action (`registerProject`); also reachable via callRuntimeTool / MCP
 /// tools/call.
 #[derive(Debug, Deserialize)]
@@ -25,8 +25,9 @@ struct RegisterProjectRequest {
 }
 
 /// `POST /api/projects/create` — thin REST wrapper over
-/// `ToolCall::CreateProject`. Mutation with side effects; creates a new
-/// directory on the selected agent and registers it as a WebCodex project.
+/// `ToolCall::CreateProject`. Mutation with side effects; creates a new directory
+/// or explicitly adopts an existing empty directory on the selected Runner, then
+/// registers it as a WebCodex project.
 /// Dedicated GPT Action (`createProject`); also reachable via callRuntimeTool
 /// / MCP tools/call.
 #[derive(Debug, Deserialize)]
@@ -44,9 +45,16 @@ struct CreateProjectRequest {
     #[serde(default)]
     pub git_init: bool,
     #[serde(default)]
-    pub allow_existing_empty: bool,
+    pub adopt_existing_empty: bool,
     #[serde(default)]
     pub overwrite: bool,
+    /// Narrow pre-0.4 ingress sentinels. This dedicated endpoint historically
+    /// ignores unrelated unknown fields, so naming only retired semantic fields
+    /// keeps that behavior without introducing a generic compatibility-field bag.
+    #[serde(default, rename = "managed_temporary_project")]
+    pub retired_managed_temporary_project: Option<Value>,
+    #[serde(default, rename = "allow_existing_empty")]
+    pub retired_allow_existing_empty: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +62,13 @@ struct CreateProjectRequest {
 struct UnregisterProjectRequest {
     project: String,
     expected_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveOrRegisterProjectRequest {
+    client_id: String,
+    path: String,
 }
 
 #[handler]
@@ -87,8 +102,8 @@ pub async fn projects_list(req: &mut Request, depot: &mut Depot, res: &mut Respo
 }
 
 /// `ToolCall::RegisterProject`. Registers an existing directory as a
-/// WebCodex project on the selected agent. Mutation with side effects; executes
-/// on the selected agent and is constrained by agent policy.
+/// WebCodex project on the selected Runner. Mutation with side effects; executes
+/// on the selected Runner and is constrained by Runner policy.
 #[handler]
 pub async fn projects_register(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/register", "registerProject");
@@ -116,9 +131,10 @@ pub async fn projects_register(req: &mut Request, depot: &mut Depot, res: &mut R
     render_result(res, &audit, "register_project", None, result);
 }
 
-/// `ToolCall::CreateProject`. Creates a new directory on the selected agent
-/// and registers it as a WebCodex project. Mutation with side effects; executes
-/// on the selected agent and is constrained by agent policy.
+/// `ToolCall::CreateProject`. Creates a new directory or explicitly adopts an
+/// existing empty directory on the selected Runner, then registers it as a
+/// WebCodex project. Mutation with side effects; executes on the selected Runner
+/// and is constrained by Runner policy.
 #[handler]
 pub async fn projects_create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/projects/create", "createProject");
@@ -128,6 +144,30 @@ pub async fn projects_create(req: &mut Request, depot: &mut Depot, res: &mut Res
     let Some(body) = parse_json_body::<CreateProjectRequest>(req, res).await else {
         return;
     };
+    if body.retired_managed_temporary_project.is_some() {
+        render_result(
+            res,
+            &audit,
+            "create_project",
+            None,
+            crate::tool_runtime::ToolResult::err(
+                "invalid arguments for create_project: field 'managed_temporary_project' is no longer supported; use ordinary explicit project creation",
+            ),
+        );
+        return;
+    }
+    if body.retired_allow_existing_empty.is_some() {
+        render_result(
+            res,
+            &audit,
+            "create_project",
+            None,
+            crate::tool_runtime::ToolResult::err(
+                "invalid arguments for create_project: field 'allow_existing_empty' is no longer supported; use 'adopt_existing_empty' to explicitly adopt an existing empty directory",
+            ),
+        );
+        return;
+    }
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime
         .dispatch_with_auth(
@@ -140,13 +180,42 @@ pub async fn projects_create(req: &mut Request, depot: &mut Depot, res: &mut Res
                 allow_patch: body.allow_patch,
                 template: body.template,
                 git_init: body.git_init,
-                allow_existing_empty: body.allow_existing_empty,
+                adopt_existing_empty: body.adopt_existing_empty,
                 overwrite: body.overwrite,
             },
             auth.as_ref(),
         )
         .await;
     render_result(res, &audit, "create_project", None, result);
+}
+
+/// `POST /api/projects/resolve-or-register` — hidden operator path bootstrap.
+/// The request carries only an exact Runner identity and path, then delegates to
+/// the same ModelHidden ToolRuntime convergence primitive used by workflow
+/// bootstrap. The Server never writes Runner project TOML here.
+#[handler]
+pub async fn projects_resolve_or_register(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let audit = ActionAudit::start(
+        req,
+        depot,
+        "/api/projects/resolve-or-register",
+        "resolveOrRegisterProject",
+    );
+    let Some(runtime) = require_runtime(depot, res) else {
+        return;
+    };
+    let Some(body) = parse_json_body::<ResolveOrRegisterProjectRequest>(req, res).await else {
+        return;
+    };
+    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
+    let result = runtime
+        .resolve_or_register_project(body.client_id, body.path, auth.as_ref())
+        .await;
+    render_result(res, &audit, "resolve_or_register_project", None, result);
 }
 
 /// `POST /api/projects/unregister` — narrow ordinary authenticated project

@@ -3,17 +3,20 @@ use super::*;
 async fn mcp_export_runtime(
     root: &std::path::Path,
     owner: Option<&str>,
-) -> (
-    Arc<ToolRuntime>,
-    Arc<crate::shell_client::ShellClientRegistry>,
-) {
-    use crate::shell_protocol::{
-        ShellAgentProjectSummary, ShellClientCapabilities, ShellClientRegisterRequest,
-    };
-    let registry = Arc::new(crate::shell_client::ShellClientRegistry::default());
+) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
+    mcp_export_runtime_with_surface(root, owner, ModelSurface::FullOperatorRuntime).await
+}
+
+async fn mcp_export_runtime_with_surface(
+    root: &std::path::Path,
+    owner: Option<&str>,
+    model_surface: ModelSurface,
+) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
+    use crate::runner_protocol::{RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest};
+    let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
     registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -21,13 +24,13 @@ async fn mcp_export_runtime(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst-export".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: owner.map(str::to_string),
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities::default(),
+                capabilities: RunnerCapabilities::default(),
                 policy: None,
             },
         ))
@@ -37,16 +40,19 @@ async fn mcp_export_runtime(
         &registry,
         "exporter",
         "inst-export",
-        vec![ShellAgentProjectSummary {
+        vec![RunnerProjectSummary {
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: root.to_string_lossy().into_owned(),
             allow_patch: true,
             kind: None,
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -56,21 +62,21 @@ async fn mcp_export_runtime(
     )
     .await;
     let runtime = Arc::new(
-        ToolRuntime::new_for_tests_with_shell_clients(registry.clone())
-            .with_model_surface(ModelSurface::FullOperatorRuntime),
+        ToolRuntime::new_for_tests_with_runner_registry(registry.clone())
+            .with_model_surface(model_surface),
     );
     (runtime, registry)
 }
 
 async fn poll_mcp_export_request(
-    registry: &Arc<crate::shell_client::ShellClientRegistry>,
-) -> crate::shell_protocol::ShellAgentShellRequest {
-    use crate::shell_protocol::ShellAgentPollRequest;
+    registry: &Arc<crate::runner_http::RunnerRegistry>,
+) -> crate::runner_protocol::RunnerRequest {
+    use crate::runner_protocol::RunnerPollRequest;
     loop {
         if let Some(request) = registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
+                runner_instance_id: "inst-export".to_string(),
             })
             .await
             .unwrap()
@@ -82,15 +88,15 @@ async fn poll_mcp_export_request(
 }
 
 async fn complete_mcp_export_request(
-    registry: &Arc<crate::shell_client::ShellClientRegistry>,
-    request: crate::shell_protocol::ShellAgentShellRequest,
+    registry: &Arc<crate::runner_http::RunnerRegistry>,
+    request: crate::runner_protocol::RunnerRequest,
     stdout: Value,
 ) {
-    use crate::shell_protocol::ShellAgentResultRequest;
+    use crate::runner_protocol::RunnerResultRequest;
     registry
-        .complete(ShellAgentResultRequest {
+        .complete(RunnerResultRequest {
             client_id: "exporter".to_string(),
-            agent_instance_id: "inst-export".to_string(),
+            runner_instance_id: "inst-export".to_string(),
             request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(stdout.to_string()),
@@ -103,7 +109,7 @@ async fn complete_mcp_export_request(
 }
 
 fn mcp_export_optimized_chunk_range(
-    request: &crate::shell_protocol::ShellAgentShellRequest,
+    request: &crate::runner_protocol::RunnerRequest,
     path: &str,
     file_bytes: usize,
 ) -> (usize, usize) {
@@ -119,8 +125,8 @@ fn mcp_export_optimized_chunk_range(
 }
 
 async fn complete_mcp_export_optimized_chunk(
-    registry: &Arc<crate::shell_client::ShellClientRegistry>,
-    request: crate::shell_protocol::ShellAgentShellRequest,
+    registry: &Arc<crate::runner_http::RunnerRegistry>,
+    request: crate::runner_protocol::RunnerRequest,
     path: &str,
     bytes: &[u8],
 ) -> usize {
@@ -144,19 +150,19 @@ async fn complete_mcp_export_optimized_chunk(
 }
 
 async fn complete_mcp_export_metadata_with_max(
-    registry: Arc<crate::shell_client::ShellClientRegistry>,
+    registry: Arc<crate::runner_http::RunnerRegistry>,
     path: &str,
     bytes: usize,
     sha256: &str,
     mime_type: &str,
     max_bytes: usize,
 ) {
-    use crate::shell_protocol::{ShellAgentPollRequest, ShellAgentResultRequest};
+    use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
     let request = loop {
         if let Some(request) = registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
+                runner_instance_id: "inst-export".to_string(),
             })
             .await
             .unwrap()
@@ -171,9 +177,9 @@ async fn complete_mcp_export_metadata_with_max(
     assert_eq!(payload["max_bytes"], max_bytes);
     assert_eq!(payload["allow_missing"], false);
     registry
-        .complete(ShellAgentResultRequest {
+        .complete(RunnerResultRequest {
             client_id: "exporter".to_string(),
-            agent_instance_id: "inst-export".to_string(),
+            runner_instance_id: "inst-export".to_string(),
             request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
@@ -194,7 +200,7 @@ async fn complete_mcp_export_metadata_with_max(
 }
 
 async fn complete_mcp_export_metadata(
-    registry: Arc<crate::shell_client::ShellClientRegistry>,
+    registry: Arc<crate::runner_http::RunnerRegistry>,
     path: &str,
     bytes: usize,
     sha256: &str,
@@ -222,22 +228,22 @@ enum McpExportChunkFault {
 }
 
 async fn complete_mcp_export_resource_read(
-    registry: Arc<crate::shell_client::ShellClientRegistry>,
+    registry: Arc<crate::runner_http::RunnerRegistry>,
     path: &str,
     bytes: Vec<u8>,
     mime_type: &str,
     sha256: &str,
     fault: McpExportChunkFault,
 ) {
-    use crate::shell_protocol::{ShellAgentPollRequest, ShellAgentResultRequest};
+    use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
     complete_mcp_export_metadata(registry.clone(), path, bytes.len(), sha256, mime_type).await;
     let mut expected_offset = 0usize;
     while expected_offset < bytes.len() {
         let request = loop {
             if let Some(request) = registry
-                .poll(ShellAgentPollRequest {
+                .poll(RunnerPollRequest {
                     client_id: "exporter".to_string(),
-                    agent_instance_id: "inst-export".to_string(),
+                    runner_instance_id: "inst-export".to_string(),
                 })
                 .await
                 .unwrap()
@@ -295,9 +301,9 @@ async fn complete_mcp_export_resource_read(
         })
         .to_string();
         registry
-            .complete(ShellAgentResultRequest {
+            .complete(RunnerResultRequest {
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
+                runner_instance_id: "inst-export".to_string(),
                 request_id: request.request_id,
                 exit_code: Some(0),
                 stdout: Some(stdout),
@@ -322,7 +328,7 @@ async fn complete_mcp_export_resource_read(
 
 async fn issue_mcp_artifact_export_with_metadata_max(
     runtime: Arc<ToolRuntime>,
-    registry: Arc<crate::shell_client::ShellClientRegistry>,
+    registry: Arc<crate::runner_http::RunnerRegistry>,
     auth: crate::auth::AuthContext,
     path: &str,
     bytes: &[u8],
@@ -372,7 +378,7 @@ async fn issue_mcp_artifact_export_with_metadata_max(
 
 async fn issue_mcp_artifact_export(
     runtime: Arc<ToolRuntime>,
-    registry: Arc<crate::shell_client::ShellClientRegistry>,
+    registry: Arc<crate::runner_http::RunnerRegistry>,
     auth: crate::auth::AuthContext,
     path: &str,
     bytes: &[u8],
@@ -443,6 +449,151 @@ async fn mcp_artifact_export_surface_is_stateless_full_operator_only() {
     }
 }
 
+#[tokio::test]
+async fn adaptive_artifact_export_direct_and_gateway_preserve_protocol_and_caller_gates() {
+    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
+    auth.is_bootstrap = true;
+    for via_gateway in [false, true] {
+        let arguments = json!({"project": "agent:any:any", "path": "report.pdf"});
+        let params = if via_gateway {
+            json!({
+                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {"tool": "export_project_artifact", "arguments": arguments}
+            })
+        } else {
+            json!({"name": "export_project_artifact", "arguments": arguments})
+        };
+        for (stateless, expected_error) in [
+            (false, "stateless-2026"),
+            (true, "authenticated caller identity is unavailable"),
+        ] {
+            let outcome = handle_mcp_request(
+                &runtime,
+                rpc(
+                    "tools/call",
+                    Some(json!(3101)),
+                    if stateless {
+                        mcp_2026_params(params.clone())
+                    } else {
+                        params.clone()
+                    },
+                ),
+                if stateless { None } else { Some(&auth) },
+            )
+            .await;
+            let McpOutcome::BadRequest(value) = outcome else {
+                panic!(
+                    "export must reject gateway={via_gateway}, stateless={stateless}: {outcome:?}"
+                );
+            };
+            assert_eq!(value["error"]["code"], -32602);
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_error),
+                "gateway={via_gateway}, stateless={stateless}: {value}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn adaptive_artifact_export_gateway_returns_resource_link_and_round_trips_binary() {
+    use base64::Engine as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) =
+        mcp_export_runtime_with_surface(tmp.path(), Some("alice"), ModelSurface::AdaptiveRuntime)
+            .await;
+    let auth = mcp_export_api_auth("key-adaptive-gateway-export", "alice");
+    let path = "paper/adaptive-gateway.pdf";
+    let bytes = b"%PDF-1.7\nadaptive gateway export\n%%EOF\n".to_vec();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
+    let export_call = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc(
+                    "tools/call",
+                    Some(json!(3102)),
+                    mcp_2026_params(json!({
+                        "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                        "arguments": {
+                            "tool": "export_project_artifact",
+                            "arguments": {
+                                "project": "agent:exporter:demo",
+                                "path": path
+                            }
+                        }
+                    })),
+                ),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    complete_mcp_export_metadata(
+        registry.clone(),
+        path,
+        bytes.len(),
+        &sha256,
+        "application/pdf",
+    )
+    .await;
+    let outcome = export_call.await.unwrap();
+    let McpOutcome::Ok(export) = outcome else {
+        panic!("adaptive gateway artifact export must succeed, got {outcome:?}");
+    };
+    let uri = export["result"]["content"][0]["uri"]
+        .as_str()
+        .expect("gateway export must return a ResourceLink")
+        .to_string();
+    assert!(uri.starts_with(MCP_ARTIFACT_EXPORT_URI_PREFIX));
+    let serialized_export = serde_json::to_string(&export).unwrap();
+    assert!(!serialized_export.contains("content_base64"));
+    assert!(!serialized_export.contains("\"blob\""));
+
+    let read_call = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let uri = uri.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc(
+                    "resources/read",
+                    Some(json!(3103)),
+                    mcp_2026_params(json!({"uri": uri})),
+                ),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    complete_mcp_export_resource_read(
+        registry,
+        path,
+        bytes.clone(),
+        "application/pdf",
+        &sha256,
+        McpExportChunkFault::None,
+    )
+    .await;
+    let outcome = read_call.await.unwrap();
+    let McpOutcome::Ok(resource) = outcome else {
+        panic!("adaptive gateway ResourceLink read must succeed, got {outcome:?}");
+    };
+    let decoded = general_purpose::STANDARD
+        .decode(resource["result"]["contents"][0]["blob"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, bytes);
+}
+
 #[test]
 fn mcp_artifact_export_oauth_binding_survives_access_token_refresh() {
     let oauth = |access_token_id: &str, client_id: &str| {
@@ -473,7 +624,7 @@ fn mcp_artifact_export_oauth_binding_survives_access_token_refresh() {
 
 #[tokio::test]
 async fn mcp_artifact_export_oauth_resource_read_uses_project_read_and_stable_identity() {
-    use crate::shell_protocol::ShellAgentPollRequest;
+    use crate::runner_protocol::RunnerPollRequest;
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let oauth = |access_token_id: &str, scopes: Vec<String>| {
@@ -586,9 +737,9 @@ async fn mcp_artifact_export_oauth_resource_read_uses_project_read_and_stable_id
         other => panic!("OAuth export read without project:read must fail, got {other:?}"),
     }
     assert!(registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "exporter".to_string(),
-            agent_instance_id: "inst-export".to_string(),
+            runner_instance_id: "inst-export".to_string(),
         })
         .await
         .unwrap()
@@ -597,7 +748,7 @@ async fn mcp_artifact_export_oauth_resource_read_uses_project_read_and_stable_id
 
 #[tokio::test]
 async fn export_project_artifact_non_mcp_path_fails_before_runner_read() {
-    use crate::shell_protocol::ShellAgentPollRequest;
+    use crate::runner_protocol::RunnerPollRequest;
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-export", "alice");
@@ -617,9 +768,9 @@ async fn export_project_artifact_non_mcp_path_fails_before_runner_read() {
         .as_deref()
         .is_some_and(|error| error.contains("MCP-only")));
     assert!(registry
-        .poll(ShellAgentPollRequest {
+        .poll(RunnerPollRequest {
             client_id: "exporter".to_string(),
-            agent_instance_id: "inst-export".to_string(),
+            runner_instance_id: "inst-export".to_string(),
         })
         .await
         .unwrap()
@@ -851,7 +1002,7 @@ async fn http_mcp_artifact_export_resources_read_streams_valid_json_blob() {
 
 #[tokio::test]
 async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_ordered() {
-    use crate::shell_protocol::ShellAgentPollRequest;
+    use crate::runner_protocol::RunnerPollRequest;
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-pipeline", "alice");
@@ -923,9 +1074,9 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
     );
     assert!(
         registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
+                runner_instance_id: "inst-export".to_string(),
             })
             .await
             .unwrap()
@@ -943,9 +1094,9 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
     }
     assert!(
         registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
+                runner_instance_id: "inst-export".to_string(),
             })
             .await
             .unwrap()
@@ -971,9 +1122,9 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
     );
     assert!(
         registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
+                runner_instance_id: "inst-export".to_string(),
             })
             .await
             .unwrap()
@@ -1001,7 +1152,7 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
     assert_eq!(format!("{:x}", Sha256::digest(&decoded)), sha256);
     assert_eq!(
         registry
-            .get_client_view("exporter")
+            .get_runner_view("exporter")
             .await
             .unwrap()
             .pending_requests,
@@ -1229,7 +1380,7 @@ async fn mcp_artifact_export_optimized_batch_drains_before_offset_ordered_error(
     }
     assert_eq!(
         registry
-            .get_client_view("exporter")
+            .get_runner_view("exporter")
             .await
             .unwrap()
             .pending_requests,
@@ -1301,7 +1452,7 @@ async fn mcp_artifact_export_same_size_mutations_fail_final_sha() {
 
 #[tokio::test]
 async fn mcp_artifact_export_backpressure_is_two_way_bounded_and_retryable() {
-    use crate::shell_protocol::ShellAgentPollRequest;
+    use crate::runner_protocol::RunnerPollRequest;
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-gate", "alice");
@@ -1355,9 +1506,9 @@ async fn mcp_artifact_export_backpressure_is_two_way_bounded_and_retryable() {
     assert!(matches!(busy, Err(McpArtifactExportReadError::Busy)));
     assert!(
         registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: "exporter".to_string(),
-                agent_instance_id: "inst-export".to_string(),
+                runner_instance_id: "inst-export".to_string(),
             })
             .await
             .unwrap()

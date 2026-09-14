@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PLATFORMS = ("linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
+DESKTOP_PLATFORMS = ("darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
 BINARIES = ("webcodex", "webcodex-server", "webcodex-runner")
 
 
@@ -25,6 +26,13 @@ def sha256(path: Path) -> str:
 
 def archive_filename(version: str, platform: str) -> str:
     return f"webcodex-v{version}-{platform}.tar.gz"
+
+
+def desktop_filename(version: str, platform: str) -> str:
+    if platform not in DESKTOP_PLATFORMS:
+        raise SystemExit(f"unsupported Desktop platform: {platform}")
+    suffix = "-setup.exe" if platform.startswith("win32-") else ".dmg"
+    return f"webcodex-desktop-v{version}-{platform}{suffix}"
 
 
 def expected_members(platform: str) -> set[str]:
@@ -104,6 +112,14 @@ def main() -> int:
             "url": f"https://github.com/{args.repo}/releases/download/v{version}/{filename}",
             "sha256": digest,
         }
+
+    for platform in DESKTOP_PLATFORMS:
+        desktop_name = desktop_filename(version, platform)
+        desktop_path = args.artifact_dir / desktop_name
+        if not desktop_path.is_file() or desktop_path.stat().st_size <= 0:
+            raise SystemExit(f"missing or empty Desktop distribution artifact: {desktop_path}")
+        desktop_digest = sha256(desktop_path)
+        checksum_lines.append(f"{desktop_digest}  {desktop_name}")
 
     manifest = {
         "version": version,

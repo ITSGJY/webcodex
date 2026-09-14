@@ -1,6 +1,6 @@
 //! Shared model-output normalization for `read_file`.
 //!
-//! Both the local ToolRuntime and the agent-backed path produce their final
+//! Both the local ToolRuntime and the Runner-backed path produce their final
 //! model-facing success object through [`success_output`], so the field set,
 //! cursor math, and line-numbered text representation are owned in one place.
 //! The agent path additionally validates the runner's v1 envelope (see the
@@ -10,8 +10,8 @@ use crate::file_read_range::{FileReadRange, MAX_SERIALIZED_OUTPUT_BYTES};
 use serde_json::{json, Value};
 
 /// Space reserved inside the final 256 KiB model-result budget for the outer
-/// `ToolResult` envelope and bounded recorder metadata added after the file
-/// payload is built (`session_recorded`, ids, and the counts-only session hint).
+/// `ToolResult` envelope and bounded model-facing Session metadata added after
+/// the file payload is built (for example continuity/recovery and inbox hints).
 /// `read_file` is read-only, so it never receives a permission decision block.
 pub const MODEL_RESULT_ENVELOPE_RESERVE_BYTES: usize = 4 * 1024;
 

@@ -18,6 +18,44 @@ fn oauth_mcp_service(scopes: &str) -> (tempfile::TempDir, Service, String) {
     oauth_mcp_service_with_surface(scopes, ModelSurface::LocalCoding)
 }
 
+async fn oauth_mcp_service_with_plugin_runner(
+    scopes: &str,
+) -> (tempfile::TempDir, Service, String) {
+    let config = test_config_oauth2(Some("secret"));
+    let (tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let client = seed_oauth_client(&db, &user);
+    let token = seed_oauth_access_token(&db, &client, &user, scopes);
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::LocalCoding));
+    let mut capabilities = RunnerCapabilities::default();
+    capabilities.native_tool_plugins = true;
+    runtime
+        .runner_registry
+        .register(crate::test_support::current_runner_registration(
+            RunnerRegisterRequest {
+                client_id: "oauth-plugin-runner".to_string(),
+                runner_instance_id: "oauth-plugin-runner-instance".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: Some("OAuth Plugin Runner".to_string()),
+                owner: Some("alice".to_string()),
+                hostname: None,
+                host_context: None,
+                capabilities,
+                policy: Some(Default::default()),
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let service = Service::new(build_test_router(config, db, runtime));
+    (tmp, service, token)
+}
+
 fn assert_mcp_oauth_scope_rejected(
     status: StatusCode,
     body: &Value,
@@ -144,6 +182,182 @@ async fn oauth2_mcp_local_gateway_catalog_and_call_require_explicit_scope() {
 }
 
 #[tokio::test]
+async fn oauth2_native_plugin_catalog_and_call_require_explicit_plugin_scope() {
+    let (_tmp, service, token) = oauth_mcp_service("runtime:read");
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert!(!body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == crate::plugin_gateway::PLUGIN_TOOL_NAME));
+
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+            "arguments": {"action": "list"}
+        }),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_PLUGIN_INSPECT),
+    );
+
+    let (_tmp, service, token) = oauth_mcp_service("runtime:read plugin:inspect plugin:invoke");
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert!(body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == crate::plugin_gateway::PLUGIN_TOOL_NAME));
+
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+            "arguments": {"action": "list"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], false);
+    assert_eq!(body["result"]["structuredContent"]["runners"], json!([]));
+
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+            "arguments": {
+                "action": "call",
+                "binding": "wc_pbind_00000000000000000000000000000000",
+                "arguments": {"value": "hello"}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(
+        body["result"]["structuredContent"]["error"]["code"], "describe_required",
+        "a syntactically valid call must reach binding resolution after plugin:invoke scope"
+    );
+
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+            "arguments": {"action": "check", "runner": "runner-a", "plugin": "repo-tools"}
+        }),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_PLUGIN_MANAGE),
+    );
+}
+
+#[tokio::test]
+async fn oauth2_managed_ssh_resource_surface_requires_explicit_ssh_local_scope() {
+    let (_tmp, service, token) = oauth_mcp_service("runtime:read project:write job:run");
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert!(!body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME));
+
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME,
+            "arguments": {"action": "list", "runner": "runner-a"}
+        }),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_SSH_LOCAL),
+    );
+
+    let (_tmp, service, token) = oauth_mcp_service("runtime:read ssh:local");
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert!(body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME));
+
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME,
+            "arguments": {"action": "list", "runner": "runner-a"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(
+        body["result"]["structuredContent"]["error"]["code"],
+        "ssh_resource_registry_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn oauth2_plugin_gateway_visibility_uses_any_plugin_scope_and_provider_names_stay_hidden() {
+    let tool_name = "oauth_plugin_echo";
+    let (_tmp, service, token) = oauth_mcp_service_with_plugin_runner("runtime:read").await;
+    let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let names = listed_tool_names(&body);
+    assert!(!names.contains(crate::plugin_gateway::PLUGIN_TOOL_NAME));
+    assert!(!names.contains(tool_name));
+
+    for scope in [
+        crate::auth::SCOPE_PLUGIN_INSPECT,
+        crate::auth::SCOPE_PLUGIN_INVOKE,
+        crate::auth::SCOPE_PLUGIN_MANAGE,
+    ] {
+        let scopes = format!("runtime:read {scope}");
+        let (_tmp, service, token) = oauth_mcp_service_with_plugin_runner(&scopes).await;
+        let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "scope={scope}, body={body:?}");
+        let names = listed_tool_names(&body);
+        assert!(
+            names.contains(crate::plugin_gateway::PLUGIN_TOOL_NAME),
+            "scope={scope} must make the stable Plugin gateway visible"
+        );
+        assert!(
+            !names.contains(tool_name),
+            "provider-local names must never become outer MCP tools"
+        );
+    }
+}
+
+#[tokio::test]
 async fn oauth2_adaptive_gateway_preserves_canonical_target_scope_errors() {
     let (_tmp, service, token) =
         oauth_mcp_service_with_surface("runtime:read", ModelSurface::AdaptiveRuntime);
@@ -179,8 +393,8 @@ async fn oauth2_adaptive_gateway_preserves_canonical_target_scope_errors() {
         json!({
             "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
             "arguments": {
-                "tool": "read_file",
-                "arguments": {"project": "demo", "path": "README.md"}
+                "tool": "read_files",
+                "arguments": {"project": "demo", "items": [{"path": "README.md"}]}
             }
         }),
     )
@@ -210,6 +424,23 @@ async fn oauth2_adaptive_gateway_preserves_canonical_target_scope_errors() {
         &body,
         challenge.as_deref(),
         Some(crate::auth::SCOPE_MCP_LOCAL),
+    );
+
+    let (status, body, challenge) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+            "arguments": {"action": "list"}
+        }),
+    )
+    .await;
+    assert_mcp_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_PLUGIN_INSPECT),
     );
 
     let (status, body, _) = oauth_mcp_request(&service, &token, "tools/list", json!({})).await;
@@ -386,13 +617,13 @@ async fn oauth2_mcp_unknown_method_keeps_legacy_fail_closed_but_modern_returns_4
 }
 
 #[tokio::test]
-async fn oauth2_mcp_tool_call_requires_project_read_for_read_file() {
+async fn oauth2_mcp_tool_call_requires_project_read_for_read_files() {
     let (_tmp, service, token) = oauth_mcp_service("project:read");
     let (status, body, _) = oauth_mcp_request(
         &service,
         &token,
         "tools/call",
-        json!({"name": "read_file", "arguments": {"project": "demo", "path": "README.md"}}),
+        json!({"name": "read_files", "arguments": {"project": "demo", "items": [{"path": "README.md"}]}}),
     )
     .await;
     assert_ne!(status, StatusCode::FORBIDDEN, "body: {:?}", body);
@@ -402,7 +633,7 @@ async fn oauth2_mcp_tool_call_requires_project_read_for_read_file() {
         &service,
         &token,
         "tools/call",
-        json!({"name": "read_file", "arguments": {"project": "demo", "path": "README.md"}}),
+        json!({"name": "read_files", "arguments": {"project": "demo", "items": [{"path": "README.md"}]}}),
     )
     .await;
     assert_mcp_oauth_scope_rejected(

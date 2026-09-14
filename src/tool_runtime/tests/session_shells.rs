@@ -1,8 +1,8 @@
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{
-    PersistentShellResult, ShellAgentPersistentShellResultRequest, ShellAgentProjectSummary,
-    ShellClientCapabilities,
+use crate::runner_protocol::{
+    PersistentShellResult, RunnerCapabilities, RunnerPersistentShellResultRequest,
+    RunnerProjectSummary,
 };
 
 const CLIENT: &str = "persistent-agent";
@@ -19,21 +19,24 @@ async fn setup(
         &runtime,
         CLIENT,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             persistent_shell,
             ..Default::default()
         },
-        vec![ShellAgentProjectSummary {
+        vec![RunnerProjectSummary {
             id: PROJECT_ID.to_string(),
             name: Some(PROJECT_ID.to_string()),
             path: root.to_string_lossy().to_string(),
             allow_patch: true,
             kind: None,
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -42,7 +45,7 @@ async fn setup(
         }],
     )
     .await;
-    let project = crate::tool_runtime::agent_project_runtime_id(CLIENT, PROJECT_ID);
+    let project = crate::tool_runtime::runner_project_runtime_id(CLIENT, PROJECT_ID);
     let mut options = sessions::SessionCreateOptions::new(
         Some(project.clone()),
         Some("persistent shell".to_string()),
@@ -59,9 +62,7 @@ async fn setup(
     (runtime, project, session)
 }
 
-async fn next_persistent_request(
-    runtime: &ToolRuntime,
-) -> crate::shell_protocol::ShellAgentShellRequest {
+async fn next_persistent_request(runtime: &ToolRuntime) -> crate::runner_protocol::RunnerRequest {
     let request = wait_for_patch_agent_request(runtime, CLIENT).await;
     assert_eq!(request.kind, "persistent_shell");
     request
@@ -69,7 +70,7 @@ async fn next_persistent_request(
 
 async fn complete(
     runtime: &ToolRuntime,
-    request: &crate::shell_protocol::ShellAgentShellRequest,
+    request: &crate::runner_protocol::RunnerRequest,
     shell_state: &str,
     execution_state: &str,
     stdout: &str,
@@ -99,7 +100,7 @@ async fn complete(
 
 async fn complete_with_cwds(
     runtime: &ToolRuntime,
-    request: &crate::shell_protocol::ShellAgentShellRequest,
+    request: &crate::runner_protocol::RunnerRequest,
     shell_state: &str,
     execution_state: &str,
     stdout: &str,
@@ -110,10 +111,10 @@ async fn complete_with_cwds(
 ) {
     let operation = request.persistent_shell.as_ref().unwrap();
     runtime
-        .shell_clients
-        .complete_persistent_shell(ShellAgentPersistentShellResultRequest {
+        .runner_registry
+        .complete_persistent_shell(RunnerPersistentShellResultRequest {
             client_id: CLIENT.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: request.request_id.clone(),
             result: PersistentShellResult {
                 shell_id: operation.shell_id.clone(),
@@ -151,6 +152,236 @@ fn dispatch(runtime: ToolRuntime, call: ToolCall) -> tokio::task::JoinHandle<Too
         let auth = auth_context(None, true);
         runtime.dispatch_with_auth(call, Some(&auth)).await
     })
+}
+
+fn dispatch_recorded(
+    runtime: ToolRuntime,
+    tool_name: &'static str,
+    arguments: serde_json::Value,
+) -> tokio::task::JoinHandle<ToolResult> {
+    tokio::spawn(async move {
+        let auth = auth_context(None, true);
+        let (call, metadata) =
+            ToolCall::from_tool_name_with_recorder_metadata(tool_name, arguments).unwrap();
+        runtime
+            .dispatch_with_auth_transport_options_and_metadata(
+                call,
+                Some(&auth),
+                crate::tool_runtime::sessions::SessionTransport::Mcp,
+                metadata,
+            )
+            .await
+    })
+}
+
+async fn open_active_shell(runtime: &ToolRuntime, project: &str, session_id: &str) -> String {
+    let open_task = dispatch(
+        runtime.clone(),
+        ToolCall::OpenSessionShell {
+            project: project.to_string(),
+            session_id: session_id.to_string(),
+            cwd: None,
+            shell: None,
+        },
+    );
+    let open_request = next_persistent_request(runtime).await;
+    complete(runtime, &open_request, "running", "opened", "", None, None).await;
+    let opened = open_task.await.unwrap();
+    assert!(opened.success, "{opened:?}");
+    opened.output["shell_id"].as_str().unwrap().to_string()
+}
+
+async fn persistent_shell_handoff(runtime: &ToolRuntime, session_id: &str) -> ToolResult {
+    runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "session_handoff_summary",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "include_workspace": false,
+                    "include_checkpoints": false,
+                }),
+            )
+            .unwrap(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn persistent_shell_result_expectation_observe_preserves_nonzero_tool_result() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) = setup(temp.path(), true, SessionMode::Normal, None).await;
+    let shell_id = open_active_shell(&runtime, &project, &session.session_id).await;
+
+    let exec_task = dispatch_recorded(
+        runtime.clone(),
+        "session_shell_exec",
+        serde_json::json!({
+            "project": project,
+            "session_id": session.session_id,
+            "shell_id": shell_id,
+            "command": "test -e missing",
+            "purpose": "diagnostic",
+            "result_expectation": "observe",
+        }),
+    );
+    let exec_request = next_persistent_request(&runtime).await;
+    complete(
+        &runtime,
+        &exec_request,
+        "running",
+        "completed",
+        "",
+        Some(1),
+        None,
+    )
+    .await;
+    let result = exec_task.await.unwrap();
+    assert!(!result.success, "observe must not forge the ToolResult");
+    assert_eq!(result.output["exit_code"], 1);
+    assert_eq!(result.output["command_completed"], true);
+    assert_eq!(result.output["tool_failure"], false);
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(50))
+        .unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "session_shell_exec")
+        .unwrap();
+    assert_eq!(finished.result_expectation.as_deref(), Some("observe"));
+    assert_eq!(
+        finished.failure_expectation_result.as_deref(),
+        Some("matched_expected_result")
+    );
+    let handoff = persistent_shell_handoff(&runtime, &session.session_id).await;
+    assert!(handoff.success, "{handoff:?}");
+    assert_eq!(handoff.output["tool_failures"]["expected_count"], 1);
+    assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 0);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn persistent_shell_result_expectation_success_default_keeps_nonzero_actionable() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) = setup(temp.path(), true, SessionMode::Normal, None).await;
+    let shell_id = open_active_shell(&runtime, &project, &session.session_id).await;
+
+    let exec_task = dispatch_recorded(
+        runtime.clone(),
+        "session_shell_exec",
+        serde_json::json!({
+            "project": project,
+            "session_id": session.session_id,
+            "shell_id": shell_id,
+            "command": "test -e missing",
+            "purpose": "diagnostic",
+        }),
+    );
+    let exec_request = next_persistent_request(&runtime).await;
+    complete(
+        &runtime,
+        &exec_request,
+        "running",
+        "completed",
+        "",
+        Some(1),
+        None,
+    )
+    .await;
+    let result = exec_task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["exit_code"], 1);
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(50))
+        .unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "session_shell_exec")
+        .unwrap();
+    assert_eq!(finished.result_expectation, None);
+    assert_eq!(
+        finished.failure_expectation_result.as_deref(),
+        Some("unexpected_failure")
+    );
+    let handoff = persistent_shell_handoff(&runtime, &session.session_id).await;
+    assert!(handoff.success, "{handoff:?}");
+    assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 1);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn persistent_shell_result_expectation_observe_keeps_shell_reset_actionable() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) = setup(temp.path(), true, SessionMode::Normal, None).await;
+    let shell_id = open_active_shell(&runtime, &project, &session.session_id).await;
+
+    let exec_task = dispatch_recorded(
+        runtime.clone(),
+        "session_shell_exec",
+        serde_json::json!({
+            "project": project,
+            "session_id": session.session_id,
+            "shell_id": shell_id,
+            "command": "sleep 10",
+            "timeout_secs": 1,
+            "purpose": "diagnostic",
+            "result_expectation": "observe",
+        }),
+    );
+    let exec_request = next_persistent_request(&runtime).await;
+    complete(
+        &runtime,
+        &exec_request,
+        "lost",
+        "lost",
+        "",
+        None,
+        Some("shell_reset_required"),
+    )
+    .await;
+    let result = exec_task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["error_code"], "shell_reset_required");
+    assert_eq!(result.output["tool_failure"], true);
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(50))
+        .unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "session_shell_exec")
+        .unwrap();
+    assert_eq!(finished.result_expectation.as_deref(), Some("observe"));
+    assert_eq!(
+        finished.failure_expectation_result.as_deref(),
+        Some("unexpected_failure")
+    );
+    let handoff = persistent_shell_handoff(&runtime, &session.session_id).await;
+    assert!(handoff.success, "{handoff:?}");
+    assert_eq!(handoff.output["tool_failures"]["expected_count"], 0);
+    assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 1);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        1
+    );
 }
 
 #[tokio::test]
@@ -566,7 +797,7 @@ async fn runner_disconnect_converges_server_status_to_lost() {
     let shell_id = opened.output["shell_id"].as_str().unwrap().to_string();
 
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect(CLIENT, "inst")
         .await;
     let auth = auth_context(None, true);
@@ -771,7 +1002,7 @@ async fn setup_ssh_with_capabilities(
         &runtime,
         CLIENT,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             async_jobs: true,
             persistent_shell: true,
@@ -779,16 +1010,19 @@ async fn setup_ssh_with_capabilities(
             ssh_persistent_shell,
             ..Default::default()
         },
-        vec![ShellAgentProjectSummary {
+        vec![RunnerProjectSummary {
             id: PROJECT_ID.to_string(),
             name: Some(PROJECT_ID.to_string()),
             path: root.to_string_lossy().to_string(),
             allow_patch: true,
             kind: None,
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -797,7 +1031,7 @@ async fn setup_ssh_with_capabilities(
         }],
     )
     .await;
-    let project = crate::tool_runtime::agent_project_runtime_id(CLIENT, PROJECT_ID);
+    let project = crate::tool_runtime::runner_project_runtime_id(CLIENT, PROJECT_ID);
     let context = sessions::SessionExecutionContext {
         default_cwd: None,
         default_shell: None,

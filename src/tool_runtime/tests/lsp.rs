@@ -1,16 +1,17 @@
 use super::support::*;
 use crate::lsp_bridge::{
-    error_codes, parse_agent_lsp_result_envelope, AgentLspPayload, AgentLspRequest,
-    AgentLspResultEnvelope, CallHierarchyDirection, CallHierarchyEdgeDirection,
-    CallHierarchyResult, DocumentDiagnosticsResult, DocumentDiagnosticsStatus,
-    DocumentSymbolsResult, HoverResult, LocationsResult, LspAvailabilityStatus, LspStatusResult,
-    PublicCallHierarchyEdge, PublicCallHierarchySymbol, PublicDiagnostic, PublicHover,
-    PublicLocation, PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol,
+    error_codes, parse_runner_lsp_result_envelope, CallHierarchyDirection,
+    CallHierarchyEdgeDirection, CallHierarchyResult, DocumentDiagnosticsResult,
+    DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult, LocationsResult,
+    LspAvailabilityStatus, LspStatusResult, PublicCallHierarchyEdge, PublicCallHierarchySymbol,
+    PublicDiagnostic, PublicHover, PublicLocation, PublicPosition, PublicRange, PublicSymbol,
+    PublicWorkspaceSymbol, RunnerLspPayload, RunnerLspRequest, RunnerLspResultEnvelope,
     WorkspaceSymbolsResult, AGENT_LSP_REQUEST_KIND,
 };
-use crate::shell_protocol::{ShellClientCapabilities, ShellClientRegisterRequest};
+use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
 use crate::tool_runtime::tool_definition::{
-    lookup_tool_definition, model_visible_tool_definitions, AgentCapability, TOOL_CATEGORY_LSP,
+    lookup_tool_definition, model_visible_tool_definitions, RunnerCapabilityRequirement,
+    TOOL_CATEGORY_LSP,
 };
 use crate::tool_runtime::{ToolCall, ToolResult};
 use serde_json::{json, Value};
@@ -36,8 +37,8 @@ fn lsp_tools_are_registered_read_only_and_not_shell_like() {
         assert!(!def.metadata.destructive, "{name}");
         assert!(!def.metadata.shell_like, "{name}");
         assert_eq!(
-            def.agent_capability,
-            Some(AgentCapability::LspReadOnlyNavigation),
+            def.runner_capability,
+            Some(RunnerCapabilityRequirement::LspReadOnlyNavigation),
             "{name}"
         );
         assert_eq!(
@@ -55,8 +56,8 @@ fn lsp_tools_are_registered_read_only_and_not_shell_like() {
         crate::tool_runtime::metadata::ToolEffect::Observe
     );
     assert_eq!(
-        hierarchy.agent_capability,
-        Some(AgentCapability::LspCallHierarchy)
+        hierarchy.runner_capability,
+        Some(RunnerCapabilityRequirement::LspCallHierarchy)
     );
     assert_eq!(
         hierarchy.metadata.authority,
@@ -121,13 +122,13 @@ fn lsp_input_schemas_have_required_bounds() {
 
     let symbols = &by_name["document_symbols"].input_schema;
     assert_eq!(symbols["required"], json!(["project", "path"]));
-    assert_eq!(symbols["properties"]["limit"]["maximum"], 500);
+    assert!(symbols["properties"]["limit"].get("maximum").is_none());
     assert_eq!(symbols["additionalProperties"], false);
 
     let diagnostics = &by_name["document_diagnostics"].input_schema;
     assert_eq!(diagnostics["required"], json!(["project", "path"]));
     assert_eq!(diagnostics["properties"]["limit"]["minimum"], 1);
-    assert_eq!(diagnostics["properties"]["limit"]["maximum"], 200);
+    assert!(diagnostics["properties"]["limit"].get("maximum").is_none());
     assert_eq!(diagnostics["properties"]["limit"]["default"], 100);
     assert_eq!(diagnostics["additionalProperties"], false);
     let hierarchy = &by_name["call_hierarchy"].input_schema;
@@ -140,7 +141,8 @@ fn lsp_input_schemas_have_required_bounds() {
         json!(["incoming", "outgoing", "both"])
     );
     assert_eq!(hierarchy["properties"]["depth"]["maximum"], 2);
-    assert_eq!(hierarchy["properties"]["limit"]["maximum"], 100);
+    assert_eq!(hierarchy["properties"]["limit"]["minimum"], 1);
+    assert!(hierarchy["properties"]["limit"].get("maximum").is_none());
     assert_eq!(hierarchy["additionalProperties"], false);
     let diagnostics_output = &by_name["document_diagnostics"].output_schema;
     let output_properties = &diagnostics_output["properties"]["output"]["properties"];
@@ -192,7 +194,7 @@ fn lsp_input_schemas_have_required_bounds() {
     assert_eq!(workspace["properties"]["query"]["minLength"], 1);
     assert_eq!(workspace["properties"]["query"]["maxLength"], 200);
     assert_eq!(workspace["properties"]["limit"]["default"], 50);
-    assert_eq!(workspace["properties"]["limit"]["maximum"], 200);
+    assert!(workspace["properties"]["limit"].get("maximum").is_none());
     assert_eq!(workspace["additionalProperties"], false);
     let workspace_item = &by_name["workspace_symbols"].output_schema["properties"]["output"]
         ["properties"]["symbols"]["items"];
@@ -207,7 +209,7 @@ fn lsp_input_schemas_have_required_bounds() {
     );
     assert_eq!(goto["properties"]["line"]["minimum"], 1);
     assert_eq!(goto["properties"]["column"]["minimum"], 1);
-    assert_eq!(goto["properties"]["limit"]["maximum"], 100);
+    assert!(goto["properties"]["limit"].get("maximum").is_none());
 
     let refs = &by_name["find_references"].input_schema;
     assert_eq!(
@@ -215,7 +217,7 @@ fn lsp_input_schemas_have_required_bounds() {
         json!(["project", "path", "line", "column"])
     );
     assert_eq!(refs["properties"]["include_declaration"]["default"], true);
-    assert_eq!(refs["properties"]["limit"]["maximum"], 200);
+    assert!(refs["properties"]["limit"].get("maximum").is_none());
     assert_eq!(refs["additionalProperties"], false);
 
     // Flattened Action fields must list path/line/column/include_declaration/limit.
@@ -343,9 +345,9 @@ async fn register_lsp_agent_capabilities(
 ) -> String {
     let project_path = root.to_string_lossy().to_string();
     runtime
-        .shell_clients
+        .runner_registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -353,13 +355,13 @@ async fn register_lsp_agent_capabilities(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities {
+                capabilities: RunnerCapabilities {
                     shell: true,
                     file_read: true,
                     file_write: true,
@@ -373,13 +375,13 @@ async fn register_lsp_agent_capabilities(
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
         "inst",
         vec![registered_project(project_id, &project_path)],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, project_id)
+    crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
 }
 
 async fn complete_lsp_agent_request(
@@ -391,7 +393,7 @@ async fn complete_lsp_agent_request(
     assert_eq!(req.kind, AGENT_LSP_REQUEST_KIND);
     assert!(req.lsp.is_some());
     assert!(req.command.is_empty());
-    let envelope = AgentLspResultEnvelope::ok(result);
+    let envelope = RunnerLspResultEnvelope::ok(result);
     complete_patch_agent_request(
         runtime,
         client_id,
@@ -528,6 +530,21 @@ fn call_hierarchy_result_with_edge(path: &str) -> CallHierarchyResult {
     result
 }
 
+fn call_hierarchy_result_with_edge_count(path: &str, count: usize) -> CallHierarchyResult {
+    let mut result = call_hierarchy_result_with_edge(path);
+    let template = result.edges[0].clone();
+    result.edges = (0..count)
+        .map(|index| {
+            let mut edge = template.clone();
+            edge.from.name = format!("caller{index}");
+            edge.from.path = format!("src/caller{index}.rs");
+            edge
+        })
+        .collect();
+    result.returned_count = count;
+    result
+}
+
 async fn dispatch_call_hierarchy_result(
     client_id: &str,
     result: CallHierarchyResult,
@@ -557,6 +574,54 @@ async fn dispatch_call_hierarchy_result(
     });
     complete_lsp_agent_request(&runtime, client_id, result).await;
     task.await.unwrap()
+}
+
+async fn dispatch_call_hierarchy_with_limit(
+    client_id: &str,
+    requested_limit: Option<usize>,
+    result: CallHierarchyResult,
+) -> (RunnerLspRequest, ToolResult) {
+    let runtime = test_runtime();
+    let tmp = tempfile::tempdir().unwrap();
+    let project = register_lsp_agent(&runtime, client_id, "demo", tmp.path(), true).await;
+    let mut arguments = json!({
+        "project": project,
+        "path": "src/main.rs",
+        "line": 1,
+        "column": 4,
+        "direction": "both",
+        "depth": 1
+    });
+    if let Some(limit) = requested_limit {
+        arguments["limit"] = json!(limit);
+    }
+    let call = ToolCall::from_tool_name("call_hierarchy", arguments).unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(call, Some(&auth_context(None, true)))
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    let sent = request
+        .lsp
+        .as_ref()
+        .expect("call_hierarchy Runner request")
+        .request
+        .clone();
+    let envelope = RunnerLspResultEnvelope::ok(result);
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &request.request_id,
+        0,
+        &envelope.to_stdout_json(),
+        "",
+    )
+    .await;
+    (sent, task.await.unwrap())
 }
 
 fn assert_malformed_call_hierarchy(case: &str, result: &ToolResult) {
@@ -670,7 +735,7 @@ async fn call_hierarchy_dispatch_uses_typed_bridge_and_validates_bounds() {
     let request = wait_for_patch_agent_request(&runtime, "hierarchy-agent").await;
     assert_eq!(
         request.lsp.as_ref().map(|payload| &payload.request),
-        Some(&AgentLspRequest::CallHierarchy {
+        Some(&RunnerLspRequest::CallHierarchy {
             path: "src/main.rs".into(),
             line: 1,
             column: 4,
@@ -679,7 +744,7 @@ async fn call_hierarchy_dispatch_uses_typed_bridge_and_validates_bounds() {
             limit: 50,
         })
     );
-    let envelope = AgentLspResultEnvelope::ok(call_hierarchy_result("src/main.rs"));
+    let envelope = RunnerLspResultEnvelope::ok(call_hierarchy_result("src/main.rs"));
     complete_patch_agent_request(
         &runtime,
         "hierarchy-agent",
@@ -693,7 +758,7 @@ async fn call_hierarchy_dispatch_uses_typed_bridge_and_validates_bounds() {
     assert!(result.success, "{result:?}");
     assert_eq!(result.output["project"], project);
 
-    for (depth, limit) in [(0, 50), (1, 101)] {
+    for (depth, limit) in [(0, 50), (3, 50), (1, 0)] {
         let invalid = runtime
             .dispatch_with_auth(
                 ToolCall::CallHierarchy {
@@ -711,6 +776,60 @@ async fn call_hierarchy_dispatch_uses_typed_bridge_and_validates_bounds() {
             .await;
         assert!(!invalid.success, "{depth}/{limit}: {invalid:?}");
     }
+}
+
+#[tokio::test]
+async fn call_hierarchy_result_limit_is_normalized_before_runner_and_result_validation() {
+    for (index, (requested_limit, effective_limit)) in [
+        (None, 50),
+        (Some(25), 25),
+        (Some(500), 100),
+        (Some(1_000_000_000), 100),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let client_id = format!("hierarchy-budget-{index}");
+        let (request, result) = dispatch_call_hierarchy_with_limit(
+            &client_id,
+            requested_limit,
+            call_hierarchy_result("src/main.rs"),
+        )
+        .await;
+        assert!(result.success, "requested={requested_limit:?}: {result:?}");
+        assert!(matches!(
+            request,
+            RunnerLspRequest::CallHierarchy {
+                depth: 1,
+                limit,
+                ..
+            } if limit == effective_limit
+        ));
+    }
+
+    let (request, accepted) = dispatch_call_hierarchy_with_limit(
+        "hierarchy-budget-result-ok",
+        Some(500),
+        call_hierarchy_result_with_edge_count("src/main.rs", 100),
+    )
+    .await;
+    assert!(matches!(
+        request,
+        RunnerLspRequest::CallHierarchy { limit: 100, .. }
+    ));
+    assert!(accepted.success, "{accepted:?}");
+
+    let (request, rejected) = dispatch_call_hierarchy_with_limit(
+        "hierarchy-budget-result-overflow",
+        Some(500),
+        call_hierarchy_result_with_edge_count("src/main.rs", 101),
+    )
+    .await;
+    assert!(matches!(
+        request,
+        RunnerLspRequest::CallHierarchy { limit: 100, .. }
+    ));
+    assert_malformed_call_hierarchy("effective-limit-overflow", &rejected);
 }
 
 #[tokio::test]
@@ -905,7 +1024,7 @@ async fn disconnected_agent_blocks_document_diagnostics_dispatch() {
     let tmp = tempfile::tempdir().unwrap();
     let project = register_lsp_agent(&runtime, "offline-lsp", "demo", tmp.path(), true).await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("offline-lsp", "inst")
         .await;
     let result = runtime
@@ -1421,21 +1540,21 @@ async fn read_only_session_allows_lsp_tools() {
 
 #[test]
 fn malformed_agent_envelope_is_rejected() {
-    assert!(parse_agent_lsp_result_envelope("hello").is_err());
+    assert!(parse_runner_lsp_result_envelope("hello").is_err());
     assert!(
-        parse_agent_lsp_result_envelope(r#"{"format":"nope","success":true,"result":{}}"#).is_err()
+        parse_runner_lsp_result_envelope(r#"{"format":"nope","success":true,"result":{}}"#)
+            .is_err()
     );
-    let ok = AgentLspResultEnvelope::ok(json!({"ok": true}));
-    let parsed = parse_agent_lsp_result_envelope(&ok.to_stdout_json()).unwrap();
+    let ok = RunnerLspResultEnvelope::ok(json!({"ok": true}));
+    let parsed = parse_runner_lsp_result_envelope(&ok.to_stdout_json()).unwrap();
     assert!(parsed.success);
 }
 
 #[test]
 fn typed_payload_rejects_arbitrary_operation() {
     let bad = r#"{"project_id":"p","request":{"operation":"arbitrary_passthrough","method":"workspace/symbol"}}"#;
-    assert!(serde_json::from_str::<AgentLspPayload>(bad).is_err());
+    assert!(serde_json::from_str::<RunnerLspPayload>(bad).is_err());
     let old_request = r#"{"request_id":"r","client_id":"c","command":"echo","timeout_secs":1,"requested_by":"t","created_at":1}"#;
-    let req: crate::shell_protocol::ShellAgentShellRequest =
-        serde_json::from_str(old_request).unwrap();
+    let req: crate::runner_protocol::RunnerRequest = serde_json::from_str(old_request).unwrap();
     assert!(req.lsp.is_none());
 }

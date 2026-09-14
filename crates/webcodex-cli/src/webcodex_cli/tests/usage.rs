@@ -79,11 +79,28 @@ fn cli_version_output_includes_build_metadata() {
 #[test]
 fn project_doctor_and_hosted_connect_dispatch() {
     assert!(matches!(
-        cli_action(["project", "register", "--config", "/tmp/agent.toml", "/tmp/repo"]),
+        cli_action(["project", "register", "--config", "/tmp/runner.toml", "/tmp/repo"]),
         CliAction::ProjectRegister(opts)
-            if opts.config == std::path::PathBuf::from("/tmp/agent.toml")
+            if opts.config == std::path::PathBuf::from("/tmp/runner.toml")
                 && opts.project == std::path::PathBuf::from("/tmp/repo")
                 && !opts.json
+    ));
+    assert!(matches!(
+        cli_action([
+            "project",
+            "activate",
+            "--config",
+            "/tmp/runner.toml",
+            "--user-token-file",
+            "/tmp/user-token",
+            "/tmp/repo-b",
+            "--json",
+        ]),
+        CliAction::ProjectActivate(opts)
+            if opts.config == std::path::PathBuf::from("/tmp/runner.toml")
+                && opts.user_token_file == std::path::PathBuf::from("/tmp/user-token")
+                && opts.project == std::path::PathBuf::from("/tmp/repo-b")
+                && opts.json
     ));
     assert!(matches!(
         cli_action(["doctor"]),
@@ -115,9 +132,10 @@ fn webcodex_cli_help_presents_primary_mental_model() {
     for command in [
         "pairing create",
         "project register",
+        "project activate",
         "auth status",
         "tokens",
-        "agent-tokens",
+        "runner-tokens",
     ] {
         assert!(stdout.contains(command), "help missing {command}: {stdout}");
     }
@@ -130,14 +148,21 @@ fn webcodex_cli_help_presents_primary_mental_model() {
 }
 
 #[test]
-fn project_register_and_login_project_help_prioritize_user_language() {
+fn project_registration_activation_and_login_help_prioritize_user_language() {
     let project_help = cli_exit(["project", "register", "--help"]).unwrap();
     assert!(project_help.contains("Add one existing project to a Runner configuration"));
-    assert!(project_help.contains("Advanced: projects_dir"));
+    assert!(project_help.contains("Advanced: project_registry_dir"));
+    assert!(project_help.contains("not a workspace root"));
     assert!(project_help.contains("allowed_roots"));
+    let activate_help = cli_exit(["project", "activate", "--help"]).unwrap();
+    assert!(activate_help.contains("Activate one explicitly selected local project"));
+    assert!(activate_help.contains("canonical exact project root"));
+    assert!(activate_help.contains("generation CAS"));
+    assert!(activate_help.contains("--user-token-file PATH"));
     let login_help = cli_exit(["login", "--help"]).unwrap();
     assert!(login_help.contains("one-time login code"));
     assert!(login_help.contains("--project PATH"));
+    assert!(login_help.contains("--code-stdin"));
     assert!(login_help.contains("projects may be added later"));
 
     assert!(matches!(
@@ -155,6 +180,20 @@ fn project_register_and_login_project_help_prioritize_user_language() {
             if opts.allowed_roots == vec![std::path::PathBuf::from("/tmp")]
                 && opts.project == Some(std::path::PathBuf::from("/tmp/repo"))
     ));
+
+    match cli_action([
+        "login",
+        "https://example.test",
+        "--code",
+        "wc_pair_example",
+        "--code-stdin",
+    ]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(stderr.contains("use only one of --code or --code-stdin"));
+        }
+        other => panic!("expected pairing-code source conflict, got {other:?}"),
+    }
 }
 
 #[test]
@@ -238,7 +277,7 @@ fn top_level_help_prioritizes_primary_paths_without_hiding_operator_surface() {
         .any(|line| line.trim_start().starts_with("tokens ")));
     assert!(out
         .lines()
-        .any(|line| line.trim_start().starts_with("agent-tokens ")));
+        .any(|line| line.trim_start().starts_with("runner-tokens ")));
     assert!(!out
         .lines()
         .any(|line| line.trim_start().starts_with("token ")));
@@ -302,7 +341,7 @@ fn webcodex_cli_runner_help_mentions_lifecycle_subcommands() {
             assert!(stdout.contains("Usage: webcodex runner init"));
             assert!(stdout.contains("Stable Runner client id"));
             assert!(stdout.contains("Human-readable Runner name"));
-            assert!(stdout.contains("agent.toml"));
+            assert!(stdout.contains("runner.toml"));
         }
         other => panic!("expected Runner init help exit, got {other:?}"),
     }
@@ -331,11 +370,12 @@ fn webcodex_cli_runner_help_mentions_lifecycle_subcommands() {
         CliAction::Exit { code, stdout, .. } => {
             assert_eq!(code, 0);
             assert!(stdout.contains("--user-token-file PATH"));
-            assert!(stdout.contains("--agent-token-file PATH"));
+            assert!(stdout.contains("--runner-token-file PATH"));
+            assert!(!stdout.contains("--agent-token-file PATH"));
             assert!(stdout.contains("--scope user|system"));
             assert!(stdout.contains("--service-file PATH"));
             assert!(stdout.contains("Runner config path"));
-            assert!(stdout.contains("agent.toml"));
+            assert!(stdout.contains("runner.toml"));
             assert!(stdout.contains("no tokens"));
         }
         other => panic!("expected help exit, got {other:?}"),
@@ -456,7 +496,7 @@ fn canonical_plural_local_credential_namespaces_dispatch() {
     ));
     assert!(matches!(
         cli_action([
-            "agent-tokens",
+            "runner-tokens",
             "create-local",
             "--server-url",
             "https://example.test",
@@ -467,7 +507,7 @@ fn canonical_plural_local_credential_namespaces_dispatch() {
             "--client-id",
             "runner-1",
         ]),
-        CliAction::AgentTokenCreateLocal(_)
+        CliAction::RunnerTokenCreateLocal(_)
     ));
 }
 
@@ -486,7 +526,7 @@ fn canonical_plural_admin_actions_dispatch_and_singular_groups_fail_closed() {
     ));
     assert!(matches!(
         cli_action([
-            "agent-tokens",
+            "runner-tokens",
             "list",
             "--server-url",
             "https://example.test",
@@ -498,7 +538,7 @@ fn canonical_plural_admin_actions_dispatch_and_singular_groups_fail_closed() {
 
     for (group, replacement) in [
         ("token", "webcodex tokens"),
-        ("agent-token", "webcodex agent-tokens"),
+        ("agent-token", "webcodex runner-tokens"),
     ] {
         match cli_action([group, "list"]) {
             CliAction::Exit {
@@ -514,6 +554,36 @@ fn canonical_plural_admin_actions_dispatch_and_singular_groups_fail_closed() {
             other => panic!("singular credential group still dispatched: {other:?}"),
         }
     }
+}
+
+#[test]
+fn legacy_agent_tokens_alias_uses_canonical_runner_token_implementation() {
+    assert!(matches!(
+        cli_action([
+            "agent-tokens",
+            "create-local",
+            "--server-url",
+            "https://example.test",
+            "--username",
+            "alice",
+            "--credential",
+            "wc_acct_example",
+            "--client-id",
+            "runner-1",
+        ]),
+        CliAction::RunnerTokenCreateLocal(_)
+    ));
+    assert!(matches!(
+        cli_action([
+            "agent-tokens",
+            "list",
+            "--server-url",
+            "https://example.test",
+            "--username",
+            "alice",
+        ]),
+        CliAction::Admin(_)
+    ));
 }
 
 #[test]
@@ -539,13 +609,16 @@ fn usage_lists_only_canonical_credential_group_spellings() {
         .any(|line| line.trim_start().starts_with("tokens ")));
     assert!(stdout
         .lines()
-        .any(|line| line.trim_start().starts_with("agent-tokens ")));
+        .any(|line| line.trim_start().starts_with("runner-tokens ")));
     assert!(!stdout
         .lines()
         .any(|line| line.trim_start().starts_with("token ")));
     assert!(!stdout
         .lines()
         .any(|line| line.trim_start().starts_with("agent-token ")));
+    assert!(!stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("agent-tokens ")));
 }
 
 #[test]
@@ -557,12 +630,12 @@ fn removed_local_credential_flag_aliases_are_rejected() {
         ),
         (vec!["tokens", "create-local", "--user", "alice"], "--user"),
         (
-            vec!["agent-tokens", "create-local", "--admin-token", "secret"],
+            vec!["runner-tokens", "create-local", "--admin-token", "secret"],
             "--admin-token",
         ),
         (
             vec![
-                "agent-tokens",
+                "runner-tokens",
                 "create-local",
                 "--admin-token-env",
                 "TOKEN_ENV",

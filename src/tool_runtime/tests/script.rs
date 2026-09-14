@@ -2,9 +2,9 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{
-    ShellAgentJobUpdateRequest, ShellAgentResultPayload, ShellAgentResultRequest,
-    ShellClientCapabilities, ShellCommandExecutionState, ShellScriptLanguage, SCRIPT_MAX_BYTES,
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerResultPayload, RunnerResultRequest,
+    ShellCommandExecutionState, ShellScriptLanguage, SCRIPT_MAX_BYTES,
 };
 use crate::tool_runtime::activity::{ActivityRecord, ActivityRecorder};
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
@@ -57,11 +57,13 @@ async fn register_script_agent(
     root: &std::path::Path,
     structured_script_payload: bool,
 ) -> String {
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         structured_validation_argv: true,
         structured_process_argv: true,
         structured_script_payload,
+        structured_script_javascript: structured_script_payload,
+        structured_script_typescript: structured_script_payload,
         ..Default::default()
     };
     register_agent_with_projects(
@@ -72,7 +74,7 @@ async fn register_script_agent(
         vec![registered_project("demo", &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, "demo")
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
 async fn register_script_job_agent(
@@ -80,13 +82,15 @@ async fn register_script_job_agent(
     client_id: &str,
     root: &std::path::Path,
 ) -> String {
-    let capabilities = ShellClientCapabilities {
+    let capabilities = RunnerCapabilities {
         shell: true,
         async_jobs: true,
         async_shell_jobs: true,
         structured_validation_argv: true,
         structured_process_argv: true,
         structured_script_payload: true,
+        structured_script_javascript: true,
+        structured_script_typescript: true,
         structured_execution_jobs: true,
         ..Default::default()
     };
@@ -98,13 +102,13 @@ async fn register_script_job_agent(
         vec![registered_project("demo", &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, "demo")
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
 async fn update_script_job(
     runtime: &ToolRuntime,
     client_id: &str,
-    request: &crate::shell_protocol::ShellAgentShellRequest,
+    request: &crate::runner_protocol::RunnerRequest,
     status: &str,
     state: Option<ShellCommandExecutionState>,
     exit_code: Option<i32>,
@@ -113,10 +117,10 @@ async fn update_script_job(
     error: Option<&str>,
 ) {
     runtime
-        .shell_clients
-        .update_job(ShellAgentJobUpdateRequest {
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             job_id: request.job_id.clone().expect("structured Job id"),
             request_id: Some(request.request_id.clone()),
             update_seq: None,
@@ -131,6 +135,7 @@ async fn update_script_job(
             error: error.map(str::to_string),
             command_execution_state: state,
             validation_progress: None,
+            activity: None,
             finished: state.is_some(),
         })
         .await
@@ -148,11 +153,11 @@ async fn complete_script_lifecycle(
     error: Option<&str>,
 ) {
     runtime
-        .shell_clients
-        .complete(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id,
                 exit_code,
                 stdout: Some(stdout.to_string()),
@@ -162,44 +167,11 @@ async fn complete_script_lifecycle(
             },
             command_execution_state: Some(state),
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: None,
         })
         .await
         .unwrap();
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn server_local_compatibility_executes_a_temporary_script_file_directly() {
-    let cwd = tempfile::tempdir().unwrap();
-    let observed_path = cwd.path().join("observed-script-path");
-    let marker = cwd.path().join("marker");
-    let payload = crate::shell_protocol::ShellScriptPayload {
-        language: ShellScriptLanguage::Sh,
-        script: "printf '%s' \"$0\" > \"$1\"\nprintf '%s\\n' \"$0\" \"$2\"\n".to_string(),
-        args: vec![
-            observed_path.to_string_lossy().into_owned(),
-            "; touch marker".to_string(),
-        ],
-    };
-    let (exit_code, stdout, stderr, _) =
-        super::super::helpers::run_script_sync_bounded(payload, None, cwd.path().to_path_buf(), 10)
-            .await
-            .unwrap_or_else(|_| panic!("local compatibility script execution should return"));
-
-    assert_eq!(exit_code, 0, "{stderr}");
-    assert_eq!(stdout, "<temporary-script>\n; touch marker\n");
-    assert!(
-        !marker.exists(),
-        "script arguments must remain literal argv"
-    );
-    let temporary_path = std::path::PathBuf::from(std::fs::read_to_string(observed_path).unwrap());
-    assert_eq!(
-        temporary_path.extension().and_then(|value| value.to_str()),
-        Some("sh")
-    );
-    assert!(!temporary_path.starts_with(cwd.path()));
-    assert!(!temporary_path.exists());
 }
 
 #[tokio::test]
@@ -207,8 +179,8 @@ async fn run_script_wire_is_typed_body_free_command_and_supports_more_than_32_ki
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project = register_script_agent(&runtime, "script-wire", temp.path(), true).await;
-    let mut large_script = "# typed script payload\n".repeat(1_800);
-    large_script.push_str("printf 'done\\n'\n");
+    let mut large_script = "// typed script payload\n".repeat(1_800);
+    large_script.push_str("console.log('done');\n");
     assert!(large_script.len() > 32 * 1024);
 
     let task = tokio::spawn({
@@ -218,7 +190,7 @@ async fn run_script_wire_is_typed_body_free_command_and_supports_more_than_32_ki
         async move {
             runtime
                 .dispatch_with_auth(
-                    script_sync_call(project, None, ShellScriptLanguage::Bash, large_script),
+                    script_sync_call(project, None, ShellScriptLanguage::Javascript, large_script),
                     Some(&auth_context(None, true)),
                 )
                 .await
@@ -229,7 +201,7 @@ async fn run_script_wire_is_typed_body_free_command_and_supports_more_than_32_ki
     assert_eq!(request.command, "");
     assert!(request.process.is_none());
     let payload = request.script.as_ref().expect("typed script payload");
-    assert_eq!(payload.language, ShellScriptLanguage::Bash);
+    assert_eq!(payload.language, ShellScriptLanguage::Javascript);
     assert_eq!(payload.script, large_script);
     assert_eq!(
         payload.args,
@@ -251,7 +223,7 @@ async fn run_script_wire_is_typed_body_free_command_and_supports_more_than_32_ki
     .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["language"], "bash");
+    assert_eq!(result.output["language"], "javascript");
     assert_eq!(result.output["stdout_tail"], "done\n");
     for omitted in [
         "execution_source",
@@ -290,8 +262,8 @@ async fn run_script_fast_success_projects_back_and_removes_the_hidden_job() {
                     script_call(
                         project,
                         None,
-                        ShellScriptLanguage::Bash,
-                        "printf 'fast\\n'\n",
+                        ShellScriptLanguage::Javascript,
+                        "console.log('fast');\n",
                     ),
                     Some(&auth),
                 )
@@ -329,6 +301,7 @@ async fn run_script_fast_success_projects_back_and_removes_the_hidden_job() {
     .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["language"], "javascript");
     for omitted in [
         "execution_state",
         "command_started",
@@ -380,11 +353,11 @@ async fn run_script_fast_success_projects_back_and_removes_the_hidden_job() {
         });
 
     assert!(runtime
-        .shell_clients
+        .runner_registry
         .hidden_job_ids_for_test()
         .await
         .is_empty());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -451,7 +424,7 @@ async fn run_script_explicit_sync_wait_captures_terminal_after_old_ten_second_th
     assert!(result.output.get("command_completed").is_none());
     assert!(result.output.get("job_id").is_none());
     assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
     assert!(
         probe_patch_agent_request(&runtime, "script-extended-sync-wait")
             .await
@@ -472,7 +445,12 @@ async fn run_script_fast_missing_interpreter_retains_not_started_through_the_hid
         async move {
             runtime
                 .dispatch_with_auth(
-                    script_call(project, None, ShellScriptLanguage::Bash, "true\n"),
+                    script_call(
+                        project,
+                        None,
+                        ShellScriptLanguage::Javascript,
+                        "Promise.resolve();\n",
+                    ),
                     Some(&auth),
                 )
                 .await
@@ -480,8 +458,11 @@ async fn run_script_fast_missing_interpreter_retains_not_started_through_the_hid
     });
     let request = wait_for_patch_agent_request(&runtime, "script-prestart-job").await;
     let queued = runtime
-        .shell_clients
-        .get_hidden_job_for_auth(Some(&auth), request.job_id.as_deref().unwrap())
+        .runner_registry
+        .get_hidden_job_for_auth(
+            Some(&crate::test_support::runner_access(&auth)),
+            request.job_id.as_deref().unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(queued.status, "agent_queued");
@@ -498,7 +479,9 @@ async fn run_script_fast_missing_interpreter_retains_not_started_through_the_hid
         None,
         None,
         None,
-        Some("interpreter_unavailable: bash is unavailable"),
+        Some(
+            "interpreter_unavailable: JavaScript/Node interpreter is unavailable; command was not started",
+        ),
     )
     .await;
 
@@ -510,7 +493,7 @@ async fn run_script_fast_missing_interpreter_retains_not_started_through_the_hid
     assert_eq!(result.output["promoted_to_job"], false);
     assert_eq!(result.output["terminal"], true);
     assert_eq!(result.output["failure_kind"], "interpreter_unavailable");
-    assert!(runtime.shell_clients.list_jobs(Some(10)).await.is_empty());
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
@@ -526,9 +509,9 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     );
     let auth = auth_context(None, true);
     let unique_body = format!(
-        "# raw-body-{}\n{}\nprintf 'done\\n'\n",
+        "// raw-body-{}\n{}\nconsole.log('done');\n",
         uuid::Uuid::new_v4(),
-        "# typed script payload\n".repeat(1_800)
+        "// typed script payload\n".repeat(1_800)
     );
     assert!(unique_body.len() > 32 * 1024);
     let unique_arg = format!("raw-arg-{}", uuid::Uuid::new_v4());
@@ -546,7 +529,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
                 .dispatch_with_auth(
                     ToolCall::RunScript {
                         project,
-                        language: ShellScriptLanguage::Bash,
+                        language: ShellScriptLanguage::Javascript,
                         script: body,
                         args: vec![arg],
                         stdin: Some(stdin),
@@ -566,6 +549,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     assert_eq!(request.command, "");
     assert!(request.process.is_none());
     let payload = request.script.as_ref().expect("typed script payload");
+    assert_eq!(payload.language, ShellScriptLanguage::Javascript);
     assert_eq!(payload.script, unique_body);
     assert_eq!(payload.args.as_slice(), std::slice::from_ref(&unique_arg));
     assert_eq!(request.stdin.as_deref(), Some(unique_stdin.as_str()));
@@ -585,11 +569,12 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["promoted_to_job"], true);
+    assert_observe_job_continuation(&handoff.output);
     assert_eq!(handoff.output["execution_state"], "running");
     let job_id = handoff.output["job_id"].as_str().unwrap();
     assert_eq!(request.job_id.as_deref(), Some(job_id));
 
-    let job = runtime.shell_clients.get_job(job_id).await.unwrap();
+    let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(job.kind, "run_script");
     assert_eq!(job.session_id.as_deref(), Some(session.session_id.as_str()));
     let metadata = job
@@ -597,7 +582,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
         .as_ref()
         .expect("safe structured metadata");
     assert_eq!(metadata.execution_source, "run_script");
-    assert_eq!(metadata.language, Some(ShellScriptLanguage::Bash));
+    assert_eq!(metadata.language, Some(ShellScriptLanguage::Javascript));
     assert_eq!(metadata.script_bytes, Some(unique_body.len()));
     assert_eq!(metadata.arg_count, 1);
     assert!(metadata.stdin_present);
@@ -644,6 +629,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
                 }],
                 tail_lines: 40,
                 wait_secs: None,
+                wake_on: Default::default(),
             },
             Some(&auth),
         )
@@ -655,6 +641,10 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     assert_eq!(
         observed_job["structured_execution"]["execution_source"],
         "run_script"
+    );
+    assert_eq!(
+        observed_job["structured_execution"]["language"],
+        "javascript"
     );
     assert_eq!(
         observed_job["structured_execution"]["script_bytes"],
@@ -694,7 +684,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
         None,
     )
     .await;
-    let terminal = runtime.shell_clients.get_job(job_id).await.unwrap();
+    let terminal = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(terminal.status, "completed");
     assert_eq!(
         terminal.command_execution_state,
@@ -703,6 +693,177 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     assert!(probe_patch_agent_request(&runtime, "script-slow-job")
         .await
         .is_none());
+}
+
+#[tokio::test]
+async fn typescript_slow_handoff_keeps_one_execution_and_safe_durable_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(40));
+    let project = register_script_job_agent(&runtime, "typescript-slow-job", temp.path()).await;
+    let session = runtime.sessions.start_session_with_guards(
+        Some(project.clone()),
+        Some("typescript structured script continuation".to_string()),
+        SessionMode::Normal,
+        sessions::SessionGuards::default(),
+    );
+    let unique_body = format!(
+        "interface Secret {{ value: string }}\nconst secret: Secret = {{ value: 'raw-ts-body-{}' }};\nconsole.log(secret.value);\n",
+        uuid::Uuid::new_v4()
+    );
+    let unique_arg = format!("raw-ts-arg-{}", uuid::Uuid::new_v4());
+    let unique_stdin = format!("raw-ts-stdin-{}", uuid::Uuid::new_v4());
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let body = unique_body.clone();
+        let arg = unique_arg.clone();
+        let stdin = unique_stdin.clone();
+        let session_id = session.session_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunScript {
+                        project,
+                        language: ShellScriptLanguage::Typescript,
+                        script: body,
+                        args: vec![arg],
+                        stdin: Some(stdin),
+                        session_id: Some(session_id),
+                        timeout_secs: Some(60),
+                        sync_wait_secs: None,
+                        cwd: None,
+                        purpose: Some(ExecutionPurpose::Operation),
+                    },
+                    Some(&auth_context(None, true)),
+                )
+                .await
+        }
+    });
+
+    let request = wait_for_patch_agent_request(&runtime, "typescript-slow-job").await;
+    assert_eq!(request.kind, "start_script_job");
+    assert_eq!(request.command, "");
+    assert!(request.process.is_none());
+    let payload = request.script.as_ref().expect("typed TypeScript payload");
+    assert_eq!(payload.language, ShellScriptLanguage::Typescript);
+    assert_eq!(payload.script, unique_body);
+    assert_eq!(payload.args.as_slice(), std::slice::from_ref(&unique_arg));
+    assert_eq!(request.stdin.as_deref(), Some(unique_stdin.as_str()));
+    update_script_job(
+        &runtime,
+        "typescript-slow-job",
+        &request,
+        "running",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let handoff = task.await.unwrap();
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert_observe_job_continuation(&handoff.output);
+    assert_eq!(handoff.output["execution_state"], "running");
+    let job_id = handoff.output["job_id"].as_str().unwrap();
+    assert_eq!(request.job_id.as_deref(), Some(job_id));
+    let job = runtime.runner_registry.get_job(job_id).await.unwrap();
+    assert_eq!(job.kind, "run_script");
+    let metadata = job
+        .structured_execution
+        .as_ref()
+        .expect("safe TypeScript structured metadata");
+    assert_eq!(metadata.execution_source, "run_script");
+    assert_eq!(metadata.language, Some(ShellScriptLanguage::Typescript));
+    assert_eq!(metadata.script_bytes, Some(unique_body.len()));
+    assert_eq!(metadata.arg_count, 1);
+    assert!(metadata.stdin_present);
+    let durable = serde_json::to_string(&job).unwrap();
+    for raw in [&unique_body, &unique_arg, &unique_stdin] {
+        assert!(
+            !durable.contains(raw),
+            "durable Job leaked raw TypeScript input"
+        );
+    }
+    let session_summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(100))
+        .unwrap();
+    assert_eq!(
+        session_summary
+            .events
+            .iter()
+            .filter(|event| event.tool_name == "run_script" && event.kind == "tool_call_started")
+            .count(),
+        1,
+        "TypeScript handoff must not record or launch a second model tool execution"
+    );
+
+    update_script_job(
+        &runtime,
+        "typescript-slow-job",
+        &request,
+        "completed",
+        Some(ShellCommandExecutionState::Completed),
+        Some(0),
+        Some("done\n"),
+        None,
+        None,
+    )
+    .await;
+    assert!(probe_patch_agent_request(&runtime, "typescript-slow-job")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn typescript_started_runtime_rejection_remains_completed_nonzero() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_script_agent(&runtime, "typescript-runtime-reject", temp.path(), true).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    script_sync_call(
+                        project,
+                        None,
+                        ShellScriptLanguage::Typescript,
+                        "enum RuntimeSyntax { Value }\nconsole.log(RuntimeSyntax.Value);",
+                    ),
+                    Some(&auth_context(None, true)),
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "typescript-runtime-reject").await;
+    assert_eq!(
+        request.script.as_ref().map(|script| script.language),
+        Some(ShellScriptLanguage::Typescript)
+    );
+    complete_script_lifecycle(
+        &runtime,
+        "typescript-runtime-reject",
+        request.request_id,
+        ShellCommandExecutionState::Completed,
+        Some(1),
+        "",
+        "ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX\n",
+        Some("runtime rejected transform-required TypeScript syntax"),
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["execution_state"], "completed");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], true);
+    assert_eq!(result.output["exit_code"], 1);
+    assert_eq!(result.output["failure_kind"], "command_exit_nonzero");
 }
 
 #[tokio::test]
@@ -717,7 +878,12 @@ async fn run_script_nonzero_timeout_uncertainty_and_interpreter_absence_are_trut
         async move {
             runtime
                 .dispatch_with_auth(
-                    script_sync_call(project, None, ShellScriptLanguage::Sh, "exit 19"),
+                    script_sync_call(
+                        project,
+                        None,
+                        ShellScriptLanguage::Javascript,
+                        "process.exit(19);",
+                    ),
                     Some(&auth_context(None, true)),
                 )
                 .await
@@ -791,7 +957,7 @@ async fn run_script_nonzero_timeout_uncertainty_and_interpreter_absence_are_trut
     });
     wait_for_patch_agent_request(&runtime, "script-lifecycle").await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("script-lifecycle", "inst")
         .await;
     let uncertain = uncertain_task.await.unwrap();
@@ -883,7 +1049,7 @@ async fn run_script_session_defaults_and_evidence_are_body_and_stdin_free() {
             }),
         )
         .unwrap();
-    let raw_script = "printf RAW_SCRIPT_BODY";
+    let raw_script = "console.log('RAW_SCRIPT_BODY');";
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
@@ -894,7 +1060,7 @@ async fn run_script_session_defaults_and_evidence_are_body_and_stdin_free() {
                     script_sync_call(
                         project,
                         Some(session_id),
-                        ShellScriptLanguage::Sh,
+                        ShellScriptLanguage::Javascript,
                         raw_script,
                     ),
                     Some(&auth_context(None, true)),
@@ -909,7 +1075,7 @@ async fn run_script_session_defaults_and_evidence_are_body_and_stdin_free() {
     );
     assert_eq!(
         request.script.as_ref().unwrap().language,
-        ShellScriptLanguage::Sh,
+        ShellScriptLanguage::Javascript,
         "Session default_shell must not override explicit language"
     );
     complete_script_lifecycle(
@@ -940,7 +1106,7 @@ async fn run_script_session_defaults_and_evidence_are_body_and_stdin_free() {
         .find(|event| event.kind == "tool_call_started" && event.tool_name == "run_script")
         .unwrap();
     let input = started.input_summary.as_ref().unwrap();
-    assert_eq!(input["language"], "sh");
+    assert_eq!(input["language"], "javascript");
     assert_eq!(input["script_bytes"], raw_script.len());
     assert_eq!(input["arg_count"], 4);
     assert_eq!(input["stdin_present"], true);
@@ -954,7 +1120,7 @@ async fn run_script_session_defaults_and_evidence_are_body_and_stdin_free() {
 
     let commands = recorder.commands.lock().unwrap();
     assert_eq!(commands.len(), 1);
-    let expected_preview = format!("sh script ({} bytes, 4 args)", raw_script.len());
+    let expected_preview = format!("javascript script ({} bytes, 4 args)", raw_script.len());
     assert_eq!(commands[0].as_deref(), Some(expected_preview.as_str()));
     assert!(!commands[0].as_deref().unwrap().contains("RAW_SCRIPT_BODY"));
 }
@@ -1180,30 +1346,6 @@ async fn run_script_shared_bounds_reject_before_enqueue_with_full_prestart_tuple
             session_id: None,
             timeout_secs: Some(60),
             sync_wait_secs: Some(0),
-            cwd: None,
-            purpose: None,
-        },
-        ToolCall::RunScript {
-            project: project.clone(),
-            language: ShellScriptLanguage::Sh,
-            script: "true".to_string(),
-            args: Vec::new(),
-            stdin: None,
-            session_id: None,
-            timeout_secs: Some(60),
-            sync_wait_secs: Some(61),
-            cwd: None,
-            purpose: None,
-        },
-        ToolCall::RunScript {
-            project: project.clone(),
-            language: ShellScriptLanguage::Sh,
-            script: "true".to_string(),
-            args: Vec::new(),
-            stdin: None,
-            session_id: None,
-            timeout_secs: Some(5),
-            sync_wait_secs: Some(6),
             cwd: None,
             purpose: None,
         },

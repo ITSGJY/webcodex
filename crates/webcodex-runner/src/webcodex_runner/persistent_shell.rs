@@ -12,12 +12,14 @@ use super::shell::shell_quote;
 use super::shell::shell_quote_powershell;
 use super::shell::{base_shell_env, cwd_allowed};
 use super::ssh::SshConnectionPool;
-use crate::shell_protocol::{
-    PersistentShellRequest, PersistentShellResult, ShellAgentShellRequest,
-    RAW_SHELL_COMMAND_MAX_BYTES,
+#[cfg(test)]
+use crate::runner_protocol::RunnerRequest;
+use crate::runner_protocol::{
+    PersistentShellRequest, PersistentShellResult, RAW_SHELL_COMMAND_MAX_BYTES,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use webcodex_core::runner_operation::RunnerPersistentShellOperation;
 #[cfg(any(unix, windows))]
 use webcodex_persistent_shell::canonical_dialect;
 use webcodex_persistent_shell::{
@@ -47,35 +49,28 @@ impl PersistentShellManager {
         }
     }
 
-    pub(crate) fn handle(
+    pub(crate) fn handle_operation(
         &self,
         policy: &RunnerPolicy,
         shell: &ShellConfig,
         ssh: &SshConfig,
         ssh_generation: u64,
-        projects_dir: &Path,
-        request: &ShellAgentShellRequest,
+        project_registry_dir: &Path,
+        client_id: &str,
+        request: &RunnerPersistentShellOperation,
     ) -> PersistentShellResult {
         self.processes.update_limits(limits(shell));
         let ssh_resource = request
             .job_context
             .as_ref()
             .and_then(|context| context.ssh_resource.as_deref());
-        let Some(operation) = request.persistent_shell.as_ref() else {
-            return error_result(
-                "",
-                "",
-                "",
-                "persistent_shell_invalid_request",
-                "persistent shell payload is required",
-            );
-        };
+        let operation = &request.request;
         if operation.action == "close" {
             return self.close(operation);
         }
 
         let project =
-            match validate_boundary(policy, shell, projects_dir, &request.client_id, operation) {
+            match validate_boundary(policy, shell, project_registry_dir, client_id, operation) {
                 Ok(project) => project,
                 Err((code, message)) => {
                     if operation.action != "open" {
@@ -103,13 +98,13 @@ impl PersistentShellManager {
                         policy,
                         ssh,
                         ssh_generation,
-                        request,
+                        client_id,
                         operation,
                         resource,
                         &project,
                     )
                 } else {
-                    self.open(policy, shell, request, operation, &project)
+                    self.open(policy, shell, client_id, operation, &project)
                 }
             }
             "exec" => {
@@ -142,7 +137,7 @@ impl PersistentShellManager {
         policy: &RunnerPolicy,
         ssh: &SshConfig,
         ssh_generation: u64,
-        request: &ShellAgentShellRequest,
+        client_id: &str,
         operation: &PersistentShellRequest,
         resource_name: &str,
         _project: &RunnerProjectShellContext,
@@ -210,7 +205,7 @@ impl PersistentShellManager {
             workflow_session_id: operation.workflow_session_id.clone(),
             runtime_project_id: operation.runtime_project_id.clone(),
             executor: EXECUTOR_SSH.to_string(),
-            client_id: Some(request.client_id.clone()),
+            client_id: Some(client_id.to_string()),
         };
         // The bootstrap is the initialization command: it reserves FD 7/8 on the
         // remote shell (so the shared command wrapper's markers always reach the
@@ -242,7 +237,7 @@ impl PersistentShellManager {
         _policy: &RunnerPolicy,
         _ssh: &SshConfig,
         _ssh_generation: u64,
-        _request: &ShellAgentShellRequest,
+        _client_id: &str,
         operation: &PersistentShellRequest,
         _resource_name: &str,
         _project: &RunnerProjectShellContext,
@@ -388,11 +383,11 @@ impl PersistentShellManager {
         &self,
         policy: &RunnerPolicy,
         shell: &ShellConfig,
-        request: &ShellAgentShellRequest,
+        client_id: &str,
         operation: &PersistentShellRequest,
         project: &RunnerProjectShellContext,
     ) -> PersistentShellResult {
-        let launch = match build_launch(policy, shell, request, operation, project) {
+        let launch = match build_launch(policy, shell, client_id, operation, project) {
             Ok(launch) => launch,
             Err((code, message)) => {
                 return error_result(
@@ -596,6 +591,39 @@ impl PersistentShellManager {
         self.processes.close_project(runtime_project_id, reason)
     }
 
+    #[cfg(test)]
+    pub(crate) fn handle(
+        &self,
+        policy: &RunnerPolicy,
+        shell: &ShellConfig,
+        ssh: &SshConfig,
+        ssh_generation: u64,
+        project_registry_dir: &Path,
+        request: &RunnerRequest,
+    ) -> PersistentShellResult {
+        let Some(operation) = request.persistent_shell.clone() else {
+            return error_result(
+                "",
+                "",
+                "",
+                "persistent_shell_invalid_request",
+                "persistent shell payload is required",
+            );
+        };
+        self.handle_operation(
+            policy,
+            shell,
+            ssh,
+            ssh_generation,
+            project_registry_dir,
+            &request.client_id,
+            &RunnerPersistentShellOperation {
+                request: operation,
+                job_context: request.job_context.clone(),
+            },
+        )
+    }
+
     pub(crate) fn close_exact(
         &self,
         shell_id: &str,
@@ -629,7 +657,7 @@ fn limits(shell: &ShellConfig) -> ShellLimits {
 fn validate_boundary(
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     client_id: &str,
     operation: &PersistentShellRequest,
 ) -> Result<RunnerProjectShellContext, (&'static str, String)> {
@@ -651,7 +679,7 @@ fn validate_boundary(
                 "runtime project does not belong to this Runner".to_string(),
             )
         })?;
-    find_project_shell_context_by_id(projects_dir, project_id).ok_or_else(|| {
+    find_project_shell_context_by_id(project_registry_dir, project_id).ok_or_else(|| {
         (
             "persistent_shell_project_unavailable",
             "project is disabled, unregistered, or not executable by this Runner".to_string(),
@@ -815,7 +843,7 @@ fn selected_profile<'a>(
 fn build_launch(
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    request: &ShellAgentShellRequest,
+    client_id: &str,
     operation: &PersistentShellRequest,
     project: &RunnerProjectShellContext,
 ) -> Result<ShellLaunch, (&'static str, String)> {
@@ -823,7 +851,7 @@ fn build_launch(
     cwd_allowed(policy, &cwd).map_err(|message| ("persistent_shell_cwd_denied", message))?;
     build_launch_at_cwd(
         shell,
-        request,
+        client_id,
         operation,
         project,
         cwd,
@@ -833,7 +861,7 @@ fn build_launch(
 
 fn build_launch_at_cwd(
     shell: &ShellConfig,
-    request: &ShellAgentShellRequest,
+    client_id: &str,
     operation: &PersistentShellRequest,
     project: &RunnerProjectShellContext,
     cwd: PathBuf,
@@ -929,7 +957,7 @@ fn build_launch_at_cwd(
             workflow_session_id: operation.workflow_session_id.clone(),
             runtime_project_id: operation.runtime_project_id.clone(),
             executor: EXECUTOR_AGENT.to_string(),
-            client_id: Some(request.client_id.clone()),
+            client_id: Some(client_id.to_string()),
         },
         dialect,
         profile: profile_name,
@@ -1142,11 +1170,11 @@ fn error_result(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::shell_protocol::ShellAgentShellRequest;
+    use crate::runner_protocol::RunnerRequest;
     use std::collections::BTreeMap;
 
-    fn request(action: &str, shell_id: &str, command: Option<&str>) -> ShellAgentShellRequest {
-        ShellAgentShellRequest {
+    fn request(action: &str, shell_id: &str, command: Option<&str>) -> RunnerRequest {
+        RunnerRequest {
             request_id: format!("req-{action}"),
             client_id: "agent-1".to_string(),
             kind: "persistent_shell".to_string(),
@@ -1171,6 +1199,7 @@ mod tests {
             lsp: None,
             job_context: None,
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: None,
             persistent_shell: Some(PersistentShellRequest {
                 action: action.to_string(),
@@ -1189,7 +1218,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, RunnerPolicy) {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
-        let projects = temp.path().join("projects.d");
+        let projects = temp.path().join("project-registry");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(project.join("sub")).unwrap();
         std::fs::create_dir_all(&projects).unwrap();
@@ -1534,11 +1563,11 @@ mod windows_tests {
     use super::super::config::SshResourceConfig;
     use super::super::ssh::SshConnectionPool;
     use super::*;
-    use crate::shell_protocol::ShellAgentShellRequest;
+    use crate::runner_protocol::RunnerRequest;
     use std::collections::BTreeMap;
 
-    fn request(action: &str, shell_id: &str, command: Option<&str>) -> ShellAgentShellRequest {
-        ShellAgentShellRequest {
+    fn request(action: &str, shell_id: &str, command: Option<&str>) -> RunnerRequest {
+        RunnerRequest {
             request_id: format!("req-{action}"),
             client_id: "msi".to_string(),
             kind: "persistent_shell".to_string(),
@@ -1563,6 +1592,7 @@ mod windows_tests {
             lsp: None,
             job_context: None,
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: None,
             persistent_shell: Some(PersistentShellRequest {
                 action: action.to_string(),
@@ -1583,7 +1613,7 @@ mod windows_tests {
         shell_id: &str,
         resource: &str,
         command: Option<&str>,
-    ) -> ShellAgentShellRequest {
+    ) -> RunnerRequest {
         serde_json::from_value(serde_json::json!({
             "request_id": format!("req-ssh-{action}-{shell_id}"),
             "client_id": "msi",
@@ -1620,7 +1650,7 @@ mod windows_tests {
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, RunnerPolicy) {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
-        let projects = temp.path().join("projects.d");
+        let projects = temp.path().join("project-registry");
         std::fs::create_dir_all(project.join("sub")).unwrap();
         std::fs::create_dir_all(&projects).unwrap();
         let escaped = project.to_string_lossy().replace('\\', "\\\\");
@@ -1794,8 +1824,15 @@ mod windows_tests {
         };
         let open = request("open", "wc_shell_profile_mapping", None);
         let operation = open.persistent_shell.as_ref().unwrap();
-        let launch =
-            build_launch_at_cwd(&shell, &open, operation, &project, cwd.clone(), 4096).unwrap();
+        let launch = build_launch_at_cwd(
+            &shell,
+            open.client_id.as_str(),
+            operation,
+            &project,
+            cwd.clone(),
+            4096,
+        )
+        .unwrap();
         assert_eq!(launch.program, "pwsh.exe");
         assert_eq!(launch.dialect, "powershell");
         assert_eq!(launch.args, vec!["-NoProfile", "-NonInteractive"]);
@@ -1812,7 +1849,7 @@ mod windows_tests {
         explicit.persistent_shell.as_mut().unwrap().shell = Some("bash".to_string());
         let error = build_launch_at_cwd(
             &ShellConfig::default(),
-            &explicit,
+            explicit.client_id.as_str(),
             explicit.persistent_shell.as_ref().unwrap(),
             &RunnerProjectShellContext {
                 id: "demo".to_string(),
@@ -1835,7 +1872,7 @@ mod windows_tests {
         let invalid = request("open", "wc_shell_bad_args", None);
         let error = build_launch_at_cwd(
             &invalid_shell,
-            &invalid,
+            invalid.client_id.as_str(),
             invalid.persistent_shell.as_ref().unwrap(),
             &default_project,
             cwd,

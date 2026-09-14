@@ -86,11 +86,11 @@ async fn stateless_2026_tool_call(
     .await
 }
 
-async fn stateless_observation_shell_clients() -> Arc<crate::shell_client::ShellClientRegistry> {
-    let shell_clients = Arc::new(crate::shell_client::ShellClientRegistry::default());
-    shell_clients
+async fn stateless_observation_runner_registry() -> Arc<crate::runner_http::RunnerRegistry> {
+    let runner_registry = Arc::new(crate::runner_http::RunnerRegistry::default());
+    runner_registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -98,49 +98,55 @@ async fn stateless_observation_shell_clients() -> Arc<crate::shell_client::Shell
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: "mcp-observation-agent".to_string(),
-                agent_instance_id: "inst-mcp-observation".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst-mcp-observation".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities::default(),
+                capabilities: RunnerCapabilities::default(),
                 policy: None,
             },
         ))
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &shell_clients,
+        &runner_registry,
         "mcp-observation-agent",
         "inst-mcp-observation",
         vec![
-            crate::shell_protocol::ShellAgentProjectSummary {
+            crate::runner_protocol::RunnerProjectSummary {
                 id: "shared".to_string(),
                 name: Some("Shared observation project".to_string()),
                 path: "/tmp/mcp-observation-shared".to_string(),
                 allow_patch: true,
                 kind: Some("repo".to_string()),
+                registration_source: None,
                 description: None,
                 hooks: Vec::new(),
                 disabled: false,
                 revision: None,
+                root_fingerprint: None,
+                lineage: None,
                 git_branch: None,
                 git_head: None,
                 git_dirty: None,
                 updated_at: 1,
                 shell_profile: None,
             },
-            crate::shell_protocol::ShellAgentProjectSummary {
+            crate::runner_protocol::RunnerProjectSummary {
                 id: "foreign".to_string(),
                 name: Some("Foreign observation project".to_string()),
                 path: "/tmp/mcp-observation-foreign".to_string(),
                 allow_patch: true,
                 kind: Some("repo".to_string()),
+                registration_source: None,
                 description: None,
                 hooks: Vec::new(),
                 disabled: false,
                 revision: None,
+                root_fingerprint: None,
+                lineage: None,
                 git_branch: None,
                 git_head: None,
                 git_dirty: None,
@@ -150,18 +156,18 @@ async fn stateless_observation_shell_clients() -> Arc<crate::shell_client::Shell
         ],
     )
     .await;
-    shell_clients
+    runner_registry
 }
 
 fn spawn_stateless_observation_agent_executor(
-    registry: Arc<crate::shell_client::ShellClientRegistry>,
+    registry: Arc<crate::runner_http::RunnerRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             if let Some(request) = registry
-                .poll(crate::shell_protocol::ShellAgentPollRequest {
+                .poll(crate::runner_protocol::RunnerPollRequest {
                     client_id: "mcp-observation-agent".to_string(),
-                    agent_instance_id: "inst-mcp-observation".to_string(),
+                    runner_instance_id: "inst-mcp-observation".to_string(),
                 })
                 .await
                 .unwrap()
@@ -172,9 +178,9 @@ fn spawn_stateless_observation_agent_executor(
                     (-1, "unexpected observation fixture agent request")
                 };
                 registry
-                    .complete(crate::shell_protocol::ShellAgentResultRequest {
+                    .complete(crate::runner_protocol::RunnerResultRequest {
                         client_id: "mcp-observation-agent".to_string(),
-                        agent_instance_id: "inst-mcp-observation".to_string(),
+                        runner_instance_id: "inst-mcp-observation".to_string(),
                         request_id: request.request_id,
                         exit_code: Some(exit_code),
                         stdout: Some(String::new()),
@@ -256,7 +262,7 @@ async fn start_stateless_observation_session(
 }
 
 #[test]
-fn stateless_full_trace_preserves_raw_context_ack_and_records_effective_internal_ack() {
+fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_arguments() {
     // Full tracing retains the request/response trees plus decoded trace payloads.
     // Keep this integration fixture off the default libtest stack for the same
     // reason as the larger stateless MCP continuity/observation fixtures below.
@@ -269,7 +275,7 @@ fn stateless_full_trace_preserves_raw_context_ack_and_records_effective_internal
                 .build()
                 .expect("build stateless full-trace test runtime")
                 .block_on(
-                    stateless_full_trace_preserves_raw_context_ack_and_records_effective_internal_ack_body(),
+                    stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_arguments_body(),
                 );
         })
         .expect("spawn stateless full-trace test thread")
@@ -277,7 +283,8 @@ fn stateless_full_trace_preserves_raw_context_ack_and_records_effective_internal
         .expect("stateless full-trace test thread panicked");
 }
 
-async fn stateless_full_trace_preserves_raw_context_ack_and_records_effective_internal_ack_body() {
+async fn stateless_full_trace_preserves_raw_context_ack_and_records_clean_effective_arguments_body()
+{
     let trace_root = tempfile::tempdir().unwrap();
     let mut env = crate::test_support::TestEnvGuard::new();
     env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
@@ -334,13 +341,202 @@ async fn stateless_full_trace_preserves_raw_context_ack_and_records_effective_in
     assert!(effective
         .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD)
         .is_none());
-    assert_eq!(
-        effective
-            [crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD],
-        42
-    );
+    assert_eq!(effective, json!({}));
+    assert!(!effective.to_string().contains("__webcodex_"));
     let final_response = read_phase("final_response");
     assert_eq!(final_response["result"]["isError"], false);
+}
+
+#[test]
+fn stateless_full_trace_correlates_only_hashed_openai_window() {
+    std::thread::Builder::new()
+        .name("mcp-stateless-window-trace".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build stateless window-trace test runtime")
+                .block_on(stateless_full_trace_correlates_only_hashed_openai_window_body());
+        })
+        .expect("spawn stateless window-trace test thread")
+        .join()
+        .expect("stateless window-trace test thread panicked");
+}
+
+async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
+    use std::collections::BTreeSet;
+
+    let trace_root = tempfile::tempdir().unwrap();
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+    env.set(
+        "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+        trace_root.path().to_string_lossy().as_ref(),
+    );
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db.clone(), runtime));
+    let raw_window = "openai-window-trace-opaque-secret";
+
+    for id in [51_i64, 52_i64] {
+        let mut params = mcp_2026_params(json!({"name": "list_tools", "arguments": {}}));
+        params["_meta"]["openai/session"] = json!(raw_window);
+        let (status, body) = stateless_2026_jsonrpc(
+            &service,
+            "secret",
+            Some(MCP_STATELESS_PROTOCOL_VERSION),
+            Some("tools/call"),
+            Some("list_tools"),
+            None,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": params,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["isError"], false, "{body}");
+    }
+
+    // tools/list is liveness evidence for the same hashed Window, but it is not
+    // meaningful coding work and cannot establish a Workflow Session relation.
+    let mut list_params = mcp_2026_params(json!({}));
+    list_params["_meta"]["openai/session"] = json!(raw_window);
+    let (status, listed) = stateless_2026_jsonrpc(
+        &service,
+        "secret",
+        Some(MCP_STATELESS_PROTOCOL_VERSION),
+        Some("tools/list"),
+        None,
+        None,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 53,
+            "method": "tools/list",
+            "params": list_params,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(listed["result"]["tools"].is_array(), "{listed}");
+    crate::tool_request_trace::flush_full_trace_writer();
+
+    let mut trace_ids = BTreeSet::new();
+    let mut window_keys = BTreeSet::new();
+    let mut traced_requests = 0_usize;
+    for entry in std::fs::read_dir(trace_root.path()).unwrap().flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let trace_dir = entry.path();
+        let Ok(events_text) = std::fs::read_to_string(trace_dir.join("events.jsonl")) else {
+            continue;
+        };
+        assert!(
+            !events_text.contains(raw_window),
+            "raw OpenAI window identity leaked into trace metadata"
+        );
+        let events = events_text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        if let Some(parsed) = events.iter().find(|event| {
+            event["event"] == "mcp_tool_request_parsed" && event["tool_name"] == "list_tools"
+        }) {
+            traced_requests += 1;
+            let trace_id = parsed["server_trace_id"]
+                .as_str()
+                .expect("parsed trace event server_trace_id");
+            let window_key = parsed["client_window_key"]
+                .as_str()
+                .expect("parsed trace event hashed client window");
+            assert_eq!(parsed["client_window_source"], "openai-session");
+            assert_eq!(window_key.len(), 64);
+            assert!(window_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_ne!(window_key, raw_window);
+            trace_ids.insert(trace_id.to_string());
+            window_keys.insert(window_key.to_string());
+        }
+
+        for event in &events {
+            let Some(relative) = event.get("payload_path").and_then(Value::as_str) else {
+                continue;
+            };
+            let compressed = std::fs::read(trace_dir.join(relative)).unwrap();
+            let raw = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&raw).contains(raw_window),
+                "raw OpenAI window identity leaked into compressed trace payload"
+            );
+        }
+    }
+
+    assert_eq!(traced_requests, 2, "expected one parsed event per request");
+    assert_eq!(
+        trace_ids.len(),
+        2,
+        "requests must keep distinct trace identities"
+    );
+    assert_eq!(
+        window_keys.len(),
+        1,
+        "the same ChatGPT window must produce one stable hashed correlation key"
+    );
+
+    let durable_rows = {
+        let conn = db.conn_for_tests();
+        let mut stmt = conn
+            .prepare(
+                "SELECT action_name, operation, client_window_key, client_window_source,
+                        server_trace_id, summary_json, error_summary, warning_summary,
+                        window_meaningful, recorder_gap_session_id
+                 FROM action_events
+                 WHERE client_window_key IS NOT NULL
+                 ORDER BY window_started_at_ms, event_id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+    assert_eq!(durable_rows.len(), 3);
+    let durable_debug = format!("{durable_rows:?}");
+    assert!(
+        !durable_debug.contains(raw_window),
+        "raw OpenAI Window identity leaked into ActionAudit SQLite rows: {durable_debug}"
+    );
+    let durable_keys = durable_rows
+        .iter()
+        .map(|row| row.2.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(durable_keys.len(), 1);
+    assert_eq!(durable_rows.last().unwrap().0, "toolsList");
+    assert_eq!(
+        durable_rows.last().unwrap().1.as_deref(),
+        Some("mcp_tools_list")
+    );
+    assert_eq!(durable_rows.last().unwrap().8, 0);
+    assert!(durable_rows.last().unwrap().9.is_none());
 }
 
 #[tokio::test]
@@ -370,13 +566,59 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
 
     // End the connection guard structurally inside the block: the awaited
     // requests below must not overlap it.
-    let (endpoint, action, operation, status, summary) = {
+    let (
+        endpoint,
+        action,
+        operation,
+        status,
+        summary,
+        duration_ms,
+        request_observed_at_ms,
+        response_handed_at_ms,
+        response_streaming,
+        window_continuity_eligible,
+    ) = {
         let conn = db.conn_for_tests();
-        let (endpoint, action, operation, status): (String, String, String, String) = conn
+        let (
+            endpoint,
+            action,
+            operation,
+            status,
+            duration_ms,
+            request_observed_at_ms,
+            response_handed_at_ms,
+            response_streaming,
+            window_continuity_eligible,
+        ): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
             .query_row(
-                "SELECT endpoint, action_name, operation, status FROM action_events",
+                "SELECT endpoint, action_name, operation, status, duration_ms,
+                        request_observed_at_ms, response_handed_at_ms,
+                        response_streaming, window_continuity_eligible
+                 FROM action_events",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
             )
             .unwrap();
         // Summary-level discipline: no tool output is persisted for MCP rows.
@@ -385,12 +627,37 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
                 row.get(0)
             })
             .unwrap();
-        (endpoint, action, operation, status, summary)
+        (
+            endpoint,
+            action,
+            operation,
+            status,
+            summary,
+            duration_ms,
+            request_observed_at_ms,
+            response_handed_at_ms,
+            response_streaming,
+            window_continuity_eligible,
+        )
     };
     assert_eq!(endpoint, "/mcp");
     assert_eq!(action, "toolsCall");
     assert_eq!(operation, "list_tools");
     assert_eq!(status, "success");
+    let request_observed_at_ms = request_observed_at_ms.expect("canonical MCP request start");
+    let response_handed_at_ms = response_handed_at_ms.expect("canonical MCP response handoff");
+    assert!(response_handed_at_ms >= request_observed_at_ms);
+    assert!(duration_ms >= 0);
+    assert!(
+        duration_ms <= response_handed_at_ms - request_observed_at_ms,
+        "legacy ActionAudit duration ends at its pre-render audit boundary, not response handoff"
+    );
+    assert_eq!(response_streaming, Some(0));
+    assert_eq!(
+        window_continuity_eligible,
+        Some(0),
+        "observability/discovery tools must not become meaningful continuity endpoints"
+    );
     let summary: Value = serde_json::from_str(&summary).unwrap();
     assert_eq!(summary["transport"], "mcp");
     assert!(
@@ -398,7 +665,7 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
         "summary must not embed tool output: {summary}"
     );
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["schema_version"], 3);
+    assert_eq!(telemetry["schema_version"], 5);
     assert_eq!(telemetry["tool_name"], "list_tools");
     assert_eq!(telemetry["tool_category"], "runtime");
     assert_eq!(telemetry["success"], true);
@@ -440,6 +707,43 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
 }
 
 #[tokio::test]
+async fn observe_jobs_action_audit_remains_window_meaningful_transport() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db.clone(), runtime));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/call",
+            "params": {
+                "name": "observe_jobs",
+                "arguments": {"items": [{"job_id": "missing-job-for-activity-test"}]}
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    let body: Value = response.take_json().await.unwrap();
+    assert!(body.get("result").is_some(), "{body}");
+
+    let (operation, window_meaningful, continuity_eligible): (String, i64, Option<i64>) = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT operation, window_meaningful, window_continuity_eligible FROM action_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(operation, "observe_jobs");
+    assert_eq!(window_meaningful, 1);
+    assert_eq!(continuity_eligible, Some(1));
+}
+
+#[tokio::test]
 async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
@@ -451,7 +755,7 @@ async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
             "jsonrpc": "2.0",
             "id": 101,
             "method": "tools/call",
-            "params": {"name": "read_file", "arguments": {}}
+            "params": {"name": "read_files", "arguments": {}}
         }))
         .send(&service)
         .await;
@@ -462,14 +766,14 @@ async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
     let summary: String = db
         .conn_for_tests()
         .query_row(
-            "SELECT summary_json FROM action_events WHERE operation = 'read_file'",
+            "SELECT summary_json FROM action_events WHERE operation = 'read_files'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     let summary: Value = serde_json::from_str(&summary).unwrap();
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["tool_name"], "read_file");
+    assert_eq!(telemetry["tool_name"], "read_files");
     assert_eq!(telemetry["success"], false);
     assert_eq!(telemetry["error_kind"], "invalid_arguments");
     assert!(telemetry["serialized_result_bytes"].is_null());
@@ -773,15 +1077,8 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
         .as_array()
         .unwrap()
         .is_empty());
-    assert_eq!(
-        acknowledged["session_continuity"]["status"], "unacknowledged",
-        "guidance ACK must remain independent when model-facing context ACK is omitted"
-    );
-    assert!(acknowledged["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(acknowledged["session_recovery"]["current_handoff"].is_object());
+    assert!(acknowledged.get("session_continuity").is_none());
+    assert!(acknowledged.get("session_recovery").is_none());
     let retained = runtime
         .sessions
         .list_messages(
@@ -1112,6 +1409,22 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
     let service = Service::new(build_test_router(config, db.clone(), runtime.clone()));
 
+    fn assert_no_recovery_required(value: &Value) {
+        let serialized = serde_json::to_string(value).unwrap();
+        assert!(
+            !serialized.contains("\"recovery_required\""),
+            "model-facing Context projection retained duplicate recovery_required: {serialized}"
+        );
+    }
+
+    fn assert_no_context_checkpoint_continuation(value: &Value) {
+        let serialized = serde_json::to_string(value).unwrap();
+        assert!(
+            !serialized.contains("\"session_context_continuation\""),
+            "model-facing Context projection retained static session_context_continuation: {serialized}"
+        );
+    }
+
     let (status, session_body) = stateless_2026_tool_call(
         &service,
         "secret",
@@ -1143,14 +1456,13 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     .await;
     assert_eq!(status, StatusCode::OK, "{cached_read_body}");
     let cached_read = stateless_tool_output(&cached_read_body);
-    assert_eq!(cached_read["session_context_revision"], 0);
-    assert_eq!(cached_read["session_continuity"]["status"], "invalid");
-    assert_eq!(cached_read["session_continuity"]["ack_revision"], 999);
-    assert!(cached_read["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(cached_read["session_recovery"]["current_handoff"].is_object());
+    for field in [
+        "session_context_revision",
+        "session_continuity",
+        "session_recovery",
+    ] {
+        assert!(cached_read.get(field).is_none(), "{field}");
+    }
     assert_eq!(runtime.sessions.context_revision(&session_id), Some(0));
 
     let mut exact_args =
@@ -1163,6 +1475,7 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         stateless_2026_tool_call(&service, "secret", 229, "start_session", exact_args, None).await;
     assert_eq!(status, StatusCode::OK, "{exact_body}");
     let exact = stateless_tool_output(&exact_body);
+    assert_no_context_checkpoint_continuation(&exact);
     assert_eq!(exact["session_context_revision"], 1);
     assert!(exact.get("session_continuity").is_none());
     assert!(exact.get("session_recovery").is_none());
@@ -1184,7 +1497,7 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     .await;
     assert_eq!(status, StatusCode::OK, "{second_cached_read_body}");
     let second_cached_read = stateless_tool_output(&second_cached_read_body);
-    assert_eq!(second_cached_read["session_context_revision"], 1);
+    assert!(second_cached_read.get("session_context_revision").is_none());
     assert!(second_cached_read.get("session_continuity").is_none());
     assert!(second_cached_read.get("session_recovery").is_none());
     assert_eq!(runtime.sessions.context_revision(&session_id), Some(1));
@@ -1199,6 +1512,8 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         stateless_2026_tool_call(&service, "secret", 231, "start_session", stale_args, None).await;
     assert_eq!(status, StatusCode::OK, "{stale_body}");
     let stale = stateless_tool_output(&stale_body);
+    assert_no_context_checkpoint_continuation(&stale);
+    assert_no_recovery_required(&stale);
     assert_eq!(stale["session_context_revision"], 2);
     assert_eq!(stale["session_continuity"]["status"], "behind");
     assert_eq!(stale["session_continuity"]["ack_revision"], 0);
@@ -1219,14 +1534,19 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         stateless_2026_tool_call(&service, "secret", 232, "start_session", future_args, None).await;
     assert_eq!(status, StatusCode::OK, "{future_body}");
     let future = stateless_tool_output(&future_body);
-    assert_eq!(future["session_context_revision"], 3);
+    assert_no_context_checkpoint_continuation(&future);
+    assert!(future.get("session_context_revision").is_none());
     assert_eq!(future["session_continuity"]["status"], "invalid");
-    assert_eq!(future["session_continuity"]["ack_revision"], 999);
-    assert!(future["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(future["session_recovery"]["current_handoff"].is_object());
+    assert_no_recovery_required(&future);
+    assert!(future.get("session_recovery").is_none());
+    assert!(future["session_continuity"].get("recovery_tool").is_none());
+    assert!(future["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
+    assert_eq!(
+        future["session_continuity"]["suggested_call"],
+        json!({"tool": "session_handoff_summary", "arguments": {"session_id": session_id}})
+    );
 
     let missing_args =
         with_mcp_recording_session(json!({"title": "context checkpoint missing"}), &session_id);
@@ -1235,9 +1555,94 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
             .await;
     assert_eq!(status, StatusCode::OK, "{missing_body}");
     let missing = stateless_tool_output(&missing_body);
-    assert_eq!(missing["session_context_revision"], 4);
+    assert_no_context_checkpoint_continuation(&missing);
+    assert_no_recovery_required(&missing);
+    assert!(missing.get("session_context_revision").is_none());
     assert_eq!(missing["session_continuity"]["status"], "unacknowledged");
-    assert!(missing["session_recovery"]["current_handoff"].is_object());
+    assert!(missing.get("session_recovery").is_none());
+    assert!(missing["session_continuity"].get("recovery_tool").is_none());
+    assert!(missing["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
+    assert_eq!(
+        missing["session_continuity"]["suggested_call"],
+        json!({
+            "tool": "session_handoff_summary",
+            "arguments": {"session_id": session_id},
+        })
+    );
+    assert_eq!(runtime.sessions.context_revision(&session_id), Some(4));
+
+    // Explicit recovery returns one current-state handoff and a safe baseline.
+    let (status, recovered_body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        2331,
+        "session_handoff_summary",
+        json!({"session_id": session_id}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recovered_body}");
+    let recovered = stateless_tool_output(&recovered_body);
+    assert_no_context_checkpoint_continuation(&recovered);
+    assert_no_recovery_required(&recovered);
+    assert_eq!(recovered["session_context_revision"], 4);
+    assert_eq!(recovered["session_continuity"]["status"], "recovered");
+    assert!(recovered["validation"].is_object());
+    assert!(recovered["jobs"].is_object());
+    assert!(recovered.get("session_recovery").is_none());
+    assert_eq!(runtime.sessions.context_revision(&session_id), Some(4));
+
+    for partial in [
+        json!({"limit": 1}),
+        json!({"summary_only": true}),
+        json!({"include_validation": false}),
+        json!({"include_workspace": false}),
+        json!({"include_checkpoints": false}),
+    ] {
+        let mut args = partial;
+        args["session_id"] = json!(session_id);
+        let (status, body) = stateless_2026_tool_call(
+            &service,
+            "secret",
+            2332,
+            "session_handoff_summary",
+            args,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let output = stateless_tool_output(&body);
+        assert!(output.get("session_context_revision").is_none());
+        assert_no_context_checkpoint_continuation(&output);
+        assert_no_recovery_required(&output);
+        assert!(output["session_continuity"]["suggested_call"].is_object());
+        assert!(output.get("session_recovery").is_none());
+    }
+
+    // Reading C with explicit recorder W cannot establish W's baseline.
+    let other = runtime.sessions.start_session(None, None);
+    let (status, body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        2333,
+        "session_handoff_summary",
+        with_mcp_recording_session(json!({"session_id": session_id}), &other.session_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let output = stateless_tool_output(&body);
+    assert!(output.get("session_context_revision").is_none());
+    assert!(output["session_continuity"].get("recovery_tool").is_none());
+    assert!(output["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
+    assert_eq!(
+        output["session_continuity"]["suggested_call"]["arguments"]["session_id"],
+        other.session_id
+    );
 
     let mut after_missing_args = with_mcp_recording_session(
         json!({"title": "context checkpoint after missing"}),
@@ -1258,9 +1663,45 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     .await;
     assert_eq!(status, StatusCode::OK, "{after_missing_body}");
     let after_missing = stateless_tool_output(&after_missing_body);
+    assert_no_recovery_required(&after_missing);
     assert_eq!(after_missing["session_context_revision"], 5);
     assert!(after_missing.get("session_continuity").is_none());
     assert!(after_missing.get("session_recovery").is_none());
+
+    let mut malformed_args =
+        with_mcp_recording_session(json!({"title": "malformed ACK effect"}), &session_id);
+    malformed_args["ack_session_context_revision"] = json!({"invalid": true});
+    let (status, malformed_body) = stateless_2026_tool_call(
+        &service,
+        "secret",
+        2341,
+        "start_session",
+        malformed_args,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{malformed_body}");
+    let malformed = stateless_tool_output(&malformed_body);
+    assert_no_context_checkpoint_continuation(&malformed);
+    assert_no_recovery_required(&malformed);
+    assert!(
+        malformed["session_id"].is_string(),
+        "business Session creation must execute"
+    );
+    assert_eq!(malformed["session_continuity"]["status"], "invalid");
+    assert!(malformed.get("session_context_revision").is_none());
+    assert!(malformed.get("session_recovery").is_none());
+    assert!(malformed["session_continuity"]
+        .get("recovery_tool")
+        .is_none());
+    assert!(malformed["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
+    assert_eq!(
+        malformed["session_continuity"]["suggested_call"],
+        json!({"tool": "session_handoff_summary", "arguments": {"session_id": session_id}})
+    );
+    assert_eq!(runtime.sessions.context_revision(&session_id), Some(6));
 
     let audit = serde_json::to_string(
         &runtime
@@ -1593,14 +2034,14 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
     let (_tmp, db) = test_db();
     let ledger_dir = tempfile::tempdir().unwrap();
     let ledger = ledger_dir.path().join("sessions.json");
-    let shell_clients = stateless_observation_shell_clients().await;
-    let agent_executor = spawn_stateless_observation_agent_executor(shell_clients.clone());
+    let runner_registry = stateless_observation_runner_registry().await;
+    let agent_executor = spawn_stateless_observation_agent_executor(runner_registry.clone());
     let shared_project =
-        crate::tool_runtime::agent_project_runtime_id("mcp-observation-agent", "shared");
+        crate::tool_runtime::runner_project_runtime_id("mcp-observation-agent", "shared");
     let foreign_project =
-        crate::tool_runtime::agent_project_runtime_id("mcp-observation-agent", "foreign");
+        crate::tool_runtime::runner_project_runtime_id("mcp-observation-agent", "foreign");
     let runtime = Arc::new(
-        ToolRuntime::new_for_tests_with_shell_clients(shell_clients.clone())
+        ToolRuntime::new_for_tests_with_runner_registry(runner_registry.clone())
             .with_session_ledger(&ledger)
             .with_model_surface(ModelSurface::FullOperatorRuntime),
     );
@@ -1929,7 +2370,7 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
     drop(service);
     drop(runtime);
     let restored_runtime = Arc::new(
-        ToolRuntime::new_for_tests_with_shell_clients(shell_clients)
+        ToolRuntime::new_for_tests_with_runner_registry(runner_registry)
             .with_session_ledger(&ledger)
             .with_model_surface(ModelSurface::FullOperatorRuntime),
     );
@@ -2276,7 +2717,7 @@ async fn http_mcp_2026_reads_computer_app_template_with_cache_contract() {
         json!({
             "transport": "mcp",
             "resource_uri": MCP_COMPUTER_UI_RESOURCE_URI,
-            "resource_version": "v11",
+            "resource_version": "v12",
             "protocol_era": "stateless_2026",
             "ui_capability_present": true,
             "mcp_error_code": Value::Null,
@@ -2330,7 +2771,7 @@ async fn http_mcp_computer_app_resource_protocol_failure_is_audited_without_cont
     assert_eq!(http_status, 400);
     let summary: Value = serde_json::from_str(&summary).unwrap();
     assert_eq!(summary["resource_uri"], MCP_COMPUTER_UI_RESOURCE_URI);
-    assert_eq!(summary["resource_version"], "v11");
+    assert_eq!(summary["resource_version"], "v12");
     assert_eq!(summary["protocol_era"], "validation_failed");
     assert_eq!(summary["ui_capability_present"], true);
     assert_eq!(

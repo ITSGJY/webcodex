@@ -1,5 +1,5 @@
 use super::*;
-use crate::shell_client::ShellClientRegistry;
+use crate::runner_http::RunnerRegistry;
 use crate::test_support::{seed_oauth_client, seed_user, test_config, test_config_oauth2, test_db};
 use salvo::test::{ResponseExt, TestClient};
 use salvo::Service;
@@ -15,6 +15,8 @@ mod model_ergonomics_tests;
 mod project_files_tests;
 #[path = "runtime_http/tests/projects_tests.rs"]
 mod projects_tests;
+#[path = "runtime_http/tests/runner_config_tests.rs"]
+mod runner_config_tests;
 
 #[test]
 fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
@@ -196,7 +198,7 @@ fn phase2_oauth_service_with_shared_key_hash(
 fn runtime_with_local_project(root: &std::path::Path, project_id: &str) -> ToolRuntime {
     let _ = (root, project_id);
     ToolRuntime::new(
-        Arc::new(ShellClientRegistry::default()),
+        Arc::new(RunnerRegistry::default()),
         Arc::new(crate::tool_runtime::RuntimeInfo::default()),
     )
 }
@@ -226,9 +228,7 @@ fn build_projects_router(
                 .push(Router::with_path("projects/list").post(projects_list))
                 .push(Router::with_path("projects/register").post(projects_register))
                 .push(Router::with_path("projects/create").post(projects_create))
-                .push(Router::with_path("projects/read_file").post(projects_read_file))
                 .push(Router::with_path("projects/git_status").post(projects_git_status))
-                .push(Router::with_path("projects/git_diff").post(projects_git_diff))
                 .push(
                     Router::with_path("projects/apply_unified_diff")
                         .post(projects_apply_unified_diff),
@@ -244,11 +244,8 @@ fn build_projects_router(
                 )
                 .push(Router::with_path("projects/run_job").post(projects_run_job))
                 .push(Router::with_path("projects/list_files").post(projects_list_files))
-                .push(Router::with_path("projects/search_text").post(projects_search_text))
-                .push(
-                    Router::with_path("projects/git_diff_summary").post(projects_git_diff_summary),
-                )
                 .push(Router::with_path("jobs/list").post(jobs_list))
+                .push(Router::with_path("jobs/stop").post(job_stop))
                 .push(Router::with_path("jobs/tail").post(job_tail))
                 .push(Router::with_path("runtime/status").post(runtime_status)),
         )
@@ -260,13 +257,13 @@ fn effective_status(resp: &Response) -> StatusCode {
 
 async fn register_import_agent_with_capabilities(
     root: &std::path::Path,
-    capabilities: Option<crate::shell_protocol::ShellClientCapabilities>,
-) -> (Arc<ToolRuntime>, Arc<ShellClientRegistry>) {
-    use crate::shell_protocol::{ShellAgentProjectSummary, ShellClientRegisterRequest};
-    let registry = Arc::new(ShellClientRegistry::default());
+    capabilities: Option<crate::runner_protocol::RunnerCapabilities>,
+) -> (Arc<ToolRuntime>, Arc<RunnerRegistry>) {
+    use crate::runner_protocol::{RunnerProjectSummary, RunnerRegisterRequest};
+    let registry = Arc::new(RunnerRegistry::default());
     registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -274,8 +271,8 @@ async fn register_import_agent_with_capabilities(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: "importer".to_string(),
-                agent_instance_id: "inst-import".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst-import".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
@@ -290,16 +287,19 @@ async fn register_import_agent_with_capabilities(
         &registry,
         "importer",
         "inst-import",
-        vec![ShellAgentProjectSummary {
+        vec![RunnerProjectSummary {
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: root.to_string_lossy().to_string(),
             allow_patch: true,
             kind: Some("repo".to_string()),
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -308,30 +308,28 @@ async fn register_import_agent_with_capabilities(
         }],
     )
     .await;
-    let runtime = Arc::new(ToolRuntime::new_for_tests_with_shell_clients(
+    let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
         registry.clone(),
     ));
     (runtime, registry)
 }
 
-async fn register_import_agent(
-    root: &std::path::Path,
-) -> (Arc<ToolRuntime>, Arc<ShellClientRegistry>) {
+async fn register_import_agent(root: &std::path::Path) -> (Arc<ToolRuntime>, Arc<RunnerRegistry>) {
     register_import_agent_with_capabilities(root, None).await
 }
 
 async fn complete_one_agent_request(
-    registry: Arc<ShellClientRegistry>,
+    registry: Arc<RunnerRegistry>,
     stdout: impl Into<String>,
     stderr: impl Into<String>,
     exit_code: i32,
 ) {
-    use crate::shell_protocol::{ShellAgentPollRequest, ShellAgentResultRequest};
+    use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
     let request = loop {
         if let Some(request) = registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: "importer".to_string(),
-                agent_instance_id: "inst-import".to_string(),
+                runner_instance_id: "inst-import".to_string(),
             })
             .await
             .unwrap()
@@ -341,9 +339,9 @@ async fn complete_one_agent_request(
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
     registry
-        .complete(ShellAgentResultRequest {
+        .complete(RunnerResultRequest {
             client_id: "importer".to_string(),
-            agent_instance_id: "inst-import".to_string(),
+            runner_instance_id: "inst-import".to_string(),
             request_id: request.request_id,
             exit_code: Some(exit_code),
             stdout: Some(stdout.into()),
@@ -355,13 +353,11 @@ async fn complete_one_agent_request(
         .unwrap();
 }
 
-fn spawn_startup_agent_executor(registry: Arc<ShellClientRegistry>) -> tokio::task::JoinHandle<()> {
-    use crate::shell_protocol::{
-        ShellAgentPollRequest, ShellAgentResultRequest, ShellAgentShellRequest,
-    };
+fn spawn_startup_agent_executor(registry: Arc<RunnerRegistry>) -> tokio::task::JoinHandle<()> {
+    use crate::runner_protocol::{RunnerPollRequest, RunnerRequest, RunnerResultRequest};
     use std::path::Path;
 
-    fn execute(request: &ShellAgentShellRequest) -> (i32, String, String) {
+    fn execute(request: &RunnerRequest) -> (i32, String, String) {
         if request.kind == "file_read" {
             return (1, String::new(), "No such file or directory".to_string());
         }
@@ -402,18 +398,18 @@ fn spawn_startup_agent_executor(registry: Arc<ShellClientRegistry>) -> tokio::ta
     tokio::spawn(async move {
         loop {
             if let Some(request) = registry
-                .poll(ShellAgentPollRequest {
+                .poll(RunnerPollRequest {
                     client_id: "importer".to_string(),
-                    agent_instance_id: "inst-import".to_string(),
+                    runner_instance_id: "inst-import".to_string(),
                 })
                 .await
                 .unwrap()
             {
                 let (exit_code, stdout, stderr) = execute(&request);
                 registry
-                    .complete(ShellAgentResultRequest {
+                    .complete(RunnerResultRequest {
                         client_id: "importer".to_string(),
-                        agent_instance_id: "inst-import".to_string(),
+                        runner_instance_id: "inst-import".to_string(),
                         request_id: request.request_id,
                         exit_code: Some(exit_code),
                         stdout: Some(stdout),
@@ -445,12 +441,7 @@ async fn all_project_endpoints_require_bearer_auth() {
 
     let endpoints: Vec<(&str, Value)> = vec![
         ("/api/projects/list", json!({})),
-        (
-            "/api/projects/read_file",
-            json!({"project": "demo", "path": "README.md"}),
-        ),
         ("/api/projects/git_status", json!({"project": "demo"})),
-        ("/api/projects/git_diff", json!({"project": "demo"})),
         (
             "/api/projects/apply_unified_diff",
             json!({"project": "demo", "diff": "diff"}),
@@ -780,7 +771,7 @@ async fn flattened_tool_manifest_exact_name_survives_null_params_wrapper() {
 }
 
 #[tokio::test]
-async fn http_start_coding_task_retirement_precedes_flattened_legacy_params() {
+async fn http_start_coding_task_flattened_legacy_params_do_not_revive_unknown_tool() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let tmp_proj = tempfile::tempdir().unwrap();
@@ -807,16 +798,15 @@ async fn http_start_coding_task_retirement_precedes_flattened_legacy_params() {
     let body: Value = resp.take_json().await.unwrap();
     assert_eq!(body["status"], 400);
     let error = body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("no longer supported"), "{body}");
-    assert!(error.contains("work_on_project"), "{body}");
+    assert!(error.contains("unknown tool 'start_coding_task'"), "{body}");
 }
 
 // =========================================================================
-// Retired compatibility tool entry
+// Removed tool identity
 // =========================================================================
 
 #[tokio::test]
-async fn http_start_coding_task_is_retired() {
+async fn http_start_coding_task_uses_ordinary_unknown_tool_path() {
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
@@ -829,8 +819,10 @@ async fn http_start_coding_task_is_retired() {
     assert_eq!(effective_status(&resp), StatusCode::BAD_REQUEST);
     let body: Value = resp.take_json().await.unwrap();
     let error = body["error"].as_str().unwrap();
-    assert!(error.contains("no longer supported"), "{error}");
-    assert!(error.contains("work_on_project"), "{error}");
+    assert!(
+        error.contains("unknown tool 'start_coding_task'"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -844,6 +836,75 @@ fn extract_tool_call_params_precede_flattened_fields() {
 
     assert_eq!(tool, "git_status");
     assert_eq!(params, json!({"project": "right"}));
+}
+
+#[test]
+fn extract_tool_call_plugin_tool_preserves_provider_local_tool_inside_params() {
+    let body = json!({
+        "tool": "plugin_tool",
+        "params": {
+            "action": "describe",
+            "runner": "runner-a",
+            "plugin": "repo-tools",
+            "tool": "safe_delete"
+        },
+        TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_plugin_record"
+    });
+    let (tool, params) = extract_tool_call(&body).unwrap();
+    assert_eq!(tool, "plugin_tool");
+    assert_eq!(params["action"], "describe");
+    assert_eq!(params["tool"], "safe_delete");
+    let parsed = ToolCall::from_tool_name(&tool, params).unwrap();
+    assert_eq!(parsed.tool_name(), "plugin_tool");
+    assert!(matches!(parsed, ToolCall::PluginTool(_)));
+    assert_eq!(
+        extract_recording_session_id(&body),
+        Some("wc_sess_plugin_record".to_string())
+    );
+
+    let (tool, params) = extract_tool_call(&json!({
+        "tool": "plugin_tool",
+        "params": {
+            "action": "call",
+            "binding": "wc_pbind_00000000000000000000000000000000",
+            "arguments": {"path": "build/old.bin"}
+        }
+    }))
+    .unwrap();
+    assert!(matches!(
+        ToolCall::from_tool_name(&tool, params).unwrap(),
+        ToolCall::PluginTool(_)
+    ));
+}
+
+#[test]
+fn plugin_tool_api_trace_projection_hides_binding_and_raw_arguments() {
+    let body = json!({
+        "tool": "plugin_tool",
+        "params": {
+            "action": "call",
+            "binding": "wc_pbind_0123456789abcdef0123456789abcdef",
+            "arguments": {"path": "private/target.txt", "secret": "must-not-leak"}
+        },
+        TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_plugin_record"
+    });
+    let raw = tool_call_trace_raw_body(&body);
+    let encoded = serde_json::to_string(&raw).unwrap();
+    assert!(!encoded.contains("wc_pbind_"));
+    assert!(!encoded.contains("private/target.txt"));
+    assert!(!encoded.contains("must-not-leak"));
+    assert_eq!(raw["tool"], "plugin_tool");
+    assert_eq!(raw["arguments"]["binding_present"], true);
+    assert_eq!(raw["arguments"]["arguments_present"], true);
+    assert_eq!(raw["recording_session_id_present"], true);
+
+    let effective = tool_call_trace_effective_arguments("plugin_tool", &body["params"]);
+    let encoded = serde_json::to_string(&effective).unwrap();
+    assert!(!encoded.contains("wc_pbind_"));
+    assert!(!encoded.contains("private/target.txt"));
+    assert!(!encoded.contains("must-not-leak"));
+    assert_eq!(effective["binding_present"], true);
+    assert_eq!(effective["arguments_present"], true);
 }
 
 #[test]
@@ -941,6 +1002,7 @@ fn extract_tool_call_collects_flattened_write_project_file_fields() {
 }
 
 #[test]
+#[cfg(feature = "workspace-checkpoints")]
 fn extract_tool_call_collects_flattened_checkpoint_restore_fields() {
     // GPT Action flattened call for workspace_checkpoint_restore: the
     // recorder metadata (recording_session_id) must be stripped from
@@ -1026,9 +1088,16 @@ async fn http_tools_list_returns_names_and_count() {
     let names = body["names"].as_array().unwrap();
     assert!(!names.is_empty(), "names must not be empty");
     assert!(names.iter().any(|n| n == "list_tools"));
-    assert!(names.iter().any(|n| n == "git_diff_summary"));
     assert!(names.iter().any(|n| n == "git_log"));
     assert!(names.iter().any(|n| n == "show_changes"));
+    assert!(names.iter().any(|n| n == "git_diff_hunks"));
+    assert!(names.iter().any(|n| n == "observe_jobs"));
+    for retired in ["git_diff", "git_diff_summary", "job_status", "job_log"] {
+        assert!(
+            !names.iter().any(|name| name == retired),
+            "retired tool {retired} must stay absent from /api/tools/list"
+        );
+    }
     assert_eq!(body["count"], names.len());
     for tool in body["tools"].as_array().unwrap() {
         assert!(tool["inputSchema"].is_object());
@@ -1323,7 +1392,7 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
             TOOL_CALL_RECORDING_SESSION_ID_FIELD: session_id,
             "job_id": "missing-job",
             "expected_failure": true,
-            "expected_failure_kind": "job_not_found",
+            "expected_failure_kind": "invalid_arguments",
             "assertion_name": "api hidden metadata compatibility"
         }))
         .send(&service)
@@ -1343,9 +1412,9 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
     assert_eq!(event["tool_name"], "job_status");
     assert_eq!(event["status"], "failed");
     assert_eq!(event["expected_failure"], true);
-    assert_eq!(event["expected_failure_kind"], "job_not_found");
+    assert_eq!(event["expected_failure_kind"], "invalid_arguments");
     assert_eq!(event["assertion_name"], "api hidden metadata compatibility");
-    assert_eq!(event["actual_failure_kind"], "job_not_found");
+    assert_eq!(event["actual_failure_kind"], "invalid_arguments");
     assert_eq!(
         event["failure_expectation_result"],
         "matched_expected_failure"
@@ -1414,7 +1483,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
         .iter()
         .find(|event| event["kind"] == "tool_call_finished")
         .expect("recorded REST model-facing result");
-    assert_eq!(finished["context_revision"], 1);
+    assert!(finished.get("context_revision").is_none());
 }
 
 #[tokio::test]
@@ -1588,7 +1657,7 @@ async fn http_tools_call_rejects_arguments_even_when_params_are_present() {
     let (status, body) = http_tool_call(
         &service,
         json!({
-            "tool": "git_diff_summary",
+            "tool": "show_changes",
             "params": {"project": "agent:canonical:p"},
             "arguments": {"project": "agent:retired:p"},
         }),
@@ -1603,12 +1672,32 @@ async fn http_tools_call_rejects_arguments_even_when_params_are_present() {
 }
 
 #[tokio::test]
+async fn http_tools_call_rejects_app_only_work_result_state() {
+    let (_tmp, service) = phase2_service();
+    let (status, body) = http_tool_call(
+        &service,
+        json!({
+            "tool": "work_result_state",
+            "params": {
+                "project": "agent:canonical:p",
+                "session_id": format!("wc_sess_{}", "1".repeat(32))
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("Work Result App state")));
+}
+
+#[tokio::test]
 async fn http_tools_call_generic_path_dispatches_representative_project_tools() {
     // One read-side and one write-side tool are sufficient to prove the generic
     // extraction -> ToolCall -> ToolRuntime -> HTTP ToolResult path.
     let (_tmp, service) = phase2_service();
     for (tool, params) in [
-        ("git_diff_summary", json!({"project": "agent:nope:nope"})),
+        ("git_status", json!({"project": "agent:nope:nope"})),
         (
             "write_project_file",
             json!({"project": "agent:nope:nope", "path": "x.txt", "content": "a"}),
@@ -1626,16 +1715,14 @@ async fn http_tools_call_generic_path_dispatches_representative_project_tools() 
 
 #[tokio::test]
 async fn api_show_changes_with_session_id() {
-    use crate::shell_protocol::{
-        ShellAgentPollRequest, ShellAgentResultRequest, ShellClientCapabilities,
-    };
+    use crate::runner_protocol::{RunnerCapabilities, RunnerPollRequest, RunnerResultRequest};
 
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let tmp_proj = tempfile::tempdir().unwrap();
     let (runtime, registry) = register_import_agent_with_capabilities(
         tmp_proj.path(),
-        Some(ShellClientCapabilities {
+        Some(RunnerCapabilities {
             shell: true,
             git: true,
             internal_posix_script: true,
@@ -1675,9 +1762,9 @@ async fn api_show_changes_with_session_id() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let req = loop {
             let req = registry
-                .poll(ShellAgentPollRequest {
+                .poll(RunnerPollRequest {
                     client_id: "importer".to_string(),
-                    agent_instance_id: "inst-import".to_string(),
+                    runner_instance_id: "inst-import".to_string(),
                 })
                 .await
                 .unwrap();
@@ -1690,14 +1777,36 @@ async fn api_show_changes_with_session_id() {
             );
             tokio::task::yield_now().await;
         };
-        let stdout = "## main\n?? README.md\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nstatus_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0\nfiles_total=1\nfiles_returned=1\nfiles_truncated=0\nfiles_limit=200\nmodified=0\nadded=0\ndeleted=0\nrenamed=0\ncopied=0\nuntracked=1\nconflicted=0\nstaged=0\nunstaged=0\nstatus_trunc_count=0\nstatus_trunc_bytes=0\nstatus_trunc_path=0\nstatus_bytes=20\n@@WEBCODEX_SHOW_CHANGES_SEP@@\ncommit=abc123\nshort=abc123\nsummary=test head\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nhead_exit=0\nhead_truncated=0\nhead_bytes=44\n@@WEBCODEX_SHOW_CHANGES_SEP@@\n\n@@WEBCODEX_SHOW_CHANGES_SEP@@\ndiff_stat_exit=0\ndiff_stat_truncated=0\ndiff_stat_bytes=0\n";
+        let stdout = format!(
+            "{}{}{}{}",
+            crate::tool_runtime::framed_show_changes_test_block(
+                'S',
+                "## main\n?? README.md\n",
+                "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0\nfiles_total=1\nfiles_returned=1\nfiles_truncated=0\nfiles_limit=200\nmodified=0\nadded=0\ndeleted=0\nrenamed=0\ncopied=0\nuntracked=1\nconflicted=0\nstaged=0\nunstaged=0\nstatus_trunc_count=0\nstatus_trunc_bytes=0\nstatus_trunc_path=0\nstatus_bytes=20\n"
+            ),
+            crate::tool_runtime::framed_show_changes_test_block(
+                'H',
+                "commit=abc123\nshort=abc123\nsummary=test head\n",
+                "head_exit=0\nhead_truncated=0\nhead_bytes=44\n"
+            ),
+            crate::tool_runtime::framed_show_changes_test_block(
+                'T',
+                "",
+                "diff_stat_exit=0\ndiff_stat_truncated=0\ndiff_stat_bytes=0\n"
+            ),
+            crate::tool_runtime::framed_show_changes_test_block(
+                'N',
+                "",
+                "numstat_exit=0\nnumstat_truncated=0\nnumstat_bytes=0\n"
+            )
+        );
         registry
-            .complete(ShellAgentResultRequest {
+            .complete(RunnerResultRequest {
                 client_id: "importer".to_string(),
-                agent_instance_id: "inst-import".to_string(),
+                runner_instance_id: "inst-import".to_string(),
                 request_id: req.request_id,
                 exit_code: Some(0),
-                stdout: Some(stdout.to_string()),
+                stdout: Some(stdout),
                 stderr: Some(String::new()),
                 duration_ms: Some(1),
                 error: None,
@@ -1792,8 +1901,8 @@ async fn oauth2_tools_call_scope_matrix() {
             crate::auth::SCOPE_RUNTIME_READ,
         ),
         (
-            "read_file",
-            json!({"project": "demo", "path": "README.md"}),
+            "read_files",
+            json!({"project": "demo", "items": [{"path": "README.md"}]}),
             project_read,
             runtime_read,
             crate::auth::SCOPE_PROJECT_READ,
@@ -1954,8 +2063,8 @@ async fn bridge_oauth2_tools_call_still_requires_project_read_and_job_run_scopes
     let (status, body, challenge) = oauth_tools_call(
         &service,
         &token,
-        "read_file",
-        json!({"project": "demo", "path": "README.md"}),
+        "read_files",
+        json!({"project": "demo", "items": [{"path": "README.md"}]}),
     )
     .await;
     assert_oauth_scope_rejected(
@@ -2016,7 +2125,7 @@ async fn http_tools_list_includes_phase4_edit_tools() {
     assert!(names.iter().any(|n| n == "write_project_file"));
     assert_eq!(body["count"], names.len());
     let tools = body["tools"].as_array().unwrap();
-    for name in ["read_file", "run_shell", "write_project_file"] {
+    for name in ["read_files", "run_shell", "write_project_file"] {
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == name)

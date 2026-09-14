@@ -20,17 +20,19 @@ mod import_http;
 mod jobs;
 mod project_files;
 mod projects;
+mod runner_config;
 
 pub use import_http::import_conversation_files_to_project;
-pub use jobs::{
-    job_log, job_status, job_stop, job_tail, jobs_list, projects_run_job, projects_run_shell,
-};
+pub use jobs::{job_stop, job_tail, jobs_list, projects_run_job, projects_run_shell};
 pub use project_files::{
-    projects_apply_unified_diff, projects_discard_untracked, projects_git_diff,
-    projects_git_diff_summary, projects_git_restore_paths, projects_git_status,
-    projects_list_files, projects_read_file, projects_search_text,
+    projects_apply_unified_diff, projects_discard_untracked, projects_git_restore_paths,
+    projects_git_status, projects_list_files,
 };
-pub use projects::{projects_create, projects_list, projects_register, projects_unregister};
+pub use projects::{
+    projects_create, projects_list, projects_register, projects_resolve_or_register,
+    projects_unregister,
+};
+pub use runner_config::{runner_config_check, runner_config_reload};
 
 fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()
@@ -272,7 +274,7 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
             return;
         }
     };
-    guard.capture_payload("raw_request_body", &body);
+    guard.capture_payload("raw_request_body", &tool_call_trace_raw_body(&body));
     let (tool, params) = match extract_tool_call(&body) {
         Ok(pair) => pair,
         Err(msg) => {
@@ -292,15 +294,19 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
         }
     };
     guard.set_tool_name(Some(tool.clone()));
+    let window = crate::client_window::api_window(req, res);
+    guard.set_client_window(Some(&window));
     guard.parsed("ok");
-    guard.capture_payload("effective_arguments", &params);
+    guard.capture_payload(
+        "effective_arguments",
+        &tool_call_trace_effective_arguments(&tool, &params),
+    );
     // dispatch_started only after argument extraction succeeds and immediately
     // before ToolRuntime dispatch.
     guard.dispatch_started();
 
     let session_id = extract_recording_session_id(&body);
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
-    let window = crate::client_window::api_window(req, res);
     let active_trace_id = guard.active_trace_id();
     let outcome = scope_active_trace(
         active_trace_id,
@@ -439,13 +445,56 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
     }
 }
 
+fn tool_call_trace_raw_body(body: &Value) -> Value {
+    let Some(object) = body.as_object() else {
+        return body.clone();
+    };
+    if object.get(TOOL_CALL_TOOL_FIELD).and_then(Value::as_str)
+        != Some(crate::plugin_gateway::PLUGIN_TOOL_NAME)
+    {
+        return body.clone();
+    }
+    let plugin_arguments = object
+        .get(TOOL_CALL_PARAMS_FIELD)
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut flattened = serde_json::Map::new();
+            for (key, value) in object {
+                if key == TOOL_CALL_TOOL_FIELD
+                    || key == TOOL_CALL_PARAMS_FIELD
+                    || key == TOOL_CALL_RECORDING_SESSION_ID_FIELD
+                {
+                    continue;
+                }
+                flattened.insert(key.clone(), value.clone());
+            }
+            Value::Object(flattened)
+        });
+    json!({
+        "tool": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+        "arguments": crate::plugin_gateway::audit_arguments(&plugin_arguments),
+        "recording_session_id_present": object
+            .get(TOOL_CALL_RECORDING_SESSION_ID_FIELD)
+            .is_some(),
+    })
+}
+
+fn tool_call_trace_effective_arguments(tool: &str, params: &Value) -> Value {
+    if tool == crate::plugin_gateway::PLUGIN_TOOL_NAME {
+        crate::plugin_gateway::audit_arguments(params)
+    } else {
+        params.clone()
+    }
+}
+
 /// Extract `(tool, params)` from a raw `callRuntimeTool` request body.
 ///
 /// Accepted shapes (all route to the same tool dispatch):
 /// - `{"tool":"list_tools"}`
 /// - `{"tool":"list_tools","params":null}`
-/// - `{"tool":"git_diff_summary","params":{"project":"agent:c:p"}}`
-/// - `{"tool":"git_diff_summary","project":"agent:c:p"}`
+/// - `{"tool":"show_changes","params":{"project":"agent:c:p"}}`
+/// - `{"tool":"show_changes","project":"agent:c:p"}`
 /// - `{"tool":"git_status","project":"agent:c:p","recording_session_id":"wc_sess_..."}`
 ///
 /// Non-null `params` take precedence over flattened GPT Action fields. A null

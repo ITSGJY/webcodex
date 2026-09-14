@@ -1,14 +1,13 @@
 use super::activity::{ActivityRecorder, NoopActivityRecorder};
+#[cfg(feature = "workspace-checkpoints")]
 use super::checkpoint;
-use super::local_jobs::{LocalJobKiller, LocalJobRecord, SystemJobKiller};
 use super::observations::RuntimeObservations;
 use super::permissions::PermissionEvaluator;
 use super::runtime_info::RuntimeInfo;
 use super::sessions;
 use super::SessionShellRegistry;
-use crate::shell_client::ShellClientRegistry;
+use crate::runner_http::RunnerRegistry;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -105,16 +104,17 @@ impl ValidationTerminalReconciliationTestHook {
 
 #[derive(Clone)]
 pub struct ToolRuntime {
-    pub shell_clients: Arc<ShellClientRegistry>,
+    pub runner_registry: Arc<RunnerRegistry>,
     pub(crate) mcp_gateway: Arc<crate::mcp_gateway::McpGatewayRuntime>,
+    pub(crate) plugin_gateway: Arc<crate::plugin_gateway::PluginGatewayRuntime>,
+    pub(crate) ssh_resource_gateway: Arc<crate::ssh_resource_gateway::SshResourceGatewayRuntime>,
     pub(crate) coding_agent_runs: Arc<super::coding_agent::CodingAgentServerState>,
     pub runtime_info: Arc<RuntimeInfo>,
     runtime_exposure: crate::model_surface::RuntimeExposure,
+    #[cfg(feature = "workspace-checkpoints")]
     pub(crate) checkpoint_store: checkpoint::CheckpointStore,
     pub(crate) sessions: sessions::SessionStore,
     pub(crate) session_shells: SessionShellRegistry,
-    pub(crate) local_jobs: Arc<Mutex<HashMap<String, LocalJobRecord>>>,
-    pub(crate) job_killer: Arc<dyn LocalJobKiller>,
     pub(crate) semantic_navigation_probe_timeout: Duration,
     pub(crate) repository_overview_probe_timeout: Duration,
     /// One deadline shared by every item in a `read_files` batch.
@@ -154,12 +154,22 @@ pub struct ToolRuntime {
     /// last successful meaningful tool call). Shared with the connector
     /// runtime; never stores payloads or secrets.
     pub(crate) observations: Arc<RuntimeObservations>,
+    /// Process-local payload-free view of currently in-flight MCP Window
+    /// requests. It is observability only and intentionally resets on restart.
+    pub(crate) window_activity: Arc<super::window_activity::WindowActivityRegistry>,
+    /// Fail-open metrics projection. This consumes canonical runtime/transport
+    /// facts and has no authority over execution or persistence.
+    pub(crate) metrics: Arc<dyn super::runtime_metrics::RuntimeMetrics>,
+    /// Durable ActionAudit-backed Window activity query handle. This shares the
+    /// normal Server SQLite database and never becomes an authorization store.
+    pub(crate) window_activity_db: Option<Arc<crate::Database>>,
     /// Optional Control-owned durable project Memory store. It is injected by
     /// the server from the existing webcodex.db handle; Runner-native project
     /// filesystems never own Memory v1 persistence.
     pub(crate) memory_db: Option<Arc<crate::Database>>,
-    /// Optional Control-owned durable Agent and Conversation store. It shares
-    /// the Server SQLite handle with other durable domains but owns independent tables.
+    /// Optional Control-owned durable user-domain store. Durable Agent, Conversation,
+    /// AgentTask, and Goal state share this Server SQLite handle while remaining
+    /// independent tables, lifecycles, and authority domains.
     pub(crate) communication_db: Option<Arc<crate::Database>>,
     /// Optional process-local Host continuation registry/controller. It is
     /// created only when the durable communication database is injected and is
@@ -168,20 +178,23 @@ pub struct ToolRuntime {
 }
 
 impl ToolRuntime {
-    pub fn new(shell_clients: Arc<ShellClientRegistry>, runtime_info: Arc<RuntimeInfo>) -> Self {
+    pub fn new(runner_registry: Arc<RunnerRegistry>, runtime_info: Arc<RuntimeInfo>) -> Self {
         Self {
-            shell_clients,
+            runner_registry,
             mcp_gateway: Arc::new(crate::mcp_gateway::McpGatewayRuntime::default()),
+            plugin_gateway: Arc::new(crate::plugin_gateway::PluginGatewayRuntime::default()),
+            ssh_resource_gateway: Arc::new(
+                crate::ssh_resource_gateway::SshResourceGatewayRuntime::default(),
+            ),
             coding_agent_runs: Arc::new(super::coding_agent::CodingAgentServerState::default()),
             runtime_info,
             runtime_exposure: crate::model_surface::RuntimeExposure::Runtime(
                 crate::model_surface::ModelSurface::LocalCoding,
             ),
+            #[cfg(feature = "workspace-checkpoints")]
             checkpoint_store: checkpoint::CheckpointStore::default(),
             sessions: sessions::SessionStore::default(),
             session_shells: SessionShellRegistry::default(),
-            local_jobs: Arc::new(Mutex::new(HashMap::new())),
-            job_killer: Arc::new(SystemJobKiller),
             semantic_navigation_probe_timeout:
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
             repository_overview_probe_timeout:
@@ -202,6 +215,9 @@ impl ToolRuntime {
             permission_evaluator: PermissionEvaluator::from_env(),
             activity: Arc::new(NoopActivityRecorder),
             observations: Arc::new(RuntimeObservations::default()),
+            window_activity: Arc::new(super::window_activity::WindowActivityRegistry::default()),
+            metrics: Arc::new(super::runtime_metrics::TracingRuntimeMetrics),
+            window_activity_db: None,
             memory_db: None,
             communication_db: None,
             agent_continuations: None,
@@ -240,6 +256,17 @@ impl ToolRuntime {
         self
     }
 
+    pub(crate) fn with_window_activity_database(mut self, db: Arc<crate::Database>) -> Self {
+        self.window_activity_db = Some(db);
+        self
+    }
+
+    pub(crate) fn window_activity_registry(
+        &self,
+    ) -> Arc<super::window_activity::WindowActivityRegistry> {
+        self.window_activity.clone()
+    }
+
     pub(crate) fn with_memory_database(mut self, db: Arc<crate::Database>) -> Self {
         self.memory_db = Some(db);
         self
@@ -255,14 +282,12 @@ impl ToolRuntime {
 
     #[cfg(test)]
     pub(crate) fn new_for_tests() -> Self {
-        Self::new_for_tests_with_shell_clients(Arc::new(ShellClientRegistry::default()))
+        Self::new_for_tests_with_runner_registry(Arc::new(RunnerRegistry::default()))
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_tests_with_shell_clients(
-        shell_clients: Arc<ShellClientRegistry>,
-    ) -> Self {
-        Self::new(shell_clients, Arc::new(RuntimeInfo::default()))
+    pub(crate) fn new_for_tests_with_runner_registry(runner_registry: Arc<RunnerRegistry>) -> Self {
+        Self::new(runner_registry, Arc::new(RuntimeInfo::default()))
     }
 
     pub fn with_session_ledger(mut self, path: impl Into<PathBuf>) -> Self {
@@ -279,7 +304,8 @@ impl ToolRuntime {
         project: &str,
         limit: Option<usize>,
     ) -> sessions::WorkflowSessionConsoleList {
-        self.sessions.console_list_for_project(project, limit)
+        self.sessions
+            .console_list_for_project(project, limit, sessions::console_validation_hooks())
     }
 
     pub(crate) fn workflow_session_console_detail(
@@ -288,8 +314,12 @@ impl ToolRuntime {
         session_id: &str,
         limit: Option<usize>,
     ) -> Option<sessions::WorkflowSessionConsoleDetail> {
-        self.sessions
-            .console_detail_for_project(project, session_id, limit)
+        self.sessions.console_detail_for_project(
+            project,
+            session_id,
+            limit,
+            sessions::console_validation_hooks(),
+        )
     }
 
     #[cfg(test)]
@@ -325,18 +355,6 @@ impl ToolRuntime {
     #[cfg(test)]
     pub(crate) fn with_structured_execution_sync_wait(mut self, wait: Duration) -> Self {
         self.structured_execution_sync_wait = wait;
-        self
-    }
-
-    /// Replace the in-memory session store with one capped at `max_events_per_session`
-    /// events, so tests can exercise ledger truncation without recording hundreds of
-    /// events. Sessions are still durable-exact within the in-memory store.
-    #[cfg(test)]
-    pub(crate) fn with_session_event_cap(mut self, max_events_per_session: usize) -> Self {
-        self.sessions = sessions::SessionStore::new_in_memory(
-            sessions::DEFAULT_MAX_SESSIONS,
-            max_events_per_session,
-        );
         self
     }
 

@@ -37,11 +37,16 @@ async fn dispatch_hygiene_with_agent(
     });
 
     let forbidden = ["python3", "-c"].join(" ");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    // A hygiene check can issue both the fixed diagnostic script and a bounded
+    // size-probe script. On Windows each local POSIX-shell startup is noticeably
+    // more expensive, especially while the full Rust test suite is running in
+    // parallel, so the old 10-second harness deadline was below the production
+    // per-script timeout and could fail despite healthy bounded execution.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while !task.is_finished() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "hygiene check did not finish within 10 seconds for client {client_id}"
+            "hygiene check did not finish within 30 seconds for client {client_id}"
         );
         if let Some(req) = probe_patch_agent_request(runtime, client_id).await {
             assert_eq!(req.kind, "run_internal_posix_script");
@@ -52,7 +57,7 @@ async fn dispatch_hygiene_with_agent(
                 .expect("hygiene diagnostics must carry a typed internal script");
             assert_eq!(
                 payload.language,
-                crate::shell_protocol::ShellScriptLanguage::Sh
+                crate::runner_protocol::ShellScriptLanguage::Sh
             );
             assert!(payload.args.is_empty());
             assert!(
@@ -78,7 +83,7 @@ async fn setup_clean_git_repo(
     let tmp = TempDir::new().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial commit");
-    let project = register_agent_project_at_path(runtime, client_id, project_id, tmp.path()).await;
+    let project = register_runner_project_at_path(runtime, client_id, project_id, tmp.path()).await;
     (tmp, project)
 }
 
@@ -156,7 +161,7 @@ fn workspace_hygiene_check_openapi_operation_count_unchanged() {
         .values()
         .map(|m| m.as_object().unwrap().len())
         .sum();
-    assert_eq!(count, 22, "operation count must stay 22");
+    assert_eq!(count, 16, "operation count must stay 16");
 }
 
 // =========================================================================
@@ -440,7 +445,7 @@ async fn workspace_hygiene_check_does_not_mark_tracked_auth_source_names_critica
     for path in [
         "src/auth/tokens.rs",
         "src/auth/project_credential.rs",
-        "src/agent_tokens_http.rs",
+        "src/runner_tokens_http.rs",
     ] {
         let full = tmp.path().join(path);
         fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -474,7 +479,7 @@ async fn workspace_hygiene_check_does_not_mark_tracked_auth_source_names_critica
     for path in [
         "src/auth/tokens.rs",
         "src/auth/project_credential.rs",
-        "src/agent_tokens_http.rs",
+        "src/runner_tokens_http.rs",
     ] {
         assert!(
             findings.iter().all(|finding| finding["path"] != path),
@@ -529,7 +534,7 @@ async fn workspace_hygiene_check_non_git_project_does_not_fail() {
     // Do NOT git init — this is a non-git project.
     fs::write(tmp.path().join("README.md"), "hello\n").unwrap();
 
-    let project = register_agent_project_at_path(&runtime, "hyc-nongit", "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, "hyc-nongit", "demo", tmp.path()).await;
 
     let result =
         dispatch_hygiene_with_agent(&runtime, "hyc-nongit", project, None, None, None).await;
@@ -600,7 +605,9 @@ async fn workspace_hygiene_check_read_only_session_allowed() {
         "read_only session should allow workspace_hygiene_check: {:?}",
         result.error
     );
-    assert_eq!(result.output["session_recorded"], true);
+    assert!(result.output.get("session_recorded").is_none());
+    assert!(result.output.get("session_event_id").is_none());
+    assert!(result.output.get("session_id").is_none());
 }
 
 // =========================================================================

@@ -1,6 +1,5 @@
 //! Runtime dispatch adapters for file, artifact, and text-edit tool calls.
 
-use super::files::SearchRequest;
 use super::project_resolution::{ProjectResolverError, ResolvedProject};
 use super::{sessions::SessionTransport, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
@@ -19,17 +18,6 @@ impl ToolRuntime {
                 paths,
                 session_id: _,
             } => self.delete_project_files(project, paths).await,
-            ToolCall::ReadFile {
-                project,
-                path,
-                session_id: _,
-                start_line,
-                limit,
-                with_line_numbers,
-            } => {
-                self.read_file(project, path, start_line, limit, with_line_numbers)
-                    .await
-            }
             ToolCall::ReadFiles {
                 project,
                 items,
@@ -49,7 +37,8 @@ impl ToolRuntime {
                 session_id: _,
                 path,
                 limit,
-            } => self.list_project_files(project, path, limit).await,
+                offset,
+            } => self.list_project_files(project, path, limit, offset).await,
             ToolCall::ListProjectTrackedFiles {
                 project,
                 session_id: _,
@@ -69,57 +58,6 @@ impl ToolRuntime {
                 max_depth,
                 limit,
             } => self.project_overview(project, path, max_depth, limit).await,
-            ToolCall::SearchProjectText {
-                project,
-                pattern,
-                pattern_mode,
-                session_id: _,
-                path,
-                limit,
-                context_before,
-                context_after,
-                include_globs,
-                exclude_globs,
-                result_mode,
-                timeout_secs,
-            } => match project_resolution {
-                Some(Ok(resolved)) => {
-                    self.search_project_text_resolved(
-                        &resolved,
-                        &project,
-                        SearchRequest {
-                            pattern,
-                            path,
-                            limit,
-                            context_before,
-                            context_after,
-                            include_globs,
-                            exclude_globs,
-                            result_mode,
-                            timeout_secs,
-                        },
-                        pattern_mode,
-                    )
-                    .await
-                }
-                Some(Err(error)) => error.into_tool_result(),
-                None => {
-                    self.search_project_text(
-                        project,
-                        pattern,
-                        pattern_mode,
-                        path,
-                        limit,
-                        context_before,
-                        context_after,
-                        include_globs,
-                        exclude_globs,
-                        result_mode,
-                        timeout_secs,
-                    )
-                    .await
-                }
-            },
             ToolCall::SearchProjectTexts {
                 project,
                 queries,
@@ -169,7 +107,7 @@ impl ToolRuntime {
                         }
                         Some(Err(error)) => error.into_tool_result(),
                         None => ToolResult::err(
-                            "export_project_artifact requires an exact resolved agent project",
+                            "export_project_artifact requires an exact resolved Runner project",
                         ),
                     }
                 }

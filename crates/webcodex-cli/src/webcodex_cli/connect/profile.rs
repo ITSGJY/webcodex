@@ -31,6 +31,8 @@ pub(crate) struct ConnectOptions {
     pub(crate) oauth_redirect_uri: Option<String>,
     pub(crate) oauth_computer_permissions: bool,
     pub(crate) oauth_local_mcp: bool,
+    pub(crate) oauth_local_plugins: bool,
+    pub(crate) oauth_local_ssh: bool,
     pub(crate) oauth_coding_agent: bool,
     pub(crate) username: Option<String>,
     pub(crate) project: PathBuf,
@@ -53,7 +55,7 @@ pub(super) struct ResolvedKey {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(super) struct ExistingAgentConfig {
+pub(super) struct ExistingRunnerConfig {
     pub(super) server_url: String,
     pub(super) token: String,
     pub(super) client_id: String,
@@ -69,6 +71,8 @@ pub(crate) struct ProjectFile {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registration_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     #[serde(default = "default_true")]
@@ -269,30 +273,46 @@ pub(super) fn validate_existing_regular_file(path: &Path) -> Result<(), String> 
     Ok(())
 }
 
-pub(super) fn read_existing_agent_config(
+pub(super) fn read_existing_runner_config(
     path: &Path,
-) -> Result<Option<ExistingAgentConfig>, String> {
+) -> Result<Option<ExistingRunnerConfig>, String> {
     if !path.exists() {
         return Ok(None);
     }
     validate_existing_regular_file(path)?;
     let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("failed to read agent config {}: {error}", path.display()))?;
+        .map_err(|error| format!("failed to read Runner config {}: {error}", path.display()))?;
     toml::from_str(&content)
         .map(Some)
-        .map_err(|error| format!("failed to parse agent config {}: {error}", path.display()))
+        .map_err(|error| format!("failed to parse Runner config {}: {error}", path.display()))
 }
 
 pub(crate) fn read_project_files(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
 ) -> Result<Vec<(PathBuf, ProjectFile)>, String> {
-    let entries = match std::fs::read_dir(projects_dir) {
+    match std::fs::symlink_metadata(project_registry_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "Runner project registry {} is not a real directory; refusing to follow it",
+                project_registry_dir.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect Runner project registry {}: {error}",
+                project_registry_dir.display()
+            ))
+        }
+    }
+    let entries = match std::fs::read_dir(project_registry_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(format!(
-                "failed to read project directory {}: {error}",
-                projects_dir.display()
+                "failed to read Runner project registry {}: {error}",
+                project_registry_dir.display()
             ))
         }
     };
@@ -320,8 +340,8 @@ pub(crate) fn read_project_files(
     Ok(projects)
 }
 
-pub(crate) fn read_enabled_project_count(projects_dir: &Path) -> Result<usize, String> {
-    read_project_files(projects_dir).map(|projects| {
+pub(crate) fn read_enabled_project_count(project_registry_dir: &Path) -> Result<usize, String> {
+    read_project_files(project_registry_dir).map(|projects| {
         projects
             .into_iter()
             .filter(|(_, project)| !project.disabled)
@@ -366,8 +386,8 @@ fn recover_key_for_project(
     };
     for profile in profile_names {
         let profile_dir = client_output_dir_for_profile(config_base, &profile);
-        let config_path = profile_dir.join("agent.toml");
-        let Some(config) = read_existing_agent_config(&config_path)? else {
+        let config_path = webcodex_runner_config::paths::resolve_runner_config_path(&profile_dir)?;
+        let Some(config) = read_existing_runner_config(&config_path)? else {
             continue;
         };
         let Ok(stored_server) = canonical_server_url(&config.server_url) else {
@@ -379,7 +399,9 @@ fn recover_key_for_project(
         let Ok(key) = normalize_shared_key(&config.token) else {
             continue;
         };
-        let project_match = read_project_files(&profile_dir.join("projects.d"))?
+        let project_registry_dir =
+            webcodex_runner_config::paths::select_project_registry_dir(&profile_dir)?;
+        let project_match = read_project_files(&project_registry_dir)?
             .iter()
             .any(|(_, project)| stored_project_matches(project, canonical_project));
         if project_match || explicit_profile.is_some() {
@@ -526,11 +548,11 @@ pub(crate) fn render_project_file(project: &ProjectFile) -> Result<String, Strin
 }
 
 pub(crate) fn resolve_project(
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     canonical_project: &Path,
     explicit_id: Option<&str>,
 ) -> Result<(PathBuf, ProjectFile, bool), String> {
-    let existing = read_project_files(projects_dir)?;
+    let existing = read_project_files(project_registry_dir)?;
     if let Some((path, project)) = existing
         .iter()
         .find(|(_, project)| stored_project_matches(project, canonical_project))
@@ -576,7 +598,7 @@ pub(crate) fn resolve_project(
             ));
         }
     }
-    let project_path = projects_dir.join(format!("{id}.toml"));
+    let project_path = project_registry_dir.join(format!("{id}.toml"));
     Ok((
         project_path,
         ProjectFile {
@@ -585,6 +607,7 @@ pub(crate) fn resolve_project(
             shell_profile: None,
             name: Some(basename.to_string()),
             kind: None,
+            registration_source: None,
             description: None,
             allow_patch: true,
             disabled: false,
@@ -594,30 +617,30 @@ pub(crate) fn resolve_project(
     ))
 }
 
-fn read_agent_document(path: &Path) -> Result<Table, String> {
+fn read_runner_document(path: &Path) -> Result<Table, String> {
     if !path.exists() {
         return Ok(Table::new());
     }
     validate_existing_regular_file(path)?;
     let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("failed to read agent config {}: {error}", path.display()))?;
+        .map_err(|error| format!("failed to read Runner config {}: {error}", path.display()))?;
     let document: TomlValue = toml::from_str(&content)
-        .map_err(|error| format!("failed to parse agent config {}: {error}", path.display()))?;
+        .map_err(|error| format!("failed to parse Runner config {}: {error}", path.display()))?;
     document
         .as_table()
         .cloned()
-        .ok_or_else(|| format!("agent config {} is not a TOML table", path.display()))
+        .ok_or_else(|| format!("Runner config {} is not a TOML table", path.display()))
 }
 
-pub(super) fn render_agent_document(
+pub(super) fn render_runner_document(
     path: &Path,
     server_url: &str,
     key: &str,
     client_id: &str,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     canonical_project: &Path,
 ) -> Result<String, String> {
-    let mut root = read_agent_document(path)?;
+    let mut root = read_runner_document(path)?;
     root.insert(
         "server_url".to_string(),
         TomlValue::String(server_url.to_string()),
@@ -632,9 +655,13 @@ pub(super) fn render_agent_document(
         TomlValue::String(client_id.to_string()),
     );
     root.remove("owner");
+    // A hosted connect update is also a config-spelling migration. Keeping the
+    // legacy key while inserting the canonical one would create a Runner config
+    // that the load-time dual-field fence correctly rejects.
+    root.remove("projects_dir");
     root.insert(
-        "projects_dir".to_string(),
-        TomlValue::String(projects_dir.to_string_lossy().to_string()),
+        "project_registry_dir".to_string(),
+        TomlValue::String(project_registry_dir.to_string_lossy().to_string()),
     );
     root.insert(
         "transport".to_string(),
@@ -647,7 +674,7 @@ pub(super) fn render_agent_document(
         .entry("policy".to_string())
         .or_insert_with(|| TomlValue::Table(Table::new()))
         .as_table_mut()
-        .ok_or_else(|| format!("agent config {} has a non-table policy", path.display()))?;
+        .ok_or_else(|| format!("Runner config {} has a non-table policy", path.display()))?;
     policy.insert("allow_raw_shell".to_string(), TomlValue::Boolean(true));
     policy.insert("allow_cwd_anywhere".to_string(), TomlValue::Boolean(false));
     let mut roots = policy
@@ -663,11 +690,11 @@ pub(super) fn render_agent_document(
         "allowed_roots".to_string(),
         TomlValue::Array(roots.into_iter().map(TomlValue::String).collect()),
     );
-    toml::to_string(&root).map_err(|error| format!("failed to render agent config: {error}"))
+    toml::to_string(&root).map_err(|error| format!("failed to render Runner config: {error}"))
 }
 
 pub(super) fn validate_existing_profile(
-    config: Option<&ExistingAgentConfig>,
+    config: Option<&ExistingRunnerConfig>,
     canonical_server: &str,
     key: &str,
 ) -> Result<(), String> {
@@ -768,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_key_is_generated_once_then_recovered_from_the_matching_profile() {
+    fn omitted_key_is_generated_once_then_recovered_from_matching_legacy_registry_profile() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir(&project).unwrap();
@@ -783,6 +810,8 @@ mod tests {
             oauth_redirect_uri: None,
             oauth_computer_permissions: false,
             oauth_local_mcp: false,
+            oauth_local_plugins: false,
+            oauth_local_ssh: false,
             oauth_coding_agent: false,
             username: None,
             project: project.clone(),
@@ -798,6 +827,9 @@ mod tests {
         assert!(first.generated);
         let profile = derived_profile("https://example.test", &first.value);
         let profile_dir = config_base.join("clients").join(&profile);
+        // Deliberately exercise a pre-normalization hosted profile. New
+        // profiles use project-registry/, but a sole projects.d/ remains a
+        // supported compatibility layout.
         std::fs::create_dir_all(profile_dir.join("projects.d")).unwrap();
         std::fs::write(
             profile_dir.join("agent.toml"),
@@ -820,10 +852,39 @@ mod tests {
             recovered.recovered_profile.as_deref(),
             Some(profile.as_str())
         );
+        assert!(!profile_dir.join("runner.toml").exists());
         std::fs::write(profile_dir.join(KEY_DISCLOSED_FILE), "disclosed = true\n").unwrap();
         let disclosed =
             resolve_key(&options, &config_base, "https://example.test", &project).unwrap();
         assert!(!disclosed.generated);
+
+        std::fs::write(profile_dir.join("runner.toml"), "conflicting = true\n").unwrap();
+        let error =
+            resolve_key(&options, &config_base, "https://example.test", &project).unwrap_err();
+        assert!(error.contains("runner.toml"));
+        assert!(error.contains("agent.toml"));
+        assert!(error.contains("refusing to guess"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_reader_rejects_symlinked_registry_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let registry = tmp.path().join("project-registry");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(
+            outside.join("demo.toml"),
+            "id = \"demo\"\npath = \"/tmp/demo\"\n",
+        )
+        .unwrap();
+        symlink(&outside, &registry).unwrap();
+
+        let error = read_project_files(&registry).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(outside.join("demo.toml").is_file());
     }
 
     #[test]
@@ -839,7 +900,7 @@ mod tests {
     #[test]
     fn project_collision_gets_stable_suffix_and_explicit_collision_fails() {
         let tmp = tempfile::tempdir().unwrap();
-        let projects = tmp.path().join("projects.d");
+        let projects = tmp.path().join("project-registry");
         std::fs::create_dir(&projects).unwrap();
         let one = tmp.path().join("one/demo");
         let two = tmp.path().join("two/demo");
@@ -867,20 +928,84 @@ mod tests {
         assert!(error.contains("different path"));
     }
 
+    #[test]
+    fn project_record_round_trip_preserves_kind_and_registration_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("project-registry");
+        std::fs::create_dir(&projects).unwrap();
+        std::fs::write(
+            projects.join("demo.toml"),
+            "id = \"demo\"\npath = \"/tmp/demo\"\nkind = \"repo\"\nregistration_source = \"auto_registered\"\nallow_patch = true\n",
+        )
+        .unwrap();
+
+        let records = read_project_files(&projects).unwrap();
+        assert_eq!(records.len(), 1);
+        let project = &records[0].1;
+        assert_eq!(project.kind.as_deref(), Some("repo"));
+        assert_eq!(
+            project.registration_source.as_deref(),
+            Some("auto_registered")
+        );
+
+        let rendered = render_project_file(project).unwrap();
+        let reparsed: ProjectFile = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.kind.as_deref(), Some("repo"));
+        assert_eq!(
+            reparsed.registration_source.as_deref(),
+            Some("auto_registered")
+        );
+    }
+
+    #[test]
+    fn runner_document_migrates_legacy_projects_dir_without_dual_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("agent.toml");
+        let project = tmp.path().join("project");
+        let legacy_registry = tmp.path().join("projects.d");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&legacy_registry).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "server_url = \"https://example.test\"\ntoken = \"shared\"\nclient_id = \"client\"\nprojects_dir = {:?}\ncustom_field = \"preserved\"\n",
+                legacy_registry.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let rendered = render_runner_document(
+            &config,
+            "https://example.test",
+            "shared",
+            "client",
+            &legacy_registry,
+            &project.canonicalize().unwrap(),
+        )
+        .unwrap();
+        let parsed: TomlValue = toml::from_str(&rendered).unwrap();
+        assert!(parsed.get("projects_dir").is_none());
+        assert_eq!(
+            parsed["project_registry_dir"].as_str(),
+            Some(legacy_registry.to_string_lossy().as_ref())
+        );
+        assert_eq!(parsed["custom_field"].as_str(), Some("preserved"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn atomic_config_updates_preserve_secret_permissions_and_merge_roots() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("agent.toml");
+        let config = tmp.path().join("runner.toml");
         let project_one = tmp.path().join("one");
         let project_two = tmp.path().join("two");
-        let projects = tmp.path().join("projects.d");
+        let projects = tmp.path().join("project-registry");
         std::fs::create_dir(&project_one).unwrap();
         std::fs::create_dir(&project_two).unwrap();
         std::fs::create_dir(&projects).unwrap();
-        let first = render_agent_document(
+        let first = render_runner_document(
             &config,
             "https://example.test",
             "shared",
@@ -890,7 +1015,7 @@ mod tests {
         )
         .unwrap();
         assert!(atomic_write(&config, first.as_bytes(), true).unwrap());
-        let second = render_agent_document(
+        let second = render_runner_document(
             &config,
             "https://example.test",
             "shared",
@@ -907,7 +1032,7 @@ mod tests {
             std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!tmp.path().join("one/agent.toml").exists());
+        assert!(!tmp.path().join("one/runner.toml").exists());
         assert!(!atomic_write(&config, second.as_bytes(), true).unwrap());
     }
 }

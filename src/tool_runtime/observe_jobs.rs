@@ -1,18 +1,24 @@
 //! Bounded multi-Job observation composed from the canonical single-Job path.
 
-use super::{ObserveJobsItem, RecoveryKind, RecoveryTool, ToolResult, ToolRuntime};
+use super::{
+    ContinuationCarrier, ContinuationKind, ContinuationSemantics, ObserveJobsItem,
+    ObserveJobsWakeOn, RecoveryKind, SuggestedToolCall, ToolResult, ToolRuntime,
+};
 use crate::auth::AuthContext;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::Instant;
+use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES;
 use webcodex_workspace::file_read_normalize::MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
-use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 
 pub(crate) const MAX_OBSERVE_JOBS_ITEMS: usize = 8;
-pub(crate) const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
 pub(crate) const MAX_OBSERVE_JOBS_TAIL_LINES: usize = 200;
+const MAX_OBSERVE_JOBS_WAIT_SECS: u64 = 60;
+/// Final serialized model-facing budget for packing multiple already-bounded
+/// Job observations. This does not change any single Job stream/tail retention.
+const MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES: usize = MODEL_INSPECTION_MAX_RESULT_BYTES;
 const MAX_OBSERVE_JOBS_ERROR_CHARS: usize = 512;
 
 #[derive(Debug)]
@@ -86,27 +92,36 @@ fn observation_error_kind(result: &ToolResult) -> &'static str {
     }
 }
 
-fn observation_recovery(error_kind: &str) -> (RecoveryKind, Option<RecoveryTool>) {
+fn observation_recovery(error_kind: &str) -> RecoveryKind {
     match error_kind {
-        "invalid_observation_token" | "output_budget_exceeded" => (RecoveryKind::FixInput, None),
-        "unknown_job" => (RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs)),
-        _ => (RecoveryKind::NoAction, None),
+        "invalid_observation_token" | "output_budget_exceeded" => RecoveryKind::FixInput,
+        "unknown_job" => RecoveryKind::Reobserve,
+        _ => RecoveryKind::NoAction,
     }
 }
 
 fn batch_item(observed: ObservedJob) -> Value {
     if observed.result.success {
+        let mut output = observed.result.output;
+        if let Some(output) = output.as_object_mut() {
+            // observe_jobs owns one shared wait for the batch. The final item
+            // refreshes are snapshots only; leaking job_log's internal
+            // non-waiting metadata would present a second, contradictory wait
+            // fact to the model.
+            output.remove("wait_outcome");
+            output.remove("waited_ms");
+        }
         json!({
             "index": observed.index,
             "job_id": observed.job_id,
             "success": true,
-            "output": observed.result.output,
+            "output": output,
             "error_kind": null,
             "error": null,
         })
     } else {
         let error_kind = observation_error_kind(&observed.result);
-        let (recovery_kind, recovery_tool) = observation_recovery(error_kind);
+        let recovery_kind = observation_recovery(error_kind);
         let mut item = json!({
             "index": observed.index,
             "job_id": observed.job_id,
@@ -116,8 +131,8 @@ fn batch_item(observed: ObservedJob) -> Value {
             "recovery_kind": recovery_kind.as_str(),
             "error": bounded_error(observed.result.error.as_deref()),
         });
-        if let Some(recovery_tool) = recovery_tool {
-            item["recovery_tool"] = json!(recovery_tool.as_str());
+        if error_kind == "unknown_job" {
+            item["suggested_call"] = SuggestedToolCall::new("list_jobs", json!({})).to_value();
         }
         item
     }
@@ -162,26 +177,35 @@ fn batch_output(
                 && item["output"]["terminal"].as_bool() == Some(true)
         })
         .count();
-    json!({
+    let mut output = json!({
         "requested_count": requested_count,
         "returned_count": returned_count,
         "succeeded_count": succeeded_count,
         "failed_count": returned_count - succeeded_count,
         "items": items,
-        "wake_reason": wake_reason.as_str(),
-        "waited_ms": waited_ms,
+        "wait": {
+            "outcome": wake_reason.as_str(),
+            "waited_ms": waited_ms,
+        },
         "changed_count": changed_count,
         "terminal_count": terminal_count,
         "output_truncated": output_truncated,
         "next_index": next_index,
-    })
+    });
+    if next_index.is_some() {
+        output["continuation_semantics"] =
+            ContinuationSemantics::new(ContinuationKind::Batch, ContinuationCarrier::Index)
+                .to_value();
+    }
+    output
 }
 
 fn serialized_batch_fits(output: &Value) -> bool {
     serde_json::to_vec(&ToolResult::ok(output.clone()))
         .map(|bytes| {
             bytes.len()
-                <= MAX_SERIALIZED_OUTPUT_BYTES.saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+                    .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
         })
         .unwrap_or(false)
 }
@@ -259,6 +283,262 @@ fn apply_output_budget(
     ))
 }
 
+fn copy_non_null(
+    source: &serde_json::Map<String, Value>,
+    target: &mut serde_json::Map<String, Value>,
+    key: &str,
+) {
+    if let Some(value) = source.get(key).filter(|value| !value.is_null()) {
+        target.insert(key.to_string(), value.clone());
+    }
+}
+
+fn copy_present(
+    source: &serde_json::Map<String, Value>,
+    target: &mut serde_json::Map<String, Value>,
+    key: &str,
+) {
+    if let Some(value) = source.get(key) {
+        target.insert(key.to_string(), value.clone());
+    }
+}
+
+fn sparse_success_item(item: &Value) -> Option<Value> {
+    let item = item.as_object()?;
+    if item.get("success").and_then(Value::as_bool) != Some(true)
+        || !item.get("error_kind").is_some_and(Value::is_null)
+        || !item.get("error").is_some_and(Value::is_null)
+        || item.get("recovery_kind").is_some()
+        || item.get("suggested_call").is_some()
+    {
+        return None;
+    }
+    let job_id = item.get("job_id")?.as_str()?.to_string();
+    let observation = item.get("output")?.as_object()?;
+    if observation.get("job_id")?.as_str()? != job_id {
+        return None;
+    }
+    let status = observation.get("status")?.as_str()?.to_string();
+    let terminal = observation.get("terminal")?.as_bool()?;
+    let changed = observation.get("changed")?.as_bool()?;
+    let log_delta_status = observation.get("log_delta_status")?.as_str()?;
+    if !matches!(
+        log_delta_status,
+        "baseline" | "delta" | "unchanged" | "reset"
+    ) {
+        return None;
+    }
+    let observation_token = observation.get("observation_token")?.as_str()?;
+    if observation_token.is_empty() {
+        return None;
+    }
+    let stdout_tail = observation.get("stdout_tail")?.as_str()?;
+    let stderr_tail = observation.get("stderr_tail")?.as_str()?;
+    let stdout_truncated = observation.get("stdout_truncated")?.as_bool()?;
+    let stderr_truncated = observation.get("stderr_truncated")?.as_bool()?;
+    let stdout_delta_reset = observation.get("stdout_delta_reset")?.as_bool()?;
+    let stderr_delta_reset = observation.get("stderr_delta_reset")?.as_bool()?;
+    let earlier_stdout_unavailable = observation
+        .get("earlier_stdout_unavailable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let earlier_stderr_unavailable = observation
+        .get("earlier_stderr_unavailable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut sparse = serde_json::Map::new();
+    sparse.insert("job_id".to_string(), json!(job_id));
+    sparse.insert("status".to_string(), json!(status));
+    sparse.insert("terminal".to_string(), json!(terminal));
+    sparse.insert("changed".to_string(), json!(changed));
+    sparse.insert("log_delta_status".to_string(), json!(log_delta_status));
+    sparse.insert("observation_token".to_string(), json!(observation_token));
+    copy_present(observation, &mut sparse, "continuation_semantics");
+
+    for key in [
+        "exit_code",
+        "command_execution_state",
+        "activity",
+        "detected_summary",
+        "validation",
+        "ssh_resource",
+    ] {
+        copy_non_null(observation, &mut sparse, key);
+    }
+
+    if log_delta_status != "unchanged" {
+        copy_present(observation, &mut sparse, "stdout_tail");
+        copy_present(observation, &mut sparse, "stderr_tail");
+    } else {
+        if !stdout_tail.is_empty() {
+            copy_present(observation, &mut sparse, "stdout_tail");
+        }
+        if !stderr_tail.is_empty() {
+            copy_present(observation, &mut sparse, "stderr_tail");
+        }
+    }
+
+    for (key, present) in [
+        ("stdout_truncated", stdout_truncated),
+        ("stderr_truncated", stderr_truncated),
+        ("stdout_delta_reset", stdout_delta_reset),
+        ("stderr_delta_reset", stderr_delta_reset),
+        ("earlier_stdout_unavailable", earlier_stdout_unavailable),
+        ("earlier_stderr_unavailable", earlier_stderr_unavailable),
+    ] {
+        if present {
+            copy_present(observation, &mut sparse, key);
+        }
+    }
+    for key in ["recovery_state", "recovery_reason_code", "recovery_reason"] {
+        copy_non_null(observation, &mut sparse, key);
+    }
+
+    let exceptional_log_evidence = log_delta_status == "reset"
+        || stdout_truncated
+        || stderr_truncated
+        || stdout_delta_reset
+        || stderr_delta_reset
+        || earlier_stdout_unavailable
+        || earlier_stderr_unavailable
+        || observation
+            .get("recovery_state")
+            .is_some_and(|value| !value.is_null())
+        || observation
+            .get("recovery_reason_code")
+            .is_some_and(|value| !value.is_null())
+        || observation
+            .get("recovery_reason")
+            .is_some_and(|value| !value.is_null());
+    if exceptional_log_evidence {
+        for key in [
+            "stdout_lines",
+            "stderr_lines",
+            "stdout_returned_lines",
+            "stderr_returned_lines",
+            "stdout_retained_from_line",
+            "stderr_retained_from_line",
+            "cursor",
+            "last_update_seq",
+        ] {
+            copy_non_null(observation, &mut sparse, key);
+        }
+        if log_delta_status == "reset" {
+            for key in [
+                "stdout_truncated",
+                "stderr_truncated",
+                "stdout_delta_reset",
+                "stderr_delta_reset",
+                "earlier_stdout_unavailable",
+                "earlier_stderr_unavailable",
+            ] {
+                copy_present(observation, &mut sparse, key);
+            }
+        }
+    }
+
+    if matches!(log_delta_status, "baseline" | "reset") {
+        for key in ["purpose", "command_summary"] {
+            copy_non_null(observation, &mut sparse, key);
+        }
+    }
+    Some(Value::Object(sparse))
+}
+
+/// Final model-facing projection for ordinary successful Job observations.
+/// The canonical batch and canonical single-Job snapshots remain unchanged for
+/// budgeting, Session/audit recording, operator diagnostics, and internal use.
+pub(crate) fn sparsify_observe_jobs_model_result(result: &mut ToolResult) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    if output.get("output_truncated").and_then(Value::as_bool) != Some(false)
+        || !output.get("next_index").is_some_and(Value::is_null)
+    {
+        return;
+    }
+    let Some(items) = output.get("items").and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() || items.len() > MAX_OBSERVE_JOBS_ITEMS {
+        return;
+    }
+    let count = items.len() as u64;
+    if output.get("requested_count").and_then(Value::as_u64) != Some(count)
+        || output.get("returned_count").and_then(Value::as_u64) != Some(count)
+        || output.get("succeeded_count").and_then(Value::as_u64) != Some(count)
+        || output.get("failed_count").and_then(Value::as_u64) != Some(0)
+    {
+        return;
+    }
+    let Some(wait) = output.get("wait").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(wait_outcome) = wait.get("outcome").and_then(Value::as_str) else {
+        return;
+    };
+    if !matches!(
+        wait_outcome,
+        "immediate" | "updated" | "terminal" | "timeout"
+    ) {
+        // item_error is intentionally kept in the canonical batch shape.
+        return;
+    }
+    let Some(waited_ms) = wait.get("waited_ms").and_then(Value::as_u64) else {
+        return;
+    };
+
+    let mut sparse_items = Vec::with_capacity(items.len());
+    let mut changed_count = 0u64;
+    let mut terminal_count = 0u64;
+    for item in items {
+        let Some(sparse) = sparse_success_item(item) else {
+            return;
+        };
+        changed_count += u64::from(sparse.get("changed").and_then(Value::as_bool) == Some(true));
+        terminal_count += u64::from(sparse.get("terminal").and_then(Value::as_bool) == Some(true));
+        sparse_items.push(sparse);
+    }
+    if output.get("changed_count").and_then(Value::as_u64) != Some(changed_count)
+        || output.get("terminal_count").and_then(Value::as_u64) != Some(terminal_count)
+    {
+        return;
+    }
+
+    output.insert("items".to_string(), Value::Array(sparse_items));
+    for key in [
+        "requested_count",
+        "returned_count",
+        "succeeded_count",
+        "failed_count",
+        "changed_count",
+        "terminal_count",
+        "output_truncated",
+        "next_index",
+    ] {
+        output.remove(key);
+    }
+    if waited_ms == 0 {
+        if let Some(wait) = output.get_mut("wait").and_then(Value::as_object_mut) {
+            wait.remove("waited_ms");
+        }
+    }
+}
+
+fn normalize_observe_jobs_preferences(
+    tail_lines: usize,
+    wait_secs: Option<u64>,
+) -> (usize, Option<u64>) {
+    (
+        tail_lines.min(MAX_OBSERVE_JOBS_TAIL_LINES),
+        wait_secs.map(|wait_secs| wait_secs.min(MAX_OBSERVE_JOBS_WAIT_SECS)),
+    )
+}
+
 impl ToolRuntime {
     fn validate_observe_jobs_input(
         items: &[ObserveJobsItem],
@@ -281,11 +561,11 @@ impl ToolRuntime {
                 item.job_id
             ));
         }
-        if !(1..=MAX_OBSERVE_JOBS_TAIL_LINES).contains(&tail_lines) {
-            return Err("observe_jobs tail_lines must be between 1 and 200".into());
+        if tail_lines == 0 {
+            return Err("observe_jobs tail_lines must be at least 1".into());
         }
-        if wait_secs.is_some_and(|wait_secs| !(1..=60).contains(&wait_secs)) {
-            return Err("observe_jobs wait_secs must be between 1 and 60".into());
+        if wait_secs == Some(0) {
+            return Err("observe_jobs wait_secs must be at least 1".into());
         }
         let mut seen = HashSet::with_capacity(items.len());
         if let Some(duplicate) = items
@@ -337,81 +617,63 @@ impl ToolRuntime {
         items: &[ObserveJobsItem],
         auth: Option<&AuthContext>,
         wait_secs: u64,
+        wake_on: ObserveJobsWakeOn,
+        deadline: Instant,
     ) -> Result<WakeReason, String> {
-        let deadline = Instant::now() + Duration::from_secs(wait_secs);
-        loop {
-            let mut waits = stream::iter(items.iter().cloned().enumerate().map(
-                |(index, item)| async move {
-                    let result = self
-                        .job_log_for_auth(
-                            item.job_id.clone(),
-                            None,
-                            Some(1),
-                            auth,
-                            item.after_observation_token,
-                            Some(wait_secs),
-                        )
-                        .await;
-                    ObservedJob {
-                        index,
-                        job_id: item.job_id,
-                        result,
-                    }
-                },
-            ))
-            .buffer_unordered(MAX_OBSERVE_JOBS_ITEMS);
-            let heartbeat = (Instant::now() + Duration::from_millis(200)).min(deadline);
-            tokio::select! {
-                first = waits.next() => {
-                    let first = first.ok_or_else(|| {
-                        "observe_jobs shared wait had no item futures".to_string()
-                    })?;
-                    if !first.result.success {
-                        return Ok(WakeReason::ItemError);
-                    }
-                    if first.result.output["terminal"].as_bool() == Some(true) {
-                        return Ok(WakeReason::Terminal);
-                    }
-                    if first.result.output["changed"].as_bool() == Some(true) {
+        // Each Job keeps its own waiter across other Jobs' updates. The
+        // canonical Notify + revision recheck covers updates both before and
+        // during wait registration; no polling heartbeat is needed here.
+        let mut waits = stream::iter(items.iter().cloned().map(|mut item| async move {
+            loop {
+                if Instant::now() >= deadline {
+                    return Ok(WakeReason::Timeout);
+                }
+                let result = self
+                    .job_log_for_auth(
+                        item.job_id.clone(),
+                        None,
+                        Some(1),
+                        auth,
+                        item.after_observation_token.clone(),
+                        Some(wait_secs),
+                    )
+                    .await;
+                if !result.success {
+                    return Ok(WakeReason::ItemError);
+                }
+                if result.output["terminal"].as_bool() == Some(true) {
+                    return Ok(WakeReason::Terminal);
+                }
+                if result.output["changed"].as_bool() == Some(true) {
+                    if wake_on == ObserveJobsWakeOn::Change {
                         return Ok(WakeReason::Updated);
                     }
-                    match first.result.output["wait_outcome"].as_str() {
-                        Some("terminal") => return Ok(WakeReason::Terminal),
-                        Some("updated" | "immediate") => return Ok(WakeReason::Updated),
-                        Some("timeout") if Instant::now() >= deadline => {
-                            return Ok(WakeReason::Timeout);
-                        }
-                        Some("timeout") => {}
-                        _ => {
-                            return Err(
-                                "observe_jobs canonical wait returned an invalid wait outcome"
-                                    .into(),
-                            );
-                        }
+                    // Private wait cursor only: final requested-tail refresh
+                    // still uses the caller's original token for every delta.
+                    let token = result.output["observation_token"]
+                        .as_str()
+                        .filter(|token| !token.is_empty())
+                        .ok_or("observe_jobs canonical wait returned no observation token")?;
+                    if item.after_observation_token.as_deref() == Some(token) {
+                        return Err("observe_jobs canonical wait did not advance its token".into());
                     }
+                    item.after_observation_token = Some(token.to_string());
+                } else if result.output["wait_outcome"].as_str() == Some("timeout") {
+                    return Ok(WakeReason::Timeout);
+                } else {
+                    return Err(
+                        "observe_jobs canonical wait returned an invalid wait outcome".into(),
+                    );
                 }
-                _ = tokio::time::sleep_until(heartbeat) => {}
             }
-            drop(waits);
-
-            // Agent notifications are an optimization, not a second source of
-            // truth. Re-enter the canonical immediate path on one shared
-            // heartbeat so a notification race cannot defer a visible token
-            // change until the full deadline. These one-line snapshots are
-            // discarded; the caller performs the final requested-tail refresh.
-            let heartbeat_observation = self.observe_jobs_pass(items, 1, auth).await;
-            if observed_has_error(&heartbeat_observation) {
-                return Ok(WakeReason::ItemError);
-            }
-            if observed_has_terminal(&heartbeat_observation) {
-                return Ok(WakeReason::Terminal);
-            }
-            if observed_has_change(&heartbeat_observation) {
-                return Ok(WakeReason::Updated);
-            }
-            if Instant::now() >= deadline {
-                return Ok(WakeReason::Timeout);
-            }
+        }))
+        .buffer_unordered(MAX_OBSERVE_JOBS_ITEMS);
+        // This one absolute deadline also bounds every re-entered canonical
+        // wait. Non-terminal updates never reset or extend the batch duration.
+        match tokio::time::timeout_at(deadline, waits.next()).await {
+            Ok(Some(reason)) => reason,
+            Ok(None) => Err("observe_jobs shared wait had no item futures".into()),
+            Err(_) => Ok(WakeReason::Timeout),
         }
     }
 
@@ -420,8 +682,10 @@ impl ToolRuntime {
         items: Vec<ObserveJobsItem>,
         tail_lines: usize,
         wait_secs: Option<u64>,
+        wake_on: ObserveJobsWakeOn,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let (tail_lines, wait_secs) = normalize_observe_jobs_preferences(tail_lines, wait_secs);
         if let Err(error) = Self::validate_observe_jobs_input(&items, tail_lines, wait_secs) {
             return ToolResult::err(error);
         }
@@ -437,7 +701,7 @@ impl ToolRuntime {
             Some(WakeReason::ItemError)
         } else if observed_has_terminal(&initial) {
             Some(WakeReason::Terminal)
-        } else if observed_has_change(&initial) {
+        } else if wake_on == ObserveJobsWakeOn::Change && observed_has_change(&initial) {
             Some(WakeReason::Updated)
         } else {
             None
@@ -449,7 +713,13 @@ impl ToolRuntime {
             let wait_secs = wait_secs.expect("shared wait requires validated wait_secs");
             let wait_started = Instant::now();
             let wait_reason = match self
-                .wait_for_any_observed_job(&items, auth, wait_secs)
+                .wait_for_any_observed_job(
+                    &items,
+                    auth,
+                    wait_secs,
+                    wake_on,
+                    wait_started + Duration::from_secs(wait_secs),
+                )
                 .await
             {
                 Ok(reason) => reason,
@@ -462,7 +732,9 @@ impl ToolRuntime {
                     WakeReason::ItemError
                 } else if observed_has_terminal(&refreshed) || wait_reason == WakeReason::Terminal {
                     WakeReason::Terminal
-                } else if observed_has_change(&refreshed) || wait_reason == WakeReason::Updated {
+                } else if wake_on == ObserveJobsWakeOn::Change
+                    && (observed_has_change(&refreshed) || wait_reason == WakeReason::Updated)
+                {
                     WakeReason::Updated
                 } else {
                     WakeReason::Timeout
@@ -491,6 +763,21 @@ mod tests {
     }
 
     #[test]
+    fn oversized_observation_preferences_are_clamped() {
+        assert_eq!(
+            normalize_observe_jobs_preferences(500, Some(120)),
+            (
+                MAX_OBSERVE_JOBS_TAIL_LINES,
+                Some(MAX_OBSERVE_JOBS_WAIT_SECS)
+            )
+        );
+        assert_eq!(
+            normalize_observe_jobs_preferences(40, Some(5)),
+            (40, Some(5))
+        );
+    }
+
+    #[test]
     fn batch_item_failures_expose_bounded_recovery_and_success_omits_it() {
         let missing = batch_item(ObservedJob {
             index: 0,
@@ -499,7 +786,30 @@ mod tests {
         });
         assert_eq!(missing["error_kind"], "unknown_job");
         assert_eq!(missing["recovery_kind"], "reobserve");
-        assert_eq!(missing["recovery_tool"], "list_jobs");
+        assert!(missing.get("recovery_tool").is_none());
+        let suggested = &missing["suggested_call"];
+        assert_eq!(suggested, &json!({"tool": "list_jobs", "arguments": {}}));
+        let parsed = crate::tool_runtime::ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .expect("unknown Job recovery must be parser-ready");
+        match parsed {
+            crate::tool_runtime::ToolCall::ListJobs {
+                project,
+                session_id,
+                ..
+            } => {
+                assert!(project.is_none());
+                assert!(session_id.is_none());
+            }
+            other => panic!("unexpected recovery call: {}", other.tool_name()),
+        }
+        assert!(
+            crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
+                suggested["tool"].as_str().unwrap()
+            )
+        );
 
         let invalid_token = batch_item(ObservedJob {
             index: 1,
@@ -508,6 +818,7 @@ mod tests {
         });
         assert_eq!(invalid_token["recovery_kind"], "fix_input");
         assert!(invalid_token.get("recovery_tool").is_none());
+        assert!(invalid_token.get("suggested_call").is_none());
 
         let success = batch_item(ObservedJob {
             index: 2,
@@ -516,6 +827,7 @@ mod tests {
         });
         assert!(success.get("recovery_kind").is_none());
         assert!(success.get("recovery_tool").is_none());
+        assert!(success.get("suggested_call").is_none());
     }
 
     #[test]
@@ -527,12 +839,14 @@ mod tests {
             "output": {
                 "changed": false,
                 "terminal": false,
-                "stdout_tail": "x".repeat(MAX_SERIALIZED_OUTPUT_BYTES),
+                "stdout_tail": "x".repeat(MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES),
             },
             "error_kind": null,
             "error": null,
         });
         let output = apply_output_budget(1, vec![item], WakeReason::Immediate, 0).unwrap();
+        assert_eq!(output["wait"]["outcome"], "immediate");
+        assert_eq!(output["wait"]["waited_ms"], 0);
         assert_eq!(output["returned_count"], 1);
         assert_eq!(output["items"][0]["success"], false);
         assert_eq!(output["items"][0]["error_kind"], "output_budget_exceeded");
@@ -540,7 +854,7 @@ mod tests {
         assert_eq!(output["output_truncated"], false);
         assert!(
             serde_json::to_vec(&ToolResult::ok(output)).unwrap().len()
-                <= MAX_SERIALIZED_OUTPUT_BYTES
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
         );
     }
 
@@ -567,12 +881,43 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(output["returned_count"], 2);
-        assert_eq!(output["output_truncated"], true);
-        assert_eq!(output["next_index"], 2);
+        // Four ~90 KiB observations straddle the old 256 KiB aggregate budget
+        // but fit comfortably inside the explicit 512 KiB model-facing packer.
+        assert_eq!(output["returned_count"], 4);
+        assert_eq!(output["output_truncated"], false);
+        assert!(output["next_index"].is_null());
+        assert_eq!(output["wait"]["outcome"], "immediate");
         assert!(
             serde_json::to_vec(&ToolResult::ok(output)).unwrap().len()
-                <= MAX_SERIALIZED_OUTPUT_BYTES
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+        );
+
+        let output =
+            apply_output_budget(8, (0..8).map(item).collect(), WakeReason::Immediate, 0).unwrap();
+        assert!(output["returned_count"].as_u64().unwrap() > 2);
+        assert!(output["returned_count"].as_u64().unwrap() < 8);
+        assert_eq!(output["output_truncated"], true);
+        assert_eq!(
+            output["next_index"], output["returned_count"],
+            "next_index must identify the first whole observation omitted by aggregate packing"
+        );
+        assert!(
+            serde_json::to_vec(&ToolResult::ok(output)).unwrap().len()
+                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn aggregate_ceiling_does_not_expand_single_job_snapshot_or_tail_contracts() {
+        assert_eq!(MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES, 512 * 1024);
+        assert_eq!(MAX_OBSERVE_JOBS_TAIL_LINES, 200);
+        assert_eq!(
+            webcodex_core::runtime_contract::DEFAULT_OBSERVE_JOBS_TAIL_LINES,
+            40
+        );
+        assert_eq!(
+            webcodex_core::runner_protocol::JOB_SNAPSHOT_STREAM_MAX_BYTES,
+            64 * 1024
         );
     }
 }

@@ -1,16 +1,15 @@
-//! Agent-side project management tools: `register_project`, `unregister_project`,
-//! `create_project`, and the internal Runner-managed temporary-project path used
-//! by coding-task startup.
+//! Runner-side project management tools: `register_project`, `unregister_project`,
+//! and `create_project`.
 //!
-//! Registration and creation route to the selected agent through the project-op
+//! Registration and creation route to the selected Runner through the project-op
 //! path. Unregistration reuses the shared project lifecycle path so the
 //! model-facing tool and `POST /api/projects/unregister` have the same revision
 //! CAS, active-Job fence, capability check, uncertain-delivery semantics, and
 //! server inventory update. The Runner remains authoritative for its local
-//! `projects.d` registration state.
+//! project registration records in the Runner project registry.
 //!
 //! The server never writes project config files or creates directories on the
-//! agent host directly. OS permissions and agent policy
+//! Runner host directly. OS permissions and Runner policy
 //! (`allow_cwd_anywhere` / `allowed_roots`) remain the real boundary; there is
 //! no workspace abstraction.
 
@@ -18,18 +17,15 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::tool_result::{RecoveryKind, ToolResult};
-use super::{agent_project_runtime_id, ToolRuntime};
-use crate::auth::AuthContext;
-use crate::shell_client::{RunnerFeature, ShellClientSemanticView};
-use crate::shell_protocol::{
-    ShellAgentProjectSummary, SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
-};
+use super::{runner_project_runtime_id, ToolRuntime};
+use crate::auth::{AuthContext, SCOPE_PROJECT_READ};
+use crate::runner_http::{RunnerFeature, RunnerSemanticView};
+use crate::runner_protocol::{RunnerProjectSummary, RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION};
 
-/// Maximum time the runtime waits for an agent project-op response. Project
+/// Maximum time the runtime waits for a Runner project-op response. Project
 /// operations are fast (write a small TOML, maybe create a directory + git
 /// init), so 30s is generous while still bounding the caller.
 const PROJECT_OP_WAIT_SECS: u64 = 32;
-const MANAGED_TEMPORARY_PROJECT_SOURCE: &str = "managed_temporary";
 const AUTO_REGISTERED_PROJECT_SOURCE: &str = "auto_registered";
 
 const LIST_PROJECTS_MAX_QUERY_CHARS: usize = 200;
@@ -105,7 +101,7 @@ fn validate_list_projects_options(
 }
 
 fn project_candidates(
-    clients: &[ShellClientSemanticView],
+    clients: &[RunnerSemanticView],
     options: &ListProjectsOptions,
     query: Option<&str>,
 ) -> Vec<ProjectCandidate> {
@@ -120,7 +116,7 @@ fn project_candidates(
             continue;
         }
         for (project_index, project) in view.projects.iter().enumerate() {
-            let runtime_id = agent_project_runtime_id(&view.client_id, &project.id);
+            let runtime_id = runner_project_runtime_id(&view.client_id, &project.id);
             if options
                 .project
                 .as_deref()
@@ -157,12 +153,48 @@ impl ToolRuntime {
             Ok(validated) => validated,
             Err(result) => return result,
         };
+        let access = crate::runner_http::runner_access_from_auth(auth);
         let clients = self
-            .shell_clients
-            .list_client_semantic_views_for_auth(auth)
+            .runner_registry
+            .list_runner_semantic_views_for_auth(access.as_ref())
             .await;
         self.list_projects_from_semantic_clients(auth, &options, query.as_deref(), limit, &clients)
             .await
+    }
+
+    /// Reuse the canonical Runner/project visibility projection for an exact
+    /// Project id without dispatching a model-visible tool. This is an
+    /// observability fence only: it grants no Project authority and callers
+    /// must still hold `project:read` explicitly.
+    pub(crate) async fn exact_project_visible_to_auth(
+        &self,
+        auth: &AuthContext,
+        project: &str,
+    ) -> bool {
+        if !auth.has_scope(SCOPE_PROJECT_READ) {
+            return false;
+        }
+        let result = self
+            .list_projects_with_options(
+                Some(auth),
+                ListProjectsOptions {
+                    project: Some(project.to_string()),
+                    limit: Some(1),
+                    summary_only: true,
+                    ..ListProjectsOptions::default()
+                },
+            )
+            .await;
+        result.success
+            && result
+                .output
+                .get("projects")
+                .and_then(Value::as_array)
+                .is_some_and(|projects| {
+                    projects
+                        .iter()
+                        .any(|value| value.get("id").and_then(Value::as_str) == Some(project))
+                })
     }
 
     #[cfg(test)]
@@ -170,7 +202,7 @@ impl ToolRuntime {
         &self,
         auth: Option<&AuthContext>,
         options: ListProjectsOptions,
-        clients: &[crate::shell_protocol::ShellClientView],
+        clients: &[crate::runner_protocol::RunnerView],
     ) -> ToolResult {
         let (query, limit) = match validate_list_projects_options(&options) {
             Ok(validated) => validated,
@@ -179,7 +211,7 @@ impl ToolRuntime {
         let semantic_clients = clients
             .iter()
             .cloned()
-            .map(ShellClientSemanticView::from_public_view_for_test)
+            .map(RunnerSemanticView::from_public_view_for_test)
             .collect::<Vec<_>>();
         self.list_projects_from_semantic_clients(
             auth,
@@ -197,14 +229,23 @@ impl ToolRuntime {
         options: &ListProjectsOptions,
         query: Option<&str>,
         limit: Option<usize>,
-        clients: &[ShellClientSemanticView],
+        clients: &[RunnerSemanticView],
     ) -> ToolResult {
+        let access = crate::runner_http::runner_access_from_auth(auth);
         let mut candidates = project_candidates(clients, options, query);
         let matched_count = candidates.len();
         if let Some(limit) = limit {
             candidates.truncate(limit);
         }
         let truncated = candidates.len() < matched_count;
+        let project_ids: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.runtime_id.as_str())
+            .collect();
+        let active_jobs_by_project = self
+            .runner_registry
+            .count_active_jobs_for_projects(access.as_ref(), &project_ids)
+            .await;
 
         let mut list = Vec::with_capacity(candidates.len());
         for ProjectCandidate {
@@ -213,13 +254,12 @@ impl ToolRuntime {
             project_index,
         } in candidates
         {
-            // Extract only one selected Project and the small Runner fields used by
-            // its projection before awaiting Job state. Candidate staging above
-            // never owns or clones a ShellClientView (and therefore never clones
-            // the Runner's complete projects Vec per match).
+            // Extract only one selected Project and its small Runner projection.
+            // Candidate staging never clones a Runner's complete project inventory;
+            // Job counts above share one authorized registry snapshot.
             let (
                 client_id,
-                agent_status,
+                runner_status,
                 connected,
                 last_seen,
                 project,
@@ -247,10 +287,10 @@ impl ToolRuntime {
                     smoke_project_capabilities(client, project),
                 )
             };
-            let active_jobs = self
-                .shell_clients
-                .count_active_jobs_for_project(auth, &runtime_id)
-                .await;
+            let active_jobs = active_jobs_by_project
+                .get(&runtime_id)
+                .copied()
+                .unwrap_or(0);
             let value = if options.summary_only {
                 json!({
                     "id": runtime_id,
@@ -262,7 +302,8 @@ impl ToolRuntime {
                     "enabled": !project.disabled,
                     "active_jobs": active_jobs,
                     "source": project_source(&project),
-                    "agent_status": agent_status,
+                    // Runtime Console and CLI ops consume this established list_projects key.
+                    "agent_status": runner_status,
                     "connected": connected,
                     "resolved_shell_profile": resolved_shell_profile,
                     "shell_profile_status": shell_profile_status,
@@ -286,7 +327,8 @@ impl ToolRuntime {
                     "revision": project.revision,
                     "active_jobs": active_jobs,
                     "source": project_source(&project),
-                    "agent_status": agent_status,
+                    // Runtime Console and CLI ops consume this established list_projects key.
+                    "agent_status": runner_status,
                     "connected": connected,
                     "last_seen": last_seen,
                     "shell_profile": project.shell_profile,
@@ -382,9 +424,9 @@ impl ToolRuntime {
         ToolResult::err_with_output(message, response.body)
     }
 
-    /// Create a new directory on the selected agent and register it as a
-    /// WebCodex project. See the `ToolCall::CreateProject` doc comment for the
-    /// full contract.
+    /// Create a new directory on the selected Runner, or explicitly adopt an
+    /// already-existing empty directory, and register it as a WebCodex project.
+    /// See the `ToolCall::CreateProject` doc comment for the full contract.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_project(
         &self,
@@ -396,7 +438,7 @@ impl ToolRuntime {
         allow_patch: bool,
         template: Option<String>,
         git_init: bool,
-        allow_existing_empty: bool,
+        adopt_existing_empty: bool,
         overwrite: bool,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
@@ -410,44 +452,15 @@ impl ToolRuntime {
             allow_patch,
             template,
             git_init,
-            allow_existing_empty,
+            adopt_existing_empty,
             overwrite,
             auth,
         )
         .await
     }
 
-    /// Ask a Runner to create a directory under its configured managed
-    /// temporary-project root and register it through the ordinary projects.d
-    /// lifecycle. The Runner, rather than this server, owns all directory-name
-    /// generation, path validation, and filesystem mutation.
-    pub(crate) async fn create_managed_temporary_project(
-        &self,
-        client_id: String,
-        name: Option<String>,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        if let Some(name) = name.as_deref() {
-            if let Err(error) = validate_project_op_name(name) {
-                return ToolResult::err(error);
-            }
-        }
-        self.submit_project_op(
-            "create_project",
-            client_id.clone(),
-            json!({
-                "kind": "create_project",
-                "client_id": client_id,
-                "managed_temporary_project": true,
-                "name": name,
-            }),
-            auth,
-        )
-        .await
-    }
-
     /// Ask the selected Runner to resolve an existing registration by
-    /// canonical path or persist a new projects.d entry under its registry
+    /// canonical path or persist a new project registration record under its registry
     /// write lock. This internal operation is intentionally absent from the
     /// model-visible tool registry.
     pub(crate) async fn resolve_or_register_project(
@@ -456,6 +469,7 @@ impl ToolRuntime {
         path: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Err(error) = validate_project_op_path(&path) {
             return ToolResult::err_with_output(
                 error,
@@ -468,13 +482,13 @@ impl ToolRuntime {
             );
         }
         if let Some(client) = self
-            .shell_clients
-            .get_client_semantic_view_for_auth(&client_id, auth)
+            .runner_registry
+            .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
             .await
         {
             if let Err(error) = self
-                .shell_clients
-                .assert_client_access(auth, &client_id)
+                .runner_registry
+                .assert_runner_access(access.as_ref(), &client_id)
                 .await
             {
                 return ToolResult::err(error);
@@ -486,11 +500,11 @@ impl ToolRuntime {
                         "error_kind": "agent_capability_unavailable",
                         "failure_kind": "capability_unavailable",
                         "reason_code": "runner_generation_baseline_invariant",
-                        "capability": SHELL_CLIENT_CAPABILITY_PROJECT_PATH_REGISTRATION,
+                        "capability": RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION,
                         "state_changed": false,
                     }),
                 )
-                .with_recovery(RecoveryKind::NoAction, None);
+                .with_recovery(RecoveryKind::NoAction);
             }
         }
         self.submit_project_op(
@@ -502,10 +516,106 @@ impl ToolRuntime {
         .await
     }
 
+    /// Ask the exact Runner to prepare or re-observe one managed detached
+    /// worktree and register it as an ordinary runtime Project. `operation_id`
+    /// is transport/idempotency identity only and grants no Project authority.
+    pub(crate) async fn prepare_managed_worktree(
+        &self,
+        client_id: String,
+        path: String,
+        base_ref: Option<String>,
+        operation_id: String,
+        resume_project_id: Option<String>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        if let Err(error) = validate_project_op_path(&path) {
+            return ToolResult::err_with_output(
+                error,
+                json!({
+                    "error_kind": "invalid_project_path",
+                    "failure_kind": "invalid_arguments",
+                    "field": "path",
+                    "state_changed": false,
+                }),
+            );
+        }
+        if let Some(client) = self
+            .runner_registry
+            .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
+            .await
+        {
+            if let Err(error) = self
+                .runner_registry
+                .assert_runner_access(access.as_ref(), &client_id)
+                .await
+            {
+                return ToolResult::err(error);
+            }
+            if !client.supports(RunnerFeature::ManagedWorktree) {
+                return ToolResult::err_with_output(
+                    "agent_capability_unavailable: Runner does not support managed worktree bootstrap",
+                    json!({
+                        "error_kind": "agent_capability_unavailable",
+                        "failure_kind": "capability_unavailable",
+                        "capability": crate::runner_protocol::RUNNER_CAPABILITY_MANAGED_WORKTREE,
+                        "state_changed": false,
+                    }),
+                )
+                .with_recovery(RecoveryKind::NoAction);
+            }
+        }
+        let fresh_managed_bootstrap = resume_project_id.is_none();
+        let payload = json!({
+            "path": path,
+            "base_ref": base_ref,
+            "operation_id": operation_id,
+            "resume_project_id": resume_project_id,
+        });
+        let first = self
+            .submit_project_op(
+                "prepare_managed_worktree",
+                client_id.clone(),
+                payload.clone(),
+                auth,
+            )
+            .await;
+        let indeterminate = !first.success
+            && ["error_code", "error_kind"].into_iter().any(|field| {
+                first.output.get(field).and_then(Value::as_str) == Some("operation_indeterminate")
+            });
+        if !indeterminate {
+            return first;
+        }
+        // A lost response may have followed either worktree creation or registry
+        // publication. Re-issue the *same* operation identity exactly once: the
+        // Runner only re-observes/converges that deterministic target and never
+        // creates a second worktree for this tool invocation.
+        let mut recovered = self
+            .submit_project_op("prepare_managed_worktree", client_id, payload, auth)
+            .await;
+        if recovered.success
+            && fresh_managed_bootstrap
+            && recovered.output.get("outcome").and_then(Value::as_str)
+                == Some("managed_worktree_recovered")
+            && recovered.output.get("registered").and_then(Value::as_bool) == Some(false)
+        {
+            // This operation_id is freshly generated and never model-supplied.
+            // Seeing its already-registered Project after the first response was
+            // indeterminate proves the mutation happened earlier in this same
+            // work_on_project call, even though the re-observation attempt itself
+            // did not write the registry. Normalize to call-level mutation truth.
+            recovered.output["registered"] = json!(true);
+            recovered.output["created_config"] = json!(true);
+            recovered.output["changed"] = json!(true);
+        }
+        recovered
+    }
+
     /// Shared implementation for both `register_project` and `create_project`.
     /// `kind` is `"register_project"` or `"create_project"`. Fields not
     /// applicable to `register_project` (template, git_init,
-    /// allow_existing_empty) are ignored by the agent for that kind.
+    /// adopt_existing_empty) are ignored by the Runner for that kind.
     #[allow(clippy::too_many_arguments)]
     async fn project_op(
         &self,
@@ -518,13 +628,13 @@ impl ToolRuntime {
         allow_patch: bool,
         template: Option<String>,
         git_init: bool,
-        allow_existing_empty: bool,
+        adopt_existing_empty: bool,
         overwrite: bool,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         // -- basic server-side request shape validation ----------------------
-        // The agent does the authoritative path/policy validation, but the
-        // server rejects obviously malformed requests early so the agent is
+        // The Runner does the authoritative path/policy validation, but the
+        // server rejects obviously malformed requests early so the Runner is
         // never bothered with them.
         if let Err(e) = validate_project_op_id(&id) {
             return ToolResult::err(e);
@@ -551,15 +661,14 @@ impl ToolRuntime {
             "allow_patch": allow_patch,
             "template": template,
             "git_init": git_init,
-            "allow_existing_empty": allow_existing_empty,
+            "adopt_existing_empty": adopt_existing_empty,
             "overwrite": overwrite,
         });
         self.submit_project_op(kind, client_id, payload, auth).await
     }
 
     /// Shared transport, response parsing, cache-upsert, and owner-boundary
-    /// path for public project operations and internal managed temporary
-    /// project creation.
+    /// path for public project operations.
     async fn submit_project_op(
         &self,
         kind: &str,
@@ -567,21 +676,22 @@ impl ToolRuntime {
         payload: Value,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let access = crate::runner_http::runner_access_from_auth(auth);
         // -- owner boundary + client existence --------------------------------
         let Some(client_view) = self
-            .shell_clients
-            .get_client_view_for_auth(&client_id, auth)
+            .runner_registry
+            .get_runner_view_for_auth(&client_id, access.as_ref())
             .await
         else {
             return ToolResult::err(format!(
-                "unknown agent client '{}'. Call listAgents to discover registered client_ids.",
+                "unknown Runner '{}'. Call list_runners to discover registered client_ids.",
                 client_id
             ));
         };
-        let expected_agent_instance_id = client_view.agent_instance_id.clone();
+        let expected_runner_instance_id = client_view.runner_instance_id.clone();
         if let Err(e) = self
-            .shell_clients
-            .assert_client_access(auth, &client_id)
+            .runner_registry
+            .assert_runner_access(access.as_ref(), &client_id)
             .await
         {
             return ToolResult::err(e);
@@ -595,7 +705,7 @@ impl ToolRuntime {
             }
         };
         let (request_id, rx) = match self
-            .shell_clients
+            .runner_registry
             .enqueue_project_op(
                 client_id.clone(),
                 kind,
@@ -616,7 +726,7 @@ impl ToolRuntime {
             match tokio::time::timeout(Duration::from_secs(PROJECT_OP_WAIT_SECS), rx).await {
                 Ok(Ok(response)) => response,
                 Ok(Err(_)) | Err(_) => {
-                    self.shell_clients.cancel_request(&request_id).await;
+                    self.runner_registry.cancel_request(&request_id).await;
                     return ToolResult::err_with_output(
                         "operation_indeterminate",
                         json!({"error_code":"operation_indeterminate"}),
@@ -632,13 +742,13 @@ impl ToolRuntime {
         }
         let stdout = response.stdout.as_deref().unwrap_or("");
         if stdout.is_empty() {
-            return ToolResult::err("agent returned empty project op result");
+            return ToolResult::err("Runner returned empty project op result");
         }
         let result: Value = match serde_json::from_str::<Value>(stdout) {
             Ok(value) => value,
             Err(error) => {
                 return ToolResult::err(format!(
-                    "failed to parse agent project op response: {} (stdout: {})",
+                    "failed to parse Runner project op response: {} (stdout: {})",
                     error,
                     truncate_for_error(stdout)
                 ))
@@ -660,19 +770,19 @@ impl ToolRuntime {
         let Some(project) = parse_project_summary_from_result(&result, &client_id) else {
             return project_projection_reconcile_required(
                 &client_id,
-                &expected_agent_instance_id,
+                &expected_runner_instance_id,
                 &result,
                 "authoritative_project_summary_missing",
             );
         };
         if let Err(error) = self
-            .shell_clients
-            .upsert_client_project_for_instance(&client_id, &expected_agent_instance_id, project)
+            .runner_registry
+            .upsert_runner_project_for_instance(&client_id, &expected_runner_instance_id, project)
             .await
         {
             return project_projection_reconcile_required(
                 &client_id,
-                &expected_agent_instance_id,
+                &expected_runner_instance_id,
                 &result,
                 if error.contains("stale or replaced") {
                     "runner_instance_changed_before_projection"
@@ -688,7 +798,7 @@ impl ToolRuntime {
 
 fn project_projection_reconcile_required(
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     result: &Value,
     reason_code: &str,
 ) -> ToolResult {
@@ -712,7 +822,7 @@ fn project_projection_reconcile_required(
             "reason_code": reason_code,
             "state_changed": state_changed,
             "client_id": client_id,
-            "agent_instance_id": agent_instance_id,
+            "agent_instance_id": runner_instance_id,
             "agent_project_id": project_id.clone(),
             "revision": revision.clone(),
             "authoritative_outcome": result.get("outcome").cloned().unwrap_or(Value::Null),
@@ -725,11 +835,7 @@ fn project_projection_reconcile_required(
     )
 }
 
-fn project_query_matches(
-    needle: &str,
-    runtime_id: &str,
-    project: &ShellAgentProjectSummary,
-) -> bool {
+fn project_query_matches(needle: &str, runtime_id: &str, project: &RunnerProjectSummary) -> bool {
     [
         Some(runtime_id),
         Some(project.id.as_str()),
@@ -742,17 +848,21 @@ fn project_query_matches(
     .any(|value| value.to_lowercase().contains(needle))
 }
 
-fn project_source(project: &ShellAgentProjectSummary) -> &'static str {
-    match project.kind.as_deref() {
-        Some(MANAGED_TEMPORARY_PROJECT_SOURCE) => MANAGED_TEMPORARY_PROJECT_SOURCE,
+fn project_source(project: &RunnerProjectSummary) -> &'static str {
+    match project.registration_source.as_deref() {
         Some(AUTO_REGISTERED_PROJECT_SOURCE) => AUTO_REGISTERED_PROJECT_SOURCE,
-        _ => "agent_registered",
+        // A present additive provenance field is authoritative. Known explicit
+        // and unknown future wire values both fail closed to ordinary registered
+        // provenance so a future string cannot break the project inventory.
+        Some(_) => "agent_registered",
+        None if project.kind.as_deref() == Some(AUTO_REGISTERED_PROJECT_SOURCE) => {
+            AUTO_REGISTERED_PROJECT_SOURCE
+        }
+        None => "agent_registered",
     }
 }
 
-fn project_git_available(
-    project: &crate::shell_protocol::ShellAgentProjectSummary,
-) -> Option<bool> {
+fn project_git_available(project: &crate::runner_protocol::RunnerProjectSummary) -> Option<bool> {
     if project.git_branch.is_some() || project.git_head.is_some() || project.git_dirty.is_some() {
         Some(true)
     } else {
@@ -760,7 +870,7 @@ fn project_git_available(
     }
 }
 
-fn smoke_marker_present(project: &crate::shell_protocol::ShellAgentProjectSummary) -> bool {
+fn smoke_marker_present(project: &crate::runner_protocol::RunnerProjectSummary) -> bool {
     let name = project.name.as_deref().unwrap_or_default();
     [project.id.as_str(), name, project.path.as_str()]
         .iter()
@@ -769,8 +879,8 @@ fn smoke_marker_present(project: &crate::shell_protocol::ShellAgentProjectSummar
 }
 
 fn smoke_project_capabilities(
-    client: &ShellClientSemanticView,
-    project: &crate::shell_protocol::ShellAgentProjectSummary,
+    client: &RunnerSemanticView,
+    project: &crate::runner_protocol::RunnerProjectSummary,
 ) -> Value {
     let git_available = project_git_available(project);
     let safe_smoke_project =
@@ -794,16 +904,16 @@ fn smoke_project_capabilities(
 
 /// Resolve which shell profile a project uses and whether it is configured.
 /// Returns `(resolved_name, status)` where:
-/// - `resolved_name` = `project_shell_profile` (if set) else the agent's
+/// - `resolved_name` = `project_shell_profile` (if set) else the Runner's
 ///   `default_profile` (if any) else `None`.
-/// - `status` = `"configured"` if the resolved name exists in the agent's
+/// - `status` = `"configured"` if the resolved name exists in the Runner's
 ///   configured profiles; `"missing"` if a name resolved but is not
 ///   configured; `"not_configured"` if no profile resolves at all; and
-///   `"unknown"` if the agent did not report a shell-profiles summary so the
+///   `"unknown"` if the Runner did not report a shell-profiles summary so the
 ///   configured set cannot be checked.
 fn resolve_project_shell_profile(
     project_shell_profile: Option<&str>,
-    summary: Option<&crate::shell_protocol::ShellProfilesSummary>,
+    summary: Option<&crate::runner_protocol::ShellProfilesSummary>,
 ) -> (Option<String>, &'static str) {
     let resolved = project_shell_profile
         .map(str::to_string)
@@ -827,7 +937,7 @@ fn resolve_project_shell_profile(
 // Server-side request-shape validation helpers
 // =============================================================================
 
-/// Validate the project `id` field server-side. The agent does the
+/// Validate the project `id` field server-side. The Runner does the
 /// authoritative validation, but this rejects obviously malformed ids early.
 /// Rules: non-empty, <= 64 chars, ASCII letters/digits/dash/underscore only,
 /// no slash, no backslash, no dot-dot, no NUL.
@@ -860,7 +970,7 @@ fn validate_project_op_id(id: &str) -> Result<(), String> {
 }
 
 /// Validate the project `name` field server-side: non-empty after trim, <= 120
-/// chars, no NUL.
+/// UTF-8 bytes, no NUL.
 fn validate_project_op_name(name: &str) -> Result<(), String> {
     if name.contains('\0') {
         return Err("name must not contain NUL".to_string());
@@ -869,58 +979,39 @@ fn validate_project_op_name(name: &str) -> Result<(), String> {
         return Err("name cannot be empty".to_string());
     }
     if name.len() > 120 {
-        return Err("name must be at most 120 characters".to_string());
+        return Err("name must be at most 120 UTF-8 bytes".to_string());
     }
     Ok(())
 }
 
-/// Validate the optional `description` field: <= 500 chars, no NUL.
+/// Validate the optional `description` field: <= 500 UTF-8 bytes, no NUL.
 fn validate_project_op_description(desc: &str) -> Result<(), String> {
     if desc.contains('\0') {
         return Err("description must not contain NUL".to_string());
     }
     if desc.len() > 500 {
-        return Err("description must be at most 500 characters".to_string());
+        return Err("description must be at most 500 UTF-8 bytes".to_string());
     }
     Ok(())
 }
 
-/// Validate the project `path` field server-side: non-empty, absolute, no NUL.
-/// The Server may route to an agent on a different OS, so this check must accept
-/// both POSIX and Windows absolute-path shapes without applying host-local path
-/// semantics. The agent remains authoritative for existence, policy (including
-/// current UNC support), and canonicalization.
-pub(super) fn validate_project_op_path(path: &str) -> Result<(), String> {
-    if path.is_empty() {
-        return Err("path cannot be empty".to_string());
-    }
-    if path.contains('\0') {
-        return Err("path must not contain NUL".to_string());
-    }
-    let bytes = path.as_bytes();
-    let posix_absolute = path.starts_with('/');
-    let windows_drive_absolute = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/');
-    let windows_unc_or_verbatim_absolute = path.starts_with("\\\\");
-    if !(posix_absolute || windows_drive_absolute || windows_unc_or_verbatim_absolute) {
-        return Err("path must be an absolute path".to_string());
-    }
-    Ok(())
-}
+pub(super) use webcodex_core::runtime_contract::validate_project_op_path;
 
 /// Truncate a string for inclusion in an error message (bounded).
 fn truncate_for_error(s: &str) -> String {
-    const MAX: usize = 200;
-    if s.len() <= MAX {
+    const MAX_BYTES: usize = 200;
+    if s.len() <= MAX_BYTES {
         s.to_string()
     } else {
-        format!("{}…", &s[..MAX])
+        let mut end = MAX_BYTES;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
-/// Parse a `ShellAgentProjectSummary` from the agent's project-op JSON
+/// Parse a `RunnerProjectSummary` from the Runner's project-op JSON
 /// response so the server can upsert it into the cached project list. The
 /// response includes `agent_project_id`, `client_id`, `name`, `path`, and
 /// `allow_patch` — enough to build a summary that `listProjects` can show
@@ -928,7 +1019,7 @@ fn truncate_for_error(s: &str) -> String {
 fn parse_project_summary_from_result(
     result: &Value,
     _client_id: &str,
-) -> Option<ShellAgentProjectSummary> {
+) -> Option<RunnerProjectSummary> {
     let agent_project_id = result.get("agent_project_id")?.as_str()?;
     let name = result
         .get("name")
@@ -939,13 +1030,21 @@ fn parse_project_summary_from_result(
         .get("allow_patch")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    Some(ShellAgentProjectSummary {
+    let lineage = match result.get("lineage") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
+    };
+    Some(RunnerProjectSummary {
         id: agent_project_id.to_string(),
         name: name.or_else(|| Some(agent_project_id.to_string())),
         path: path.to_string(),
         allow_patch,
         kind: result
             .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        registration_source: result
+            .get("registration_source")
             .and_then(Value::as_str)
             .map(str::to_string),
         description: result
@@ -961,6 +1060,11 @@ fn parse_project_summary_from_result(
             .get("revision")
             .and_then(Value::as_str)
             .map(str::to_string),
+        root_fingerprint: result
+            .get("root_fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        lineage,
         git_branch: None,
         git_head: None,
         git_dirty: None,
@@ -972,6 +1076,62 @@ fn parse_project_summary_from_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_managed_temporary_kind_is_projected_as_ordinary_registration() {
+        let project = RunnerProjectSummary {
+            id: "legacy".to_string(),
+            name: Some("Legacy".to_string()),
+            path: "/tmp/legacy".to_string(),
+            allow_patch: true,
+            kind: Some("managed_temporary".to_string()),
+            registration_source: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: None,
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 0,
+            shell_profile: None,
+        };
+        assert_eq!(project_source(&project), "agent_registered");
+    }
+
+    #[test]
+    fn old_runner_auto_registered_kind_is_compatibility_fallback() {
+        let mut project = RunnerProjectSummary {
+            id: "legacy-auto".to_string(),
+            name: Some("Legacy Auto".to_string()),
+            path: "/tmp/legacy-auto".to_string(),
+            allow_patch: true,
+            kind: Some(AUTO_REGISTERED_PROJECT_SOURCE.to_string()),
+            registration_source: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: None,
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 0,
+            shell_profile: None,
+        };
+        assert_eq!(project_source(&project), AUTO_REGISTERED_PROJECT_SOURCE);
+        project.registration_source = Some("explicit".to_string());
+        assert_eq!(
+            project_source(&project),
+            "agent_registered",
+            "new provenance must override the legacy kind sentinel"
+        );
+        project.registration_source = Some("future_registration_source".to_string());
+        assert_eq!(project_source(&project), "agent_registered");
+    }
 
     #[test]
     fn validate_id_rejects_empty() {
@@ -1046,6 +1206,23 @@ mod tests {
         assert!(validate_project_op_path(r"C:repo").is_err());
         assert!(validate_project_op_path(r"\repo").is_err());
         assert!(validate_project_op_path(r"relative\repo").is_err());
+    }
+
+    #[test]
+    fn validation_bounds_are_utf8_bytes() {
+        let name_error = validate_project_op_name(&"界".repeat(41)).unwrap_err();
+        assert!(name_error.contains("120 UTF-8 bytes"));
+
+        let description_error = validate_project_op_description(&"界".repeat(167)).unwrap_err();
+        assert!(description_error.contains("500 UTF-8 bytes"));
+    }
+
+    #[test]
+    fn truncate_for_error_never_splits_utf8() {
+        let input = "界".repeat(67);
+        let truncated = truncate_for_error(&input);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncated.trim_end_matches('…').as_bytes().len(), 198);
     }
 
     #[test]

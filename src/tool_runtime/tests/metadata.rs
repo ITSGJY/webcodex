@@ -2,10 +2,17 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_client::ShellClientRegistry;
-use crate::shell_protocol::{
-    ShellAgentResultRequest, ShellClientCapabilities, ShellClientRegisterRequest,
-    ShellProjectInventoryPage, AGENT_PROTOCOL_GENERATION_V2,
+use crate::runner_http::RunnerRegistry;
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerProjectLineage, RunnerRegisterRequest, RunnerResultRequest,
+    ShellProjectInventoryPage, RUNNER_PROTOCOL_GENERATION_V2,
+};
+use crate::tool_runtime::kernel::{
+    HostFileImportTrust, ToolCallContext, ToolCallErrorStatus, ToolCallRequest,
+    ToolProtocolCapabilities, ToolTransport,
+};
+use crate::tool_runtime::project_resolution::{
+    ProjectKnowledgeSourceResolution, ProjectKnowledgeUnavailableReason,
 };
 use crate::tool_runtime::sessions::{
     TOOL_CALL_EXPECTATION_METADATA_FIELDS, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
@@ -13,7 +20,6 @@ use crate::tool_runtime::sessions::{
 use crate::tool_runtime::TOOL_CALL_WRAPPER_FIELDS;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -95,8 +101,8 @@ fn list_projects_call() -> ToolCall {
     }
 }
 
-fn list_agents_call() -> ToolCall {
-    ToolCall::ListAgents {
+fn list_runners_call() -> ToolCall {
+    ToolCall::ListRunners {
         client_id: None,
         client_ids: None,
         include_projects: None,
@@ -104,8 +110,8 @@ fn list_agents_call() -> ToolCall {
     }
 }
 
-fn metadata_agent_registration(client_id: &str) -> ShellClientRegisterRequest {
-    crate::test_support::current_runner_registration(ShellClientRegisterRequest {
+fn metadata_agent_registration(client_id: &str) -> RunnerRegisterRequest {
+    crate::test_support::current_runner_registration(RunnerRegisterRequest {
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -113,13 +119,13 @@ fn metadata_agent_registration(client_id: &str) -> ShellClientRegisterRequest {
         coding_agent_providers: None,
         coding_agent_inventory: None,
         client_id: client_id.to_string(),
-        agent_instance_id: format!("inst-{client_id}"),
-        agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+        runner_instance_id: format!("inst-{client_id}"),
+        runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
         display_name: None,
         owner: None,
         hostname: None,
         host_context: None,
-        capabilities: ShellClientCapabilities::default(),
+        capabilities: RunnerCapabilities::default(),
         policy: None,
     })
 }
@@ -134,9 +140,9 @@ async fn register_computer_target_for_auth(
     computer_accessibility_observe: bool,
 ) {
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -144,14 +150,14 @@ async fn register_computer_target_for_auth(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: format!("inst-{client_id}"),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: format!("inst-{client_id}"),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some(display_name.to_string()),
                 owner: None,
                 hostname: Some(format!("host-{client_id}")),
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         computer_observe,
                         computer_snapshot_region,
                         computer_accessibility_observe,
@@ -160,7 +166,7 @@ async fn register_computer_target_for_auth(
                 ),
                 policy: None,
             },
-            Some(auth),
+            Some(&crate::test_support::runner_access(auth)),
         )
         .await
         .unwrap();
@@ -175,9 +181,9 @@ async fn register_application_target_for_auth(
     computer_application_launch: bool,
 ) {
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -185,14 +191,14 @@ async fn register_application_target_for_auth(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: format!("inst-{client_id}"),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: format!("inst-{client_id}"),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some(display_name.to_string()),
                 owner: None,
                 hostname: Some(format!("host-{client_id}")),
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         computer_application_discovery,
                         computer_application_launch,
                         ..Default::default()
@@ -200,7 +206,7 @@ async fn register_application_target_for_auth(
                 ),
                 policy: None,
             },
-            Some(auth),
+            Some(&crate::test_support::runner_access(auth)),
         )
         .await
         .unwrap();
@@ -213,9 +219,9 @@ async fn register_display_target_for_auth(
     auth: &crate::auth::AuthContext,
 ) {
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -223,21 +229,21 @@ async fn register_display_target_for_auth(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: format!("inst-{client_id}"),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: format!("inst-{client_id}"),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some(display_name.to_string()),
                 owner: None,
                 hostname: Some(format!("host-{client_id}")),
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         computer_display_observe: true,
                         ..Default::default()
                     },
                 ),
                 policy: None,
             },
-            Some(auth),
+            Some(&crate::test_support::runner_access(auth)),
         )
         .await
         .unwrap();
@@ -250,9 +256,9 @@ async fn register_pointer_target_for_auth(
     auth: &crate::auth::AuthContext,
 ) {
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -260,21 +266,21 @@ async fn register_pointer_target_for_auth(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: format!("inst-{client_id}"),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: format!("inst-{client_id}"),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some(display_name.to_string()),
                 owner: None,
                 hostname: Some(format!("host-{client_id}")),
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         computer_pointer_control: true,
                         ..Default::default()
                     },
                 ),
                 policy: None,
             },
-            Some(auth),
+            Some(&crate::test_support::runner_access(auth)),
         )
         .await
         .unwrap();
@@ -288,9 +294,9 @@ async fn register_clipboard_target_for_auth(
     write: bool,
 ) {
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -298,14 +304,14 @@ async fn register_clipboard_target_for_auth(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: format!("inst-{client_id}"),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: format!("inst-{client_id}"),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some(display_name.to_string()),
                 owner: None,
                 hostname: Some(format!("host-{client_id}")),
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         computer_clipboard_read: read,
                         computer_clipboard_write: write,
                         ..Default::default()
@@ -313,7 +319,7 @@ async fn register_clipboard_target_for_auth(
                 ),
                 policy: None,
             },
-            Some(auth),
+            Some(&crate::test_support::runner_access(auth)),
         )
         .await
         .unwrap();
@@ -326,9 +332,9 @@ async fn register_agent_projects_for_auth(
     project_id: &str,
 ) {
     runtime
-        .shell_clients
+        .runner_registry
         .register_with_auth(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -336,14 +342,14 @@ async fn register_agent_projects_for_auth(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: format!("inst-{}", client_id),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: format!("inst-{}", client_id),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
-                    ShellClientCapabilities {
+                    RunnerCapabilities {
                         shell: true,
                         file_read: true,
                         file_write: true,
@@ -353,6 +359,8 @@ async fn register_agent_projects_for_auth(
                         apply_text_edit_occurrence: false,
                         apply_text_edit_line_scope: false,
                         apply_patch: false,
+                        apply_patch_match_metadata: false,
+                        apply_patch_matching_mode: false,
                         apply_patch_strict_matching: false,
                         git: true,
                         jobs: true,
@@ -363,11 +371,15 @@ async fn register_agent_projects_for_auth(
                         ssh_persistent_shell: false,
                         structured_validation_argv: true,
                         structured_cargo_test_count_assertion: true,
+                        structured_cargo_test_execution_policy: true,
+                        structured_cargo_test_lib: true,
                         structured_go_test_json: true,
                         structured_go_test_tool: true,
                         structured_go_test_packages: true,
                         structured_process_argv: true,
                         structured_script_payload: false,
+                        structured_script_javascript: false,
+                        structured_script_typescript: false,
                         internal_posix_script: false,
                         structured_execution_jobs: false,
                         detached_process_jobs: false,
@@ -375,8 +387,9 @@ async fn register_agent_projects_for_auth(
                         lsp_call_hierarchy: false,
                         project_lifecycle: false,
                         project_path_registration: false,
-                        skill_store_read: false,
-                        skill_store_manage: false,
+                        managed_worktree: false,
+                        skill_runtime: false,
+                        skill_management: false,
                         computer_observe: false,
                         computer_application_discovery: false,
                         computer_application_launch: false,
@@ -394,16 +407,19 @@ async fn register_agent_projects_for_auth(
                         computer_text_input: false,
                         job_state_reconciliation: false,
                         coding_agent_runs: false,
+                        native_tool_plugins: false,
+                        managed_ssh_resources: false,
+                        runner_config_control: false,
                     },
                 ),
                 policy: None,
             },
-            Some(auth),
+            Some(&crate::test_support::runner_access(auth)),
         )
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
         &format!("inst-{client_id}"),
         vec![registered_project(
@@ -421,11 +437,11 @@ async fn coding_agent_start_uses_canonical_runner_capability_gate() {
         &runtime,
         "coding-capability-gate",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project("demo", "/tmp/coding-capability-gate")],
     )
     .await;
-    let project = agent_project_runtime_id("coding-capability-gate", "demo");
+    let project = runner_project_runtime_id("coding-capability-gate", "demo");
 
     let result = runtime
         .coding_agent_start(
@@ -455,7 +471,7 @@ async fn list_projects_returns_agent_registered_projects_without_server_config()
         &runtime,
         "workstation-1",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project("webcodex", "/root/git/webcodex")],
     )
     .await;
@@ -475,6 +491,38 @@ async fn list_projects_returns_agent_registered_projects_without_server_config()
 }
 
 #[tokio::test]
+async fn list_projects_uses_registration_provenance_without_reclassifying_project_kind() {
+    let runtime = test_runtime();
+    let explicit = registered_project("explicit-repo", "/root/git/explicit-repo");
+    assert_eq!(explicit.kind.as_deref(), Some("repo"));
+    let mut auto = registered_project("auto-repo", "/root/git/auto-repo");
+    auto.kind = Some("auto_registered".to_string());
+    auto.registration_source = Some("auto_registered".to_string());
+    register_agent_with_projects(
+        &runtime,
+        "registration-source-runner",
+        None,
+        RunnerCapabilities::default(),
+        vec![explicit, auto],
+    )
+    .await;
+
+    let result = runtime.dispatch(list_projects_call()).await;
+    assert!(result.success, "{:?}", result.error);
+    let projects = result.output["projects"].as_array().unwrap();
+    let explicit = projects
+        .iter()
+        .find(|project| project["agent_project_id"] == "explicit-repo")
+        .unwrap();
+    let auto = projects
+        .iter()
+        .find(|project| project["agent_project_id"] == "auto-repo")
+        .unwrap();
+    assert_eq!(explicit["source"], "agent_registered");
+    assert_eq!(auto["source"], "auto_registered");
+}
+
+#[tokio::test]
 async fn list_projects_reports_smoke_selection_capabilities() {
     let runtime = test_runtime();
     let mut test_mcp = registered_project("test-mcp", "/tmp/test-mcp");
@@ -488,7 +536,7 @@ async fn list_projects_reports_smoke_selection_capabilities() {
         &runtime,
         "special",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             file_write: true,
             git: true,
@@ -526,6 +574,88 @@ async fn list_projects_reports_smoke_selection_capabilities() {
         result.output["recommended_for_smoke"],
         json!(["agent:special:webcodex-smoke"])
     );
+}
+
+#[tokio::test]
+async fn runner_config_tools_use_normal_kernel_scope_gate_before_runner_dispatch() {
+    let runtime = test_runtime();
+    let read_only = oauth_bridge_auth_context(
+        "runner-config-read-only",
+        &[crate::auth::SCOPE_RUNTIME_READ],
+    );
+    let context = |auth| ToolCallContext {
+        transport: ToolTransport::Mcp,
+        session_id: None,
+        auth,
+        window: None,
+        record_oauth_scope_denials: false,
+        host_file_import_trust: HostFileImportTrust::Untrusted,
+    };
+
+    let check = runtime
+        .call_tool_with_protocol_capabilities(
+            ToolCallRequest {
+                tool_name: "runner_config_check".to_string(),
+                arguments: json!({"client_id": "missing-runner"}),
+            },
+            context(Some(&read_only)),
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(check.error_status.is_none());
+    let check = check
+        .result
+        .expect("read-like config check should reach dispatch");
+    assert!(!check.success);
+    assert_eq!(check.output["execution_state"], "not_started");
+    assert_eq!(check.output["error_code"], "runner_unavailable");
+
+    let denied_reload = runtime
+        .call_tool_with_protocol_capabilities(
+            ToolCallRequest {
+                tool_name: "runner_config_reload".to_string(),
+                arguments: json!({
+                    "client_id": "missing-runner",
+                    "expected_generation": 1
+                }),
+            },
+            context(Some(&read_only)),
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(denied_reload.result.is_none());
+    assert!(matches!(
+        denied_reload.error_status,
+        Some(ToolCallErrorStatus::InsufficientScope {
+            required_scope: Some(webcodex_core::authority::SCOPE_RUNNER_MANAGE),
+            ..
+        })
+    ));
+
+    let manager = oauth_bridge_auth_context(
+        "runner-config-manager",
+        &[webcodex_core::authority::SCOPE_RUNNER_MANAGE],
+    );
+    let allowed_reload = runtime
+        .call_tool_with_protocol_capabilities(
+            ToolCallRequest {
+                tool_name: "runner_config_reload".to_string(),
+                arguments: json!({
+                    "client_id": "missing-runner",
+                    "expected_generation": 1
+                }),
+            },
+            context(Some(&manager)),
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(allowed_reload.error_status.is_none());
+    let allowed_reload = allowed_reload
+        .result
+        .expect("runner:manage should reach exact Runner dispatch");
+    assert!(!allowed_reload.success);
+    assert_eq!(allowed_reload.output["execution_state"], "not_started");
+    assert_eq!(allowed_reload.output["error_code"], "runner_unavailable");
 }
 
 #[tokio::test]
@@ -576,20 +706,23 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: "agent:client-a:proj-a".to_string(),
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bridge_a),
                 )
                 .await
         }
     });
-    let req = wait_for_agent_request_for_client(&runtime, "client-a").await;
+    let req = wait_for_runner_request_for_client(&runtime, "client-a").await;
     complete_patch_agent_request_for_instance(
         &runtime,
         "client-a",
@@ -605,13 +738,16 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-b:proj-b".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&bridge_a),
         )
@@ -635,13 +771,16 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-a:proj-a".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&bridge_b),
         )
@@ -668,20 +807,23 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: "agent:client-open:proj-open".to_string(),
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&open),
                 )
                 .await
         }
     });
-    let req = wait_for_agent_request_for_client(&runtime, "client-open").await;
+    let req = wait_for_runner_request_for_client(&runtime, "client-open").await;
     complete_patch_agent_request_for_instance(
         &runtime,
         "client-open",
@@ -711,7 +853,7 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
                 .await
         }
     });
-    let req = wait_for_agent_request_for_client(&runtime, "client-open").await;
+    let req = wait_for_runner_request_for_client(&runtime, "client-open").await;
     complete_patch_agent_request_for_instance(
         &runtime,
         "client-open",
@@ -728,13 +870,16 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-a:proj-a".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&open),
         )
@@ -764,13 +909,16 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-b:proj-b".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&shared_a),
         )
@@ -780,19 +928,271 @@ async fn shared_key_list_projects_and_dispatch_are_filtered_by_auth_group() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: "agent:client-open:proj-open".to_string(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                }],
                 session_id: None,
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&shared_a),
         )
         .await;
     assert!(!result.success);
     assert_eq!(result.output["error_kind"], "unknown_project");
+}
+
+#[tokio::test]
+async fn repository_knowledge_association_revalidates_identity_availability_and_authority() {
+    let runtime = test_runtime();
+    let auth = bootstrap_auth();
+    let client_id = "repo-association";
+    let instance_id = format!("inst-{client_id}");
+    let target_path = "/tmp/repo-association-target";
+    let source_path = "/tmp/repo-association-source";
+    let source_fingerprint = format!("wc_projroot_{}", "1".repeat(64));
+    let target_fingerprint = format!("wc_projroot_{}", "2".repeat(64));
+    let base_sha = "a".repeat(40);
+    let caps = RunnerCapabilities {
+        shell: true,
+        file_read: true,
+        file_write: true,
+        ..Default::default()
+    };
+
+    let mut source = registered_project("source", source_path);
+    source.root_fingerprint = Some(source_fingerprint.clone());
+    source.allow_patch = true;
+    let mut target = registered_project("target", target_path);
+    target.root_fingerprint = Some(target_fingerprint);
+    target.allow_patch = false;
+    target.lineage = Some(RunnerProjectLineage::ManagedWorktreeSource {
+        source_project_id: "source".to_string(),
+        source_root_fingerprint: source_fingerprint.clone(),
+        base_sha: base_sha.clone(),
+    });
+    register_agent_projects(
+        &runtime,
+        client_id,
+        None,
+        caps.clone(),
+        vec![source.clone(), target.clone()],
+    )
+    .await;
+
+    let target_id = crate::tool_runtime::runner_project_runtime_id(client_id, "target");
+    let resolved_target = runtime
+        .resolve_project_input_for_auth(&target_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(resolved_target.config.path, target_path);
+    assert!(
+        !resolved_target.config.allow_patch,
+        "source allow_patch must not elevate target"
+    );
+    let available = runtime
+        .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+        .await;
+    let ProjectKnowledgeSourceResolution::Available(available) = available else {
+        panic!("expected available knowledge source");
+    };
+    assert_eq!(
+        available.source.resolved_id,
+        "agent:repo-association:source"
+    );
+    assert_eq!(available.source.config.path, source_path);
+    assert_eq!(
+        available.source.root_fingerprint.as_deref(),
+        Some(source_fingerprint.as_str())
+    );
+    assert_eq!(available.base_sha, base_sha);
+    let diagnostic = runtime
+        .project_knowledge_association_diagnostic(&resolved_target, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(diagnostic["kind"], "managed_worktree_source");
+    assert_eq!(diagnostic["status"], "available");
+    assert_eq!(
+        diagnostic["source_project"],
+        "agent:repo-association:source"
+    );
+    assert_eq!(diagnostic["base_sha"], base_sha);
+    assert_eq!(diagnostic["read_through"], false);
+    let diagnostic_text = serde_json::to_string(&diagnostic).unwrap();
+    assert!(!diagnostic_text.contains(source_path));
+    assert!(!diagnostic_text.contains(&source_fingerprint));
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&available.source, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::NotAssociated
+    ));
+    assert!(runtime
+        .project_knowledge_association_diagnostic(&available.source, Some(&auth))
+        .await
+        .is_none());
+
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![target.clone()],
+    )
+    .await;
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::SourceUnavailable
+        )
+    ));
+    let unavailable_diagnostic = runtime
+        .project_knowledge_association_diagnostic(&resolved_target, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(unavailable_diagnostic["status"], "unavailable");
+    assert!(unavailable_diagnostic.get("source_project").is_none());
+    assert!(unavailable_diagnostic.get("base_sha").is_none());
+    let target_still_resolves = runtime
+        .resolve_project_input_for_auth(&target_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(target_still_resolves.config.path, target_path);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let target_id = target_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::RunShell {
+                        project: target_id,
+                        command: "pwd".to_string(),
+                        session_id: None,
+                        timeout_secs: Some(30),
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = wait_for_runner_request_for_instance(&runtime, client_id, &instance_id).await;
+    assert_eq!(request.cwd.as_deref(), Some(target_path));
+    complete_patch_agent_request_for_instance(
+        &runtime,
+        client_id,
+        &instance_id,
+        &request.request_id,
+        0,
+        "ok\n",
+        "",
+    )
+    .await;
+    assert!(
+        task.await.unwrap().success,
+        "association failure must not block target execution"
+    );
+
+    source.disabled = true;
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![source.clone(), target.clone()],
+    )
+    .await;
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::SourceUnavailable
+        )
+    ));
+
+    source.disabled = false;
+    source.root_fingerprint = Some(format!("wc_projroot_{}", "3".repeat(64)));
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![source.clone(), target.clone()],
+    )
+    .await;
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Stale
+    ));
+
+    source.root_fingerprint = Some(source_fingerprint);
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        &instance_id,
+        vec![source, target],
+    )
+    .await;
+    let foreign_auth = shared_key_auth("foreign-repo-association-key");
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&foreign_auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::Unauthorized
+        )
+    ));
+
+    runtime
+        .runner_registry
+        .reconcile_disconnect(client_id, &instance_id)
+        .await;
+    let replacement_instance = "repo-association-replacement";
+    let replacement = runtime
+        .runner_registry
+        .register(RunnerRegisterRequest {
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
+            client_id: client_id.to_string(),
+            runner_instance_id: replacement_instance.to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            display_name: None,
+            owner: None,
+            hostname: None,
+            host_context: None,
+            capabilities: crate::test_support::current_runner_capabilities(caps),
+            policy: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement
+            .project_inventory
+            .as_ref()
+            .map(|status| status.sync_state.as_str()),
+        Some("pending")
+    );
+    assert!(matches!(
+        runtime
+            .resolve_project_knowledge_source_for_auth(&resolved_target, Some(&auth))
+            .await,
+        ProjectKnowledgeSourceResolution::Unavailable(
+            ProjectKnowledgeUnavailableReason::InventoryIncomplete
+        )
+    ));
 }
 
 #[tokio::test]
@@ -806,8 +1206,8 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
     let path_b = tempfile::tempdir().unwrap();
     let path_a = path_a.path().to_string_lossy().to_string();
     let path_b = path_b.path().to_string_lossy().to_string();
-    let project_id = crate::tool_runtime::agent_project_runtime_id(client_id, "demo");
-    let capabilities = ShellClientCapabilities {
+    let project_id = crate::tool_runtime::runner_project_runtime_id(client_id, "demo");
+    let capabilities = RunnerCapabilities {
         shell: true,
         file_read: true,
         file_write: true,
@@ -832,12 +1232,12 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
     assert_eq!(initial.config.path, path_a);
 
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect(client_id, &old_instance)
         .await;
     let replacement = runtime
-        .shell_clients
-        .register(ShellClientRegisterRequest {
+        .runner_registry
+        .register(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -845,8 +1245,8 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: client_id.to_string(),
-            agent_instance_id: new_instance.to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: new_instance.to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: None,
             hostname: None,
@@ -876,13 +1276,16 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
             purpose: None,
             shell: None,
         },
-        ToolCall::ReadFile {
+        ToolCall::ReadFiles {
             project: project_id.clone(),
-            path: "README.md".to_string(),
+            items: vec![crate::tool_runtime::ReadFilesItem {
+                path: "README.md".to_string(),
+                start_line: None,
+                limit: None,
+            }],
             session_id: None,
-            start_line: None,
-            limit: None,
             with_line_numbers: None,
+            max_result_bytes: None,
         },
         ToolCall::WriteProjectFile {
             project: project_id.clone(),
@@ -918,7 +1321,7 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
     );
 
     let completed = runtime
-        .shell_clients
+        .runner_registry
         .apply_project_inventory_page(
             client_id,
             new_instance,
@@ -961,7 +1364,7 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
                 .await
         }
     });
-    let request = wait_for_agent_request_for_instance(&runtime, client_id, new_instance).await;
+    let request = wait_for_runner_request_for_instance(&runtime, client_id, new_instance).await;
     assert_eq!(request.cwd.as_deref(), Some(path_b.as_str()));
     complete_patch_agent_request_for_instance(
         &runtime,
@@ -985,8 +1388,8 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
     let new_instance = "restart-removal-new";
     let old_root = tempfile::tempdir().unwrap();
     let old_root = old_root.path().to_string_lossy().to_string();
-    let project_id = crate::tool_runtime::agent_project_runtime_id(client_id, "demo");
-    let capabilities = ShellClientCapabilities {
+    let project_id = crate::tool_runtime::runner_project_runtime_id(client_id, "demo");
+    let capabilities = RunnerCapabilities {
         shell: true,
         file_read: true,
         file_write: true,
@@ -1002,12 +1405,12 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
     )
     .await;
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect(client_id, &old_instance)
         .await;
     runtime
-        .shell_clients
-        .register(ShellClientRegisterRequest {
+        .runner_registry
+        .register(RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -1015,8 +1418,8 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: client_id.to_string(),
-            agent_instance_id: new_instance.to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: new_instance.to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: None,
             hostname: None,
@@ -1055,7 +1458,7 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
         );
         if phase == "pending" {
             let status = runtime
-                .shell_clients
+                .runner_registry
                 .apply_project_inventory_page(
                     client_id,
                     new_instance,
@@ -1077,7 +1480,7 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
 
 #[tokio::test]
 async fn list_projects_shows_shell_profile_resolution() {
-    use crate::shell_protocol::{AgentPolicySummary, ShellProfilesSummary};
+    use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
     let runtime = test_runtime();
     let summary = ShellProfilesSummary {
         default_dialect: None,
@@ -1087,7 +1490,7 @@ async fn list_projects_shows_shell_profile_resolution() {
         prepared_cache_count: 0,
         profiles: vec![profile_summary_entry("rust", false, 2)],
     };
-    let policy = AgentPolicySummary {
+    let policy = RunnerPolicySummary {
         allow_raw_shell: true,
         allow_cwd_anywhere: true,
         allowed_roots: Vec::new(),
@@ -1164,7 +1567,7 @@ async fn project_path_registration_capability_is_projected_safely() {
         &runtime,
         "path-capable-agent",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             project_path_registration: true,
             ..Default::default()
         },
@@ -1172,7 +1575,7 @@ async fn project_path_registration_capability_is_projected_safely() {
     )
     .await;
 
-    let listed = runtime.dispatch(list_agents_call()).await;
+    let listed = runtime.dispatch(list_runners_call()).await;
     assert!(listed.success, "{:?}", listed.error);
     assert_eq!(
         listed.output["agents"][0]["capabilities"]["project_path_registration"],
@@ -1193,10 +1596,10 @@ async fn project_path_registration_capability_is_projected_safely() {
 
 #[tokio::test]
 async fn runtime_status_shell_profiles_summary_is_sanitized() {
-    use crate::shell_protocol::{
-        AgentPolicySummary, ShellProfileSummaryEntry, ShellProfilesSummary,
+    use crate::runner_protocol::{
+        RunnerPolicySummary, ShellProfileSummaryEntry, ShellProfilesSummary,
     };
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     let secret_env_value = "DO_NOT_LEAK_THIS_ENV_VALUE";
     let secret_script = "DO_NOT_LEAK_THIS_INIT_SCRIPT_BODY";
     let summary = ShellProfilesSummary {
@@ -1219,7 +1622,7 @@ async fn runtime_status_shell_profiles_summary_is_sanitized() {
     // they never reach the status JSON.
     let _ = (secret_env_value, secret_script);
     registry
-        .register(crate::shell_protocol::ShellClientRegisterRequest {
+        .register(crate::runner_protocol::RunnerRegisterRequest {
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -1227,16 +1630,16 @@ async fn runtime_status_shell_profiles_summary_is_sanitized() {
             coding_agent_providers: None,
             coding_agent_inventory: None,
             client_id: "profile-agent".to_string(),
-            agent_instance_id: "inst".to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: None,
             owner: Some("alice".to_string()),
             hostname: None,
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities::default(),
+                RunnerCapabilities::default(),
             ),
-            policy: Some(AgentPolicySummary {
+            policy: Some(RunnerPolicySummary {
                 allow_raw_shell: true,
                 allow_cwd_anywhere: false,
                 allowed_roots: Vec::new(),
@@ -1276,7 +1679,7 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
         &runtime,
         "oe",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             shell: true,
             ..Default::default()
         },
@@ -1302,13 +1705,13 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(&runtime, "oe", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "oe", "inst").await;
     assert_eq!(req.cwd.as_deref(), Some("/tmp/agent-proj"));
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "oe".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some("hi\n".to_string()),
@@ -1323,7 +1726,7 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
 }
 
 #[tokio::test]
-async fn agent_capability_rejection_matrix_names_required_capability() {
+async fn runner_capability_rejection_matrix_names_required_capability() {
     enum CapabilityCase {
         RunShell,
         GitStatus,
@@ -1332,16 +1735,16 @@ async fn agent_capability_rejection_matrix_names_required_capability() {
     let cases = [
         (
             "cap-shell",
-            ShellClientCapabilities {
+            RunnerCapabilities {
                 shell: false,
                 ..Default::default()
             },
             CapabilityCase::RunShell,
-            vec!["does not support shell", "agent client cap-shell"],
+            vec!["does not support shell", "Runner cap-shell"],
         ),
         (
             "cap-git",
-            ShellClientCapabilities {
+            RunnerCapabilities {
                 shell: false,
                 ..Default::default()
             },
@@ -1386,7 +1789,7 @@ async fn agent_capability_rejection_matrix_names_required_capability() {
 }
 
 #[tokio::test]
-async fn agent_tool_unknown_client_returns_unknown_project_error() {
+async fn runner_tool_unknown_client_returns_unknown_project_error() {
     // Project points at client "ghost" which never registered.
     let runtime = runtime_with_agent_project("ghost");
     let bootstrap = auth_context(None, true);
@@ -1419,7 +1822,7 @@ async fn agent_tool_authority_admission_matrix() {
         &runtime,
         "authority-agent",
         Some("alice"),
-        ShellClientCapabilities {
+        RunnerCapabilities {
             async_shell_jobs: true,
             ..Default::default()
         },
@@ -1665,18 +2068,31 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
         let tool_name = tool["name"].as_str().unwrap_or("unknown");
         for &field in TOOL_CALL_EXPECTATION_METADATA_FIELDS {
             let advertised = accepted.iter().any(|value| value.as_str() == Some(field));
-            if field == "assertion_name" {
-                assert_eq!(
-                    advertised,
-                    matches!(tool_name, "run_process" | "run_script" | "run_shell" | "run_job"),
-                    "{tool_name} manifest assertion_name exposure must match the model-facing generic validation tools"
-                );
-            } else {
-                assert!(
-                    !advertised,
-                    "{tool_name} manifest entry must not advertise internal expectation field {field}"
-                );
-            }
+            let expected = match field {
+                "assertion_name" => {
+                    matches!(
+                        tool_name,
+                        "run_process" | "run_script" | "run_shell" | "run_job"
+                    )
+                }
+                "result_expectation" => matches!(
+                    tool_name,
+                    "run_process"
+                        | "run_script"
+                        | "run_shell"
+                        | "session_shell_exec"
+                        | "cargo_fmt"
+                        | "cargo_check"
+                        | "cargo_test"
+                        | "go_test"
+                ),
+                "accepted_exit_codes" => tool_name == "run_process",
+                _ => false,
+            };
+            assert_eq!(
+                advertised, expected,
+                "{tool_name} manifest expectation-field exposure mismatch for {field}"
+            );
         }
     }
 
@@ -1792,7 +2208,6 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
             "artifact_upload_abort",
             vec!["project", "path", "upload_id", "session_id"],
         ),
-        ("job_status", vec!["job_id", "include_command_preview"]),
     ] {
         let accepted = accepted(tool);
         for field in fields {
@@ -1853,7 +2268,6 @@ async fn tool_manifest_model_fields_and_hidden_start_compatibility_stay_separate
 
     for field in [
         "temporary_project_name",
-        "mode",
         "deny_write_tools",
         "deny_shell_tools",
         "detail",
@@ -1870,8 +2284,16 @@ async fn tool_manifest_model_fields_and_hidden_start_compatibility_stay_separate
             "retired start-only flattened arg {field} must not remain in ToolCallRequest"
         );
     }
-    assert!(accepted_fields.contains("execution_context"));
-    assert!(properties.contains_key("execution_context"));
+    for field in ["mode", "base_ref", "execution_context"] {
+        assert!(
+            accepted_fields.contains(field),
+            "current model-visible flattened field {field} must be owned by the manifest"
+        );
+        assert!(
+            properties.contains_key(field),
+            "current model-visible flattened field {field} must be declared by ToolCallRequest"
+        );
+    }
 
     for field in properties.keys() {
         if TOOL_CALL_WRAPPER_FIELDS.contains(&field.as_str()) {
@@ -1976,6 +2398,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         "discovery",
         "inspect",
         "edit",
+        "file_transfer",
         "validate",
         "review",
         "handoff",
@@ -1993,6 +2416,10 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
     for tool in [
         "read_file",
         "search_project_text",
+        "search_project_texts",
+        "read_files",
+        "import_conversation_files_to_project",
+        "export_project_artifact",
         "show_changes",
         "apply_text_edits",
         "apply_unified_diff",
@@ -2034,10 +2461,11 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         );
     }
     assert!(
-        serialized.contains("run_shell")
-            && serialized.contains("escape hatch")
-            && serialized.contains("not the primary validation path"),
-        "run_shell should be a bounded escape hatch in recommended_flows: {serialized}"
+        serialized.contains("runner-owned sync-first")
+            && serialized.contains("run_job is runner-owned immediate async")
+            && serialized.contains("run_detached_process is supervisor-owned immediate async")
+            && serialized.contains("session_shell_exec continues an existing persistent session shell"),
+        "recommended_flows should expose the canonical execution selection vocabulary: {serialized}"
     );
 }
 
@@ -2076,7 +2504,7 @@ async fn runtime_status_uses_agent_projects_as_effective() {
         &runtime,
         "special",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             file_write: true,
             git: true,
@@ -2113,7 +2541,10 @@ async fn runtime_status_includes_build_metadata() {
     );
     assert_eq!(
         result.output["mcp_compact_schemas"],
-        crate::config::mcp_compact_schemas_enabled()
+        crate::model_surface::effective_mcp_compact_schemas(
+            runtime.runtime_exposure(),
+            crate::config::mcp_compact_schemas_override(),
+        )
     );
     let build = &result.output["build"];
     assert!(build.is_object());
@@ -2140,7 +2571,7 @@ async fn runtime_status_preserves_allowlisted_effective_config_across_projection
         &runtime,
         "effective-config-agent",
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
     )
     .await;
 
@@ -2194,6 +2625,39 @@ async fn runtime_status_preserves_allowlisted_effective_config_across_projection
             full.output["configured_public_url"]
         );
     }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn runtime_status_reports_effective_mcp_compact_schema_policy() {
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+
+    for (surface, expected) in [
+        (crate::model_surface::ModelSurface::LocalCoding, false),
+        (crate::model_surface::ModelSurface::AdaptiveRuntime, true),
+        (
+            crate::model_surface::ModelSurface::FullOperatorRuntime,
+            false,
+        ),
+    ] {
+        let runtime = test_runtime().with_model_surface(surface);
+        let result = runtime.dispatch(runtime_status_call()).await;
+        assert!(result.success, "{surface:?}: {:?}", result.error);
+        assert_eq!(
+            result.output["mcp_compact_schemas"], expected,
+            "{surface:?}"
+        );
+    }
+
+    let adaptive =
+        test_runtime().with_model_surface(crate::model_surface::ModelSurface::AdaptiveRuntime);
+    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+    let full = adaptive.dispatch(runtime_status_call()).await;
+    assert_eq!(full.output["mcp_compact_schemas"], false);
+    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
+    let compact = adaptive.dispatch(runtime_status_call()).await;
+    assert_eq!(compact.output["mcp_compact_schemas"], true);
 }
 
 #[tokio::test]
@@ -2251,7 +2715,10 @@ async fn runtime_status_reports_project_connector_exposure_when_configured() {
     );
     assert_eq!(
         compact.output["mcp_compact_schemas"],
-        crate::config::mcp_compact_schemas_enabled()
+        crate::model_surface::effective_mcp_compact_schemas(
+            runtime.runtime_exposure(),
+            crate::config::mcp_compact_schemas_override(),
+        )
     );
     assert_eq!(
         compact.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
@@ -2259,12 +2726,17 @@ async fn runtime_status_reports_project_connector_exposure_when_configured() {
     );
 }
 
+// runtime_status resolves the effective exposure-aware compact-schema policy on
+// each call. Serialize this async assertion with tests that mutate the override
+// so the value cannot change between dispatch and the matching expectation.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
-    use crate::shell_protocol::{AgentPolicySummary, ShellProfilesSummary};
+    use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
 
+    let _env = crate::test_support::TestEnvGuard::new();
     let runtime = test_runtime();
-    let policy = AgentPolicySummary {
+    let policy = RunnerPolicySummary {
         allowed_roots: vec![PathBuf::from(
             "/tmp/runtime-compact-allowed-root-never-emit",
         )],
@@ -2295,7 +2767,10 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
         assert_eq!(summary["compact"], true, "arguments: {arguments}");
         assert_eq!(
             summary["mcp_compact_schemas"],
-            crate::config::mcp_compact_schemas_enabled(),
+            crate::model_surface::effective_mcp_compact_schemas(
+                runtime.runtime_exposure(),
+                crate::config::mcp_compact_schemas_override(),
+            ),
             "arguments: {arguments}"
         );
         assert!(summary["effective_config"].is_object());
@@ -2553,9 +3028,9 @@ fn runtime_info_from_env_reads_effective_server_config() {
 
 #[tokio::test]
 async fn runtime_status_agent_summary_includes_protocol_version() {
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     let mut registration = metadata_agent_registration("agent-1");
-    registration.agent_instance_id = "inst".to_string();
+    registration.runner_instance_id = "inst".to_string();
     registration.job_concurrency_limit = Some(4);
     registration.display_name = Some("Workstation".to_string());
     registration.owner = Some("alice".to_string());
@@ -2576,7 +3051,7 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
     assert_eq!(clients[0]["client_id"], "agent-1");
     assert_eq!(
         clients[0]["agent_protocol_generation"],
-        AGENT_PROTOCOL_GENERATION_V2.get()
+        RUNNER_PROTOCOL_GENERATION_V2.get()
     );
     assert_eq!(clients[0]["transport"], "polling");
     assert_eq!(clients[0]["connected"], true);
@@ -2611,15 +3086,15 @@ async fn runtime_status_agent_summary_includes_protocol_version() {
 
 #[tokio::test]
 async fn runtime_status_includes_sanitized_policy_summary() {
-    use crate::shell_protocol::{
-        AgentConfigReloadStatus, AgentPolicySummary, ClaudeCodeProviderStatus, ProviderCallSummary,
-        ToolProvidersStatus,
+    use crate::runner_protocol::{
+        ClaudeCodeProviderStatus, ProviderCallSummary, RunnerConfigReloadStatus,
+        RunnerPolicySummary, ToolProvidersStatus,
     };
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     let mut registration = metadata_agent_registration("policy-agent");
-    registration.agent_instance_id = "inst-p".to_string();
+    registration.runner_instance_id = "inst-p".to_string();
     registration.owner = Some("alice".to_string());
-    registration.policy = Some(AgentPolicySummary {
+    registration.policy = Some(RunnerPolicySummary {
         allow_raw_shell: true,
         allow_cwd_anywhere: false,
         allowed_roots: vec![std::path::PathBuf::from("/root")],
@@ -2641,7 +3116,7 @@ async fn runtime_status_includes_sanitized_policy_summary() {
                 last_error_code: None,
                 last_call: None,
             },
-            config_reload: AgentConfigReloadStatus::default(),
+            config_reload: RunnerConfigReloadStatus::default(),
         }),
         mcp_gateway_providers: None,
     });
@@ -2672,10 +3147,10 @@ async fn runtime_status_includes_sanitized_policy_summary() {
                 error_code: None,
             }),
         },
-        config_reload: AgentConfigReloadStatus {
+        config_reload: RunnerConfigReloadStatus {
             generation: 2,
             last_reload_result: "success".to_string(),
-            ..AgentConfigReloadStatus::default()
+            ..RunnerConfigReloadStatus::default()
         },
     };
     registry
@@ -2714,7 +3189,7 @@ async fn runtime_status_includes_sanitized_policy_summary() {
     assert!(policy.get("env").is_none());
     assert!(policy.get("init_script").is_none());
 
-    let listed = runtime.dispatch(list_agents_call()).await;
+    let listed = runtime.dispatch(list_runners_call()).await;
     assert_eq!(
         listed.output["agents"][0]["tool_providers"]["claude_code"]["last_call"]["fallback_used"],
         false
@@ -2723,8 +3198,8 @@ async fn runtime_status_includes_sanitized_policy_summary() {
 
 #[tokio::test]
 async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surface() {
-    use crate::shell_protocol::{
-        AgentPolicySummary, ClaudeCodeProviderStatus, ToolProvidersStatus,
+    use crate::runner_protocol::{
+        ClaudeCodeProviderStatus, RunnerPolicySummary, ToolProvidersStatus,
     };
     let before = crate::tool_runtime::registry::registered_tool_specs();
     let names_before = before
@@ -2739,10 +3214,10 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         .unwrap()
         .input_schema
         .clone();
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     let mut registration = metadata_agent_registration("provider-surface");
-    registration.agent_instance_id = "inst-surface".to_string();
-    registration.policy = Some(AgentPolicySummary {
+    registration.runner_instance_id = "inst-surface".to_string();
+    registration.policy = Some(RunnerPolicySummary {
         tool_providers: Some(ToolProvidersStatus {
             strategy: "claude_code_then_native".to_string(),
             claude_code: ClaudeCodeProviderStatus {
@@ -2763,7 +3238,7 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
             },
             config_reload: Default::default(),
         }),
-        ..AgentPolicySummary::default()
+        ..RunnerPolicySummary::default()
     });
     registry.register(registration).await.unwrap();
     let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
@@ -2799,15 +3274,15 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         .values()
         .map(|path| path.as_object().unwrap().len())
         .sum();
-    assert_eq!(operation_count, 22);
+    assert_eq!(operation_count, 16);
 }
 
 #[tokio::test]
 async fn runtime_status_policy_summary_is_null_for_older_agents() {
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     // Older agent: no policy field (None).
     let mut registration = metadata_agent_registration("legacy-agent");
-    registration.agent_instance_id = "inst-l".to_string();
+    registration.runner_instance_id = "inst-l".to_string();
     registry.register(registration).await.unwrap();
     let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
     let result = runtime.dispatch(runtime_status_call()).await;
@@ -3061,14 +3536,14 @@ async fn computer_list_targets_is_minimal_capability_filtered_and_auth_scoped() 
 }
 
 #[tokio::test]
-async fn list_agents_includes_sanitized_policy_summary() {
-    use crate::shell_protocol::AgentPolicySummary;
-    let registry = Arc::new(ShellClientRegistry::default());
+async fn list_runners_includes_sanitized_policy_summary() {
+    use crate::runner_protocol::RunnerPolicySummary;
+    let registry = Arc::new(RunnerRegistry::default());
     let mut registration = metadata_agent_registration("list-policy-agent");
-    registration.agent_instance_id = "inst-lp".to_string();
+    registration.runner_instance_id = "inst-lp".to_string();
     registration.job_concurrency_limit = Some(8);
     registration.owner = Some("alice".to_string());
-    registration.policy = Some(AgentPolicySummary {
+    registration.policy = Some(RunnerPolicySummary {
         allow_raw_shell: false,
         allow_cwd_anywhere: true,
         allowed_roots: vec![],
@@ -3080,7 +3555,7 @@ async fn list_agents_includes_sanitized_policy_summary() {
     });
     registry.register(registration).await.unwrap();
     let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
-    let result = runtime.dispatch(list_agents_call()).await;
+    let result = runtime.dispatch(list_runners_call()).await;
     assert!(result.success);
     assert_eq!(result.output["count"], 1);
     assert_eq!(result.output["summary"]["online"], 1);
@@ -3110,7 +3585,7 @@ async fn list_agents_includes_sanitized_policy_summary() {
     assert_eq!(policy["allow_cwd_anywhere"], true);
     assert_eq!(policy["max_timeout_secs"], 120);
     assert_eq!(policy["max_output_bytes"], 4096);
-    // No secret fields leak through listAgents either.
+    // No secret fields leak through list_runners either.
     assert!(policy.get("token").is_none());
     assert!(policy.get("env").is_none());
     assert!(policy.get("init_script").is_none());
@@ -3118,15 +3593,15 @@ async fn list_agents_includes_sanitized_policy_summary() {
 
 #[tokio::test]
 async fn runtime_status_distinguishes_stale_registration_from_transport_connection() {
-    use crate::shell_client::AgentTransport;
-    let registry = Arc::new(ShellClientRegistry::default());
+    use crate::runner_http::RunnerTransport;
+    let registry = Arc::new(RunnerRegistry::default());
     let mut registration = metadata_agent_registration("ws-stale");
-    registration.agent_instance_id = "inst".to_string();
+    registration.runner_instance_id = "inst".to_string();
     registration.display_name = Some("Stale WS".to_string());
     registration.owner = Some("alice".to_string());
     registry.register(registration).await.unwrap();
     registry
-        .set_transport("ws-stale", AgentTransport::WebSocket)
+        .set_transport("ws-stale", RunnerTransport::WebSocket)
         .await
         .unwrap();
     // Force the agent past the 60s online window so it reads as stale.
@@ -3167,16 +3642,16 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
 
 #[tokio::test]
 async fn runtime_status_reflects_websocket_transport_label() {
-    let registry = Arc::new(ShellClientRegistry::default());
+    let registry = Arc::new(RunnerRegistry::default());
     let runtime = ToolRuntime::new(registry.clone(), Arc::new(RuntimeInfo::default()));
     let mut registration = metadata_agent_registration("ws-agent");
-    registration.agent_instance_id = "inst".to_string();
+    registration.runner_instance_id = "inst".to_string();
     registration.owner = Some("alice".to_string());
     registry.register(registration).await.unwrap();
     // Simulate the authoritative WebSocket ingress without changing the raw
     // announced compatibility label.
     registry
-        .set_transport("ws-agent", crate::shell_client::AgentTransport::WebSocket)
+        .set_transport("ws-agent", crate::runner_http::RunnerTransport::WebSocket)
         .await
         .unwrap();
 
@@ -3192,96 +3667,8 @@ async fn runtime_status_reflects_websocket_transport_label() {
     assert_eq!(entry["transport"], "websocket");
     assert_eq!(
         entry["agent_protocol_generation"],
-        AGENT_PROTOCOL_GENERATION_V2.get()
+        RUNNER_PROTOCOL_GENERATION_V2.get()
     );
-}
-
-#[tokio::test]
-async fn runtime_status_counts_local_jobs() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let runtime = runtime_with_project(root, "demo");
-    // Write a fake local job in "running" state and register it in the
-    // in-memory map so runtime_status counts it.
-    let job_dir = root.join(".codex/jobs/job-active");
-    fs::create_dir_all(&job_dir).unwrap();
-    fs::write(job_dir.join("status"), "running").unwrap();
-    let meta_json = json!({
-        "job_id": "job-active",
-        "project": "demo",
-        "command": "sleep 10",
-        "status": "running",
-        "created_at": 1,
-        "started_at": 1,
-        "max_runtime_secs": 600,
-        "executor": "local",
-        "path": root.to_string_lossy(),
-        "kind": "shell",
-    });
-    fs::write(
-        job_dir.join("metadata.json"),
-        serde_json::to_string_pretty(&meta_json).unwrap(),
-    )
-    .unwrap();
-    runtime.local_jobs.lock().await.insert(
-        "job-active".to_string(),
-        LocalJobRecord::new("demo".to_string(), job_dir),
-    );
-    // Also write a completed job to verify it's not counted as active.
-    let done_dir = root.join(".codex/jobs/job-done");
-    fs::create_dir_all(&done_dir).unwrap();
-    fs::write(done_dir.join("status"), "completed").unwrap();
-    fs::write(
-        done_dir.join("metadata.json"),
-        serde_json::to_string(&json!({
-            "job_id": "job-done",
-            "project": "demo",
-            "command": "true",
-            "status": "completed",
-            "created_at": 1,
-            "started_at": 1,
-            "executor": "local",
-            "path": root.to_string_lossy(),
-            "kind": "shell",
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    runtime.local_jobs.lock().await.insert(
-        "job-done".to_string(),
-        LocalJobRecord::new("demo".to_string(), done_dir),
-    );
-    let queued_dir = root.join(".codex/jobs/job-queued");
-    fs::create_dir_all(&queued_dir).unwrap();
-    fs::write(queued_dir.join("status"), "queued").unwrap();
-    fs::write(
-        queued_dir.join("metadata.json"),
-        serde_json::to_string(&json!({
-            "job_id": "job-queued",
-            "project": "demo",
-            "command": "sleep 10",
-            "status": "queued",
-            "created_at": 2,
-            "executor": "local",
-            "path": root.to_string_lossy(),
-            "kind": "shell",
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    runtime.local_jobs.lock().await.insert(
-        "job-queued".to_string(),
-        LocalJobRecord::new("demo".to_string(), queued_dir),
-    );
-
-    let result = runtime.dispatch(runtime_status_call()).await;
-    assert!(result.success, "{:?}", result.error);
-    let jobs = &result.output["jobs"];
-    assert_eq!(jobs["local_known_count"], 3);
-    assert_eq!(jobs["active_count"], 2);
-    assert_eq!(jobs["running_count"], 1);
-    assert_eq!(jobs["queued_count"], 1);
-    assert_eq!(jobs["agent_known_count"], 0);
 }
 
 #[tokio::test]

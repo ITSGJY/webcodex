@@ -56,89 +56,32 @@ fn tool_definition_explains_all_tool_call_runtime_names() {
 }
 
 #[test]
-fn tool_policy_helpers_match_tool_definitions_for_known_runtime_names() {
-    use crate::tool_runtime::metadata::lookup_tool_metadata;
-    use crate::tool_runtime::tool_definition::{
-        lookup_tool_definition, runtime_tool_agent_capability, runtime_tool_approval_policy,
-        runtime_tool_category, runtime_tool_is_read_like, runtime_tool_is_shell_like,
-        runtime_tool_is_write_like, runtime_tool_metadata, runtime_tool_permission_risk,
-        runtime_tool_requires_permission, runtime_tool_session_risk_class, tool_definitions,
-    };
-
-    for definition in tool_definitions() {
-        assert_eq!(
-            lookup_tool_definition(definition.name).map(|definition| definition.name),
-            Some(definition.name),
-            "{} must resolve through ToolDefinition before any policy fallback",
-            definition.name
-        );
-        assert_eq!(
-            lookup_tool_metadata(definition.name).copied(),
-            Some(definition.metadata()),
-            "{} lookup_tool_metadata must return ToolDefinition metadata",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_metadata(definition.name),
-            definition.metadata(),
-            "{} metadata policy helper must read the ToolDefinition metadata",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_session_risk_class(definition.name),
-            definition.session_risk_class(),
-            "{} session risk helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_is_read_like(definition.name),
-            definition.is_read_like(),
-            "{} read-like helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_is_write_like(definition.name),
-            definition.is_write_like(),
-            "{} write-like helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_is_shell_like(definition.name),
-            definition.is_shell_like(),
-            "{} shell-like helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_category(definition.name),
-            definition.category,
-            "{} category helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_requires_permission(definition.name),
-            definition.requires_permission(),
-            "{} permission helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_approval_policy(definition.name),
-            definition.metadata().approval,
-            "{} approval helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_permission_risk(definition.name),
-            definition.permission_risk(),
-            "{} permission risk helper must match ToolDefinition",
-            definition.name
-        );
-        assert_eq!(
-            runtime_tool_agent_capability(definition.name),
-            definition.agent_capability,
-            "{} agent capability helper must match ToolDefinition",
-            definition.name
+fn plugin_tool_call_parser_is_typed_bounded_and_closed() {
+    let list = ToolCall::from_tool_name("plugin_tool", json!({"action":"list"})).unwrap();
+    assert_eq!(list.tool_name(), "plugin_tool");
+    assert!(matches!(list, ToolCall::PluginTool(_)));
+    for invalid in [
+        json!({"action":"list","unknown":true}),
+        json!({"action":"list","plugin":"repo-tools"}),
+        json!({"action":"call","binding":"wc_pbind_bad","arguments":{}}),
+        json!({"action":"call","binding":"wc_pbind_00000000000000000000000000000000"}),
+        json!({"action":"describe","runner":"runner-a","plugin":"repo-tools"}),
+    ] {
+        assert!(
+            ToolCall::from_tool_name("plugin_tool", invalid).is_err(),
+            "invalid Plugin gateway arguments must fail closed"
         );
     }
+    let call = ToolCall::from_tool_name(
+        "plugin_tool",
+        json!({
+            "action":"call",
+            "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+            "arguments":{}
+        }),
+    )
+    .unwrap();
+    assert!(matches!(call, ToolCall::PluginTool(_)));
 }
 
 #[test]
@@ -188,14 +131,7 @@ fn tool_definition_metadata_fallback_facade_is_unknown_only() {
         );
         assert!(ToolCall::from_tool_name(name, json!({})).is_err(), "{name}");
         assert_model_facing_surfaces_do_not_list_name(name);
-        assert_agent_capability_lookup_rejects_non_runtime_name(name);
-    }
-}
-
-#[test]
-fn tool_metadata_has_no_non_runtime_entries() {
-    for metadata in crate::tool_runtime::metadata::iter_tool_metadata() {
-        assert!(is_known_tool_name(metadata.name), "{}", metadata.name);
+        assert_runner_capability_lookup_rejects_non_runtime_name(name);
     }
 }
 
@@ -210,7 +146,7 @@ fn tool_definition_surface_counts_stay_fixed() {
         .values()
         .map(|methods| methods.as_object().unwrap().len())
         .sum();
-    assert_eq!(openapi_operation_count, 22, "OpenAPI operation count");
+    assert_eq!(openapi_operation_count, 16, "OpenAPI operation count");
 
     let operation_ids = openapi["paths"]
         .as_object()
@@ -240,12 +176,16 @@ fn tool_definition_surface_counts_stay_fixed() {
     let tool_call_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
         .as_object()
         .expect("ToolCallRequest properties");
-    for field in ["summary_only", "include_command_preview", "compact"] {
+    for field in ["summary_only", "compact"] {
         assert!(
             tool_call_properties.contains_key(field),
             "callRuntimeTool must keep flattened GPT Action field {field}"
         );
     }
+    assert!(
+        !tool_call_properties.contains_key("include_command_preview"),
+        "retired job_status-only debug field must stay absent from callRuntimeTool",
+    );
     assert!(
         !tool_call_properties.contains_key("detail"),
         "hidden start-only detail must not be published by callRuntimeTool"
@@ -418,15 +358,15 @@ fn assert_model_facing_surfaces_do_not_list_name(name: &str) {
     }
 }
 
-fn assert_agent_capability_lookup_rejects_non_runtime_name(name: &str) {
+fn assert_runner_capability_lookup_rejects_non_runtime_name(name: &str) {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(|| {
-        let _ = crate::tool_runtime::tool_definition::runtime_tool_agent_capability(name);
+        let _ = crate::tool_runtime::tool_definition::runtime_tool_runner_capability(name);
     });
     std::panic::set_hook(previous_hook);
     assert!(
         result.is_err(),
-        "{name} must not resolve agent capability through metadata fallback"
+        "{name} must not resolve Runner capability through metadata fallback"
     );
 }

@@ -10,10 +10,10 @@
 //! full diffs, file contents, stdout/stderr bodies, validation commands,
 //! secrets, tokens, or raw session input payloads.
 
-use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
-
-use super::continuation_feedback::{continuation_feedback_value, ContinuationFeedbackInput};
+use super::continuation_feedback::{
+    continuation_feedback_value, continuation_projection_hooks, continuation_validation_snapshot,
+    ContinuationFeedbackInput, ContinuationToolFailureSnapshot,
+};
 use super::handoff_brief::{build_handoff_brief, HandoffBriefInput};
 use super::permissions::permission_summary_from_events;
 use super::session_context::{session_project_mismatch_result, SessionProjectMismatch};
@@ -25,14 +25,22 @@ use super::sessions::{SessionDiscussionCounts, SessionDiscussionSummary, Session
 use super::tool_result::ToolResult;
 use super::ToolRuntime;
 use crate::auth::AuthContext;
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use webcodex_tool_contracts::{
+    runtime_tool_session_evidence_policy, ToolFailureEvidence, ToolReviewEvidence,
+};
 
-const DEFAULT_HANDOFF_LIMIT: usize = 20;
+pub(crate) use webcodex_workflow_session::closeout_work_projection;
+
+pub(super) const DEFAULT_HANDOFF_LIMIT: usize = 20;
 const MAX_HANDOFF_LIMIT: usize = 100;
 const HANDOFF_CLOSEOUT_SESSION_EVENT_LIMIT: usize = 200;
 const MAX_RECENT_FAILED_TOOLS: usize = 10;
 const MAX_RECENT_PROGRESS: usize = 10;
 const MAX_RECENT_DECISIONS: usize = 10;
 const MAX_OPEN_ITEMS: usize = 20;
+#[cfg(feature = "workspace-checkpoints")]
 const MAX_RECENT_CHECKPOINTS: usize = 10;
 const HANDOFF_MESSAGE_CHARS: usize = 240;
 
@@ -61,6 +69,8 @@ impl ToolRuntime {
             .min(MAX_HANDOFF_LIMIT);
         let include_workspace = include_workspace.unwrap_or(true);
         let include_checkpoints = include_checkpoints.unwrap_or(true);
+        #[cfg(not(feature = "workspace-checkpoints"))]
+        let _ = include_checkpoints;
         let include_validation = include_validation.unwrap_or(true);
 
         let authorized_target = match self
@@ -216,7 +226,7 @@ impl ToolRuntime {
         };
         let jobs_project = (!jobs_project.is_empty()).then_some(jobs_project);
         let jobs = self
-            .active_jobs_summary(jobs_project.as_deref(), auth, 10)
+            .active_jobs_summary(jobs_project.as_deref(), Some(&summary.session_id), auth, 10)
             .await;
         if let Some(job_warnings) = jobs.get("warnings").and_then(Value::as_array) {
             warnings.extend(job_warnings.iter().cloned());
@@ -266,6 +276,7 @@ impl ToolRuntime {
         }
 
         // --- optional checkpoint candidates ---
+        #[cfg(feature = "workspace-checkpoints")]
         if has_project && include_checkpoints {
             let project = project.clone().unwrap_or_default();
             let checkpoints = self.handoff_checkpoint_summary(&project, limit).await;
@@ -291,9 +302,19 @@ impl ToolRuntime {
         if include_validation {
             output["validation"] = feedback_validation.clone();
         }
+        let continuation_current_validation =
+            super::validation_events::current_validation_evidence_for_session(
+                &closeout_session,
+                20,
+            );
         let (work_performed, changed_paths) = closeout_work_projection(&summary.events);
         output["work_performed"] = work_performed;
         output["changed_paths"] = changed_paths;
+        let reconciliation = reconcile_closeout_evidence(
+            output.get("tool_failures").unwrap_or(&Value::Null),
+            &closeout_session,
+            &feedback_validation,
+        );
 
         // Continuation feedback: a read-only attempt-summary + validation-delta
         // projection reused across handoff, finish, and start. Built from the
@@ -312,12 +333,12 @@ impl ToolRuntime {
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 > 0,
+            hooks: continuation_projection_hooks(),
+            current_validation: continuation_validation_snapshot(&continuation_current_validation),
+            tool_failures: ContinuationToolFailureSnapshot::new(
+                &reconciliation.actionable_unexpected_event_ids,
+            ),
         });
-        let reconciliation = reconcile_closeout_evidence(
-            output.get("tool_failures").unwrap_or(&Value::Null),
-            &closeout_session,
-            &feedback_validation,
-        );
         output["tool_failures"] = reconciliation.tool_failures;
         if include_validation {
             output["validation"] = reconciliation.validation;
@@ -447,6 +468,7 @@ impl ToolRuntime {
     /// `workspace_checkpoint_list` path. Returns the latest
     /// `last_known_good` checkpoint (preferring `validation_status == passed`)
     /// and a bounded recent list. Never returns validation.commands or diffs.
+    #[cfg(feature = "workspace-checkpoints")]
     async fn handoff_checkpoint_summary(&self, project: &str, limit: usize) -> Value {
         let list_result = self
             .workspace_checkpoint_list(project.to_string(), Some(limit))
@@ -645,13 +667,17 @@ fn compact_handoff_output(output: &Value) -> Value {
 }
 
 pub(crate) fn compact_jobs(jobs: &Value) -> Value {
-    json!({
+    let mut compact = json!({
         "active_count": jobs.get("active_count").and_then(Value::as_u64).unwrap_or(0),
         "blocking_active_count": jobs.get("blocking_active_count").and_then(Value::as_u64).unwrap_or(0),
         "nonblocking_active_count": jobs.get("nonblocking_active_count").and_then(Value::as_u64).unwrap_or(0),
         "terminal_pending_count": jobs.get("terminal_pending_count").and_then(Value::as_u64).unwrap_or(0),
         "warnings": jobs.get("warnings").cloned().unwrap_or_else(|| json!([])),
-    })
+    });
+    if jobs.get("active_job").is_some_and(Value::is_object) {
+        compact["active_job"] = jobs["active_job"].clone();
+    }
+    compact
 }
 
 pub(crate) fn compact_permissions(permissions: &Value) -> Value {
@@ -668,7 +694,7 @@ pub(crate) fn compact_tool_failures(tool_failures: &Value) -> Value {
     json!({
         "expected_count": tool_failures.get("expected_count").and_then(Value::as_u64).unwrap_or(0),
         "unexpected_count": tool_failures.get("unexpected_count").and_then(Value::as_u64).unwrap_or(0),
-        "historical_non_actionable_count": tool_failures.get("historical_non_actionable_count").and_then(Value::as_u64).unwrap_or(0),
+        "non_actionable_unexpected_count": tool_failures.get("non_actionable_unexpected_count").and_then(Value::as_u64).unwrap_or(0),
         "actionable_unexpected_count": actionable_unexpected_failure_count(tool_failures),
         "expectation_mismatch_count": tool_failures.get("expectation_mismatch_count").and_then(Value::as_u64).unwrap_or(0),
         "unexpected_success_count": tool_failures.get("unexpected_success_count").and_then(Value::as_u64).unwrap_or(0),
@@ -695,10 +721,11 @@ pub(crate) fn compact_validation(validation: &Value) -> Value {
 }
 
 pub(crate) fn validation_has_cargo_test_zero_tests(validation: &Value) -> bool {
-    validation
-        .get("cargo_test_zero_tests_run")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+    validation.get("latest_status").and_then(Value::as_str) == Some("inconclusive")
+        && validation
+            .get("cargo_test_zero_tests_run")
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 pub(crate) fn review_evidence_summary_for_session(summary: &SessionSummary) -> Value {
@@ -718,14 +745,12 @@ fn review_evidence_summary_from_events(events: &[SessionEvent]) -> Value {
         if event.status.as_deref() != Some("succeeded") {
             continue;
         }
-        let Some(kind) = review_evidence_kind(event.tool_name.as_str()) else {
-            continue;
-        };
-        match kind {
-            ReviewEvidenceKind::ReadOnlyInspection => read_only_inspection_count += 1,
-            ReviewEvidenceKind::Search => search_count += 1,
-            ReviewEvidenceKind::DiffReview => diff_review_count += 1,
-            ReviewEvidenceKind::WorkspaceReview => {
+        match runtime_tool_session_evidence_policy(event.tool_name.as_str()).review {
+            ToolReviewEvidence::None => continue,
+            ToolReviewEvidence::ReadOnlyInspection => read_only_inspection_count += 1,
+            ToolReviewEvidence::Search => search_count += 1,
+            ToolReviewEvidence::DiffReview => diff_review_count += 1,
+            ToolReviewEvidence::WorkspaceReview => {
                 // `show_changes(include_diff=true)` is one successful call that
                 // contributes both workspace and diff dimensions, but total
                 // still increments only once below.
@@ -734,7 +759,7 @@ fn review_evidence_summary_from_events(events: &[SessionEvent]) -> Value {
                     diff_review_count += 1;
                 }
             }
-            ReviewEvidenceKind::HygieneReview => {
+            ToolReviewEvidence::HygieneReview => {
                 workspace_review_count += 1;
                 hygiene_review_count += 1;
             }
@@ -797,27 +822,6 @@ pub(crate) fn compact_review_evidence(review_evidence: &Value) -> Value {
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ReviewEvidenceKind {
-    ReadOnlyInspection,
-    Search,
-    DiffReview,
-    WorkspaceReview,
-    HygieneReview,
-}
-
-fn review_evidence_kind(tool_name: &str) -> Option<ReviewEvidenceKind> {
-    match tool_name {
-        "read_file" | "read_files" | "list_project_files" | "project_overview"
-        | "git_review_summary" => Some(ReviewEvidenceKind::ReadOnlyInspection),
-        "search_project_text" | "search_project_texts" => Some(ReviewEvidenceKind::Search),
-        "git_diff" | "git_diff_summary" | "git_diff_hunks" => Some(ReviewEvidenceKind::DiffReview),
-        "show_changes" | "git_status" => Some(ReviewEvidenceKind::WorkspaceReview),
-        "workspace_hygiene_check" => Some(ReviewEvidenceKind::HygieneReview),
-        _ => None,
-    }
-}
-
 fn push_unique_tool(tools: &mut Vec<String>, tool_name: &str) {
     if !tools.iter().any(|tool| tool == tool_name) {
         tools.push(tool_name.to_string());
@@ -828,6 +832,7 @@ fn compact_validation_latest_status_fallback(validation: &Value) -> Value {
     let latest_status = match validation.get("status").and_then(Value::as_str) {
         Some("passed") => "passed",
         Some("failed") => "failed",
+        Some("inconclusive") => "inconclusive",
         Some("not_run") => "not_run",
         _ => "unknown",
     };
@@ -941,14 +946,14 @@ fn compact_workflow_outcomes(
         push_unique(&mut integrity_errors, "expectation_mismatches");
         push_unique_action(
             &mut actions,
-            "review expected failure mismatches before proceeding",
+            "review result expectation mismatches before proceeding",
         );
     }
     if unexpected_success_count > 0 {
         push_unique(&mut integrity_warnings, "unexpected_successes");
         push_unique_action(
             &mut actions,
-            "review expected-failure assertions that unexpectedly succeeded",
+            "review failure expectations that unexpectedly succeeded",
         );
     }
     if expected_count > 0
@@ -958,13 +963,24 @@ fn compact_workflow_outcomes(
     {
         push_unique(
             &mut informational_notes,
-            "expected failure assertions matched",
+            "declared result expectations matched",
         );
     }
-    if count_field(tool_failures, "historical_non_actionable_count") > 0 {
+    if count_field(tool_failures, "non_actionable_unexpected_count") > 0 {
         push_unique(
             &mut informational_notes,
-            "historical fail-closed tool failures are retained as non-actionable evidence",
+            "non-actionable failed tool calls are retained as historical/process evidence",
+        );
+    }
+    if validation
+        .pointer("/evidence_gaps/count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        push_unique(
+            &mut informational_notes,
+            "validation evidence gaps are retained separately from correctness failures",
         );
     }
 
@@ -1030,6 +1046,13 @@ fn compact_workflow_outcomes(
         Some("failed") if current_unresolved_failure_count > 0 => {
             push_unique(&mut blocking_reasons, "validation_failed");
             push_unique_action(&mut actions, VALIDATION_IDENTITY_REUSE_ACTION);
+        }
+        Some("inconclusive") => {
+            push_unique(&mut warning_reasons, "validation_inconclusive");
+            push_unique_action(
+                &mut actions,
+                "run validation that proves the intended test assertion, or explicitly set require_tests=false when zero tests are intentional",
+            );
         }
         Some("unknown") | None => {
             push_unique(&mut warning_reasons, "validation_unknown");
@@ -1164,6 +1187,7 @@ pub(crate) fn actionable_unexpected_failure_count(tool_failures: &Value) -> u64 
 pub(crate) struct CloseoutEvidenceReconciliation {
     pub(crate) validation: Value,
     pub(crate) tool_failures: Value,
+    pub(crate) actionable_unexpected_event_ids: HashSet<String>,
 }
 
 /// Reconcile immutable ledger history into the single current closeout view used
@@ -1178,24 +1202,35 @@ pub(crate) fn reconcile_closeout_evidence(
     let current = super::validation_events::current_validation_evidence_for_session(summary, 100);
     let mut projected = tool_failures.clone();
     let raw_unexpected = count_field(tool_failures, "unexpected_count");
-    let historical_non_actionable = canonical_tool_call_finished_events(&summary.events)
+    let unexpected_events = canonical_tool_call_finished_events(&summary.events)
         .into_iter()
         .filter(|event| unexpected_failure_event(event))
+        .collect::<Vec<_>>();
+    let non_actionable_event_ids = unexpected_events
+        .iter()
+        .copied()
         .filter(|event| {
-            is_resolved_unexpected_validation_failure(event, &validation)
-                || current
-                    .non_current_failure_event_ids
-                    .contains(&event.event_id)
+            current
+                .non_actionable_tool_failure_event_ids
+                .contains(&event.event_id)
                 || unexpected_failure_is_proven_non_actionable(event)
         })
-        .count() as u64;
-    let historical_non_actionable = historical_non_actionable.min(raw_unexpected);
-    projected["historical_non_actionable_count"] = json!(historical_non_actionable);
+        .map(|event| event.event_id.clone())
+        .collect::<HashSet<_>>();
+    let non_actionable_unexpected = non_actionable_event_ids.len() as u64;
+    let non_actionable_unexpected = non_actionable_unexpected.min(raw_unexpected);
+    let actionable_unexpected_event_ids = unexpected_events
+        .into_iter()
+        .filter(|event| !non_actionable_event_ids.contains(&event.event_id))
+        .map(|event| event.event_id.clone())
+        .collect::<HashSet<_>>();
+    projected["non_actionable_unexpected_count"] = json!(non_actionable_unexpected);
     projected["actionable_unexpected_count"] =
-        json!(raw_unexpected.saturating_sub(historical_non_actionable));
+        json!(raw_unexpected.saturating_sub(non_actionable_unexpected));
     CloseoutEvidenceReconciliation {
         validation,
         tool_failures: projected,
+        actionable_unexpected_event_ids,
     }
 }
 
@@ -1207,38 +1242,6 @@ fn unexpected_failure_event(event: &SessionEvent) -> bool {
             .as_deref()
             .unwrap_or(TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE)
             == TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
-}
-
-fn is_resolved_unexpected_validation_failure(event: &SessionEvent, validation: &Value) -> bool {
-    if !unexpected_failure_event(event) {
-        return false;
-    }
-    let event_project = event
-        .resolved_project
-        .as_deref()
-        .or(event.project.as_deref());
-    validation
-        .pointer("/resolved_failures/events")
-        .and_then(Value::as_array)
-        .is_some_and(|resolved| {
-            resolved.iter().any(|resolved| {
-                // Membership in resolved_failures is decided upstream by the
-                // canonical validation identity. The remaining fields only
-                // correlate that already-resolved validation fact back to its
-                // immutable source Session event; they never infer resolution.
-                resolved
-                    .get("identity")
-                    .and_then(Value::as_str)
-                    .is_some_and(|identity| !identity.is_empty())
-                    && resolved.get("success").and_then(Value::as_bool) == Some(false)
-                    && resolved.get("tool_name").and_then(Value::as_str)
-                        == Some(event.tool_name.as_str())
-                    && resolved.get("session_id").and_then(Value::as_str)
-                        == Some(event.session_id.as_str())
-                    && resolved.get("project").and_then(Value::as_str) == event_project
-                    && resolved.get("completed_at").and_then(Value::as_i64) == event.finished_at
-            })
-        })
 }
 
 fn unexpected_failure_is_proven_non_actionable(event: &SessionEvent) -> bool {
@@ -1267,9 +1270,10 @@ fn unexpected_failure_is_proven_non_actionable(event: &SessionEvent) -> bool {
     {
         return true;
     }
+    let failure_evidence = runtime_tool_session_evidence_policy(&event.tool_name).failure;
     if effect.and_then(|effect| effect.state_changed) == Some(false)
         && ((!event.shell_like && !event.git_like)
-            || event.tool_name == "workspace_checkpoint_create")
+            || failure_evidence == ToolFailureEvidence::ProvenNoStateChangeNonActionable)
     {
         return true;
     }
@@ -1291,40 +1295,12 @@ fn install_compact_workflow_outcomes(target: &mut Value, outcomes: Value) {
     }
 }
 
-pub(crate) fn closeout_work_projection(events: &[SessionEvent]) -> (Value, Value) {
-    let mut tools = BTreeMap::<String, (u64, u64, u64, Option<i64>)>::new();
-    let mut changed_paths = BTreeSet::<String>::new();
-    for event in canonical_tool_call_finished_events(events) {
-        let counts = tools.entry(event.tool_name.clone()).or_default();
-        counts.0 = counts.0.saturating_add(1);
-        match event.status.as_deref() {
-            Some("succeeded") => counts.1 = counts.1.saturating_add(1),
-            Some("failed") => counts.2 = counts.2.saturating_add(1),
-            _ => {}
-        }
-        counts.3 = event.finished_at.or(Some(event.timestamp));
-        changed_paths.extend(event.changed_paths.iter().cloned());
-    }
-    let work = tools
-        .into_iter()
-        .map(|(tool_name, (count, succeeded, failed, completed_at))| {
-            json!({
-                "tool_name": tool_name,
-                "count": count,
-                "succeeded": succeeded,
-                "failed": failed,
-                "last_completed_at": completed_at,
-            })
-        })
-        .collect::<Vec<_>>();
-    (
-        json!(work),
-        json!(changed_paths.into_iter().take(200).collect::<Vec<_>>()),
-    )
-}
-
 fn validation_historical_failures_resolved(validation: &Value) -> bool {
-    validation.get("latest_status").and_then(Value::as_str) == Some("passed")
+    validation
+        .get("successes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
         && validation
             .pointer("/historical_failures/resolved")
             .and_then(Value::as_bool)
@@ -1401,13 +1377,13 @@ fn handoff_suggested_next_actions(output: &Value) -> Vec<String> {
     if expectation_mismatch_count > 0 {
         push(
             &mut actions,
-            "review expected failure mismatches before proceeding",
+            "review result expectation mismatches before proceeding",
         );
     }
     if unexpected_success_count > 0 {
         push(
             &mut actions,
-            "review expected-failure assertions that unexpectedly succeeded",
+            "review failure expectations that unexpectedly succeeded",
         );
     }
     let open_todos = output["counts"]["open_todos"].as_u64().unwrap_or(0);

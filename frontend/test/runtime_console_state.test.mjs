@@ -2,13 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
+  runtimeCollaborationRequest,
+  isCurrentRuntimeCollaborationRequest,
+  adoptRuntimeCollaborationList,
+} from "../dist/runtime_collaboration_state.js";
+import {
   initialRuntimeConsoleState,
   runtimeDeviceIds,
   runtimeProjectsForDevice,
   filterAndSortRuntimeProjects,
   runtimeProjectIdentityText,
   preferredRuntimeProjectSelection,
-  runtimeCommunicationTranscriptAfterSeq,
   runtimeWorkflowSessionSummaryRevision,
   runtimeWorkflowSessionSummaryChanged,
   beginRuntimeCredential,
@@ -27,34 +31,18 @@ import {
   refreshRuntimeWorkflowSession,
   isCurrentRuntimeWorkflowSessionRequest,
   adoptRuntimeWorkflowSessionDetail,
-  runtimeCollaborationRequest,
-  isCurrentRuntimeCollaborationRequest,
-  adoptRuntimeCollaborationList,
-  adoptRuntimeCollaborationObservation,
-  setRuntimeCollaborationAvailable,
-  setRuntimeCollaborationPhase,
-  runtimeCollaborationNeedsRefreshRecovery,
-  mergeRuntimeCollaborationMessages,
-  runtimeCollaborationObservationAction,
-  runtimeCollaborationMessageCanMutate,
-  runtimeCollaborationMessageSides,
-  setRuntimeCollaborationReplyTarget,
-  setRuntimeCollaborationEditTarget,
-  runtimeCollaborationEditTarget,
-  markRuntimeCollaborationMutationUncertain,
-  runtimeCollaborationMutationRecovery,
-  completeRuntimeCollaborationMutationRecovery,
-  takeRuntimeCollaborationMutationNotice,
+  resolveRunnerDisclosure,
+  runtimeWindowShortKey,
+  runtimeWindowActivityLabel,
 } from "../dist/runtime_console_state.js";
 
-test("communication transcript window follows the latest bounded page", () => {
-  assert.equal(runtimeCommunicationTranscriptAfterSeq(0), 0);
-  assert.equal(runtimeCommunicationTranscriptAfterSeq(100), 0);
-  assert.equal(runtimeCommunicationTranscriptAfterSeq(101), 1);
-  assert.equal(runtimeCommunicationTranscriptAfterSeq(250), 150);
-  assert.equal(runtimeCommunicationTranscriptAfterSeq(250, 50), 200);
-  assert.equal(runtimeCommunicationTranscriptAfterSeq(-1), 0);
-  assert.equal(runtimeCommunicationTranscriptAfterSeq(Number.NaN), 0);
+test("window activity presentation is hashed-id safe and WebCodex-specific", () => {
+  assert.equal(runtimeWindowShortKey("0123456789abcdef0123456789abcdef"), "01234567…cdef");
+  assert.equal(runtimeWindowShortKey("short"), "short");
+  assert.equal(runtimeWindowActivityLabel(null, 10_000), "No WebCodex activity");
+  assert.equal(runtimeWindowActivityLabel(9_500, 10_000), "just now");
+  assert.equal(runtimeWindowActivityLabel(5_000, 10_000), "5s ago");
+  assert.equal(runtimeWindowActivityLabel(0, 10_000), "No WebCodex activity");
 });
 
 test("Workflow Session summary revision changes only for detail-relevant list state", () => {
@@ -281,243 +269,13 @@ test("session switch invalidates old collaboration responses", () => {
   const requestB = runtimeCollaborationRequest(state);
   assert.equal(isCurrentRuntimeCollaborationRequest(state, requestA), false);
   assert.equal(isCurrentRuntimeCollaborationRequest(state, requestB), true);
-  assert.equal(adoptRuntimeCollaborationList(state, requestA, [{ message_id: "wc_msg_old" }]), false);
 });
 
-test("collaboration delta replaces message state by id and completion renders todo resolution plus answer", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  const request = runtimeCollaborationRequest(state);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_todo", kind: "todo", status: "open", created_at: 1, message: "do work" },
-  ]);
-  assert.equal(adoptRuntimeCollaborationObservation(state, request, {
-    observation_token: "opaque-1",
-    messages: [
-      { message_id: "wc_msg_todo", kind: "todo", status: "resolved", created_at: 1, message: "do work", resolved_by_message_id: "wc_msg_answer" },
-      { message_id: "wc_msg_answer", kind: "answer", status: "open", created_at: 2, message: "done", reply_to: "wc_msg_todo", author_session_id: "wc_sess_worker" },
-    ],
-  }), true);
-  assert.equal(state.collaboration.messages.length, 2);
-  assert.equal(state.collaboration.messages[0].status, "resolved");
-  assert.equal(state.collaboration.messages[1].reply_to, "wc_msg_todo");
-  assert.equal(state.collaboration.observationToken, "opaque-1");
-});
-
-test("history loss reloads and has_more drains without duplicate message ids", () => {
-  assert.equal(runtimeCollaborationObservationAction({ history_lost: true, has_more: true }), "reload");
-  assert.equal(runtimeCollaborationObservationAction({ history_lost: false, has_more: true }), "drain");
-  assert.equal(runtimeCollaborationObservationAction({ wait_outcome: "timeout" }), "wait");
-  const merged = mergeRuntimeCollaborationMessages(
-    [{ message_id: "a", created_at: 1, status: "open" }],
-    [{ message_id: "a", created_at: 1, status: "resolved" }, { message_id: "b", created_at: 2 }]
-  );
-  assert.deepEqual(merged.map((message) => message.message_id), ["a", "b"]);
-  assert.equal(merged[0].status, "resolved");
-});
-
-test("project-read-only degradation keeps project selection while collaboration is marked unavailable", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  const request = runtimeCollaborationRequest(state);
-  assert.equal(setRuntimeCollaborationAvailable(state, request, false), true);
-  assert.equal(state.selectedProject, "agent:runner:project");
-  assert.equal(state.workflow.selectedSessionId, "wc_sess_a");
-  assert.equal(state.collaboration.available, false);
-});
-
-test("manual Refresh recovery is required only after collaboration is paused", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  const requestA = runtimeCollaborationRequest(state);
-  assert.equal(setRuntimeCollaborationPhase(state, requestA, "live"), true);
-  assert.equal(runtimeCollaborationNeedsRefreshRecovery(state), false);
-  assert.equal(setRuntimeCollaborationPhase(state, requestA, "paused"), true);
-  assert.equal(runtimeCollaborationNeedsRefreshRecovery(state), true);
-  selectRuntimeWorkflowSession(state, "wc_sess_b");
-  assert.equal(state.collaboration.phase, "idle");
-  assert.equal(setRuntimeCollaborationPhase(state, requestA, "paused"), false);
-  assert.equal(runtimeCollaborationNeedsRefreshRecovery(state), false);
-});
-
-test("collaboration Edit and Reply are mutually exclusive and context switches clear edit state", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  let request = runtimeCollaborationRequest(state);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_edit", kind: "guidance", status: "open", priority: "high", requires_ack: true, first_ack_observed_at: 10, created_at: 1, message: "old" },
-  ]);
-  assert.equal(setRuntimeCollaborationEditTarget(state, "wc_msg_edit"), true);
-  assert.equal(runtimeCollaborationEditTarget(state).message_id, "wc_msg_edit");
-  assert.equal(state.collaboration.replyTargetId, "");
-  setRuntimeCollaborationReplyTarget(state, "wc_msg_edit");
-  assert.equal(runtimeCollaborationEditTarget(state), null);
-  assert.equal(state.collaboration.replyTargetId, "wc_msg_edit");
-  assert.equal(setRuntimeCollaborationEditTarget(state, "wc_msg_edit"), true);
-  assert.equal(state.collaboration.replyTargetId, "");
-
-  selectRuntimeWorkflowSession(state, "wc_sess_b");
-  assert.equal(runtimeCollaborationEditTarget(state), null);
-  assert.equal(state.collaboration.replyTargetId, "");
-  request = runtimeCollaborationRequest(state);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_b", kind: "note", status: "open", created_at: 2, message: "b" },
-  ]);
-  assert.equal(setRuntimeCollaborationEditTarget(state, "wc_msg_b"), true);
-  selectRuntimeProject(state, "other", "agent:other:project");
-  assert.equal(runtimeCollaborationEditTarget(state), null);
-  assert.equal(state.collaboration.replyTargetId, "");
-});
-
-test("incoming authoritative closure cancels edit while preserving refreshed state", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  const request = runtimeCollaborationRequest(state);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_todo", kind: "todo", status: "open", created_at: 1, message: "work" },
-  ]);
-  assert.equal(setRuntimeCollaborationEditTarget(state, "wc_msg_todo"), true);
-  adoptRuntimeCollaborationObservation(state, request, {
-    messages: [{ message_id: "wc_msg_todo", kind: "todo", status: "resolved", resolved_at: 2, created_at: 1, message: "work" }],
-  });
-  assert.equal(runtimeCollaborationEditTarget(state), null);
-  assert.equal(state.collaboration.messages.length, 1);
-  assert.equal(state.collaboration.messages[0].status, "resolved");
-  assert.equal(takeRuntimeCollaborationMutationNotice(state), "Message changed while editing; current retained state was refreshed.");
-});
-
-test("withdraw and replacement responses merge by message id without duplicate history", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  const request = runtimeCollaborationRequest(state);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_old", kind: "note", status: "open", created_at: 1, message: "wrong" },
-  ]);
-  adoptRuntimeCollaborationObservation(state, request, {
-    messages: [
-      { message_id: "wc_msg_old", kind: "note", status: "resolved", closure_kind: "superseded", superseded_by_message_id: "wc_msg_new", created_at: 1, message: "wrong" },
-      { message_id: "wc_msg_new", kind: "note", status: "open", supersedes_message_id: "wc_msg_old", created_at: 2, message: "right" },
-    ],
-  });
-  assert.deepEqual(state.collaboration.messages.map((message) => message.message_id), ["wc_msg_old", "wc_msg_new"]);
-  adoptRuntimeCollaborationObservation(state, request, {
-    messages: [{ message_id: "wc_msg_new", kind: "note", status: "resolved", closure_kind: "withdrawn", created_at: 2, message: "right" }],
-  });
-  assert.equal(state.collaboration.messages.length, 2);
-  assert.equal(state.collaboration.messages[1].closure_kind, "withdrawn");
-});
-
-test("unknown mutation outcome stays fenced until exact replay confirms durability", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  const request = runtimeCollaborationRequest(state);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_old", kind: "guidance", status: "open", priority: "high", requires_ack: true, created_at: 1, message: "wrong" },
-  ]);
-  assert.equal(setRuntimeCollaborationEditTarget(state, "wc_msg_old"), true);
-  assert.equal(markRuntimeCollaborationMutationUncertain(state, request, { kind: "replace", messageId: "wc_msg_old", message: "right" }), true);
-  assert.equal(state.collaboration.messages.length, 1);
-  assert.equal(state.collaboration.uncertainMutation.messageId, "wc_msg_old");
-
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_old", kind: "guidance", status: "resolved", closure_kind: "superseded", superseded_by_message_id: "wc_msg_new", priority: "high", requires_ack: true, created_at: 1, message: "wrong" },
-    { message_id: "wc_msg_new", kind: "guidance", status: "open", supersedes_message_id: "wc_msg_old", priority: "high", requires_ack: true, created_at: 2, message: "right" },
-  ]);
-  assert.equal(state.collaboration.uncertainMutation.messageId, "wc_msg_old");
-  assert.equal(runtimeCollaborationEditTarget(state), null);
-  assert.equal(
-    takeRuntimeCollaborationMutationNotice(state),
-    "Replacement observed after refresh; exact replay required to confirm durability."
-  );
-  assert.deepEqual(runtimeCollaborationMutationRecovery(state, request), {
-    kind: "replace",
-    messageId: "wc_msg_old",
-    message: "right",
-  });
-  assert.equal(
-    completeRuntimeCollaborationMutationRecovery(
-      state, request, "Replacement durably confirmed after exact replay."
-    ),
-    true
-  );
-  assert.equal(state.collaboration.uncertainMutation, null);
-  assert.equal(
-    takeRuntimeCollaborationMutationNotice(state),
-    "Replacement durably confirmed after exact replay."
-  );
-  assert.equal(state.collaboration.messages.length, 2);
-});
-
-test("unknown replace outcome remains recoverable when retained source was evicted", () => {
-  const state = initialRuntimeConsoleState();
-  beginRuntimeCredential(state);
-  selectRuntimeProject(state, "runner", "agent:runner:project");
-  selectRuntimeWorkflowSession(state, "wc_sess_a");
-  const request = runtimeCollaborationRequest(state);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_old", kind: "note", status: "open", created_at: 1, message: "wrong" },
-  ]);
-  assert.equal(markRuntimeCollaborationMutationUncertain(state, request, { kind: "replace", messageId: "wc_msg_old", message: "right" }), true);
-  adoptRuntimeCollaborationList(state, request, [
-    { message_id: "wc_msg_new", kind: "note", status: "open", supersedes_message_id: "wc_msg_old", created_at: 2, message: "right" },
-  ]);
-  assert.equal(state.collaboration.uncertainMutation.messageId, "wc_msg_old");
-  assert.equal(
-    takeRuntimeCollaborationMutationNotice(state),
-    "Replacement observed after refresh; exact replay required to confirm durability."
-  );
-  assert.deepEqual(runtimeCollaborationMutationRecovery(state, request), {
-    kind: "replace",
-    messageId: "wc_msg_old",
-    message: "right",
-  });
-});
-
-test("only eligible open Human Join kinds expose mutation actions and ACK is not a lock", () => {
-  for (const kind of ["note", "guidance", "question", "todo"]) {
-    assert.equal(runtimeCollaborationMessageCanMutate({ kind, status: "open" }), true, kind);
-  }
-  assert.equal(runtimeCollaborationMessageCanMutate({ kind: "guidance", status: "open", requires_ack: true, first_ack_observed_at: 100 }), true);
-  for (const kind of ["answer", "progress", "decision", "risk", "proposal"]) {
-    assert.equal(runtimeCollaborationMessageCanMutate({ kind, status: "open" }), false, kind);
-  }
-  assert.equal(runtimeCollaborationMessageCanMutate({ kind: "note", status: "resolved", closure_kind: "withdrawn" }), false);
-  assert.equal(runtimeCollaborationMessageCanMutate({ kind: "todo", status: "resolved", closure_kind: "superseded" }), false);
-});
-
-test("conversation presentation never infers authorship from reply topology or message kind", () => {
-  const sides = runtimeCollaborationMessageSides([
-    { message_id: "user-root", kind: "note", message: "hello" },
-    { message_id: "reply-without-provenance", kind: "note", reply_to: "user-root", message: "received" },
-    { message_id: "local-reply", kind: "question", reply_to: "reply-without-provenance", message: "why" },
-    { message_id: "trusted-agent", kind: "progress", author_session_id: "wc_sess_worker", message: "working" },
-    { message_id: "answer-without-provenance", kind: "answer", message: "done" },
-    { message_id: "retained-reply", kind: "note", reply_to: "missing", message: "retained" },
-  ], new Set(["user-root", "local-reply"]));
-  assert.equal(sides.get("user-root"), "outgoing");
-  assert.equal(sides.get("reply-without-provenance"), "neutral");
-  assert.equal(sides.get("local-reply"), "outgoing");
-  assert.equal(sides.get("trusted-agent"), "incoming");
-  assert.equal(sides.get("answer-without-provenance"), "neutral");
-  assert.equal(sides.get("retained-reply"), "neutral");
-});
 
 test("runtime collaboration rendering uses textContent and explicitly reloads on history loss", async () => {
   const source = await readFile(new URL("../src/runtime.ts", import.meta.url), "utf8");
+  const navigationSource = await readFile(new URL("../src/runtime_navigation.ts", import.meta.url), "utf8");
+  const collaborationSource = await readFile(new URL("../src/runtime_collaboration.ts", import.meta.url), "utf8");
   const html = await readFile(new URL("../src/runtime.html", import.meta.url), "utf8");
   const css = await readFile(new URL("../src/runtime.css", import.meta.url), "utf8");
   assert.equal(html.includes("runtime-project-" + "select"), false);
@@ -545,11 +303,11 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.match(html, /runtime-session-context-lifecycle/);
   assert.match(html, /runtime-session-context-mode/);
   assert.match(css, /\.session-identity/);
-  assert.match(html, /class="session-evidence"/);
-  assert.match(html, /Details &amp; activity/);
-  assert.doesNotMatch(html, /class="inspector-card overview-panel" open/);
+  assert.match(html, /class="context-navigation"/);
+  assert.match(html, /data-context-target="runtime-context-activity"/);
   assert.match(html, /workspace path/);
-  assert.match(html, /Working &amp; Recently Updated Sessions/);
+  assert.match(html, /class="recent-panel-title">Recent Sessions<\/span>/);
+  assert.match(html, /id="runtime-inspector-close"[^>]*aria-label="Close session context"/);
   assert.match(html, /runtime-recent-session-list/);
   assert.match(html, /Runner Fleet/);
   assert.match(html, /runtime-runner-list/);
@@ -570,9 +328,9 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.match(css, /\.fleet-row/);
   assert.match(css, /\.device-group/);
   assert.match(css, /@media \(max-width: 900px\)/);
-  assert.match(css, /@media \(min-width: 1600px\)/);
-  assert.match(css, /--context-rail-width:\s*clamp\(320px,\s*18vw,\s*360px\)/);
-  assert.match(css, /\.runtime-shell\.context-docked\s*\{[^}]*--content-width:\s*1160px[^}]*grid-template-columns:\s*var\(--sidebar-width\)\s+minmax\(0,\s*1fr\)\s+var\(--context-rail-width\)/);
+  assert.match(css, /@media \(min-width: 1280px\)/);
+  assert.match(css, /--context-rail-width:\s*clamp\(320px,\s*26vw,\s*420px\)/);
+  assert.match(css, /\.runtime-shell\.context-docked\s*\{[^}]*--content-width:\s*760px[^}]*grid-template-columns:\s*var\(--sidebar-width\)\s+minmax\(0,\s*1fr\)\s+var\(--context-rail-width\)/);
   assert.match(css, /translateX\(-102%\)/);
   assert.match(css, /env\(safe-area-inset-bottom\)/);
   assert.match(css, /env\(safe-area-inset-top\)/);
@@ -586,8 +344,8 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.match(css, /\.workspace-main\s*\{[^}]*background:\s*var\(--page-surface\)/);
   assert.match(css, /--layout-major:\s*61\.8%/);
   assert.match(css, /--layout-minor:\s*38\.2%/);
-  assert.match(css, /--sidebar-width:\s*clamp\(300px,\s*21vw,\s*356px\)/);
-  assert.match(css, /--content-width:\s*1120px/);
+  assert.match(css, /--sidebar-width:\s*clamp\(280px,\s*21vw,\s*320px\)/);
+  assert.match(css, /--content-width:\s*760px/);
   assert.match(css, /\.message-card\.message-incoming\s*\{[^}]*width:\s*fit-content[^}]*max-width:\s*min\(82%,\s*880px\)/);
   assert.match(css, /\.message-card\.message-neutral\s*\{[^}]*width:\s*fit-content[^}]*max-width:\s*min\(82%,\s*880px\)/);
   assert.match(css, /\.message-card\.message-outgoing\s*\{[^}]*max-width:\s*min\(68%,\s*680px\)[^}]*align-self:\s*flex-end/);
@@ -622,35 +380,37 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.doesNotMatch(source, /api\("runner"/);
   assert.match(source, /selectRuntimeSessionLocation/);
   assert.doesNotMatch(source, /project-row-path/);
-  assert.match(source, /runtimeProjectIdentityText\(project\)/);
-  assert.match(source, /runtimeCollaborationMessageSides\(messages, locallyAuthoredCollaborationMessageIds\)/);
-  assert.match(source, /provenance-unknown/);
+  assert.match(navigationSource, /runtimeProjectIdentityText\(project\)/);
+  assert.match(collaborationSource, /runtimeCollaborationMessageSides\(messages, options\.locallyAuthoredIds\)/);
+  assert.match(collaborationSource, /provenance-unknown/);
+  assert.match(source, /sessionListMetaSnapshot = \{\s*total: typeof response\.data\.total === "number" \? Math\.max\(sessionRows\.length, response\.data\.total\) : sessionRows\.length,\s*truncated: !!response\.data\.truncated,\s*\}/);
+  assert.match(source, /runtime-session-search"\)\?\.addEventListener\("input", \(\) => renderSessionList\(sessionRows, sessionListMetaSnapshot\)\)/);
   assert.match(source, /rememberLocalCollaborationMessage/);
-  assert.match(source, /message-group-continuation/);
+  assert.match(collaborationSource, /message-group-continuation/);
   assert.match(source, /syncCollaborationComposerLayout/);
   assert.match(source, /scrollCollaborationToLatest/);
   assert.match(source, /scroll\.scrollTo\(\{ top: scroll\.scrollHeight, behavior \}\)/);
   assert.match(source, /firstRetainedRender \|\| \(hasNewMessages && shouldFollowNewMessages\)/);
   assert.match(source, /collaborationFollowLatest \|\| chatIsNearLatest\(\)/);
   assert.match(source, /collaborationPendingMessages \+= newMessageIds\.length/);
-  assert.match(source, /appendRichMessage/);
+  assert.match(collaborationSource, /appendRichMessage/);
   assert.match(source, /DRAFT_STORAGE_PREFIX/);
   assert.match(source, /WORKSPACE_VIEW_STORAGE_KEY/);
   assert.doesNotMatch(source, /window\.matchMedia\("\(pointer: fine\)"\)/);
   assert.match(source, /event\.shiftKey \|\| event\.isComposing \|\| event\.keyCode === 229/);
   assert.match(source, /form\.requestSubmit\(\)/);
-  assert.match(source, /message-entering/);
-  assert.match(source, /Acknowledgement required/);
+  assert.match(collaborationSource, /message-entering/);
+  assert.match(collaborationSource, /Acknowledgement required/);
   assert.doesNotMatch(source, /className = "message-links"/);
   assert.match(source, /renderSessionWorkspaceIdentity\(\)/);
   assert.match(source, /function revealWorkflowSessionDetail[\s\S]*scrollIntoView\(\{ block: "start", inline: "nearest" \}\)/);
   assert.match(source, /setText\("runtime-session-id", String\(detail\.session_id/);
   assert.match(source, /setText\("runtime-session-created", dateTimeLabel\(detail\.created_at\)\)/);
   assert.match(source, /setText\("runtime-session-updated", dateTimeLabel\(detail\.updated_at\)\)/);
-  const recentStart = source.indexOf("function renderRecentSessions");
-  const recentEnd = source.indexOf("function selectRecentSession", recentStart);
-  const recentRender = source.slice(recentStart, recentEnd);
-  assert.match(recentRender, /localizedLivenessPresentation\(session\)/);
+  const recentStart = navigationSource.indexOf("function renderRecentSessionRows");
+  const recentEnd = navigationSource.length;
+  const recentRender = navigationSource.slice(recentStart, recentEnd);
+  assert.match(recentRender, /formatLivenessPresentation\(session/);
   assert.match(recentRender, /attentionLabel\(session\.overview\?\.attention\)/);
   assert.match(recentRender, /updatedLabel\(session\.updated_at\)/);
   const recentSelectStart = source.indexOf("function selectRecentSession");
@@ -668,7 +428,7 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.match(autoRefresh, /document\.hidden[\s\S]*refreshCommunication\(false\)/);
   assert.match(autoRefresh, /refreshCommunication\(workspaceView === "operations"\)/);
   assert.match(autoRefresh, /window\.setInterval\(refreshAutoSurfaces, REFRESH_MS\)/);
-  assert.match(source, /appendRichMessage\(bubble, message\?\.message\)/);
+  assert.match(collaborationSource, /appendRichMessage\(bubble, message\?\.message\)/);
   assert.match(source, /action === "reload"[\s\S]*loadRetainedCollaboration/);
   assert.match(source, /action === "drain"/);
   assert.match(source, /abortCollaboration\(\)/);
@@ -689,19 +449,19 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.match(source, /function setMobileNavigationOpen/);
   assert.match(source, /function syncResponsiveNavigation/);
   assert.match(source, /WIDE_CONTEXT_MEDIA/);
-  assert.match(source, /classList\.toggle\("context-docked", contextDocked\)/);
-  assert.match(source, /contextDocked && inspector\) inspector\.open = true/);
+  assert.match(source, /classList\.toggle\("context-docked", resolved\.isDocked\)/);
+  assert.match(source, /inspector\.open = resolved\.visible/);
   assert.match(source, /event\.key === "Escape"/);
   assert.match(source, /visibleFocusableElements\(sidebar\)/);
   assert.match(source, /Reply target selected\. Your next message will reply to /);
   assert.match(source, /body\?\.focus\(\)/);
   assert.match(source, /state\.collaboration\.phase === "live" && !state\.collaboration\.uncertainMutation/);
-  assert.match(source, /Withdraw this retained message; history is preserved\./);
-  assert.match(source, /Replace this retained message while preserving its history\./);
+  assert.match(collaborationSource, /Withdraw this retained message; history is preserved\./);
+  assert.match(collaborationSource, /Replace this retained message while preserving its history\./);
   assert.match(source, /kind\?\.value === "guidance"/);
   assert.match(source, /priority\?\.value !== "high"/);
-  assert.match(source, /First ACK observed/);
-  assert.doesNotMatch(source, /Delivered|Read by model|Currently acknowledged/);
+  assert.match(collaborationSource, /First ACK observed/);
+  assert.doesNotMatch(collaborationSource, /Delivered|Read by model|Currently acknowledged/);
   assert.match(source, /Refresh failed · showing previous data/);
   assert.match(source, /runtimeCollaborationNeedsRefreshRecovery/);
   assert.match(source, /signature === renderedCollaborationSignature/);
@@ -720,29 +480,33 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   const renderProjectsStart = source.indexOf("function renderProjectSelectors");
   const renderProjectsEnd = source.indexOf("function switchProject", renderProjectsStart);
   const renderProjects = source.slice(renderProjectsStart, renderProjectsEnd);
-  assert.match(renderProjects, /document\.createElement\("button"\)/);
   assert.match(renderProjects, /signature === renderedProjectSelectorsSignature/);
-  assert.match(renderProjects, /row\.type = "button"/);
-  assert.doesNotMatch(renderProjects, /addEventListener\("keydown"/);
-  assert.match(renderProjects, /all\.textContent = tr\("All Runners"\)/);
-  assert.match(renderProjects, /switchProject\(String\(project\.client_id \|\| ""\), String\(project\.id \|\| ""\)\)/);
-  assert.match(renderProjects, /project-row-signals/);
-  assert.match(renderProjects, /project-row-meta/);
-  assert.match(renderProjects, /scan partial/);
-  assert.match(renderProjects, /row\.title = \[projectName, projectId/);
-  assert.match(renderProjects, /projectsByDevice/);
-  assert.match(renderProjects, /projectDeviceFilter/);
-  assert.match(renderProjects, /deviceProjectList\.appendChild\(sessionsPanel\)/);
-  assert.match(renderProjects, /deviceMeta\.textContent = tr\(status\) \+ " · " \+ countLabel\(deviceProjects\.length, "Project"\)/);
-  assert.match(source, /appendRichMessage\(bubble, message\?\.message\);\s*content\.appendChild\(bubble\)/);
-  assert.match(source, /footer\.appendChild\(actions\);\s*content\.appendChild\(footer\);\s*card\.appendChild\(content\)/);
-  assert.doesNotMatch(source, /message-avatar/);
-  assert.match(source, /createMessageAction\(tr\("Reply"\), "reply"/);
-  assert.match(source, /projectIcon\.appendChild\(runtimeIcon\("folder"\)\)/);
+  assert.match(renderProjects, /switchProject\(clientId, projectId\)/);
+
+  const renderProjectsTreeStart = navigationSource.indexOf("function renderProjectSelectorTree");
+  const renderProjectsTreeEnd = navigationSource.indexOf("function renderRunnerFleetRows", renderProjectsTreeStart);
+  const renderProjectsTree = navigationSource.slice(renderProjectsTreeStart, renderProjectsTreeEnd);
+  assert.match(renderProjectsTree, /document\.createElement\("summary"\)/);
+  assert.match(renderProjectsTree, /workspace\.addEventListener\("toggle"/);
+  assert.doesNotMatch(renderProjectsTree, /addEventListener\("keydown"/);
+  assert.match(renderProjectsTree, /all\.textContent = tr\("All Runners"\)/);
+  assert.match(renderProjectsTree, /project-row-signals/);
+  assert.match(renderProjectsTree, /project-row-meta/);
+  assert.match(renderProjectsTree, /scan partial/);
+  assert.match(renderProjectsTree, /row\.title = \[projectName, projectId/);
+  assert.match(renderProjectsTree, /projectsByDevice/);
+  assert.match(renderProjectsTree, /options\.projectDeviceFilter/);
+  assert.match(renderProjectsTree, /workspace\.appendChild\(sessionsPanel\)/);
+  assert.match(renderProjectsTree, /deviceMeta\.textContent = tr\(status\) \+ " · " \+ countLabel\(deviceProjects\.length, "Project"\)/);
+  assert.match(collaborationSource, /appendRichMessage\(bubble, message\?\.message\);\s*content\.appendChild\(bubble\)/);
+  assert.match(collaborationSource, /footer\.appendChild\(actions\);\s*content\.appendChild\(footer\);\s*card\.appendChild\(content\)/);
+  assert.doesNotMatch(collaborationSource, /message-avatar/);
+  assert.match(collaborationSource, /createMessageAction\(tr\("Reply"\), "reply"/);
+  assert.match(navigationSource, /projectIcon\.appendChild\(runtimeIcon\("folder"\)\)/);
   assert.match(source, /icon\.appendChild\(runtimeIcon\("message"\)\)/);
-  const renderRunnersStart = source.indexOf("function renderRunnerFleet");
-  const renderRunnersEnd = source.indexOf("function renderRecentSessions", renderRunnersStart);
-  const renderRunners = source.slice(renderRunnersStart, renderRunnersEnd);
+  const renderRunnersStart = navigationSource.indexOf("function renderRunnerFleetRows");
+  const renderRunnersEnd = navigationSource.indexOf("function renderRecentSessionRows", renderRunnersStart);
+  const renderRunners = navigationSource.slice(renderRunnersStart, renderRunnersEnd);
   assert.match(renderRunners, /projects_scan_partial/);
   assert.match(renderRunners, /Projects scanned/);
   assert.match(renderRunners, /fleet scan partial/);
@@ -762,8 +526,9 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.match(fetchProjects, /if \(query\) \{[\s\S]*renderProjectSelectors\(projectRows, projectRowsTruncated\);[\s\S]*return true;/);
   assert.match(fetchProjects, /currentProject && projectRowsTruncated/);
   assert.match(fetchProjects, /projectRowsTotal = Math\.max\(projectRows\.length, reportedTotal\)/);
-  assert.match(renderProjects, /matching Projects shown/);
-  assert.match(renderProjects, /visible Projects shown/);
+  assert.match(renderProjects, /formatProjectStatusText/);
+  assert.match(navigationSource, /matching Projects shown/);
+  assert.match(navigationSource, /visible Projects shown/);
   const applyRunnerStart = source.indexOf("function applyRunnerFilter");
   const applyRunnerEnd = source.indexOf("function runnerAttentionCount", applyRunnerStart);
   const applyRunner = source.slice(applyRunnerStart, applyRunnerEnd);
@@ -803,4 +568,57 @@ test("runtime collaboration rendering uses textContent and explicitly reloads on
   assert.match(bootstrap, /runtimeCollaborationMutationRecovery\(state, request\)/);
   assert.match(bootstrap, /confirmCollaborationMutationDurability\(request, mutationRecovery, controller\)/);
   assert.match(bootstrap, /confirmCollaborationMutationDurability[\s\S]*setRuntimeCollaborationPhase\(state, request, "live"\);[\s\S]*setHumanJoinSendEnabled\(true\)/);
+});
+
+test("runner disclosure honors user collapse over selected project and auto-reveals on navigation", () => {
+  assert.equal(resolveRunnerDisclosure(null, true), true);
+  assert.equal(resolveRunnerDisclosure(null, false), false);
+  assert.equal(resolveRunnerDisclosure(false, true), false);
+  assert.equal(resolveRunnerDisclosure(true, false), true);
+
+  let storedRunner1 = true;
+  assert.equal(resolveRunnerDisclosure(storedRunner1, false), true);
+
+  storedRunner1 = false;
+  assert.equal(resolveRunnerDisclosure(storedRunner1, true), false, "rerender must not override manual collapse");
+
+  storedRunner1 = true;
+  assert.equal(resolveRunnerDisclosure(storedRunner1, false), true, "explicit navigation auto-reveals target runner");
+});
+
+test("navigation and inspector source contracts maintain disclosure hierarchy and accessibility", async () => {
+  const [html, css, source, navigationSource] = await Promise.all([
+    readFile(new URL("../src/runtime.html", import.meta.url), "utf8"),
+    readFile(new URL("../src/runtime.css", import.meta.url), "utf8"),
+    readFile(new URL("../src/runtime.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/runtime_navigation.ts", import.meta.url), "utf8"),
+  ]);
+
+  // P3: Recent Sessions component semantics - clean class, no legacy sidebar-details overrides
+  assert.match(html, /<details id="runtime-recent-panel" class="recent-panel" open>/);
+  assert.match(html, /<span class="recent-panel-title">Recent Sessions<\/span>/);
+  assert.doesNotMatch(html, /class="[^"]*sidebar-details/);
+  assert.doesNotMatch(css, /\.sidebar-details/);
+  assert.doesNotMatch(css, /summary::before\s*\{\s*content:\s*"Show more"/);
+  assert.doesNotMatch(css, /summary\[open\]::before\s*\{\s*content:\s*"Recent Sessions"/);
+  assert.match(css, /\.recent-panel\s*\{[^}]*border-top:/);
+
+  // P1 & P2: Inspector triggers and close controls with deterministic user intent handling
+  assert.match(html, /id="runtime-inspector-close"[^>]*aria-label="Close session context"/);
+  assert.match(html, /id="runtime-inspector-backdrop"[^>]*aria-label="Close session context"/);
+  assert.match(source, /"Close session context": "关闭会话上下文"/);
+  assert.match(source, /el\("runtime-inspector-close"\)\?\.addEventListener\("click", \(\) => closeRuntimeInspector\(true, true\)\)/);
+  assert.match(source, /document\.querySelector\("\.context-trigger"\)\?\.addEventListener\("click",/);
+  assert.match(source, /reduceRuntimeContextUserIntent/);
+  assert.match(source, /resolveRuntimeContextFocusTransition/);
+  assert.doesNotMatch(source, /syncingContextDom/);
+  assert.doesNotMatch(source, /contextUserIntent\s*=\s*inspector\.open/);
+  assert.match(source, /function lock[\s\S]*closeRuntimeInspector\(false, true\);[\s\S]*contextUserIntent = null;/);
+
+  assert.match(source, /function isContextDocked/);
+  assert.match(source, /function syncContextUi/);
+  assert.match(source, /function revealRunner/);
+  assert.match(source, /function switchProject[\s\S]*if \(device\) revealRunner\(device\)/);
+  assert.match(source, /function selectRecentSession[\s\S]*if \(clientId\) revealRunner\(clientId\)/);
+  assert.match(navigationSource, /group\.open = resolveRunnerDisclosure\(storedDisclosure, defaultOpen\)/);
 });

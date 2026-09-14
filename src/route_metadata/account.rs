@@ -1,9 +1,9 @@
 use super::RouteAuth::{AuthMiddleware, HandlerManaged};
 use super::{
-    route, AuditClass::*, OpenApiVisibility::*, RouteId::*, RouteMethod::*, RouteSpec,
+    route, AuditClass::*, RouteId::*, RouteMethod::*, RouteOpenApiProjection::*, RouteSpec,
     RouteSurface::*,
 };
-use crate::auth::scopes::{OAuthRouteScopePolicy::*, SCOPE_ACCOUNT_MANAGE};
+use webcodex_core::authority::{OAuthRouteScopePolicy::*, SCOPE_ACCOUNT_MANAGE};
 
 pub(super) const ENROLLMENT_ROUTES: &[RouteSpec] = &[route(
     PairingEnroll,

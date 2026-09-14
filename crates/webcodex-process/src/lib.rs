@@ -29,6 +29,12 @@
 #[cfg(not(any(unix, windows)))]
 compile_error!("webcodex-process supports only unix and windows targets");
 
+mod program;
+
+pub use program::{
+    find_executable_in_path, is_executable_file, resolve_program_in_path, ResolvedProgram,
+};
+
 #[cfg(unix)]
 mod unix;
 
@@ -74,6 +80,16 @@ pub struct SpawnOptions {
     ///
     /// Ignored on Unix. Defaults to `0`.
     pub windows_creation_flags: u32,
+
+    /// Let children created by this managed process leave its Windows Job
+    /// Object without requiring `CREATE_BREAKAWAY_FROM_JOB`.
+    ///
+    /// This is intentionally narrow: use it only when the direct child is a
+    /// trusted process supervisor that immediately establishes its own process
+    /// ownership for descendants. It prevents incompatible nested Job Object
+    /// membership while keeping the direct child itself owned by this
+    /// [`ManagedChild`]. Ignored on Unix. Defaults to `false`.
+    pub windows_silent_child_breakaway: bool,
 }
 
 impl SpawnOptions {

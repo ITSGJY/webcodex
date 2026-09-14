@@ -1,7 +1,7 @@
 use super::*;
-use crate::shell_protocol::{
-    ShellAgentPollRequest, ShellAgentProjectSummary, ShellAgentResultRequest,
-    ShellClientCapabilities, ShellClientRegisterRequest,
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerPollRequest, RunnerProjectSummary, RunnerRegisterRequest,
+    RunnerResultRequest,
 };
 use base64::engine::general_purpose;
 use sha2::{Digest, Sha256};
@@ -13,7 +13,8 @@ fn mcp_gateway_tool_call_params_do_not_retain_outer_meta() {
         json!({
             "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
             "io.modelcontextprotocol/clientCapabilities": {"extensions": {}},
-            "io.modelcontextprotocol/clientInfo": {"name": "outer-host", "version": "2026"}
+            "io.modelcontextprotocol/clientInfo": {"name": "outer-host", "version": "2026"},
+            "openai/session": "chat-session-opaque-value"
         }),
     ] {
         let parsed: McpToolCallParams = serde_json::from_value(json!({
@@ -38,6 +39,42 @@ fn test_runtime_with_exposure(runtime_exposure: RuntimeExposure) -> ToolRuntime 
 
 fn test_runtime_with_surface(model_surface: ModelSurface) -> ToolRuntime {
     test_runtime_with_exposure(RuntimeExposure::Runtime(model_surface))
+}
+
+fn test_runtime_with_surface_and_public_url(
+    model_surface: ModelSurface,
+    public_url: &str,
+) -> ToolRuntime {
+    let runtime_info = crate::tool_runtime::RuntimeInfo {
+        configured_public_url: Some(public_url.to_string()),
+        ..Default::default()
+    };
+    ToolRuntime::new(
+        std::sync::Arc::new(crate::runner_http::RunnerRegistry::default()),
+        std::sync::Arc::new(runtime_info),
+    )
+    .with_runtime_exposure(RuntimeExposure::Runtime(model_surface))
+}
+
+fn start_authorized_test_session(
+    runtime: &ToolRuntime,
+    auth: &crate::auth::AuthContext,
+    mode: crate::tool_runtime::SessionMode,
+) -> crate::tool_runtime::SessionSummary {
+    let fingerprint = crate::tool_runtime::workflow_session_authority_fingerprint(Some(auth))
+        .expect("test authority must have a stable identity");
+    runtime
+        .sessions
+        .start_session_with_options(
+            crate::tool_runtime::SessionCreateOptions::new(
+                None,
+                Some("specialized governance test".to_string()),
+                mode,
+                crate::tool_runtime::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(fingerprint)),
+        )
+        .unwrap()
 }
 
 /// Run one synchronous operation with a temporary model-surface env value.
@@ -171,12 +208,16 @@ fn mcp_export_api_auth(api_key_id: &str, username: &str) -> crate::auth::AuthCon
     auth
 }
 
+#[path = "mcp_tests/agent_continuation_app.rs"]
+mod agent_continuation_app;
 #[path = "mcp_tests/artifact_export.rs"]
 mod artifact_export;
 #[path = "mcp_tests/computer_app.rs"]
 mod computer_app;
 #[path = "mcp_tests/file_import.rs"]
 mod file_import;
+#[path = "mcp_tests/goal_plan_app.rs"]
+mod goal_plan_app;
 #[path = "mcp_tests/http_transport.rs"]
 mod http_transport;
 #[path = "mcp_tests/model_ergonomics.rs"]
@@ -185,14 +226,24 @@ mod model_ergonomics;
 mod model_surface;
 #[path = "mcp_tests/oauth_scope.rs"]
 mod oauth_scope;
+#[path = "mcp_tests/plugin_check.rs"]
+mod plugin_check;
+#[path = "mcp_tests/plugin_tools.rs"]
+mod plugin_tools;
 #[path = "mcp_tests/project_connector.rs"]
 mod project_connector;
 #[path = "mcp_tests/protocol.rs"]
 mod protocol;
+#[path = "mcp_tests/result_app.rs"]
+mod result_app;
 #[path = "mcp_tests/runtime_tools.rs"]
 mod runtime_tools;
+#[path = "mcp_tests/ssh_resource.rs"]
+mod ssh_resource;
 #[path = "mcp_tests/tools.rs"]
 mod tools;
+#[path = "mcp_tests/work_result_app.rs"]
+mod work_result_app;
 
 // =========================================================================
 // HTTP integration tests — exercise the real Salvo router + AuthMiddleware.

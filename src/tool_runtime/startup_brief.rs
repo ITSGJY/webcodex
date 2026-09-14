@@ -1,9 +1,10 @@
-//! Shared model-facing projection for `start_coding_task`.
+//! Shared model-facing projection for canonical coding workflow startup.
 //!
 //! The runtime builds this once and every transport carries the same core
 //! value. The projection is deterministic, bounded, path-safe, and contains
 //! only the facts a coding model needs to start or continue work.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -21,6 +22,10 @@ use super::tool_inputs::StartupDetail;
 // Reserve transport-envelope headroom so a ToolResult and the GPT Actions
 // wrapper also remain below the externally documented 32 KiB ceiling.
 pub(crate) const STANDARD_STARTUP_HARD_MAX_BYTES: usize = 30 * 1024;
+pub(crate) const STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES: usize = 6 * 1024;
+pub(crate) const STARTUP_SKILL_CATALOG_MAX_BYTES: usize = 2_900;
+pub(crate) const STARTUP_PLUGIN_CATALOG_MAX_BYTES: usize = 2_900;
+pub(crate) const STARTUP_EXTENSION_DESCRIPTION_MAX_BYTES: usize = 512;
 pub(crate) const REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON: &str =
     "not_requested_by_work_on_project";
 const INSTRUCTION_CONTENT_JSON_BUDGET: usize = 10 * 1024;
@@ -38,9 +43,11 @@ const MAX_FAILURE_FILE_JSON_BYTES: usize = 160;
 const MAX_ACTION_JSON_BYTES: usize = 384;
 const MAX_INSTRUCTION_EXCERPT_JSON_BYTES: usize = 768;
 
-pub(crate) const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub(crate) const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 5;
-pub(crate) const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
+#[cfg(test)]
+pub(crate) use webcodex_core::runtime_contract::BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS;
+pub(crate) use webcodex_core::runtime_contract::{
+    BUILTIN_CODING_WORKFLOW_CONTRACT, BUILTIN_CODING_WORKFLOW_VERSION,
+};
 
 /// Stable model-facing coding/review semantics owned by WebCodex itself.
 ///
@@ -53,36 +60,41 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
         "contract": BUILTIN_CODING_WORKFLOW_CONTRACT,
         "version": BUILTIN_CODING_WORKFLOW_VERSION,
         "authority": "model_guidance_only",
-        "role_selection": "Apply a named role only when the task says so; role guidance creates no Session mode or authority.",
+        "role_selection": "Default guidance always applies; named roles only when requested. Neither grants authority.",
+        "guidance": [
+            "Defaults only: follow host safety, user scope, and project rules; guidance grants no authority.",
+            "Complete authorized work through validation and review; ask only for missing requirements or authority.",
+            "Verify Project, branch, HEAD, and existing changes; read nested rules for changed paths and recover truncated instructions.",
+            "Preserve unrelated work; make the smallest coherent change. Push/publish/deploy/restart need an explicit action and target.",
+            "Use structured tools and edit guards; after source edits or a rustfmt check diff, prefer cargo_fmt(check=false) to ensure formatting instead of reproducing rustfmt edits manually; apply model_protocol only where the exposed schema supports it.",
+            "Long required validation + independent read-only inspection: use short sync_wait_secs for same-execution Job handoff, inspect then observe; do not fan out heavy validations. Covered-source mutation makes that result stale/cache-warmup; final source needs fresh validation.",
+            "Observe existing Jobs; inspect state before retrying an unknown outcome. Timeout does not prove no effect.",
+            "Review the diff; report evidence, limits, and Jobs. finish_coding_task is advisory evidence, not proof."
+        ],
         "model_protocol": {
-            "session_context_ack": "Copy returned session_context_revision exactly to ack_session_context_revision; never derive it. No revision: keep the last ACK; if unknown, omit. Missing/invalid recovers a compact current handoff; stale may recover a bounded delta. Recovery is nonblocking.",
-            "session_recording": "After work_on_project creates or resumes a Workflow Session, pass it as recording_session_id. This is recorder provenance only; business session_id may target another Session, and recording_session_id grants no authority.",
-            "session_message_ack": "When session_attention has open requires_ack guidance still in context, echo its id in ack_session_message_ids. This request-scoped model-context proof neither resolves messages nor grants authority or gates execution.",
-            "session_message_resolution": "Resolve a handled non-todo by attaching session_message_resolution to the next ordinary call with recording_session_id; ACK-required guidance also needs ack_session_message_ids. It cannot predict the main call. Todos use complete_session_message.",
-            "context_sidecar": "context_request adds bounded context after the main tool and never authorizes its effect. Recover lost project.instructions on an observation call before dependent mutation.",
-            "normal_closeout": "Normal success: finish_coding_task(summary_only=true); full closeout only for unresolved validation/evidence or handoff/debug detail."
+            "session_context_ack": "Checkpoint/recovery tools may expose session_context_revision. Echo the latest retained revision in ack_session_context_revision only where exposed; never invent it. If unknown, omit; use the advertised Session handoff recovery path. ACK is nonblocking.",
+            "session_recording": "When work_on_project creates or resumes, pass recording_session_id for recorder provenance only. business session_id may target another Session; it grants no authority.",
+            "session_message_ack": "For retained session_attention requires_ack guidance, echo ack_session_message_ids. This request-scoped model-context proof neither resolves messages, grants authority, nor gates execution.",
+            "session_message_resolution": "For a handled non-todo, send session_message_resolution on the next ordinary call with recording_session_id; ACK guidance also needs ack_session_message_ids. It cannot predict the main call. Todos use complete_session_message.",
+            "context_sidecar": "context_request adds bounded context after the main tool and never authorizes effects. Recover lost project.instructions with an observation call before dependent mutation.",
+            "runner_targeting": "For exact Runner client_id, use runtime_status(client_id=...) or list_projects(client_id=...) before treating it as absent.",
+            "persistent_shell": "Persistent shell is primarily for repeated remote commands on one named SSH resource, preserving remote cwd/env/exports/functions/umask. Ordinary local coding stays on structured tools -> run_process/run_script -> run_shell for shell syntax; use local persistent shell only when same-process state is required.",
+            "normal_closeout": "Normal success: finish_coding_task(summary_only=true); full closeout only for unresolved evidence or handoff/debug."
         },
         "roles": {
             "implementation_owner": {
-                "purpose": "Implement one coherent change through the authoritative architecture.",
+                "purpose": "Implement one coherent change end to end.",
                 "guidance": [
-                    "Map the authoritative vertical slice before editing.",
-                    "Close it end to end before local hardening.",
-                    "Minimize new concepts, not touched-file count.",
-                    "Use compiler/schema/exhaustiveness failures to find missing adapters and projections.",
-                    "When intentionally rerunning the same logical validation, reuse the same assertion_name; do not rerun solely to clear stale historical validation evidence.",
-                    "After validation, review completeness, trust, bounds, privacy, and replay.",
-                    "Fix discovered correctness issues; do not fragment the change around speculative concerns."
+                    "Map cross-layer changes end to end; use compiler/schema/exhaustiveness failures to find missing integration.",
+                    "Minimize concepts; fix concrete issues without speculative redesign.",
+                    "When intentionally rerunning the same logical validation, reuse the same assertion_name; do not rerun solely to clear stale historical validation evidence."
                 ]
             },
             "independent_review": {
-                "purpose": "Independently challenge the change and correct concrete findings.",
+                "purpose": "Review independently within task scope.",
                 "guidance": [
-                    "Inspect independently; do not assume the implementation pass was correct.",
-                    "Challenge contracts and invariants before trusting passing tests.",
-                    "Focus on authority, bounds, malformed data, privacy, replay/races, timeout/correlation, and fail-closed behavior.",
-                    "Correct concrete findings and add focused regression evidence.",
-                    "Do not broaden into unrelated redesign."
+                    "Challenge authority, bounds, malformed data, privacy, replay/races, timeouts, and fail-closed behavior.",
+                    "For review-only tasks, report concrete findings with file/line evidence and impact; do not edit. Fix only when the task authorizes corrections, with focused regression validation."
                 ]
             }
         }
@@ -101,11 +113,184 @@ pub(crate) const REPOSITORY_MAX_ROOTS_PER_CLASS: usize = 8;
 pub(crate) const REPOSITORY_MAX_WARNINGS: usize = 8;
 pub(crate) const REPOSITORY_MAX_PROJECT_TYPE_EVIDENCE: usize = 4;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct StartupSkillEntry {
+    pub(crate) skill_id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) source_scope: String,
+    pub(crate) trust: String,
+    pub(crate) name_conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct StartupPluginEntry {
+    pub(crate) plugin: String,
+    pub(crate) name: String,
+    pub(crate) tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    #[serde(skip_serializing_if = "webcodex_core::plugin::PluginSelectionAnnotations::is_empty")]
+    pub(crate) annotations: webcodex_core::plugin::PluginSelectionAnnotations,
+}
+
+/// Shared startup metadata projection, not a resource store or authority.
+/// Entry types, discovery, and execution remain owned by their domains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct StartupCatalog<Entry> {
+    pub(crate) status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason_code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) catalog_revision: Option<String>,
+    pub(crate) total_count: usize,
+    pub(crate) returned_count: usize,
+    pub(crate) truncated: bool,
+    pub(crate) entries: Vec<Entry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) discovery_hint: Option<&'static str>,
+}
+
+pub(crate) type StartupSkillsCatalog = StartupCatalog<StartupSkillEntry>;
+pub(crate) type StartupPluginsCatalog = StartupCatalog<StartupPluginEntry>;
+
+impl<Entry: Serialize> StartupCatalog<Entry> {
+    fn unavailable_with_hint(reason_code: &'static str, discovery_hint: &'static str) -> Self {
+        Self {
+            status: "unavailable",
+            reason_code: Some(reason_code),
+            catalog_revision: None,
+            total_count: 0,
+            returned_count: 0,
+            truncated: false,
+            entries: Vec::new(),
+            discovery_hint: Some(discovery_hint),
+        }
+    }
+
+    fn update_completeness(&mut self, upstream_truncated: bool, discovery_hint: &'static str) {
+        self.returned_count = self.entries.len();
+        self.truncated = upstream_truncated || self.returned_count < self.total_count;
+        self.discovery_hint = self.truncated.then_some(discovery_hint);
+    }
+
+    fn available_bounded(
+        catalog_revision: String,
+        total_count: usize,
+        upstream_truncated: bool,
+        entries: Vec<Entry>,
+        max_bytes: usize,
+        discovery_hint: &'static str,
+    ) -> Self {
+        let mut projection = Self {
+            status: "available",
+            reason_code: None,
+            catalog_revision: Some(catalog_revision),
+            total_count,
+            returned_count: 0,
+            truncated: false,
+            entries: Vec::new(),
+            discovery_hint: None,
+        };
+        for entry in entries {
+            projection.entries.push(entry);
+            projection.update_completeness(upstream_truncated, discovery_hint);
+            // Measure the full wire envelope: optional hints and JSON escaping
+            // participate in the budget. Preserve the original greedy prefix.
+            if !serde_json::to_vec(&projection)
+                .map(|bytes| bytes.len() <= max_bytes)
+                .unwrap_or(false)
+            {
+                projection.entries.pop();
+                break;
+            }
+        }
+        projection.update_completeness(upstream_truncated, discovery_hint);
+        projection
+    }
+}
+
+impl StartupSkillsCatalog {
+    pub(crate) fn unavailable(reason_code: &'static str) -> Self {
+        Self::unavailable_with_hint(
+            reason_code,
+            "Use skills.catalog or skill_list for explicit discovery when available.",
+        )
+    }
+
+    pub(crate) fn available(
+        catalog_revision: String,
+        discovery_truncated: bool,
+        entries: Vec<StartupSkillEntry>,
+    ) -> Self {
+        Self::available_bounded(
+            catalog_revision,
+            entries.len(),
+            discovery_truncated,
+            entries,
+            STARTUP_SKILL_CATALOG_MAX_BYTES,
+            "Use skills.catalog or skill_list for broader or refreshed discovery.",
+        )
+    }
+}
+
+impl StartupPluginsCatalog {
+    pub(crate) fn unavailable(reason_code: &'static str) -> Self {
+        Self::unavailable_with_hint(
+            reason_code,
+            "Use explicit plugin_tool list and describe when Plugin discovery is available.",
+        )
+    }
+
+    pub(crate) fn available(
+        catalog_revision: String,
+        total_count: usize,
+        entries: Vec<StartupPluginEntry>,
+    ) -> Self {
+        Self::available_bounded(
+            catalog_revision,
+            total_count,
+            false,
+            entries,
+            STARTUP_PLUGIN_CATALOG_MAX_BYTES,
+            "Use plugins.catalog or explicit plugin_tool list and describe for broader or current schema discovery.",
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct StartupExtensions {
+    pub(crate) skills: StartupSkillsCatalog,
+    pub(crate) plugins: StartupPluginsCatalog,
+}
+
+impl StartupExtensions {
+    pub(crate) fn serialized_len(&self) -> usize {
+        serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+    }
+}
+
+pub(crate) fn bounded_extension_description(value: &str) -> String {
+    if value.len() <= STARTUP_EXTENSION_DESCRIPTION_MAX_BYTES {
+        return value.to_string();
+    }
+    let mut end = STARTUP_EXTENSION_DESCRIPTION_MAX_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 pub(crate) struct StartupBriefInput<'a> {
     pub(crate) detail: StartupDetail,
     pub(crate) requested_project: &'a str,
     pub(crate) project_resolution: &'a Value,
     pub(crate) resolved: &'a ResolvedProject,
+    pub(crate) knowledge_association: Option<&'a Value>,
     pub(crate) session: &'a SessionSummary,
     pub(crate) continuation_kind: &'a str,
     pub(crate) reused: bool,
@@ -115,6 +300,7 @@ pub(crate) struct StartupBriefInput<'a> {
     pub(crate) force_instruction_load: bool,
     pub(crate) include_project_instructions: bool,
     pub(crate) include_reused_instruction_content: bool,
+    pub(crate) extensions: Option<&'a StartupExtensions>,
     pub(crate) git: &'a Value,
     pub(crate) semantic_navigation: &'a Value,
     pub(crate) repository: &'a Value,
@@ -186,6 +372,18 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
         "deterministic": true,
         "llm_summary": false,
     });
+    if let Some(association) = input.knowledge_association {
+        brief["project"]["knowledge_association"] = association.clone();
+    }
+    if let Some(extensions) = input.extensions {
+        debug_assert!(extensions.serialized_len() <= STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES);
+        brief["extensions"] = serde_json::to_value(extensions).unwrap_or_else(|_| {
+            json!({
+                "skills": StartupSkillsCatalog::unavailable("skills_catalog_unavailable"),
+                "plugins": StartupPluginsCatalog::unavailable("plugin_runtime_unavailable"),
+            })
+        });
+    }
     enforce_hard_size_limit(&mut brief);
     brief
 }
@@ -253,10 +451,14 @@ fn semantic_navigation_projection(value: &Value) -> Value {
             .get("status")
             .cloned()
             .unwrap_or_else(|| json!("probe_failed")),
+        // Preserve an indeterminate startup observation as null. Coercing a
+        // timed-out status probe to false would turn "not observed" into a
+        // false semantic-navigation unavailability claim.
         "available": value
             .get("available")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .filter(|available| available.is_boolean() || available.is_null())
+            .cloned()
+            .unwrap_or(Value::Null),
         "provider": value.get("server").cloned().unwrap_or(Value::Null),
         "capability": if value
             .get("supported")
@@ -864,6 +1066,10 @@ fn continuation_projection(
         ),
     });
 
+    if active_jobs.get("active_job").is_some_and(Value::is_object) {
+        projected["jobs"]["active_job"] = active_jobs["active_job"].clone();
+    }
+
     if minimal {
         // The first action remains concrete, while bulk evidence lists are
         // represented only by their total/returned/truncated metadata.
@@ -876,6 +1082,8 @@ fn normalized_validation_status(status: Option<&str>) -> &'static str {
     match status {
         Some("passed") => "passed",
         Some("failed") => "failed",
+        Some("expected") => "expected",
+        Some("inconclusive") => "inconclusive",
         Some("not_run") => "not_run",
         Some("unavailable") => "unavailable",
         _ => "unknown",
@@ -984,7 +1192,7 @@ fn startup_issues(
     if blocking_jobs > 0 {
         push_unique(&mut blockers, "active_jobs_blocking");
     }
-    if input.resolved.config.is_agent() && input.owning_runner_available == Some(false) {
+    if input.owning_runner_available == Some(false) {
         push_unique(&mut blockers, "runner_unavailable");
     }
     if input.runtime_status_call_failed {
@@ -1393,191 +1601,7 @@ pub(crate) fn validate_schema_instance_for_test(
     instance: &Value,
     schema: &Value,
 ) -> Result<(), String> {
-    validate_schema_instance_at(instance, schema, "$")
-}
-
-#[cfg(test)]
-fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> Result<(), String> {
-    if let Some(schemas) = schema.get("allOf").and_then(Value::as_array) {
-        for child in schemas {
-            validate_schema_instance_at(instance, child, path)?;
-        }
-    }
-    if let Some(condition) = schema.get("if") {
-        let branch = if validate_schema_instance_at(instance, condition, path).is_ok() {
-            schema.get("then")
-        } else {
-            schema.get("else")
-        };
-        if let Some(branch) = branch {
-            validate_schema_instance_at(instance, branch, path)?;
-        }
-    }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        let results = variants
-            .iter()
-            .map(|variant| validate_schema_instance_at(instance, variant, path))
-            .collect::<Vec<_>>();
-        let successes = results.iter().filter(|result| result.is_ok()).count();
-        return (successes == 1).then_some(()).ok_or_else(|| {
-            let errors = results
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, result)| {
-                    result
-                        .err()
-                        .map(|error| format!("variant {index}: {error}"))
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            format!("{path}: expected exactly one matching schema, got {successes}; {errors}")
-        });
-    }
-    if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
-        return variants
-            .iter()
-            .find_map(|variant| {
-                validate_schema_instance_at(instance, variant, path)
-                    .ok()
-                    .map(|_| ())
-            })
-            .ok_or_else(|| format!("{path}: no anyOf variant matched"));
-    }
-    if let Some(expected) = schema.get("const") {
-        if instance != expected {
-            return Err(format!("{path}: const mismatch"));
-        }
-    }
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        if !values.iter().any(|value| value == instance) {
-            return Err(format!("{path}: value is outside the declared enum"));
-        }
-    }
-    if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
-        let matches = match expected_type {
-            "object" => instance.is_object(),
-            "array" => instance.is_array(),
-            "string" => instance.is_string(),
-            "boolean" => instance.is_boolean(),
-            "integer" => instance.as_i64().is_some() || instance.as_u64().is_some(),
-            "number" => instance.is_number(),
-            "null" => instance.is_null(),
-            _ => true,
-        };
-        if !matches {
-            return Err(format!("{path}: expected {expected_type}"));
-        }
-    }
-    if let Some(object) = instance.as_object() {
-        let properties = schema.get("properties").and_then(Value::as_object);
-        if let Some(required) = schema.get("required").and_then(Value::as_array) {
-            for field in required.iter().filter_map(Value::as_str) {
-                if !object.contains_key(field) {
-                    return Err(format!("{path}: missing required field {field}"));
-                }
-            }
-        }
-        if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
-            let properties = properties
-                .ok_or_else(|| format!("{path}: strict object schema is missing properties"))?;
-            for field in object.keys() {
-                if !properties.contains_key(field) {
-                    return Err(format!("{path}: unknown field {field}"));
-                }
-            }
-        }
-        if let Some(properties) = properties {
-            for (field, value) in object {
-                if let Some(child_schema) = properties.get(field) {
-                    validate_schema_instance_at(value, child_schema, &format!("{path}.{field}"))?;
-                }
-            }
-        }
-    }
-    if let Some(array) = instance.as_array() {
-        if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
-            if array.len() > max_items as usize {
-                return Err(format!("{path}: maxItems exceeded"));
-            }
-        }
-        if schema.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
-            for (index, item) in array.iter().enumerate() {
-                if array[..index].iter().any(|earlier| earlier == item) {
-                    return Err(format!("{path}: duplicate array item"));
-                }
-            }
-        }
-        if let Some(item_schema) = schema.get("items") {
-            for (index, item) in array.iter().enumerate() {
-                validate_schema_instance_at(item, item_schema, &format!("{path}[{index}]"))?;
-            }
-        }
-    }
-    if let Some(value) = instance.as_str() {
-        if schema
-            .get("maxLength")
-            .and_then(Value::as_u64)
-            .is_some_and(|maximum| value.chars().count() > maximum as usize)
-        {
-            return Err(format!("{path}: maxLength exceeded"));
-        }
-    }
-    if let Some(number) = instance.as_i64() {
-        if schema
-            .get("minimum")
-            .and_then(Value::as_i64)
-            .is_some_and(|minimum| number < minimum)
-        {
-            return Err(format!("{path}: below minimum"));
-        }
-        if schema
-            .get("maximum")
-            .and_then(Value::as_i64)
-            .is_some_and(|maximum| number > maximum)
-        {
-            return Err(format!("{path}: above maximum"));
-        }
-    } else if let Some(number) = instance.as_u64() {
-        if schema
-            .get("maximum")
-            .and_then(Value::as_u64)
-            .is_some_and(|maximum| number > maximum)
-        {
-            return Err(format!("{path}: above maximum"));
-        }
-    }
-    if let (Some(value), Some(pattern)) = (
-        instance.as_str(),
-        schema.get("pattern").and_then(Value::as_str),
-    ) {
-        let matches = match pattern {
-            "^wc_sess_[A-Za-z0-9_]+$" => value.strip_prefix("wc_sess_").is_some_and(|tail| {
-                !tail.is_empty()
-                    && tail
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            }),
-            "^[0-9a-f]{64}$" => {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            }
-            "^repository:v1:[0-9a-f]{64}$" => {
-                value.strip_prefix("repository:v1:").is_some_and(|digest| {
-                    digest.len() == 64
-                        && digest
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                })
-            }
-            _ => true,
-        };
-        if !matches {
-            return Err(format!("{path}: pattern mismatch"));
-        }
-    }
-    Ok(())
+    webcodex_tool_contracts::test_support::validate_schema_instance(instance, schema)
 }
 
 #[cfg(test)]
@@ -1587,6 +1611,24 @@ mod tests {
     use crate::tool_runtime::project_instructions::LoadedInstructionCandidate;
     use crate::tool_runtime::sessions::SessionGuards;
     use crate::tool_runtime::{SessionMode, ToolRuntime};
+
+    #[test]
+    fn semantic_navigation_projection_preserves_probe_timeout_as_unknown() {
+        let source = json!({
+            "supported": true,
+            "available": Value::Null,
+            "status": "probe_timeout",
+            "server": Value::Null,
+            "reason_code": "status_probe_timed_out",
+        });
+        let projection = semantic_navigation_projection(&source);
+        assert_eq!(projection["supported"], true);
+        assert_eq!(projection["available"], Value::Null);
+        assert_eq!(projection["status"], "probe_timeout");
+        assert_eq!(projection["provider"], Value::Null);
+        assert_eq!(projection["capability"], "lsp_read_only_navigation");
+        assert_eq!(projection["reason_code"], "status_probe_timed_out");
+    }
 
     #[test]
     fn repository_scan_projection_keeps_only_fixed_fields() {
@@ -1912,7 +1954,7 @@ mod tests {
                     "read_count": 3,
                     "search_count": 2,
                     "navigation_count": 4,
-                    "latest_tool": "read_file",
+                    "latest_tool": "read_files",
                     "complete": true
                 }
             },
@@ -1936,8 +1978,31 @@ mod tests {
         assert_eq!(standard["exploration"]["read_count"], 3);
         assert_eq!(standard["exploration"]["search_count"], 2);
         assert_eq!(standard["exploration"]["navigation_count"], 4);
-        assert_eq!(standard["exploration"]["latest_tool"], "read_file");
+        assert_eq!(standard["exploration"]["latest_tool"], "read_files");
         assert_eq!(standard["exploration"]["complete"], true);
+    }
+
+    #[test]
+    fn continuation_projection_preserves_only_explicit_active_job_handle() {
+        let feedback = json!({"status": "available", "attempt": {}, "validation_delta": {}});
+        let mut jobs = empty_active_jobs();
+        assert!(
+            continuation_projection(&feedback, &jobs, true, "continued")["jobs"]
+                .get("active_job")
+                .is_none()
+        );
+
+        jobs["active_job"] = json!({
+            "job_id": "job-exact",
+            "status": "running",
+            "kind": "shell"
+        });
+        let projected = continuation_projection(&feedback, &jobs, true, "continued");
+        assert_eq!(
+            projected["jobs"]["active_job"],
+            json!({"job_id": "job-exact", "status": "running", "kind": "shell"})
+        );
+        assert_eq!(projected["jobs"]["active_count"], 0);
     }
 
     #[test]
@@ -1999,6 +2064,8 @@ mod tests {
                 client_id: "size".to_string(),
                 allow_patch: true,
             },
+            root_fingerprint: None,
+            knowledge_association: None,
         };
         let instructions = instruction_snapshot();
         let git = json!({
@@ -2029,6 +2096,44 @@ mod tests {
             "terminal_pending_count": 1,
             "recent": [{"status": "recovering"}],
         });
+        let extensions = StartupExtensions {
+            skills: StartupSkillsCatalog::available(
+                format!("wc_skillcat_{}", "a".repeat(64)),
+                false,
+                (0..64)
+                    .map(|index| StartupSkillEntry {
+                        skill_id: format!("wc_skill_{index:032x}"),
+                        name: format!("skill-{index:02}"),
+                        description: format!("skill-{index:02}-{}", "s".repeat(500)),
+                        source_scope: "project".to_string(),
+                        trust: "project_content".to_string(),
+                        name_conflict: index < 2,
+                    })
+                    .collect(),
+            ),
+            plugins: StartupPluginsCatalog::available(
+                format!("wc_plugcat_{}", "b".repeat(64)),
+                64,
+                (0..64)
+                    .map(|index| StartupPluginEntry {
+                        plugin: format!("plugin-{index:02}"),
+                        name: format!("Plugin {index:02}"),
+                        tool: format!("tool_{index:02}"),
+                        title: Some(format!("Tool {index:02}")),
+                        description: Some(format!("plugin-{index:02}-{}", "p".repeat(500))),
+                        annotations: webcodex_core::plugin::PluginSelectionAnnotations {
+                            read_only_hint: Some(true),
+                            destructive_hint: Some(false),
+                            idempotent_hint: Some(true),
+                            open_world_hint: Some(false),
+                        },
+                    })
+                    .collect(),
+            ),
+        };
+        assert!(extensions.serialized_len() <= STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES);
+        assert!(extensions.skills.truncated);
+        assert!(extensions.plugins.truncated);
         let project_resolution = json!({
             "source": "project",
             "outcome": "resolved_existing_project",
@@ -2041,6 +2146,7 @@ mod tests {
                 requested_project: "agent:size:demo",
                 project_resolution: &project_resolution,
                 resolved: &resolved,
+                knowledge_association: None,
                 session: &session,
                 continuation_kind: "continued",
                 reused: true,
@@ -2050,6 +2156,7 @@ mod tests {
                 force_instruction_load: true,
                 include_project_instructions: true,
                 include_reused_instruction_content: false,
+                extensions: Some(&extensions),
                 git: &git,
                 semantic_navigation: &semantic_navigation,
                 repository: &large_repository(),

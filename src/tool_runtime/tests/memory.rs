@@ -1,18 +1,16 @@
-use super::super::context_projection::{
-    ContextMaterialCapabilities, MAX_CONTEXT_PROJECTION_BYTES,
-    TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD,
-};
+use super::super::context_projection::{ContextMaterialCapabilities, MAX_CONTEXT_PROJECTION_BYTES};
 use super::super::kernel::{
     check_runtime_tool_scope, HostFileImportTrust, ToolCallContext, ToolCallErrorStatus,
-    ToolCallRequest, ToolProtocolCapabilities, ToolTransport,
+    ToolCallRequest, ToolInvocationMetadata, ToolProtocolCapabilities, ToolTransport,
 };
 use super::super::permissions::{AuthorityMode, PermissionEvaluator};
 use super::super::project_resolution::ResolvedProject;
+use super::super::sessions::SessionContextRevisionAck;
 use super::super::{ToolResult, ToolRuntime};
 use super::support::*;
 use crate::db::{memory_catalog_revision, MemoryPriority, MAX_MEMORY_BOOTSTRAP_BYTES};
 use crate::projects::ProjectConfig;
-use crate::shell_protocol::{ShellClientCapabilities, ShellClientRegisterRequest};
+use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -26,6 +24,8 @@ fn resolved(id: &str, client: &str, root: &str) -> ResolvedProject {
             client_id: client.to_string(),
             allow_patch: true,
         },
+        root_fingerprint: None,
+        knowledge_association: None,
     }
 }
 
@@ -48,22 +48,21 @@ async fn list_files_with_session_context(
     ack_revision: Option<u64>,
     context_request: Vec<&str>,
 ) -> ToolResult {
-    use super::super::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD;
-
-    let mut arguments = json!({"project": project, "path": ".", "limit": 20});
-    if let Some(ack_revision) = ack_revision {
-        arguments[TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD] = json!(ack_revision);
-    }
-    if !context_request.is_empty() {
-        arguments[TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD] = json!(context_request);
-    }
+    let arguments = json!({"project": project, "path": ".", "limit": 20});
+    let invocation_metadata = ToolInvocationMetadata {
+        context_request: context_request.into_iter().map(str::to_string).collect(),
+        ack_session_context_revision: ack_revision
+            .map(SessionContextRevisionAck::Revision)
+            .unwrap_or(SessionContextRevisionAck::Unacknowledged),
+        ..Default::default()
+    };
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let session_id = session_id.to_string();
         async move {
             let auth = auth_context(None, true);
             runtime
-                .call_tool_with_protocol_capabilities(
+                .call_tool_with_invocation_metadata(
                     ToolCallRequest {
                         tool_name: "list_project_files".to_string(),
                         arguments,
@@ -76,6 +75,7 @@ async fn list_files_with_session_context(
                         record_oauth_scope_denials: false,
                         host_file_import_trust: HostFileImportTrust::Untrusted,
                     },
+                    invocation_metadata,
                     ToolProtocolCapabilities {
                         context_continuity: true,
                         context_sidecar: true,
@@ -93,7 +93,7 @@ async fn list_files_with_session_context(
             "Memory ACK fixture timed out"
         );
         if let Some(request) = probe_patch_agent_request(runtime, client_id).await {
-            let (exit_code, stdout, stderr) = run_agent_shell_request_locally(&request);
+            let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&request);
             complete_patch_agent_request(
                 runtime,
                 client_id,
@@ -830,7 +830,7 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
     let (runtime, _tmp) = runtime_with_memory();
     let root = tempfile::tempdir().unwrap();
     let project_id =
-        register_agent_project_at_path(&runtime, "memory-ack", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "memory-ack", "demo", root.path()).await;
     let project = runtime
         .resolve_project_input_for_auth(&project_id, None)
         .await
@@ -865,7 +865,9 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
     )
     .await;
     assert!(missing_ack.success);
-    assert!(missing_ack.output["session_context_revision"].is_u64());
+    assert!(missing_ack.output.get("session_context_revision").is_none());
+    assert!(missing_ack.output.get("session_continuity").is_none());
+    assert!(missing_ack.output.get("session_recovery").is_none());
     assert!(missing_ack.output.get("context_projection").is_none());
     assert!(!missing_ack.output.to_string().contains(private_summary));
 
@@ -879,7 +881,8 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
     )
     .await;
     assert!(exact.success);
-    assert_eq!(exact.output["session_context_revision"], 0);
+    assert!(exact.output.get("session_context_revision").is_none());
+    assert!(exact.output.get("session_continuity").is_none());
     assert!(exact.output.get("session_recovery").is_none());
     assert!(exact.output.get("context_projection").is_none());
     assert!(!exact.output.to_string().contains(private_summary));
@@ -917,7 +920,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
     let (runtime, _tmp) = runtime_with_memory();
     let root = tempfile::tempdir().unwrap();
     let writer = shared_key_auth_context("memory-writer");
-    let project = register_agent_project_at_path_with_auth(
+    let project = register_runner_project_at_path_with_auth(
         &runtime,
         "mem-runner",
         "demo",
@@ -975,17 +978,20 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
     ));
 
     let private_marker = runtime
-        .call_tool_with_protocol_capabilities(
+        .call_tool_with_invocation_metadata(
             ToolCallRequest {
                 tool_name: "memory_set".to_string(),
                 arguments: json!({
                     "project": project,
                     "memory_key": "private-marker",
-                    "summary": "cannot bypass",
-                    TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD: ["memory.bootstrap"]
+                    "summary": "cannot bypass"
                 }),
             },
             context(Some(&writer)),
+            ToolInvocationMetadata {
+                context_request: vec!["memory.bootstrap".to_string()],
+                ..Default::default()
+            },
             ToolProtocolCapabilities {
                 context_sidecar: true,
                 ..Default::default()
@@ -1113,17 +1119,20 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         .contains("project:write"));
 
     let manage_with_bootstrap = runtime
-        .call_tool_with_protocol_capabilities(
+        .call_tool_with_invocation_metadata(
             ToolCallRequest {
                 tool_name: "memory_set".to_string(),
                 arguments: json!({
                     "project": project,
                     "memory_key": "management-without-read",
-                    "summary": "Management does not imply read authority.",
-                    TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD: ["memory.bootstrap"]
+                    "summary": "Management does not imply read authority."
                 }),
             },
             context(Some(&manage_both)),
+            ToolInvocationMetadata {
+                context_request: vec!["memory.bootstrap".to_string()],
+                ..Default::default()
+            },
             ToolProtocolCapabilities {
                 context_sidecar: true,
                 memory_surface: true,
@@ -1148,18 +1157,21 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
     assert!(denied_bootstrap.get("projection").is_none());
 
     let mutation_with_bootstrap = runtime
-        .call_tool_with_protocol_capabilities(
+        .call_tool_with_invocation_metadata(
             ToolCallRequest {
                 tool_name: "memory_set".to_string(),
                 arguments: json!({
                     "project": project,
                     "memory_key": "post-tool-proof",
                     "summary": "Created by the current effect before its sidecar.",
-                    "bootstrap": true,
-                    TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD: ["memory.bootstrap"]
+                    "bootstrap": true
                 }),
             },
             context(Some(&writer)),
+            ToolInvocationMetadata {
+                context_request: vec!["memory.bootstrap".to_string()],
+                ..Default::default()
+            },
             ToolProtocolCapabilities {
                 context_sidecar: true,
                 memory_surface: true,
@@ -1207,14 +1219,14 @@ async fn memory_scope_lifecycle_is_offline_safe_unregister_explicit_and_purge_on
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             project_lifecycle: true,
             ..Default::default()
         },
         vec![summary.clone()],
     )
     .await;
-    let project_id = crate::tool_runtime::agent_project_runtime_id(client_id, "demo");
+    let project_id = crate::tool_runtime::runner_project_runtime_id(client_id, "demo");
     let project = runtime
         .resolve_project_input_for_auth(&project_id, Some(&admin))
         .await
@@ -1301,7 +1313,7 @@ async fn memory_scope_lifecycle_is_offline_safe_unregister_explicit_and_purge_on
         .is_some());
 
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect(client_id, &format!("inst-{client_id}"))
         .await;
     let offline = runtime.memory_scope_list(Some(&admin), None, None).await;
@@ -1323,7 +1335,7 @@ async fn memory_scope_lifecycle_is_offline_safe_unregister_explicit_and_purge_on
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             project_lifecycle: true,
             ..Default::default()
         },
@@ -1341,7 +1353,7 @@ async fn memory_scope_lifecycle_is_offline_safe_unregister_explicit_and_purge_on
                 .await
         }
     });
-    let request = wait_for_agent_request_for_client(&runtime, client_id).await;
+    let request = wait_for_runner_request_for_client(&runtime, client_id).await;
     assert_eq!(request.kind, "project_lifecycle_unregister");
     complete_patch_agent_request_for_instance(
         &runtime,
@@ -1406,11 +1418,11 @@ async fn memory_scope_same_project_id_new_root_does_not_migrate_old_memory() {
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project("demo", &root_a_text)],
     )
     .await;
-    let project_id = crate::tool_runtime::agent_project_runtime_id(client_id, "demo");
+    let project_id = crate::tool_runtime::runner_project_runtime_id(client_id, "demo");
     let project_a = runtime
         .resolve_project_input_for_auth(&project_id, Some(&admin))
         .await
@@ -1435,7 +1447,7 @@ async fn memory_scope_same_project_id_new_root_does_not_migrate_old_memory() {
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         vec![registered_project("demo", &root_b_text)],
     )
     .await;
@@ -1502,7 +1514,7 @@ async fn memory_scope_missing_or_incomplete_inventory_is_unknown_until_complete(
     let admin = bootstrap_auth_context();
     let client_id = "memory-incomplete";
     let project = resolved(
-        &crate::tool_runtime::agent_project_runtime_id(client_id, "demo"),
+        &crate::tool_runtime::runner_project_runtime_id(client_id, "demo"),
         client_id,
         "/registered/missing-at-runtime",
     );
@@ -1540,9 +1552,9 @@ async fn memory_scope_missing_or_incomplete_inventory_is_unknown_until_complete(
     assert_eq!(denied.output["error_kind"], "memory_scope_status_unknown");
 
     runtime
-        .shell_clients
+        .runner_registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -1550,13 +1562,13 @@ async fn memory_scope_missing_or_incomplete_inventory_is_unknown_until_complete(
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
-                agent_instance_id: format!("inst-{client_id}"),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: format!("inst-{client_id}"),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities::default(),
+                capabilities: RunnerCapabilities::default(),
                 policy: None,
             },
         ))
@@ -1569,7 +1581,7 @@ async fn memory_scope_missing_or_incomplete_inventory_is_unknown_until_complete(
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         Vec::new(),
     )
     .await;
@@ -1923,7 +1935,7 @@ async fn session_and_skill_observations_do_not_automatically_create_memory() {
     let (runtime, _tmp) = runtime_with_memory();
     let root = tempfile::tempdir().unwrap();
     let project_id =
-        register_agent_project_at_path(&runtime, "memory-no-auto", "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, "memory-no-auto", "demo", root.path()).await;
     let project = runtime
         .resolve_project_input_for_auth(&project_id, None)
         .await
@@ -1985,7 +1997,7 @@ async fn session_and_skill_observations_do_not_automatically_create_memory() {
             "skill_list fixture timed out"
         );
         if let Some(request) = probe_patch_agent_request(&runtime, "memory-no-auto").await {
-            let (exit_code, stdout, stderr) = run_agent_shell_request_locally(&request);
+            let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&request);
             complete_patch_agent_request(
                 &runtime,
                 "memory-no-auto",

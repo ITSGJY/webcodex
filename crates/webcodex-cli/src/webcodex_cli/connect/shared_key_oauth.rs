@@ -12,6 +12,9 @@ const BRIDGE_PROFILE_VERSION: u32 = 1;
 const BRIDGE_PROFILE_PREFIX: &str = "shared-key-oauth-";
 const BRIDGE_SECRET_DISCLOSED_PREFIX: &str = ".shared-key-oauth-secret-disclosed-";
 const LOCAL_MCP_SCOPE: &str = "mcp:local";
+const LOCAL_PLUGIN_INSPECT_SCOPE: &str = "plugin:inspect";
+const LOCAL_PLUGIN_INVOKE_SCOPE: &str = "plugin:invoke";
+const LOCAL_SSH_SCOPE: &str = "ssh:local";
 const CODING_AGENT_SCOPE: &str = "coding_agent:run";
 const BRIDGE_BASELINE_SCOPES: &[&str] = &[
     "runtime:read",
@@ -58,6 +61,10 @@ struct SharedKeyOAuthProfile {
     computer_permissions_enabled: bool,
     #[serde(default)]
     local_mcp_enabled: bool,
+    #[serde(default)]
+    local_plugins_enabled: bool,
+    #[serde(default)]
+    local_ssh_enabled: bool,
     #[serde(default)]
     coding_agent_enabled: bool,
 }
@@ -135,7 +142,16 @@ fn scope_list_is_unique(scopes: &[String]) -> bool {
 fn without_optional_class_scopes(scopes: &[String]) -> Vec<String> {
     scopes
         .iter()
-        .filter(|scope| !matches!(scope.as_str(), LOCAL_MCP_SCOPE | CODING_AGENT_SCOPE))
+        .filter(|scope| {
+            !matches!(
+                scope.as_str(),
+                LOCAL_MCP_SCOPE
+                    | LOCAL_PLUGIN_INSPECT_SCOPE
+                    | LOCAL_PLUGIN_INVOKE_SCOPE
+                    | LOCAL_SSH_SCOPE
+                    | CODING_AGENT_SCOPE
+            )
+        })
         .cloned()
         .collect()
 }
@@ -191,6 +207,26 @@ fn profile_scope_ceiling_is_valid(profile: &SharedKeyOAuthProfile) -> bool {
         .iter()
         .any(|scope| scope == LOCAL_MCP_SCOPE);
     if local_mcp_present != profile.local_mcp_enabled {
+        return false;
+    }
+    let local_plugin_inspect_present = profile
+        .allowed_scopes
+        .iter()
+        .any(|scope| scope == LOCAL_PLUGIN_INSPECT_SCOPE);
+    let local_plugin_invoke_present = profile
+        .allowed_scopes
+        .iter()
+        .any(|scope| scope == LOCAL_PLUGIN_INVOKE_SCOPE);
+    if local_plugin_inspect_present != profile.local_plugins_enabled
+        || local_plugin_invoke_present != profile.local_plugins_enabled
+    {
+        return false;
+    }
+    let local_ssh_present = profile
+        .allowed_scopes
+        .iter()
+        .any(|scope| scope == LOCAL_SSH_SCOPE);
+    if local_ssh_present != profile.local_ssh_enabled {
         return false;
     }
     let coding_agent_present = profile
@@ -294,6 +330,8 @@ async fn provision_client(
             "previous_allowed_scopes": existing.map(|profile| profile.allowed_scopes.as_slice()),
             "computer_permissions": opts.oauth_computer_permissions,
             "local_mcp": opts.oauth_local_mcp,
+            "local_plugins": opts.oauth_local_plugins,
+            "local_ssh": opts.oauth_local_ssh,
             "coding_agent": opts.oauth_coding_agent,
         }),
     })
@@ -325,6 +363,27 @@ async fn provision_client(
     if local_mcp_present != opts.oauth_local_mcp {
         return Err(
             "Server changed local MCP OAuth authority without matching the explicit connect opt-in"
+                .to_string(),
+        );
+    }
+    let local_plugin_inspect_present = allowed_scopes
+        .iter()
+        .any(|scope| scope == LOCAL_PLUGIN_INSPECT_SCOPE);
+    let local_plugin_invoke_present = allowed_scopes
+        .iter()
+        .any(|scope| scope == LOCAL_PLUGIN_INVOKE_SCOPE);
+    if local_plugin_inspect_present != opts.oauth_local_plugins
+        || local_plugin_invoke_present != opts.oauth_local_plugins
+    {
+        return Err(
+            "Server changed local Plugin OAuth authority without matching the explicit connect opt-in"
+                .to_string(),
+        );
+    }
+    let local_ssh_present = allowed_scopes.iter().any(|scope| scope == LOCAL_SSH_SCOPE);
+    if local_ssh_present != opts.oauth_local_ssh {
+        return Err(
+            "Server changed local SSH OAuth authority without matching the explicit connect opt-in"
                 .to_string(),
         );
     }
@@ -403,6 +462,8 @@ async fn provision_client(
         updated.allowed_scopes = allowed_scopes;
         updated.computer_permissions_enabled = opts.oauth_computer_permissions;
         updated.local_mcp_enabled = opts.oauth_local_mcp;
+        updated.local_plugins_enabled = opts.oauth_local_plugins;
+        updated.local_ssh_enabled = opts.oauth_local_ssh;
         updated.coding_agent_enabled = opts.oauth_coding_agent;
         let changed = updated != *existing;
         return Ok((updated, changed));
@@ -423,6 +484,8 @@ async fn provision_client(
             allowed_scopes,
             computer_permissions_enabled: opts.oauth_computer_permissions,
             local_mcp_enabled: opts.oauth_local_mcp,
+            local_plugins_enabled: opts.oauth_local_plugins,
+            local_ssh_enabled: opts.oauth_local_ssh,
             coding_agent_enabled: opts.oauth_coding_agent,
         },
         true,
@@ -512,6 +575,18 @@ pub(super) async fn finish_shared_key_oauth_connect(
                     .to_string(),
             );
         }
+        if existing.local_plugins_enabled && !opts.oauth_local_plugins {
+            return Err(
+                "this shared-key OAuth profile already has local Plugin authority enabled; reconnect with --oauth-local-plugins to reuse it, or use a different profile/redirect URI"
+                    .to_string(),
+            );
+        }
+        if existing.local_ssh_enabled && !opts.oauth_local_ssh {
+            return Err(
+                "this shared-key OAuth profile already has local SSH authority enabled; reconnect with --oauth-local-ssh to reuse it, or use a different profile/redirect URI"
+                    .to_string(),
+            );
+        }
         if existing.coding_agent_enabled && !opts.oauth_coding_agent {
             return Err(
                 "this shared-key OAuth profile already has coding-agent authority enabled; reconnect with --oauth-coding-agent to reuse it, or use a different profile/redirect URI"
@@ -584,6 +659,8 @@ mod tests {
             oauth_redirect_uri: Some("https://chatgpt.example/callback".to_string()),
             oauth_computer_permissions: false,
             oauth_local_mcp: false,
+            oauth_local_plugins: false,
+            oauth_local_ssh: false,
             oauth_coding_agent: false,
             username: None,
             project: PathBuf::from("."),
@@ -722,6 +799,8 @@ mod tests {
             allowed_scopes: vec!["runtime:read".to_string(), "project:read".to_string()],
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
+            local_plugins_enabled: false,
+            local_ssh_enabled: false,
             coding_agent_enabled: false,
         };
         let (upgraded, changed) = provision_client(
@@ -854,6 +933,8 @@ mod tests {
             allowed_scopes: vec!["runtime:read".to_string(), "project:read".to_string()],
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
+            local_plugins_enabled: false,
+            local_ssh_enabled: false,
             coding_agent_enabled: false,
         };
         assert!(profile_scope_ceiling_is_valid(&baseline));
@@ -865,6 +946,50 @@ mod tests {
         let mut mismatched_local_mcp = local_mcp.clone();
         mismatched_local_mcp.local_mcp_enabled = false;
         assert!(!profile_scope_ceiling_is_valid(&mismatched_local_mcp));
+
+        let mut local_plugins = baseline.clone();
+        local_plugins.local_plugins_enabled = true;
+        local_plugins
+            .allowed_scopes
+            .push(LOCAL_PLUGIN_INSPECT_SCOPE.to_string());
+        local_plugins
+            .allowed_scopes
+            .push(LOCAL_PLUGIN_INVOKE_SCOPE.to_string());
+        assert!(profile_scope_ceiling_is_valid(&local_plugins));
+        let mut mismatched_local_plugins = local_plugins.clone();
+        mismatched_local_plugins.local_plugins_enabled = false;
+        assert!(!profile_scope_ceiling_is_valid(&mismatched_local_plugins));
+        let mut inspect_only_plugins = baseline.clone();
+        inspect_only_plugins.local_plugins_enabled = true;
+        inspect_only_plugins
+            .allowed_scopes
+            .push(LOCAL_PLUGIN_INSPECT_SCOPE.to_string());
+        assert!(!profile_scope_ceiling_is_valid(&inspect_only_plugins));
+        let mut invoke_only_plugins = baseline.clone();
+        invoke_only_plugins.local_plugins_enabled = true;
+        invoke_only_plugins
+            .allowed_scopes
+            .push(LOCAL_PLUGIN_INVOKE_SCOPE.to_string());
+        assert!(!profile_scope_ceiling_is_valid(&invoke_only_plugins));
+        let mut legacy_plugin_scope = baseline.clone();
+        legacy_plugin_scope.local_plugins_enabled = true;
+        legacy_plugin_scope
+            .allowed_scopes
+            .push("plugin:local".to_string());
+        assert!(!profile_scope_ceiling_is_valid(&legacy_plugin_scope));
+        let mut manage_plugin_scope = local_plugins.clone();
+        manage_plugin_scope
+            .allowed_scopes
+            .push("plugin:manage".to_string());
+        assert!(!profile_scope_ceiling_is_valid(&manage_plugin_scope));
+
+        let mut local_ssh = baseline.clone();
+        local_ssh.local_ssh_enabled = true;
+        local_ssh.allowed_scopes.push(LOCAL_SSH_SCOPE.to_string());
+        assert!(profile_scope_ceiling_is_valid(&local_ssh));
+        let mut mismatched_local_ssh = local_ssh.clone();
+        mismatched_local_ssh.local_ssh_enabled = false;
+        assert!(!profile_scope_ceiling_is_valid(&mismatched_local_ssh));
 
         let baseline_output = bridge_scope_output(&baseline);
         assert!(baseline_output.contains("Scopes:"));
@@ -940,6 +1065,8 @@ mod tests {
             allowed_scopes: vec!["runtime:read".to_string()],
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
+            local_plugins_enabled: false,
+            local_ssh_enabled: false,
             coding_agent_enabled: false,
         };
         let state_path = Path::new("/protected/profile/shared-key-oauth.toml");
@@ -957,7 +1084,7 @@ mod tests {
             warn_short: false,
         };
         let generated_line =
-            bridge_browser_authorization_key_line(&generated, Path::new("agent.toml"));
+            bridge_browser_authorization_key_line(&generated, Path::new("runner.toml"));
         assert_eq!(generated_line.matches("wck_browser_once").count(), 1);
 
         let recovered = ResolvedKey {

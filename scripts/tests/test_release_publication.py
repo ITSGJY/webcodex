@@ -16,8 +16,20 @@ from scripts import release_publication as publication
 SOURCE = "a" * 40
 REQUEST = "rb_" + "b" * 24
 RUN_ID = 123456
-VERSION = "0.3.8"
+VERSION = "0.4.0"
 TAG = f"v{VERSION}"
+
+
+def _versions(**overrides: str) -> dict[str, str]:
+    values = {
+        "cargo": VERSION,
+        "npm": VERSION,
+        "desktop_package": VERSION,
+        "desktop_cargo": VERSION,
+        "desktop_tauri": VERSION,
+    }
+    values.update(overrides)
+    return values
 
 
 def _state() -> dict:
@@ -80,6 +92,20 @@ def _write_bundle(root: Path) -> dict:
         digest = hashlib.sha256(payload).hexdigest()
         artifact_payload[platform] = {"filename": name, "sha256": digest}
         checksum_lines.append(f"{digest}  {name}")
+    desktop_artifacts = {}
+    for platform in collector.DESKTOP_PLATFORMS:
+        desktop_name = collector.desktop_artifact_filename(
+            VERSION,
+            platform,
+            build_kind="release",
+            tag=TAG,
+            source_sha=SOURCE,
+        )
+        desktop_bytes = f"synthetic-{platform}-desktop".encode("ascii")
+        (root / desktop_name).write_bytes(desktop_bytes)
+        desktop_digest = hashlib.sha256(desktop_bytes).hexdigest()
+        checksum_lines.append(f"{desktop_digest}  {desktop_name}")
+        desktop_artifacts[platform] = {"filename": desktop_name, "sha256": desktop_digest}
     (root / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="ascii")
     (root / "linux-x64-elf.txt").write_text("ELF x64\n", encoding="utf-8")
     (root / "linux-arm64-elf.txt").write_text("ELF arm64\n", encoding="utf-8")
@@ -104,6 +130,7 @@ def _write_bundle(root: Path) -> dict:
         "workflow_run_id": RUN_ID,
         "archive_stem": stem,
         "artifacts": artifact_payload,
+        "desktop_artifacts": desktop_artifacts,
     }
     (root / "release-build.json").write_text(json.dumps(release_build) + "\n", encoding="utf-8")
     return release_build
@@ -154,7 +181,7 @@ class PreflightTests(unittest.TestCase):
         client = mock.Mock()
         client.fetch_authenticated_user.return_value = {"login": "publisher"}
         with mock.patch.object(publication, "_require_exact_clean_root"), mock.patch.object(
-            publication, "_package_versions", return_value=(VERSION, VERSION)
+            publication, "_package_versions", return_value=_versions()
         ), mock.patch.object(publication.collector, "resolve_github_token", return_value="fake"), mock.patch.object(
             publication.collector, "GitHubClient", return_value=client
         ), mock.patch.object(publication, "_github_main_sha", return_value=SOURCE), mock.patch.object(
@@ -185,7 +212,7 @@ class PreflightTests(unittest.TestCase):
     def test_preflight_rejects_existing_local_tag(self) -> None:
         client = mock.Mock()
         with mock.patch.object(publication, "_require_exact_clean_root"), mock.patch.object(
-            publication, "_package_versions", return_value=(VERSION, VERSION)
+            publication, "_package_versions", return_value=_versions()
         ), mock.patch.object(publication.collector, "resolve_github_token", return_value="fake"), mock.patch.object(
             publication.collector, "GitHubClient", return_value=client
         ), mock.patch.object(publication, "_github_main_sha", return_value=SOURCE), mock.patch.object(
@@ -201,8 +228,20 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_fails_before_namespace_checks_on_version_mismatch(self) -> None:
         with mock.patch.object(publication, "_require_exact_clean_root"), mock.patch.object(
-            publication, "_package_versions", return_value=("0.3.7", VERSION)
+            publication, "_package_versions", return_value=_versions(cargo="0.3.9")
         ), self.assertRaises(publication.PublicationError):
+            publication.preflight_release(
+                repo=collector.DEFAULT_REPO,
+                version=VERSION,
+                source_sha=SOURCE,
+                root=Path("/tmp/exact-release-source"),
+                timeout=5,
+            )
+
+    def test_preflight_fails_closed_on_desktop_version_mismatch(self) -> None:
+        with mock.patch.object(publication, "_require_exact_clean_root"), mock.patch.object(
+            publication, "_package_versions", return_value=_versions(desktop_package="0.3.9")
+        ), self.assertRaisesRegex(publication.PublicationError, "desktop_package=0.3.9"):
             publication.preflight_release(
                 repo=collector.DEFAULT_REPO,
                 version=VERSION,
@@ -228,7 +267,7 @@ class ReclaimTagTests(unittest.TestCase):
         with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(
             publication, "_git", side_effect=["", "https://github.com/yyjeqhc/webcodex.git", SOURCE, TAG, SOURCE]
         ), mock.patch.object(publication, "_remote_main_source", return_value=SOURCE), mock.patch.object(
-            publication, "_package_versions", return_value=(VERSION, VERSION)
+            publication, "_package_versions", return_value=_versions()
         ), mock.patch.object(
             publication, "_remote_annotated_tag_identity", return_value=("b" * 40, SOURCE)
         ), mock.patch.object(publication, "_reclaim_release_check", return_value=(None, "authenticated")), mock.patch.object(
@@ -257,7 +296,7 @@ class ReclaimTagTests(unittest.TestCase):
         with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(
             publication, "_git", side_effect=["", "https://github.com/yyjeqhc/webcodex.git", SOURCE, TAG, SOURCE]
         ), mock.patch.object(publication, "_remote_main_source", return_value=SOURCE), mock.patch.object(
-            publication, "_package_versions", return_value=(VERSION, VERSION)
+            publication, "_package_versions", return_value=_versions()
         ), mock.patch.object(
             publication,
             "_remote_annotated_tag_identity",
@@ -305,7 +344,7 @@ class ReclaimTagTests(unittest.TestCase):
             "_git",
             side_effect=["", "https://github.com/yyjeqhc/webcodex.git", SOURCE, ""],
         ), mock.patch.object(publication, "_remote_main_source", return_value=SOURCE), mock.patch.object(
-            publication, "_package_versions", return_value=(VERSION, VERSION)
+            publication, "_package_versions", return_value=_versions()
         ), mock.patch.object(
             publication,
             "_remote_annotated_tag_identity",
@@ -452,6 +491,19 @@ class NpmStagingTests(unittest.TestCase):
             "workflow_run_id": RUN_ID,
             "archive_stem": f"webcodex-v{VERSION}",
             "artifacts": {platform: "a" * 64 for platform in collector.PLATFORMS},
+            "desktop_artifacts": {
+                platform: {
+                    "filename": collector.desktop_artifact_filename(
+                        VERSION,
+                        platform,
+                        build_kind="release",
+                        tag=TAG,
+                        source_sha=SOURCE,
+                    ),
+                    "sha256": "b" * 64,
+                }
+                for platform in collector.DESKTOP_PLATFORMS
+            },
         }
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -480,8 +532,8 @@ class NpmStagingTests(unittest.TestCase):
 
         self.assertEqual(result["npm_smoke"], "passed")
         self.assertEqual(len(calls), 2)
-        self.assertTrue(calls[0][1].endswith("scripts/stage_npm_release.sh"))
-        self.assertTrue(calls[1][1].endswith("scripts/npm_package_smoke.sh"))
+        self.assertEqual(Path(calls[0][1]).name, "stage_npm_release.sh")
+        self.assertEqual(Path(calls[1][1]).name, "npm_package_smoke.sh")
         self.assertIn("--binary-dir", calls[1])
         self.assertFalse(any("cargo" in argument for call in calls for argument in call))
         extract.assert_called_once()
@@ -492,7 +544,14 @@ class DraftVerificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             meta = _write_bundle(root)
-            names = ["SHA256SUMS", *(entry["filename"] for entry in meta["artifacts"].values())]
+            desktop_names = [
+                meta["desktop_artifacts"][platform]["filename"] for platform in collector.DESKTOP_PLATFORMS
+            ]
+            names = [
+                "SHA256SUMS",
+                *(entry["filename"] for entry in meta["artifacts"].values()),
+                *desktop_names,
+            ]
             assets = []
             for index, name in enumerate(names, 1):
                 path = root / name
@@ -522,9 +581,22 @@ class DraftVerificationTests(unittest.TestCase):
                     timeout=5,
                 )
             self.assertTrue(summary["draft"])
-            self.assertEqual(len(summary["assets"]), len(collector.PLATFORMS) + 1)
+            self.assertEqual(len(summary["assets"]), 11)
 
-            release["assets"][0]["digest"] = "sha256:" + "0" * 64
+            desktop_name = meta["desktop_artifacts"]["darwin-arm64"]["filename"]
+            desktop_asset = next(asset for asset in release["assets"] if asset["name"] == desktop_name)
+            desktop_asset["digest"] = "sha256:" + "0" * 64
+            with mock.patch.object(publication.collector, "resolve_github_token", return_value="fake"), mock.patch.object(
+                publication.collector, "GitHubClient", return_value=mock.sentinel.github_client
+            ), mock.patch.object(publication, "_find_authenticated_release_by_tag", return_value=release):
+                with self.assertRaises(publication.PublicationError):
+                    publication.verify_draft_assets(
+                        repo=collector.DEFAULT_REPO,
+                        bundle_dir=root,
+                        timeout=5,
+                    )
+
+            release["assets"] = [asset for asset in release["assets"] if asset["name"] != desktop_name]
             with mock.patch.object(publication.collector, "resolve_github_token", return_value="fake"), mock.patch.object(
                 publication.collector, "GitHubClient", return_value=mock.sentinel.github_client
             ), mock.patch.object(publication, "_find_authenticated_release_by_tag", return_value=release):
@@ -554,6 +626,38 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("rust_host: x86_64-apple-darwin", workflow)
         self.assertNotIn('rustc -vV | grep -Fxq "host:', workflow)
         self.assertNotIn('file "$binary" | grep -Fq "$EXPECTED_FILE_ARCH"', workflow)
+
+    def test_release_build_stages_desktop_candidates_in_workspace_dist(self) -> None:
+        workflow = Path(".github/workflows/release-build.yml").read_text(encoding="utf-8")
+
+        self.assertIn('desktop_dist="$GITHUB_WORKSPACE/dist"', workflow)
+        self.assertIn('desktop="$desktop_dist/${{ steps.desktop_bundle.outputs.desktop_name }}"', workflow)
+        self.assertIn('printf \'%s  %s\\n\' "$digest" "$(basename "$desktop")" > "$desktop.sha256"', workflow)
+        self.assertIn('echo "path=$desktop" >> "$GITHUB_OUTPUT"', workflow)
+        self.assertIn('--dmg "${{ steps.desktop_dmg.outputs.path }}"', workflow)
+        self.assertIn(
+            '--evidence "$GITHUB_WORKSPACE/dist/${{ steps.desktop_bundle.outputs.desktop_name }}.evidence.json"',
+            workflow,
+        )
+
+        self.assertIn('$desktopDist = Join-Path $env:GITHUB_WORKSPACE "dist"', workflow)
+        self.assertIn('$installerPath = Join-Path $desktopDist $installerName', workflow)
+        self.assertIn('"DESKTOP_INSTALLER_PATH=$installerPath" >> $env:GITHUB_ENV', workflow)
+        self.assertIn('Copy-Item -LiteralPath $built[0].FullName -Destination $env:DESKTOP_INSTALLER_PATH', workflow)
+        self.assertIn('"$($env:DESKTOP_INSTALLER_PATH).sha256"', workflow)
+        self.assertIn('-Installer $env:DESKTOP_INSTALLER_PATH', workflow)
+
+        self.assertIn("dist/webcodex-desktop-*.dmg", workflow)
+        self.assertIn("dist/webcodex-desktop-*.dmg.sha256", workflow)
+        self.assertIn("dist/webcodex-desktop-*.dmg.evidence.json", workflow)
+        self.assertIn("dist/webcodex-desktop-*-${{ matrix.platform }}-setup.exe", workflow)
+        self.assertIn("dist/webcodex-desktop-*-${{ matrix.platform }}-setup.exe.sha256", workflow)
+        self.assertIn("webcodex-desktop-v$env:VERSION-$env:WEBCODEX_RELEASE_PLATFORM-setup.exe", workflow)
+        self.assertIn("-Platform $env:WEBCODEX_RELEASE_PLATFORM", workflow)
+
+        self.assertNotIn('desktop="dist/${{ steps.desktop_bundle.outputs.desktop_name }}"', workflow)
+        self.assertNotIn('$installer = Join-Path "dist" $env:DESKTOP_INSTALLER_NAME', workflow)
+        self.assertNotIn('-Installer (Join-Path "dist" $env:DESKTOP_INSTALLER_NAME)', workflow)
 
     def test_server_image_publication_is_separate_and_multi_arch(self) -> None:
         candidate = Path(".github/workflows/release-build.yml").read_text(encoding="utf-8")

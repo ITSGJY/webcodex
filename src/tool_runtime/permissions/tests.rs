@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const WRITE_TOOL: &str = "write_project_file";
-const READ_TOOL: &str = "read_file";
+const READ_TOOL: &str = "read_files";
 
 #[test]
 fn trusted_agent_auto_authorizes_permission_bearing_tools() {
@@ -87,10 +87,9 @@ fn illegal_mode_has_explicit_handling_and_does_not_auto_authorize() {
 }
 
 #[test]
-fn legacy_permission_mode_names_are_rejected() {
-    // The removed three-mode switch must not silently alias into authority
-    // modes: dev_auto_approve / audit_only / require_approval are invalid.
-    for legacy in ["dev_auto_approve", "audit_only", "require_approval"] {
+fn ambiguous_legacy_permission_mode_is_rejected() {
+    // audit_only has no equivalent in the current authority model.
+    for legacy in ["audit_only"] {
         let config = EffectiveAuthorityConfig::from_raw(Some(legacy));
         assert!(
             matches!(config, EffectiveAuthorityConfig::InvalidMode { .. }),

@@ -5,7 +5,7 @@
 __pycache__/
 *.pyc
 
-# Local runtime data (SQLite DB, uploads, job metadata)
+# Local runtime data (SQLite DB and durable runtime state)
 data*
 
 # Local Codex CLI workspace
@@ -22,7 +22,9 @@ data*
 # committed or exposed, rotate WEBCODEX_TOKEN immediately.
 /.env
 /.webcodex-bootstrap.receipt
+/runner.toml
 /agent.toml
+/project-registry/
 /projects.d/
 /*.local.toml
 /webcodex.env
@@ -41,6 +43,10 @@ data*
 
 # Local scratch material and reports that must not be committed.
 /ignore/
+
+# Local Trellis workflow state, planning artifacts, and project-only skills.
+/.trellis/
+/.agents/skills/trellis-*/
 
 # Watched frontend development output.
 /frontend/.dev-dist/

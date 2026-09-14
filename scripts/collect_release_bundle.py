@@ -23,14 +23,15 @@ from typing import BinaryIO
 DEFAULT_REPO = "yyjeqhc/webcodex"
 PLATFORMS = ("linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
 BINARIES = ("webcodex", "webcodex-server", "webcodex-runner")
+DESKTOP_PLATFORMS = ("darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
 RELEASE_WORKFLOW_PATH = ".github/workflows/release-build.yml"
 API_VERSION = "2022-11-28"
 USER_AGENT = "webcodex-release-bundle-collector/1"
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACT_COUNT = 16
-MAX_ARTIFACT_ZIP_BYTES = 256 * 1024 * 1024
+MAX_ARTIFACT_ZIP_BYTES = 384 * 1024 * 1024
 MAX_ZIP_MEMBERS = 16
-MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+MAX_UNCOMPRESSED_BYTES = 384 * 1024 * 1024
 MAX_MEMBER_BYTES = 96 * 1024 * 1024
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 MAX_RELEASE_BUILD_BYTES = 256 * 1024
@@ -61,6 +62,24 @@ def validate_expected_tag(value: str) -> str:
     if len(tag) <= 80 and VERIFY_TAG_RE.fullmatch(tag):
         return tag
     raise CollectionError(f"invalid release or verification tag: {value!r}")
+
+
+def desktop_artifact_filename(
+    version: str,
+    platform: str,
+    *,
+    build_kind: str,
+    tag: str,
+    source_sha: str,
+) -> str:
+    if platform not in DESKTOP_PLATFORMS:
+        raise CollectionError(f"unsupported Desktop platform: {platform!r}")
+    suffix = "-setup.exe" if platform.startswith("win32-") else ".dmg"
+    if build_kind == "release":
+        return f"webcodex-desktop-v{version}-{platform}{suffix}"
+    if build_kind == "verification":
+        return f"webcodex-desktop-{tag}-{source_sha[:12]}-v{version}-{platform}{suffix}"
+    raise CollectionError(f"unsupported release build kind: {build_kind!r}")
 
 
 def resolve_github_token() -> str:
@@ -461,7 +480,7 @@ def _parse_sha256sums(text: str, expected_names: set[str]) -> dict[str, str]:
             raise CollectionError(f"duplicate SHA256SUMS entry: {name}")
         values[name] = digest
     if set(values) != expected_names:
-        raise CollectionError("SHA256SUMS does not describe exactly the six assembled archives")
+        raise CollectionError("SHA256SUMS does not describe exactly the downloadable release artifacts")
     return values
 
 
@@ -518,6 +537,7 @@ def verify_bundle_directory(
         "workflow_run_id",
         "archive_stem",
         "artifacts",
+        "desktop_artifacts",
     }
     if set(release_build) != required_fields:
         raise CollectionError("release-build.json contains unexpected or missing fields")
@@ -565,12 +585,38 @@ def verify_bundle_directory(
         artifact_files[platform] = filename
         artifact_hashes[platform] = digest
 
+    desktop_artifacts = release_build.get("desktop_artifacts")
+    if not isinstance(desktop_artifacts, dict) or set(desktop_artifacts) != set(DESKTOP_PLATFORMS):
+        raise CollectionError("release-build.json must contain exactly the supported Desktop artifacts")
+    desktop_files: dict[str, str] = {}
+    desktop_hashes: dict[str, str] = {}
+    for platform in DESKTOP_PLATFORMS:
+        item = desktop_artifacts.get(platform)
+        if not isinstance(item, dict) or set(item) != {"filename", "sha256"}:
+            raise CollectionError(f"release-build.json Desktop artifact entry is malformed: {platform}")
+        filename = item.get("filename")
+        digest = item.get("sha256")
+        expected_filename = desktop_artifact_filename(
+            version,
+            platform,
+            build_kind=build_kind,
+            tag=expected_tag,
+            source_sha=expected_source_sha,
+        )
+        if filename != expected_filename:
+            raise CollectionError(f"release-build.json Desktop filename mismatch: {platform}")
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise CollectionError(f"release-build.json Desktop SHA-256 is invalid: {platform}")
+        desktop_files[platform] = filename
+        desktop_hashes[platform] = digest
+
     expected_files = {
         "release-build.json",
         "SHA256SUMS",
         "linux-x64-elf.txt",
         "linux-arm64-elf.txt",
         *artifact_files.values(),
+        *desktop_files.values(),
     }
     if build_kind == "release":
         expected_files.add("manifest.json")
@@ -587,7 +633,7 @@ def verify_bundle_directory(
         sums_text = _read_bounded(root / "SHA256SUMS", 16 * 1024).decode("ascii")
     except UnicodeDecodeError as exc:
         raise CollectionError("SHA256SUMS is not ASCII") from exc
-    sums = _parse_sha256sums(sums_text, set(artifact_files.values()))
+    sums = _parse_sha256sums(sums_text, set(artifact_files.values()) | set(desktop_files.values()))
     for platform in PLATFORMS:
         filename = artifact_files[platform]
         path = root / filename
@@ -595,6 +641,19 @@ def verify_bundle_directory(
         if actual != artifact_hashes[platform] or sums.get(filename) != actual:
             raise CollectionError(f"assembled archive SHA-256 mismatch: {platform}")
         _verify_archive_members(path, platform)
+
+    for platform in DESKTOP_PLATFORMS:
+        filename = desktop_files[platform]
+        path = root / filename
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise CollectionError(f"Desktop distribution artifact is missing: {filename}") from exc
+        if size <= 0 or size > MAX_MEMBER_BYTES:
+            raise CollectionError(f"Desktop distribution artifact is outside its size bound: {filename}")
+        actual = sha256_file(path)
+        if actual != desktop_hashes[platform] or sums.get(filename) != actual:
+            raise CollectionError(f"Desktop distribution artifact SHA-256 mismatch: {platform}")
 
     for report in ("linux-x64-elf.txt", "linux-arm64-elf.txt"):
         try:
@@ -617,6 +676,10 @@ def verify_bundle_directory(
         "workflow_run_id": run_id,
         "archive_stem": archive_stem,
         "artifacts": artifact_hashes,
+        "desktop_artifacts": {
+            platform: {"filename": desktop_files[platform], "sha256": desktop_hashes[platform]}
+            for platform in DESKTOP_PLATFORMS
+        },
     }
 
 

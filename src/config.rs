@@ -7,12 +7,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub token: Option<String>,
     pub max_text_size: usize,
-    pub max_file_size: usize,
-    pub codex: CodexConfig,
     pub oauth2: OAuth2Config,
 }
 
-/// Server-side QUIC agent transport configuration. Sourced from
+/// Server-side QUIC Runner transport configuration. Sourced from
 /// `WEBCODEX_QUIC_*` env vars, mirroring the project's env-var config pattern.
 /// Kept as a standalone struct (not embedded in [`Config`]) so existing
 /// `Config { ... }` test literals and constructors are untouched. The listener
@@ -59,7 +57,7 @@ impl QuicServerConfig {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             alpn: std::env::var("WEBCODEX_QUIC_ALPN")
-                .unwrap_or_else(|_| crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string()),
+                .unwrap_or_else(|_| crate::runner_protocol::RUNNER_QUIC_ALPN_V1.to_string()),
         }
     }
 
@@ -171,88 +169,8 @@ impl Default for QuicServerConfig {
             listen: "0.0.0.0:8443".to_string(),
             cert: PathBuf::new(),
             key: PathBuf::new(),
-            alpn: crate::shell_protocol::AGENT_QUIC_ALPN_V1.to_string(),
+            alpn: crate::runner_protocol::RUNNER_QUIC_ALPN_V1.to_string(),
         }
-    }
-}
-
-/// Codex CLI execution configuration, sourced from `CODEX_*` env vars.
-///
-/// Codex is an optional advanced local dependency for external workflows. The
-/// WebCodex runtime itself serves `read_file`, `git_status`, `git_diff`,
-/// `apply_unified_diff`, and `run_shell` through the agent registry.
-#[derive(Debug, Clone)]
-pub struct CodexConfig {
-    /// Path/name of the Codex CLI binary. Default `codex`.
-    pub bin: String,
-    /// Approval mode passed via `--approval-mode`. Default is **empty**
-    /// (disabled): no `--approval-mode` flag is emitted. This keeps the runtime
-    /// compatible with Codex CLI builds that do not understand the flag. Set
-    /// `CODEX_APPROVAL_MODE` (e.g. `full-auto`, `suggest`) to enable it.
-    pub approval_mode: String,
-    /// Default job timeout in seconds. Default `3600`.
-    pub default_timeout_secs: i64,
-    /// Maximum prompt size in bytes. Default `100000`.
-    pub max_prompt_bytes: usize,
-    /// Allowlist of accepted `extra_args`. Empty means no extra args allowed.
-    pub allowed_extra_args: Vec<String>,
-}
-
-impl Default for CodexConfig {
-    fn default() -> Self {
-        Self {
-            bin: "codex".to_string(),
-            approval_mode: String::new(),
-            default_timeout_secs: 3600,
-            max_prompt_bytes: 100_000,
-            allowed_extra_args: Vec::new(),
-        }
-    }
-}
-
-impl CodexConfig {
-    pub fn from_env() -> Self {
-        let bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
-        // CODEX_APPROVAL_MODE defaults to empty (disabled). An empty/blank
-        // value, or the sentinels none/off/disabled, mean "do not pass
-        // --approval-mode" so the runtime works with Codex CLI builds that do
-        // not support the flag.
-        let approval_mode = std::env::var("CODEX_APPROVAL_MODE")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let default_timeout_secs = std::env::var("CODEX_DEFAULT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(3600);
-        let max_prompt_bytes = std::env::var("CODEX_MAX_PROMPT_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(100_000);
-        let allowed_extra_args = std::env::var("CODEX_ALLOWED_EXTRA_ARGS")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self {
-            bin,
-            approval_mode,
-            default_timeout_secs,
-            max_prompt_bytes,
-            allowed_extra_args,
-        }
-    }
-
-    /// Returns true if `arg` is in the configured allowlist.
-    pub fn is_extra_arg_allowed(&self, arg: &str) -> bool {
-        self.allowed_extra_args.iter().any(|allowed| allowed == arg)
     }
 }
 
@@ -397,13 +315,29 @@ pub(crate) fn tool_request_trace_max_total_bytes() -> u64 {
         .unwrap_or(2 * 1024 * 1024 * 1024)
 }
 
-/// Experimental MCP `tools/list` compact schemas switch.
+/// Optional operator override for MCP `tools/list` compact schema projection.
 ///
-/// When true, MCP discovery omits `outputSchema` only (keeps name, description,
-/// inputSchema, annotations). Default false — production behavior unchanged.
-/// Invalid / unset values follow `env_flag` and default to false.
-pub(crate) fn mcp_compact_schemas_enabled() -> bool {
-    env_flag("WEBCODEX_MCP_COMPACT_SCHEMAS").unwrap_or(false)
+/// `true` omits `outputSchema` from MCP discovery while preserving name,
+/// description, inputSchema, annotations, and adapter metadata. `false` restores
+/// the full discovery schema. Unset or invalid values defer to the selected
+/// RuntimeExposure policy rather than choosing a process-wide default here.
+pub(crate) fn mcp_compact_schemas_override() -> Option<bool> {
+    env_flag("WEBCODEX_MCP_COMPACT_SCHEMAS")
+}
+
+/// Global Server switch for optional MCP App presentation resources and metadata.
+///
+/// Apps are enabled by default. Setting `WEBCODEX_MCP_APPS_ENABLED=false` keeps
+/// canonical MCP tools/results and non-App resources available while suppressing
+/// App capability advertisement, tool linkage, presentation metadata, and static
+/// App resource reads. Invalid values follow `env_flag` and fall back to the
+/// default enabled behavior.
+fn mcp_apps_enabled_from_flag(flag: Option<bool>) -> bool {
+    flag.unwrap_or(true)
+}
+
+pub(crate) fn mcp_apps_enabled() -> bool {
+    mcp_apps_enabled_from_flag(env_flag("WEBCODEX_MCP_APPS_ENABLED"))
 }
 
 pub(crate) fn load_startup_env_files() -> Result<Vec<EnvFileLoad>, String> {
@@ -570,8 +504,6 @@ impl Config {
                 .unwrap_or_else(|_| PathBuf::from("./data")),
             token: std::env::var("WEBCODEX_TOKEN").ok(),
             max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: CodexConfig::from_env(),
             oauth2: OAuth2Config::from_env(),
         }
     }
@@ -592,10 +524,6 @@ impl Config {
             return self.data_dir.clone();
         }
         runtime_state_dir()
-    }
-
-    pub fn uploads_dir(&self) -> PathBuf {
-        self.data_dir.join("uploads")
     }
 
     pub fn is_auth_enabled(&self) -> bool {
@@ -716,102 +644,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_config_defaults() {
-        let cfg = CodexConfig::default();
-        assert_eq!(cfg.bin, "codex");
-        // Default approval mode is empty (disabled): no --approval-mode flag.
-        assert_eq!(cfg.approval_mode, "");
-        assert_eq!(cfg.default_timeout_secs, 3600);
-        assert_eq!(cfg.max_prompt_bytes, 100_000);
-        assert!(cfg.allowed_extra_args.is_empty());
-    }
-
-    #[test]
     fn constant_time_eq_matches_byte_equality() {
         assert!(constant_time_eq(b"secret123", b"secret123"));
         assert!(!constant_time_eq(b"secret123", b"secret124"));
         assert!(!constant_time_eq(b"secret123", b"secret1234"));
         assert!(!constant_time_eq(b"secret123", b""));
-    }
-
-    #[test]
-    fn codex_config_from_env_uses_defaults_when_unset() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        // Clear CODEX_* env vars so we get deterministic defaults.
-        env.remove("CODEX_BIN");
-        env.remove("CODEX_APPROVAL_MODE");
-        env.remove("CODEX_DEFAULT_TIMEOUT_SECS");
-        env.remove("CODEX_MAX_PROMPT_BYTES");
-        env.remove("CODEX_ALLOWED_EXTRA_ARGS");
-
-        let cfg = CodexConfig::from_env();
-        assert_eq!(cfg.bin, "codex");
-        // Unset CODEX_APPROVAL_MODE means disabled (empty), not full-auto.
-        assert_eq!(cfg.approval_mode, "");
-        assert_eq!(cfg.default_timeout_secs, 3600);
-        assert_eq!(cfg.max_prompt_bytes, 100_000);
-        assert!(cfg.allowed_extra_args.is_empty());
-    }
-
-    #[test]
-    fn codex_config_from_env_parses_overrides() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set("CODEX_BIN", "/usr/local/bin/codex");
-        env.set("CODEX_APPROVAL_MODE", "suggest");
-        env.set("CODEX_DEFAULT_TIMEOUT_SECS", "600");
-        env.set("CODEX_MAX_PROMPT_BYTES", "2048");
-        env.set("CODEX_ALLOWED_EXTRA_ARGS", "--verbose, --json, --no-color");
-
-        let cfg = CodexConfig::from_env();
-        assert_eq!(cfg.bin, "/usr/local/bin/codex");
-        assert_eq!(cfg.approval_mode, "suggest");
-        assert_eq!(cfg.default_timeout_secs, 600);
-        assert_eq!(cfg.max_prompt_bytes, 2048);
-        assert_eq!(
-            cfg.allowed_extra_args,
-            vec!["--verbose", "--json", "--no-color"]
-        );
-        assert!(cfg.is_extra_arg_allowed("--verbose"));
-        assert!(cfg.is_extra_arg_allowed("--json"));
-        assert!(!cfg.is_extra_arg_allowed("--danger"));
-
-        // Restore defaults.
-        env.remove("CODEX_BIN");
-        env.remove("CODEX_APPROVAL_MODE");
-        env.remove("CODEX_DEFAULT_TIMEOUT_SECS");
-        env.remove("CODEX_MAX_PROMPT_BYTES");
-        env.remove("CODEX_ALLOWED_EXTRA_ARGS");
-    }
-
-    #[test]
-    fn codex_config_from_env_trims_approval_mode_whitespace() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set("CODEX_APPROVAL_MODE", "  suggest  ");
-        let cfg = CodexConfig::from_env();
-        assert_eq!(cfg.approval_mode, "suggest");
-
-        // An unset/blank value normalizes to empty (disabled). The disabled
-        // sentinels (none/off/disabled) are recognized later by
-        // build_codex_command, so the config keeps the trimmed token.
-        env.set("CODEX_APPROVAL_MODE", "   ");
-        let cfg = CodexConfig::from_env();
-        assert_eq!(cfg.approval_mode, "");
-
-        env.remove("CODEX_APPROVAL_MODE");
-    }
-
-    #[test]
-    fn codex_config_from_env_ignores_invalid_numeric_values() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set("CODEX_DEFAULT_TIMEOUT_SECS", "not-a-number");
-        env.set("CODEX_MAX_PROMPT_BYTES", "-5");
-
-        let cfg = CodexConfig::from_env();
-        assert_eq!(cfg.default_timeout_secs, 3600);
-        assert_eq!(cfg.max_prompt_bytes, 100_000);
-
-        env.remove("CODEX_DEFAULT_TIMEOUT_SECS");
-        env.remove("CODEX_MAX_PROMPT_BYTES");
     }
 
     #[test]
@@ -898,17 +735,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_config_allowed_extra_args_ignores_empty_entries() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set("CODEX_ALLOWED_EXTRA_ARGS", " --verbose , , --json ");
-
-        let cfg = CodexConfig::from_env();
-        assert_eq!(cfg.allowed_extra_args, vec!["--verbose", "--json"]);
-
-        env.remove("CODEX_ALLOWED_EXTRA_ARGS");
-    }
-
-    #[test]
     fn load_startup_env_files_explicit_path_loads_webcodex_env() {
         let mut env = crate::test_support::TestEnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -924,26 +750,52 @@ mod tests {
 
         env.remove("WEBCODEX_ENV_FILE");
     }
+
     #[test]
-    fn mcp_compact_schemas_defaults_off() {
+    fn startup_env_precedence_is_default_then_file_then_process_environment() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join("webcodex.env");
+        std::fs::write(&env_file, "WEBCODEX_MCP_COMPACT_SCHEMAS=true\n").unwrap();
+        env.set("WEBCODEX_ENV_FILE", &env_file);
+        env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+
+        assert_eq!(mcp_compact_schemas_override(), None);
+        let from_file = load_startup_env_files().unwrap();
+        assert_eq!(from_file[0].loaded_count, 1);
+        assert_eq!(mcp_compact_schemas_override(), Some(true));
+
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+        let with_process_override = load_startup_env_files().unwrap();
+        assert_eq!(with_process_override[0].loaded_count, 0);
+        assert_eq!(mcp_compact_schemas_override(), Some(false));
+
+        env.remove("WEBCODEX_ENV_FILE");
+        env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    }
+    #[test]
+    fn mcp_compact_schemas_override_distinguishes_unset_true_and_false() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
-        assert!(!mcp_compact_schemas_enabled());
+        assert_eq!(mcp_compact_schemas_override(), None);
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
+        assert_eq!(mcp_compact_schemas_override(), Some(true));
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "1");
+        assert_eq!(mcp_compact_schemas_override(), Some(true));
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+        assert_eq!(mcp_compact_schemas_override(), Some(false));
+        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "maybe");
+        // Invalid values are treated as unset by env_flag and defer to the
+        // RuntimeExposure-specific default.
+        assert_eq!(mcp_compact_schemas_override(), None);
+        env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
     }
 
     #[test]
-    fn mcp_compact_schemas_true_enables() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
-        assert!(mcp_compact_schemas_enabled());
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "1");
-        assert!(mcp_compact_schemas_enabled());
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
-        assert!(!mcp_compact_schemas_enabled());
-        env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "maybe");
-        // Invalid values are treated as unset by env_flag -> default false.
-        assert!(!mcp_compact_schemas_enabled());
-        env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    fn mcp_apps_default_on_and_can_be_disabled() {
+        assert!(mcp_apps_enabled_from_flag(None));
+        assert!(mcp_apps_enabled_from_flag(Some(true)));
+        assert!(!mcp_apps_enabled_from_flag(Some(false)));
     }
 
     #[test]

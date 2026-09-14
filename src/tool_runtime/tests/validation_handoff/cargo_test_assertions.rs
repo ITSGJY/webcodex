@@ -12,10 +12,11 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             async_shell_jobs: true,
             structured_validation_argv: true,
             structured_cargo_test_count_assertion: true,
+            structured_cargo_test_execution_policy: true,
             ..Default::default()
         },
     )
@@ -37,6 +38,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
                         session_id: Some(session_id),
                         cwd: None,
                         filter: Some("focused".to_string()),
+                        lib: None,
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -46,6 +48,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
                         require_tests: Some(true),
                         min_tests: None,
                         timeout_secs: Some(600),
+                        sync_wait_secs: None,
                     },
                     Some(&auth),
                 )
@@ -54,7 +57,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
     });
     let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
     runtime
-        .shell_clients
+        .runner_registry
         .update_job(cargo_test_update(
             client_id,
             &request.request_id,
@@ -80,8 +83,17 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
         result.output["test_count_assertion"]["reason_code"],
         "minimum_not_met"
     );
+    assert_eq!(
+        result.output["test_count_assertion"]["evidence_reason_code"],
+        "complete_summary"
+    );
     assert_eq!(result.output["tests_run_count"], 0);
     assert_eq!(result.output["zero_tests_run"], true);
+    let error = result.error.as_deref().expect("zero-test recovery message");
+    assert!(error.contains("0 tests executed"), "{error}");
+    assert!(error.contains("substring filter"), "{error}");
+    assert!(error.contains("full qualified name"), "{error}");
+    assert!(error.contains("--exact"), "{error}");
     assert_eq!(result.output["test_count_assertion"]["actual_tests_run"], 0);
     assert_cargo_result_matches_schema("cargo_test", &result);
     assert!(
@@ -97,8 +109,14 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
         .unwrap();
     let validation = validation_summary_for_session(&summary);
     assert_eq!(validation["events_total"], 1);
-    assert_eq!(validation["status"], "failed");
+    assert_eq!(validation["status"], "inconclusive");
+    assert_eq!(validation["historical_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    assert_eq!(validation["evidence_gaps"]["count"], 1);
     assert_eq!(validation["latest"]["success"], false);
+    assert_eq!(validation["latest"]["execution_success"], true);
+    assert_eq!(validation["latest"]["validation_passed"], true);
+    assert_eq!(validation["latest"]["failure_class"], "evidence_assertion");
     assert_eq!(validation["latest"]["exit_code"], 0);
     assert_eq!(
         validation["latest"]["test_count_assertion"]["reason_code"],
@@ -107,7 +125,8 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
 }
 
 #[tokio::test]
-async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_session_validation() {
+async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_session_validation()
+{
     let client_id = "vhandoff-test-count";
     let runtime = runtime_with_agent_project(client_id)
         .with_validation_sync_wait(std::time::Duration::from_millis(50));
@@ -115,10 +134,12 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             async_shell_jobs: true,
             structured_validation_argv: true,
             structured_cargo_test_count_assertion: true,
+            structured_cargo_test_execution_policy: true,
+            structured_cargo_test_lib: true,
             ..Default::default()
         },
     )
@@ -140,6 +161,7 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
                         session_id: Some(session_id),
                         cwd: None,
                         filter: Some("focused".to_string()),
+                        lib: Some(true),
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -149,6 +171,7 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
                         require_tests: Some(true),
                         min_tests: Some(2),
                         timeout_secs: Some(1800),
+                        sync_wait_secs: None,
                     },
                     Some(&auth),
                 )
@@ -156,19 +179,26 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
         }
     });
     let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    let steps: Vec<crate::runner_protocol::ShellJobValidationStep> =
+        serde_json::from_str(&request.command).expect("validation Job steps");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].program, "cargo");
+    assert!(steps[0].args.iter().any(|arg| arg == "--lib"));
     let validation = request
         .job_context
         .as_ref()
         .and_then(|context| context.validation.as_ref())
         .expect("durable validation metadata");
     assert_eq!(validation.minimum_tests, Some(2));
+    assert_eq!(validation.require_tests, Some(true));
+    assert_eq!(validation.no_run, None);
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["promoted_to_job"], true);
     assert_eq!(handoff.output["job_id"], job_id);
 
     runtime
-        .shell_clients
+        .runner_registry
         .update_job(cargo_test_update(
             client_id,
             &request.request_id,
@@ -193,6 +223,10 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
     assert_eq!(
         status.output["validation"]["test_count_assertion"]["reason_code"],
         "minimum_not_met"
+    );
+    assert_eq!(
+        status.output["validation"]["test_count_assertion"]["evidence_reason_code"],
+        "complete_summary"
     );
     assert_eq!(
         status.output["validation"]["test_count_assertion"]["minimum_tests"],
@@ -222,8 +256,14 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
     let validation = runtime
         .validation_summary_for_session_with_jobs(&summary, 50, Some(&auth))
         .await;
-    assert_eq!(validation["status"], "failed");
+    assert_eq!(validation["status"], "inconclusive");
+    assert_eq!(validation["historical_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    assert_eq!(validation["evidence_gaps"]["count"], 1);
     assert_eq!(validation["latest"]["success"], false);
+    assert_eq!(validation["latest"]["execution_success"], true);
+    assert_eq!(validation["latest"]["validation_passed"], true);
+    assert_eq!(validation["latest"]["failure_class"], "evidence_assertion");
     assert_eq!(validation["latest"]["exit_code"], 0);
     assert_eq!(
         validation["latest"]["test_count_assertion"]["reason_code"],
@@ -231,276 +271,297 @@ async fn handoff_cargo_test_count_failure_preserves_completed_job_and_failed_ses
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn local_sync_cargo_test_enforces_explicit_count_without_changing_zero_test_default() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_local_validation_crate(
-        tmp.path(),
-        r#"
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn one() {}
+async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_blocking_at_handoff() {
+    let client_id = "vhandoff-minimum-misassertion-closeout";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(300));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_cargo_test_count_assertion: true,
+            structured_cargo_test_execution_policy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let session_id = session.session_id.clone();
 
-    #[test]
-    fn two() {}
+    for (minimum, expect_success) in [(2, false), (1, true)] {
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let auth = auth.clone();
+            let project = project.clone();
+            let session_id = session_id.clone();
+            async move {
+                runtime
+                    .dispatch_with_auth(
+                        ToolCall::CargoTest {
+                            project,
+                            session_id: Some(session_id),
+                            cwd: None,
+                            filter: Some("focused".to_string()),
+                            lib: None,
+                            all_targets: None,
+                            all_features: None,
+                            no_default_features: None,
+                            features: None,
+                            package: None,
+                            no_run: None,
+                            require_tests: None,
+                            min_tests: Some(minimum),
+                            timeout_secs: Some(600),
+                            sync_wait_secs: None,
+                        },
+                        Some(&auth),
+                    )
+                    .await
+            }
+        });
+        let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+        runtime
+            .runner_registry
+            .update_job(cargo_test_update(
+                client_id,
+                &request.request_id,
+                &job_id,
+                "completed",
+                "running 1 test\n\ntest focused ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
+                "",
+                Some(0),
+                completed_progress(),
+                true,
+            ))
+            .await
+            .unwrap();
 
-    #[test]
-    #[ignore]
-    fn ignored_only() {}
-}
-"#,
+        let result = task.await.unwrap();
+        assert_eq!(
+            result.success, expect_success,
+            "minimum={minimum}: {result:?}"
+        );
+        assert_eq!(result.output["exit_code"], 0);
+        assert_eq!(result.output["tests_run_count"], 1);
+        assert_eq!(result.output["tests_failed"], 0);
+        assert_eq!(
+            result.output["test_count_assertion"]["reason_code"],
+            if expect_success {
+                "minimum_satisfied"
+            } else {
+                "minimum_not_met"
+            }
+        );
+    }
+
+    let summary = runtime.sessions.summary(&session_id, Some(50)).unwrap();
+    let raw_finished = summary
+        .events
+        .iter()
+        .filter(|event| event.kind == "tool_call_finished" && event.tool_name == "cargo_test")
+        .collect::<Vec<_>>();
+    assert_eq!(raw_finished.len(), 2);
+    assert_eq!(raw_finished[0].status.as_deref(), Some("failed"));
+    assert_eq!(raw_finished[1].status.as_deref(), Some("succeeded"));
+    assert_eq!(
+        raw_finished[0]
+            .validation_output_summary
+            .as_ref()
+            .and_then(|value| value.pointer("/test_count_assertion/reason_code"))
+            .and_then(|value| value.as_str()),
+        Some("minimum_not_met")
     );
-    let runtime = runtime_with_project(tmp.path(), "demo");
-    let config = local_project_config(&tmp.path().to_string_lossy());
-    let compatible_zero = runtime
-        .run_readonly_validation_local_job(
-            "cargo_test",
-            "demo",
-            &config,
-            None,
-            "cargo test does_not_exist",
-            validation_adapter_for_tool("cargo_test").unwrap(),
-            ValidationCommandOptions {
-                filter: Some("does_not_exist".to_string()),
-                ..Default::default()
+
+    let validation = validation_summary_for_session(&summary);
+    assert_eq!(validation["status"], "passed");
+    assert_eq!(validation["historical_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    assert_eq!(validation["evidence_gaps"]["count"], 1);
+    assert_eq!(validation["events"][0]["success"], false);
+    assert_eq!(validation["events"][0]["validation_passed"], true);
+    assert_eq!(
+        validation["events"][0]["failure_class"],
+        "evidence_assertion"
+    );
+    assert_eq!(
+        validation["events"][0]["identity"],
+        validation["events"][1]["identity"]
+    );
+
+    let handoff = runtime
+        .dispatch_with_auth(
+            ToolCall::SessionHandoffSummary {
+                session_id,
+                project: Some(project),
+                include_workspace: Some(false),
+                include_checkpoints: Some(false),
+                include_validation: Some(true),
+                summary_only: true,
+                limit: Some(50),
             },
-            ExecutionPurpose::Test,
-            30,
-            5,
-            None,
+            Some(&auth),
         )
         .await;
-    assert!(compatible_zero.success, "{:?}", compatible_zero.error);
-    assert_eq!(compatible_zero.output["exit_code"], 0);
-    assert_eq!(compatible_zero.output["passed"], true);
-    assert_eq!(compatible_zero.output["tests_run_count"], 0);
-    assert_eq!(compatible_zero.output["zero_tests_run"], true);
-    assert!(compatible_zero.output.get("test_count_assertion").is_none());
-    assert_cargo_result_matches_schema("cargo_test", &compatible_zero);
-
-    let ignored_default = runtime
-        .run_readonly_validation_local_job(
-            "cargo_test",
-            "demo",
-            &config,
-            None,
-            "cargo test ignored_only",
-            validation_adapter_for_tool("cargo_test").unwrap(),
-            ValidationCommandOptions {
-                filter: Some("ignored_only".to_string()),
-                ..Default::default()
-            },
-            ExecutionPurpose::Test,
-            30,
-            5,
-            None,
-        )
-        .await;
-    assert!(ignored_default.success, "{:?}", ignored_default.error);
-    assert_eq!(ignored_default.output["exit_code"], 0);
-    assert_eq!(ignored_default.output["passed"], true);
-    assert_eq!(ignored_default.output["tests_run_count"], 0);
-    assert_eq!(ignored_default.output["zero_tests_run"], true);
-    assert!(ignored_default.output.get("test_count_assertion").is_none());
-
-    let ignored_required = runtime
-        .run_readonly_validation_local_job(
-            "cargo_test",
-            "demo",
-            &config,
-            None,
-            "cargo test ignored_only",
-            validation_adapter_for_tool("cargo_test").unwrap(),
-            ValidationCommandOptions {
-                filter: Some("ignored_only".to_string()),
-                ..Default::default()
-            },
-            ExecutionPurpose::Test,
-            30,
-            5,
-            Some(1),
-        )
-        .await;
-    assert!(!ignored_required.success);
-    assert_eq!(ignored_required.output["exit_code"], 0);
-    assert_eq!(ignored_required.output["passed"], false);
-    assert_eq!(ignored_required.output["tests_run_count"], 0);
-    assert_eq!(ignored_required.output["zero_tests_run"], true);
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["validation"]["status"], "passed");
     assert_eq!(
-        ignored_required.output["test_count_assertion"]["reason_code"],
-        "minimum_not_met"
-    );
-    assert_eq!(
-        ignored_required.output["test_count_assertion"]["actual_tests_run"],
-        0
-    );
-    assert_cargo_result_matches_schema("cargo_test", &ignored_required);
-
-    let rejected_zero = runtime
-        .run_readonly_validation_local_job(
-            "cargo_test",
-            "demo",
-            &config,
-            None,
-            "cargo test does_not_exist",
-            validation_adapter_for_tool("cargo_test").unwrap(),
-            ValidationCommandOptions {
-                filter: Some("does_not_exist".to_string()),
-                ..Default::default()
-            },
-            ExecutionPurpose::Test,
-            30,
-            5,
-            Some(1),
-        )
-        .await;
-    assert!(!rejected_zero.success);
-    assert_eq!(rejected_zero.output["exit_code"], 0);
-    assert_eq!(rejected_zero.output["passed"], false);
-    assert_eq!(rejected_zero.output["failure_kind"], "validation_failed");
-    assert_eq!(
-        rejected_zero.output["test_count_assertion"]["minimum_tests"],
-        1
-    );
-    assert_eq!(
-        rejected_zero.output["test_count_assertion"]["actual_tests_run"],
-        0
-    );
-    assert_eq!(
-        rejected_zero.output["test_count_assertion"]["reason_code"],
-        "minimum_not_met"
-    );
-    assert_cargo_result_matches_schema("cargo_test", &rejected_zero);
-
-    let exact_minimum = runtime
-        .run_readonly_validation_local_job(
-            "cargo_test",
-            "demo",
-            &config,
-            None,
-            "cargo test",
-            validation_adapter_for_tool("cargo_test").unwrap(),
-            ValidationCommandOptions::default(),
-            ExecutionPurpose::Test,
-            30,
-            5,
-            Some(2),
-        )
-        .await;
-    assert!(exact_minimum.success, "{:?}", exact_minimum.error);
-    assert_eq!(exact_minimum.output["tests_run_count"], 2);
-    assert_eq!(
-        exact_minimum.output["test_count_assertion"]["status"],
+        handoff.output["validation"]["current_evidence"]["status"],
         "passed"
     );
     assert_eq!(
-        exact_minimum.output["test_count_assertion"]["minimum_tests"],
-        2
+        handoff.output["validation"]["current_evidence"]["evidence_gap_event_count"],
+        1
     );
-
-    let cargo_failure = runtime
-        .run_readonly_validation_local_job(
-            "cargo_test",
-            "demo",
-            &config,
-            None,
-            "cargo test -p missing-package",
-            validation_adapter_for_tool("cargo_test").unwrap(),
-            ValidationCommandOptions {
-                package: Some("missing-package".to_string()),
-                ..Default::default()
-            },
-            ExecutionPurpose::Test,
-            30,
-            5,
-            Some(1),
-        )
-        .await;
-    assert!(!cargo_failure.success);
-    assert_ne!(cargo_failure.output["exit_code"], 0);
-    assert_eq!(cargo_failure.output["failure_kind"], "validation_failed");
-    assert!(
-        cargo_failure.output.get("test_count_assertion").is_none(),
-        "the postcondition must not overwrite a real Cargo failure"
+    assert_eq!(handoff.output["tool_failures"]["unexpected_count"], 1);
+    assert_eq!(
+        handoff.output["tool_failures"]["non_actionable_unexpected_count"],
+        1
     );
-    assert_cargo_result_matches_schema("cargo_test", &cargo_failure);
+    assert_eq!(
+        handoff.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+    assert_eq!(
+        handoff.output["continuation_feedback"]["attempt"]["activity"]["failed_tool_calls"],
+        1
+    );
+    assert_eq!(
+        handoff.output["continuation_feedback"]["attempt"]["activity"]
+            ["actionable_failed_tool_calls"],
+        0
+    );
+    assert_eq!(
+        handoff.output["continuation_feedback"]["attempt"]["validation"]
+            ["evidence_gap_event_count"],
+        1
+    );
+    let continuation_reasons = handoff.output["continuation_feedback"]["attempt"]["outcome"]
+        ["reason_codes"]
+        .as_array()
+        .expect("continuation reason_codes");
+    assert!(!continuation_reasons
+        .iter()
+        .any(|reason| reason == "actionable_failed_tool_calls"));
+    assert_eq!(handoff.output["task_outcome"]["blocking"], false);
+    let blocking_reasons = handoff.output["task_outcome"]["blocking_reasons"]
+        .as_array()
+        .expect("blocking_reasons");
+    assert!(!blocking_reasons
+        .iter()
+        .any(|reason| reason == "unexpected_tool_failures"));
+    assert!(!blocking_reasons
+        .iter()
+        .any(|reason| reason == "validation_failed"));
 }
 
 #[tokio::test]
-async fn local_job_status_fails_closed_when_bounded_logs_cannot_prove_test_count() {
-    let tmp = tempfile::tempdir().unwrap();
-    let runtime = runtime_with_project(tmp.path(), "demo");
-    let job_id = "bounded-local-validation";
-    let dir = tmp.path().join(".codex/jobs").join(job_id);
-    std::fs::create_dir_all(&dir).unwrap();
-    let (record, _) = crate::tool_runtime::local_jobs::LocalJobRecord::initialize(
-        "demo".to_string(),
-        dir.clone(),
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("metadata.json"),
-        serde_json::to_string(&json!({
-            "job_id": job_id,
-            "project": "demo",
-            "command": "cargo test",
-            "kind": "validation",
-            "created_at": 1,
-            "started_at": 1,
-            "validation_tool": "cargo_test",
-            "validation_kind": "test",
-            "minimum_tests": 6,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(dir.join("status"), "completed").unwrap();
-    std::fs::write(dir.join("exit_code"), "0").unwrap();
-    std::fs::write(dir.join("finished_at"), "2").unwrap();
-    let mut stdout = (0..(crate::tool_runtime::helpers::MAX_LOCAL_LOG_LINES + 100))
-        .map(|index| format!("progress line {index}\n"))
-        .collect::<String>();
-    stdout.push_str("test result: ok. 7 passed; 0 failed; 0 ignored\n");
-    std::fs::write(dir.join("stdout.log"), stdout).unwrap();
-    std::fs::write(dir.join("stderr.log"), "").unwrap();
-    record.observe().unwrap();
-    record.mark_terminal();
-    runtime
-        .local_jobs
-        .lock()
-        .await
-        .insert(job_id.to_string(), record.clone());
-
-    let bounded = record.read_log_lines(
-        "stdout.log",
+async fn durable_cargo_test_explicit_zero_opt_out_survives_job_reconciliation() {
+    let client_id = "vhandoff-zero-opt-out";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(50));
+    register_agent(
+        &runtime,
+        client_id,
         None,
-        Some(crate::tool_runtime::helpers::MAX_LOCAL_LOG_LINES),
-    );
-    assert!(bounded.3);
-    assert!(bounded.0.lines().count() <= crate::tool_runtime::helpers::MAX_LOCAL_LOG_LINES);
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_cargo_test_count_assertion: true,
+            structured_cargo_test_execution_policy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let session_id = session.session_id.clone();
 
-    let status = runtime.job_status(job_id.to_string()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let session_id = session_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::CargoTest {
+                        project,
+                        session_id: Some(session_id),
+                        cwd: None,
+                        filter: Some("focused".to_string()),
+                        lib: None,
+                        all_targets: None,
+                        all_features: None,
+                        no_default_features: None,
+                        features: None,
+                        package: None,
+                        no_run: None,
+                        require_tests: Some(false),
+                        min_tests: None,
+                        timeout_secs: Some(1800),
+                        sync_wait_secs: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    let durable = request
+        .job_context
+        .as_ref()
+        .and_then(|context| context.validation.as_ref())
+        .expect("durable validation metadata");
+    assert_eq!(durable.minimum_tests, None);
+    assert_eq!(durable.require_tests, Some(false));
+    assert_eq!(durable.no_run, None);
+
+    let handoff = task.await.unwrap();
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert_eq!(handoff.output["job_id"], job_id);
+
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            client_id,
+            &request.request_id,
+            &job_id,
+            "completed",
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored\n",
+            "",
+            Some(0),
+            completed_progress(),
+            true,
+        ))
+        .await
+        .unwrap();
+
+    let status = runtime
+        .job_status_for_auth(job_id, false, Some(&auth))
+        .await;
     assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["status"], "completed");
-    assert_eq!(status.output["exit_code"], 0);
-    assert_eq!(status.output["validation"]["passed"], false);
-    assert_eq!(status.output["validation"]["truncated"], true);
-    assert_eq!(
-        status.output["validation"]["test_count_assertion"]["status"],
-        "unproven"
-    );
-    assert_eq!(
-        status.output["validation"]["test_count_assertion"]["reason_code"],
-        "test_count_unproven"
-    );
-    for field in [
-        "tests_run_count",
-        "tests_passed",
-        "tests_failed",
-        "zero_tests_run",
-    ] {
-        assert!(status.output["validation"][field].is_null(), "{field}");
-    }
+    assert_eq!(status.output["validation"]["passed"], true);
+    assert_eq!(status.output["validation"]["tests_run_count"], 0);
+    assert_eq!(status.output["validation"]["zero_tests_run"], true);
+    assert_eq!(status.output["validation"]["require_tests"], false);
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(50))
+        .unwrap();
+    let validation = runtime
+        .validation_summary_for_session_with_jobs(&summary, 50, Some(&auth))
+        .await;
+    assert_eq!(validation["status"], "passed");
+    assert_eq!(validation["successes"], 1);
+    assert_eq!(validation["latest_status"], "passed");
+    assert_eq!(validation["latest_success"]["require_tests"], false);
+    assert_eq!(validation["latest_success"]["zero_tests_run"], true);
 }

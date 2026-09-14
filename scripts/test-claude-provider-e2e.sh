@@ -166,14 +166,14 @@ wait_for_provider_call() {
     return 1
 }
 
-write_agent_config() {
+write_runner_config() {
     local strategy="$1"
-    cat >"$AGENT_CONFIG" <<EOF
+    cat >"$RUNNER_CONFIG" <<EOF
 server_url = "http://127.0.0.1:${PORT}"
 token = "${TOKEN}"
 client_id = "${CLIENT_ID}"
 display_name = "Claude Provider E2E"
-projects_dir = "${PROJECTS_DIR}"
+project_registry_dir = "${PROJECTS_DIR}"
 poll_interval_ms = 100
 transport = "websocket"
 
@@ -202,7 +202,7 @@ start_runner() {
     XDG_CACHE_HOME="$ISOLATED_HOME/.cache" \
     CLAUDE_CONFIG_DIR="$ISOLATED_HOME/.claude-e2e" \
     RUST_LOG=warn \
-        "$ROOT/target/debug/webcodex-runner" --config "$AGENT_CONFIG" \
+        "$ROOT/target/debug/webcodex-runner" --config "$RUNNER_CONFIG" \
         >"$RUNNER_LOG" 2>&1 &
     RUNNER_PID=$!
     wait_for_agent || fail "agent did not register"
@@ -244,10 +244,10 @@ fi
 TMP_ROOT="$(mktemp -d -t webcodex-claude-provider-e2e-XXXXXX)"
 PORT="$(find_port)"
 DATA_DIR="$TMP_ROOT/data"
-PROJECTS_DIR="$TMP_ROOT/projects.d"
+PROJECTS_DIR="$TMP_ROOT/project-registry"
 FIXTURE="$TMP_ROOT/fixture"
 ISOLATED_HOME="$TMP_ROOT/home"
-AGENT_CONFIG="$TMP_ROOT/agent.toml"
+RUNNER_CONFIG="$TMP_ROOT/runner.toml"
 SERVER_LOG="$TMP_ROOT/server.log"
 RUNNER_LOG="$TMP_ROOT/agent.log"
 mkdir -p "$DATA_DIR" "$PROJECTS_DIR" "$FIXTURE" \
@@ -276,7 +276,7 @@ SERVER_PID=$!
 wait_for_port "$PORT" || fail "server port did not open"
 ok "isolated server started"
 
-write_agent_config claude_code_then_native
+write_runner_config claude_code_then_native
 start_runner
 ok "fallback-strategy agent registered"
 
@@ -286,7 +286,7 @@ python3 - "$TOOLS_BEFORE" <<'PY' || fail "public MCP tools exposed Claude intern
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     names = {t["name"] for t in json.load(stream)["result"]["tools"]}
-assert {"read_file", "search_project_text"} <= names
+assert {"read_files", "search_project_texts"} <= names
 # replace_in_file was removed entirely and must never re-enter the surface.
 assert "replace_in_file" not in names
 assert not ({"Edit", "Read", "Bash", "Write", "NotebookEdit", "Agent"} & names)
@@ -303,13 +303,14 @@ ok "OpenAPI operation count remains below GPT Actions limit"
 
 READ_ARGS="$(python3 - "$RUNTIME_PROJECT" <<'PY'
 import json, sys
-print(json.dumps({"project": sys.argv[1], "path": "fixture.txt"}))
+print(json.dumps({"project": sys.argv[1], "items": [{"path": "fixture.txt"}]}))
 PY
 )"
-tool_call read_file "$READ_ARGS" | python3 -c '
+tool_call read_files "$READ_ARGS" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-assert d["success"] and "before" in d["output"]["text"]
+item = d["output"]["items"][0]
+assert d["success"] and item["success"] and "before" in item["output"]["text"]
 ' || fail "Native read failed"
 api_post /api/runtime/status '{}' | python3 -c '
 import json, sys
@@ -318,19 +319,20 @@ c = next(x for x in d["output"]["agents"]["clients"] if x["client_id"] == sys.ar
 claude = c["tool_providers"]["claude_code"]
 assert claude["process_state"] == "not_started"
 assert claude.get("last_call") is None
-' "$CLIENT_ID" || fail "read_file started Claude"
-ok "read_file stayed Native without starting Claude"
+' "$CLIENT_ID" || fail "read_files started Claude"
+ok "read_files stayed Native without starting Claude"
 
 SEARCH_ARGS="$(python3 - "$RUNTIME_PROJECT" <<'PY'
 import json, sys
-print(json.dumps({"project": sys.argv[1], "pattern": "needle", "path": "."}))
+print(json.dumps({"project": sys.argv[1], "queries": [{"pattern": "needle", "path": "."}]}))
 PY
 )"
-tool_call search_project_text "$SEARCH_ARGS" | python3 -c '
+tool_call search_project_texts "$SEARCH_ARGS" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-assert d["success"]
-assert d["output"]["backend"] in ("rg", "grep")
+item = d["output"]["items"][0]
+assert d["success"] and item["success"]
+assert item["output"]["backend"] in ("rg", "grep")
 ' || fail "Native search fallback failed"
 wait_for_provider_call native true success null || fail "search fallback evidence did not propagate"
 ok "search fallback recorded selected_provider=native"
@@ -353,18 +355,24 @@ RUNNER_PID=""
 assert_groups_gone "$FIRST_GROUPS"
 ok "fallback-strategy Claude process group reaped"
 
-write_agent_config claude_code
+write_runner_config claude_code
 start_runner
 ok "strict Claude agent registered"
 
-# Strict `claude_code` cannot map a compatible search tool (Claude Code builds
-# do not necessarily expose a Grep), so search must surface a deterministic
-# provider capability error instead of routing through Claude Edit or Bash.
-# No file writes are ever routed to the provider. A failed tool result renders
-# as HTTP 400 with a ToolResult body, so curl must not `-f` fail on that status.
+# Strict `claude_code` cannot map a compatible search capability (Claude Code
+# builds do not necessarily expose a Grep), so a one-query search_project_texts
+# batch must preserve the deterministic provider capability error on that item
+# instead of routing through Claude Edit or Bash. No file writes are routed to
+# the provider; batch item failures remain isolated inside a successful batch.
 SEARCH_STRICT_BODY="$(python3 - "$RUNTIME_PROJECT" <<'PY'
 import json, sys
-print(json.dumps({"tool": "search_project_text", "project": sys.argv[1], "pattern": "needle", "path": "."}))
+print(json.dumps({
+    "tool": "search_project_texts",
+    "params": {
+        "project": sys.argv[1],
+        "queries": [{"pattern": "needle", "path": "."}],
+    },
+}))
 PY
 )"
 STRICT_RESPONSE="$(curl -sS --max-time 15 \
@@ -375,8 +383,10 @@ STRICT_RESPONSE="$(curl -sS --max-time 15 \
 printf '%s' "$STRICT_RESPONSE" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-assert not d["success"]
-out = d.get("output") or {}
+assert d["success"]
+items = (d.get("output") or {}).get("items") or []
+assert len(items) == 1 and not items[0]["success"]
+out = items[0].get("output") or {}
 assert out.get("format") == "webcodex.external_provider_error.v1"
 assert out.get("code") == "provider_capability_unavailable"
 ' || fail "strict Claude search did not surface a deterministic capability error"

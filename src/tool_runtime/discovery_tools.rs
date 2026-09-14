@@ -1,6 +1,7 @@
 //! Runtime dispatch adapters for discovery and observability tool calls.
 
-use super::runtime_info::ListAgentsOptions;
+use super::kernel::ToolProtocolCapabilities;
+use super::runtime_info::ListRunnersOptions;
 use super::tool_inputs::ListToolsOptions;
 use super::{ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
@@ -10,6 +11,7 @@ impl ToolRuntime {
         &self,
         call: ToolCall,
         auth: Option<&AuthContext>,
+        protocol_capabilities: ToolProtocolCapabilities,
     ) -> ToolResult {
         match call {
             ToolCall::ListTools {
@@ -23,15 +25,15 @@ impl ToolRuntime {
                 summary_only,
                 limit,
             })),
-            ToolCall::ListAgents {
+            ToolCall::ListRunners {
                 client_id,
                 client_ids,
                 include_projects,
                 summary_only,
             } => {
-                self.list_agents_with_options(
+                self.list_runners_with_options(
                     auth,
-                    ListAgentsOptions {
+                    ListRunnersOptions {
                         client_id,
                         client_ids,
                         include_projects,
@@ -95,6 +97,7 @@ impl ToolRuntime {
                     intent,
                     include_recommended_flows,
                     include_risk_summary,
+                    protocol_capabilities,
                 )
                 .await
             }

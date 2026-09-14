@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(windows)]
+use crate::webcodex_runner::config::default_windows_shell_program_for_path;
 
 /// Write a shell init script for this platform's default shell into `dir`
 /// that exports `name=value`, and return its path.
@@ -23,7 +25,7 @@ fn write_init_script(dir: &Path, name: &str, value: &str) -> PathBuf {
 #[test]
 fn shell_config_default_preserves_sh_c_behavior() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     let result = run_shell(
         &cfg.policy,
@@ -43,9 +45,13 @@ fn shell_config_default_shell_is_platform_native() {
     let shell = ShellConfig::default();
     #[cfg(windows)]
     {
-        // The default Windows shell is native PowerShell; the default command
-        // must execute without any sh/Git Bash/WSL on PATH.
-        assert_eq!(shell.program, "powershell.exe");
+        // Prefer PowerShell 7 when it is discoverable, while preserving the
+        // native Windows PowerShell fallback and avoiding any sh/Git Bash/WSL
+        // dependency for ordinary configured-shell work.
+        assert_eq!(
+            shell.program,
+            default_windows_shell_program_for_path(std::env::var_os("PATH").as_deref())
+        );
         assert!(shell.args.iter().any(|arg| arg == "-Command"));
         assert!(
             shell.args.iter().any(|arg| arg == "-NoProfile"),
@@ -70,13 +76,32 @@ fn shell_config_default_shell_is_platform_native() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn shell_config_windows_default_prefers_pwsh_and_falls_back() {
+    let pwsh_dir = tempfile::tempdir().unwrap();
+    std::fs::write(pwsh_dir.path().join("pwsh.exe"), b"").unwrap();
+    let pwsh_path = std::env::join_paths([pwsh_dir.path()]).unwrap();
+    assert_eq!(
+        default_windows_shell_program_for_path(Some(pwsh_path.as_os_str())),
+        "pwsh.exe"
+    );
+
+    let fallback_dir = tempfile::tempdir().unwrap();
+    let fallback_path = std::env::join_paths([fallback_dir.path()]).unwrap();
+    assert_eq!(
+        default_windows_shell_program_for_path(Some(fallback_path.as_os_str())),
+        "powershell.exe"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn shell_config_path_prepend_discovers_fake_executable() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let bin_dir = tmp.path().join("bin");
     std::fs::create_dir(&bin_dir).unwrap();
     let exe = bin_dir.join("webcodex-fake-tool");
@@ -106,7 +131,7 @@ fn shell_config_path_prepend_discovers_fake_executable() {
 #[test]
 fn shell_config_path_prepend_discovers_fake_executable_and_keeps_windows_path() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let bin_dir = tmp.path().join("bin dir");
     std::fs::create_dir(&bin_dir).unwrap();
     // PowerShell executes .cmd files from PATH through cmd.exe; `<nul
@@ -120,7 +145,7 @@ fn shell_config_path_prepend_discovers_fake_executable_and_keeps_windows_path() 
     )
     .unwrap();
     let shell = ShellConfig {
-        path_prepend: vec![bin_dir],
+        path_prepend: vec![bin_dir.clone()],
         ..ShellConfig::default()
     };
     let cwd = tmp.path().to_string_lossy().to_string();
@@ -137,8 +162,11 @@ fn shell_config_path_prepend_discovers_fake_executable_and_keeps_windows_path() 
     assert_eq!(result.stdout.as_deref(), Some("fake-tool-ok"), "{result:?}");
 
     // path_prepend must extend the inherited Windows PATH (spelled `Path` in
-    // the process block), not replace it: the prepended directory comes
-    // first and the System32 entries survive.
+    // the process block), not replace it. PowerShell itself may put its own
+    // installation directory before the supplied PATH when it starts, so the
+    // stable contract is that our directory remains ahead of inherited entries
+    // such as System32. The successful fake-tool lookup above independently
+    // proves that the configured prepend is effective.
     let result = run_shell(
         &cfg.policy,
         &shell,
@@ -150,14 +178,23 @@ fn shell_config_path_prepend_discovers_fake_executable_and_keeps_windows_path() 
     );
     assert_eq!(result.exit_code, Some(0), "{result:?}");
     let path = result.stdout.unwrap();
-    let dir_text = tmp.path().join("bin dir").to_string_lossy().to_string();
+    let entries = std::env::split_paths(&std::ffi::OsString::from(&path)).collect::<Vec<_>>();
+    let prepend_index = entries
+        .iter()
+        .position(|entry| webcodex_runner_config::paths::paths_equal(entry, &bin_dir))
+        .unwrap_or_else(|| panic!("configured path_prepend entry is missing from PATH: {path}"));
+    let system32_index = entries
+        .iter()
+        .position(|entry| {
+            entry
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("\\windows\\system32")
+        })
+        .unwrap_or_else(|| panic!("inherited Windows System32 PATH entry is missing: {path}"));
     assert!(
-        path.starts_with(&dir_text),
-        "prepended directory is not first in PATH: {path}"
-    );
-    assert!(
-        path.contains("System32"),
-        "inherited Windows PATH lost: {path}"
+        prepend_index < system32_index,
+        "configured path_prepend no longer precedes inherited System32: {path}"
     );
 }
 
@@ -166,14 +203,14 @@ fn shell_config_dialect_field_parses_and_validates() {
     use crate::webcodex_runner::config::ShellDialect;
 
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("agent.toml");
+    let path = tmp.path().join("runner.toml");
     std::fs::write(
         &path,
         r#"
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -203,7 +240,7 @@ args = ["-c"]
 server_url = "http://127.0.0.1:8000"
 token = "test-token"
 client_id = "agent-1"
-projects_dir = "projects.d"
+project_registry_dir = "project-registry"
 
 [policy]
 allow_cwd_anywhere = true
@@ -223,7 +260,7 @@ dialect = "cmd"
 fn shell_config_default_environment_is_inherited() {
     let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     let _env = EnvGuard::new().set("WEBCODEX_INHERITED_TEST", "inherited-ok");
     let result = run_shell(
@@ -242,7 +279,7 @@ fn shell_config_default_environment_is_inherited() {
 #[test]
 fn shell_config_env_values_are_available() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let shell = ShellConfig {
         env: HashMap::from([("WEBCODEX_TEST_VALUE".to_string(), "env-ok".to_string())]),
         ..ShellConfig::default()
@@ -264,7 +301,7 @@ fn shell_config_env_values_are_available() {
 #[test]
 fn shell_config_init_script_is_sourced() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let init = write_init_script(tmp.path(), "WEBCODEX_INIT_TEST", "init-ok");
     let shell = ShellConfig {
         init_script: Some(init),
@@ -287,7 +324,7 @@ fn shell_config_init_script_is_sourced() {
 #[test]
 fn shell_config_init_script_awkward_path_is_sourced() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     // Space, single quote, and non-ASCII characters in the init script path.
     let init_dir = tmp.path().join("init dir '脚本");
     std::fs::create_dir_all(&init_dir).unwrap();
@@ -313,7 +350,7 @@ fn shell_config_init_script_awkward_path_is_sourced() {
 #[test]
 fn shell_job_init_script_failure_blocks_command_and_reports_exit() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     // Windows: `exit 3` inside the dot-sourced script terminates the process
     // with 3. Unix: `false` fails the sourced script so `&&` short-circuits
     // with exit 1. Either way the requested command must never run.
@@ -356,7 +393,7 @@ fn shell_config_bash_like_args_are_respected_when_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let shell = ShellConfig {
         program: "/bin/bash".to_string(),
         args: vec!["-lc".to_string()],

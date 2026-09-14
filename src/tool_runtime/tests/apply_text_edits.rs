@@ -2,9 +2,7 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{
-    ShellAgentPollRequest, ShellAgentResultRequest, ShellClientCapabilities,
-};
+use crate::runner_protocol::{RunnerCapabilities, RunnerPollRequest, RunnerResultRequest};
 use serde_json::Value;
 
 fn scoped_text_edit(
@@ -45,6 +43,13 @@ fn apply_text_edits_occurrence_and_recovery_schemas_are_model_visible() {
             .unwrap()
             .contains(&serde_json::json!("occurrence")));
     }
+    for variant in &edit_variants[2..] {
+        assert!(variant["properties"]["new_text"].get("minLength").is_none());
+        assert!(variant["properties"]["new_text"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("no-op"));
+    }
     let output = &spec.output_schema["properties"]["output"]["properties"]["conflict_recovery"];
     assert_eq!(output["properties"]["schema_version"]["const"], 1);
     assert_eq!(output["properties"]["candidate_ranges"]["maxItems"], 8);
@@ -67,6 +72,7 @@ fn apply_text_edits_occurrence_and_recovery_schemas_are_model_visible() {
         serde_json::json!(["not_started", "completed", "outcome_unknown"])
     );
     assert_eq!(output_properties["retry_guidance"]["type"], "string");
+    assert_eq!(output_properties["ignored_noop_count"]["type"], "integer");
     assert!(output["properties"]["conflict_kind"]["enum"]
         .as_array()
         .unwrap()
@@ -141,6 +147,8 @@ fn apply_text_edits_occurrence_and_recovery_schemas_are_model_visible() {
     assert!(spec.description.contains("occurrence"));
     assert!(spec.description.contains("line_scope"));
     assert!(spec.description.contains("global source order"));
+    assert!(spec.description.contains("direct_retry_safe"));
+    assert!(spec.description.contains("reread_required"));
     assert!(
         spec.description.chars().count() <= crate::tool_runtime::MODEL_TOOL_DESCRIPTION_MAX_CHARS
     );
@@ -195,6 +203,31 @@ fn apply_text_edits_multiple_edits_atomic() {
     assert_eq!(updated, "alpha\nBETA\ngamma\nDELTA\n");
     assert_eq!(out["applied_count"], 2);
     assert_eq!(out["edits"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn apply_text_edits_ignores_empty_insert_noop_without_blocking_other_edits() {
+    let original = "alpha\nbeta\n";
+    let edits = vec![
+        text_edit(
+            ApplyTextEditKind::InsertBefore,
+            None,
+            Some(""),
+            Some("anchor-that-does-not-exist"),
+        ),
+        text_edit(
+            ApplyTextEditKind::ReplaceExact,
+            Some("beta"),
+            Some("BETA"),
+            None,
+        ),
+    ];
+    let (updated, out) =
+        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap();
+    assert_eq!(updated, "alpha\nBETA\n");
+    assert_eq!(out["applied_count"], 2);
+    assert_eq!(out["ignored_noop_count"], 1);
+    assert_eq!(out["edits"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -569,10 +602,10 @@ fn apply_text_edits_stale_sha_still_rejects_before_occurrence() {
 
 async fn assert_no_apply_text_edits_runner_request(runtime: &ToolRuntime, client_id: &str) {
     let request = runtime
-        .shell_clients
-        .poll(ShellAgentPollRequest {
+        .runner_registry
+        .poll(RunnerPollRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap();
@@ -589,7 +622,7 @@ async fn apply_text_edits_conflict_then_same_sha_occurrence_retry_needs_no_hidde
         &runtime,
         "ate-recovery",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             apply_text_edit_occurrence: true,
             ..Default::default()
@@ -627,9 +660,9 @@ async fn apply_text_edits_conflict_then_same_sha_occurrence_retry_needs_no_hidde
         serde_json::from_str(first_request.content.as_deref().unwrap()).unwrap();
     assert_eq!(first_payload["recovery_metadata_version"], 1);
     assert!(first_payload["changes"][0]["edits"][0]["occurrence"].is_null());
-    runtime.shell_clients.complete(ShellAgentResultRequest {
+    runtime.runner_registry.complete(RunnerResultRequest {
         client_id: "ate-recovery".to_string(),
-        agent_instance_id: "inst".to_string(),
+        runner_instance_id: "inst".to_string(),
         request_id: first_request.request_id,
         exit_code: Some(0),
         stdout: Some(serde_json::json!({
@@ -716,10 +749,10 @@ async fn apply_text_edits_conflict_then_same_sha_occurrence_retry_needs_no_hidde
     assert_eq!(second_payload["changes"][0]["expected_sha256"], sha);
     assert_eq!(second_payload["changes"][0]["edits"][0]["occurrence"], 2);
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "ate-recovery".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: second_request.request_id,
             exit_code: Some(0),
             stdout: Some(
@@ -747,7 +780,7 @@ async fn apply_text_edits_without_occurrence_unique_match_queues_and_succeeds() 
         &runtime,
         "ate-no-occurrence-unique",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -779,10 +812,10 @@ async fn apply_text_edits_without_occurrence_unique_match_queues_and_succeeds() 
     let payload: Value = serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
     assert!(payload["changes"][0]["edits"][0]["occurrence"].is_null());
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "ate-no-occurrence-unique".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
@@ -808,7 +841,7 @@ async fn apply_text_edits_without_occurrence_ambiguous_match_fails_closed() {
         &runtime,
         "ate-no-occurrence-ambiguous",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -838,10 +871,10 @@ async fn apply_text_edits_without_occurrence_ambiguous_match_fails_closed() {
     });
     let request = wait_for_patch_agent_request(&runtime, "ate-no-occurrence-ambiguous").await;
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "ate-no-occurrence-ambiguous".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
@@ -948,7 +981,7 @@ async fn apply_text_edits_dry_run_does_not_write() {
         &runtime,
         "ate-dry",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -989,10 +1022,10 @@ async fn apply_text_edits_dry_run_does_not_write() {
         .is_none());
 
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "ate-dry".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(
@@ -1021,7 +1054,7 @@ async fn apply_text_edits_scoped_request_fails_closed_before_enqueue_without_cap
         &runtime,
         "ate-scope-off",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             apply_text_edit_occurrence: true,
             apply_text_edit_line_scope: false,
@@ -1060,10 +1093,10 @@ async fn apply_text_edits_scoped_request_fails_closed_before_enqueue_without_cap
         .unwrap()
         .contains("No files were modified"));
     assert!(runtime
-        .shell_clients
-        .poll(ShellAgentPollRequest {
+        .runner_registry
+        .poll(RunnerPollRequest {
             client_id: "ate-scope-off".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap()
@@ -1122,7 +1155,7 @@ async fn apply_text_edits_session_event_summary() {
         &runtime,
         "ate-sess",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -1166,10 +1199,10 @@ async fn apply_text_edits_session_event_summary() {
     let req = wait_for_patch_agent_request(&runtime, "ate-sess").await;
     assert_eq!(req.kind, "file_apply_text_edits");
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "ate-sess".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(
@@ -1261,7 +1294,7 @@ async fn apply_text_edits_effect_runtime(client_id: &str) -> (ToolRuntime, Strin
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_write: true,
             ..Default::default()
         },
@@ -1300,7 +1333,7 @@ async fn apply_text_edits_dropped_waiter_after_dispatch_is_outcome_unknown() {
     assert_eq!(request.kind, "file_apply_text_edits");
     assert_eq!(
         runtime
-            .shell_clients
+            .runner_registry
             .cancel_request_dispatch_state(&request.request_id)
             .await,
         Some(true)

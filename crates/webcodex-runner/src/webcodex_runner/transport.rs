@@ -1,7 +1,8 @@
 use super::config::{
-    max_concurrent_jobs, projects_dir, validate_quic_config, HotRunnerConfig, QuicClientConfig,
+    max_concurrent_jobs, project_registry_dir, validate_quic_config, QuicClientConfig,
     ReloadableRunnerConfig, RunnerConfig,
 };
+use super::contains_any;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use super::detached_job::DetachedJobStore;
 #[cfg(windows)]
@@ -13,42 +14,70 @@ use super::shutdown::{
     ShutdownReport, BACKGROUND_JOIN_BUDGET, DEFAULT_SHUTDOWN_BUDGET, JOB_DRAIN_BUDGET,
     LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
 };
-use super::util::contains_any;
-use super::{PersistentShellManager, ShellCommandResult};
+use super::PersistentShellManager;
 use crate::runner_config::{
     TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
 };
-use crate::shell_protocol::{
-    read_quic_frame, write_quic_frame, write_quic_register_frame, AgentEnvelope, QuicFrameError,
-    QuicRegisterFrame, ShellAgentJobUpdateRequest, ShellAgentJobUpdateResponse,
-    ShellAgentPersistentShellResultRequest, ShellAgentPersistentShellResultResponse,
-    ShellAgentProjectSummary, ShellAgentResultPayload, ShellAgentResultRequest,
-    ShellAgentResultResponse, ShellJobInventory, ShellProjectInventoryPage,
-    ShellProjectInventoryStatus, PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES,
-    PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
+use crate::runner_protocol::{
+    read_quic_frame, write_quic_frame, write_quic_register_frame, QuicFrameError,
+    QuicRegisterFrame, RunnerEnvelope, RunnerOfflineRequest, RunnerProjectSummary,
+    ShellJobInventory, ShellProjectInventoryStatus,
 };
+#[cfg(test)]
+use crate::runner_protocol::{
+    PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
+};
+
+mod project_inventory;
+mod result_submission;
+mod websocket_connect;
+
 use crate::{
-    build_register_request_with_provider_status, dispatch_request, handle_one_poll, is_project_op,
-    register, CommandResult, JobManager, PollingDispatchSupervisor, PollingRecoveryAction,
-    RegisterRecoveryAction, RunnerHttpError, RunnerHttpErrorKind,
+    build_register_request_with_provider_status, dispatch_request_with_outcome, handle_one_poll,
+    register, JobManager, PollingDispatchSupervisor, PollingRecoveryAction, RegisterRecoveryAction,
+};
+#[cfg(test)]
+use crate::{CommandResult, RunnerHttpError, RunnerHttpErrorKind};
+#[cfg(test)]
+use project_inventory::{
+    handle_project_inventory_status, ProjectInventoryStatusAction,
+    POLLING_PROJECT_REFRESH_INTERVAL, PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS,
+};
+use project_inventory::{
+    log_project_inventory_degraded, paged_sync_after_registration, polling_projects_for_poll,
+    try_queue_project_inventory_page, PollingProjectRefresh, ProjectInventorySync,
+    StreamingProjectInventoryCoordinator,
 };
 use reqwest::blocking::Client;
+#[cfg(test)]
+use result_submission::{
+    dropped_result_log_line, permanent_result_rejection_log_line, result_http_error_disposition,
+    ResultHttpErrorDisposition, RESULT_SUBMIT_RETRY_BACKOFF, RUNNER_RESULT_PATH,
+};
+pub(crate) use result_submission::{
+    HttpSendConfig, ResultSubmission, RunnerSink, SubmitResultError,
+};
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
+use websocket_connect::connect_websocket_request;
+pub(crate) use websocket_connect::{build_ws_request, server_url_to_ws};
+#[cfg(test)]
+use websocket_connect::{
+    connect_websocket_request_with_proxy, http_proxy_connect_tunnel, parse_http_proxy_endpoint,
+    target_authority, websocket_proxy_from_env_with, websocket_target_endpoint, HttpProxyEndpoint,
+    WS_PROXY_CONNECT_HEADER_MAX_BYTES,
+};
 
 /// WebSocket outgoing envelope channel capacity.
 pub(crate) const WS_OUTGOING_CAPACITY: usize = 64;
 /// WebSocket ping interval.
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
-/// HTTP CONNECT response headers are read one byte at a time so no tunneled
-/// WebSocket bytes can be over-read or lost before tungstenite takes ownership.
-const WS_PROXY_CONNECT_HEADER_MAX_BYTES: usize = 16 * 1024;
 /// Bounded reconnect backoff after a transport disconnect or transient error.
 const RECONNECT_BACKOFF_STEPS: [Duration; 5] = [
     Duration::from_secs(1),
@@ -57,16 +86,7 @@ const RECONNECT_BACKOFF_STEPS: [Duration; 5] = [
     Duration::from_secs(10),
     Duration::from_secs(30),
 ];
-/// Retry only transient Server-side project-inventory staging pressure on an
-/// otherwise healthy streaming connection. Permanent/malformed inventory
-/// failures never enter this backoff.
-const PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS: [Duration; 5] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-    Duration::from_secs(30),
-];
+
 /// Reset reconnect backoff after a connection stayed up long enough to prove
 /// the endpoint is healthy. Immediate flapping still escalates.
 const RECONNECT_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
@@ -87,6 +107,9 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// A blocking polling request must return early enough to leave useful time
 /// for the process-wide cleanup budget.
 const POLLING_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Graceful polling shutdown is best effort and must not turn Ctrl-C into a
+/// multi-second network wait when the network is already degraded.
+const POLLING_OFFLINE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Reload listener polls its stop flag every 100ms, so one second is ample
 /// while still preserving most of the global budget for child processes.
 const CONFIG_RELOAD_JOIN_BUDGET: Duration = Duration::from_secs(1);
@@ -111,43 +134,37 @@ const POLLING_IDLE_BACKOFF_STEPS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
 ];
-/// Polling periodically refreshes the Server's project projection so external
-/// projects.d and Git metadata changes remain discoverable without attaching
-/// the full inventory to every poll.
-const POLLING_PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-/// The current server contract keeps an active polling instance online for
-/// 60 seconds. Permit one lease window plus scheduling slack during deployment
-/// replacement, but do not let a real duplicate runner retry forever.
-const POLLING_LEASE_CONFLICT_MAX_WAIT: Duration = Duration::from_secs(75);
-/// Result submission endpoint used by the polling transport sink.
-const AGENT_RESULT_PATH: &str = "/api/shell/agent/result";
-const AGENT_PERSISTENT_SHELL_RESULT_PATH: &str = "/api/shell/agent/persistent_shell_result";
-/// Bounded same-payload retry backoff for transient result submission
-/// failures over the polling transport. After the last step the payload is
-/// released with an explicit dropped outcome, so a single result can never
-/// monopolize the polling loop or trigger outer re-registration recovery.
-const RESULT_SUBMIT_RETRY_BACKOFF: [Duration; 3] = [
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-];
 
+/// Older Servers may keep an active polling instance leased for 60 seconds.
+/// Preserve a bounded compatibility wait when such a Server returns the legacy
+/// exact lease-conflict error; current Servers use explicit registration takeover.
+const POLLING_LEASE_CONFLICT_MAX_WAIT: Duration = Duration::from_secs(75);
+const RUNNER_OFFLINE_PATH: &str = "/api/shell/agent/offline";
 fn send_provider_metadata(
-    tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
     runtime: &ReloadableRunnerConfig,
     expected_generation: Option<u64>,
 ) {
     runtime.with_active(|config| {
         if expected_generation.is_some_and(|expected| expected != config.generation) {
-            return;
+            // An accepted result may belong to the generation that performed a
+            // successful config reload. Treat that result only as a delivery
+            // trigger: metadata is always read from the current active
+            // generation below, so stale work can never publish stale routing.
+            tracing::debug!(
+                expected_generation,
+                active_generation = config.generation,
+                "publishing current Runner metadata after config generation changed"
+            );
         }
         let Some((mut status, revision)) = config.external_tools.claim_status_update() else {
             return;
         };
         status.config_reload = config.reload_status();
         if tx
-            .try_send(AgentEnvelope::RuntimeMetadata {
+            .try_send(RunnerEnvelope::RuntimeMetadata {
                 tool_providers: status,
+                mcp_gateway_providers: Some(runtime.mcp_gateway().provider_inventory()),
             })
             .is_err()
         {
@@ -227,7 +244,7 @@ impl RunnerRuntimeState {
         &self,
         cache: &mut RunnerProjectCache,
         cfg: &RunnerConfig,
-    ) -> Vec<ShellAgentProjectSummary> {
+    ) -> Vec<RunnerProjectSummary> {
         let shutdown = self.shutdown_flag();
         cache.get_with_shutdown(cfg, Some(shutdown.as_ref()))
     }
@@ -246,9 +263,7 @@ impl RunnerRuntimeState {
     }
 
     async fn wait_for_shutdown(&self) {
-        while !self.shutdown_requested() {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        self.coordinator.wait_requested().await;
     }
 
     #[cfg(any(unix, test))]
@@ -474,9 +489,77 @@ fn install_shutdown_listener(
         .map_err(|_| "failed to start process shutdown signal listener".to_string())
 }
 
-fn complete_polling_shutdown(runtime: &RunnerRuntimeState) -> Result<(), String> {
+fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
+    use std::io::Read;
+
+    let listener = std::thread::Builder::new()
+        .name("webcodex-runner-parent-lease".to_string())
+        .spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0_u8; 64];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) | Err(_) => {
+                        runtime.request_shutdown_signal();
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })
+        .map_err(|_| "failed to start parent-liveness listener".to_string())?;
+    // This reader is intentionally detached. A blocking stdin read cannot be
+    // cancelled portably; joining it during an ordinary signal-driven shutdown
+    // would hang until the parent closed the lease. Process exit reclaims the
+    // detached thread, while EOF still triggers exact-generation shutdown.
+    drop(listener);
+    Ok(())
+}
+
+fn send_polling_offline_best_effort(client: &Client, cfg: &RunnerConfig, runner_instance_id: &str) {
+    let url = format!(
+        "{}{}",
+        cfg.server_url.trim_end_matches('/'),
+        RUNNER_OFFLINE_PATH
+    );
+    let mut request = client.post(url).timeout(POLLING_OFFLINE_TIMEOUT);
+    if !cfg.token.trim().is_empty() {
+        request = request.bearer_auth(cfg.token.trim());
+    }
+    let body = RunnerOfflineRequest {
+        client_id: cfg.client_id.clone(),
+        runner_instance_id: runner_instance_id.to_string(),
+    };
+    match request.json(&body).send() {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => tracing::debug!(
+            status = %response.status(),
+            "webcodex-runner polling offline notice was not accepted"
+        ),
+        Err(error) => tracing::debug!(
+            error = %concise_log_error(&error.to_string(), &cfg.token),
+            "webcodex-runner polling offline notice failed"
+        ),
+    }
+}
+
+fn complete_polling_shutdown(
+    client: &Client,
+    cfg: &RunnerConfig,
+    runner_instance_id: &str,
+    registered: bool,
+    runtime: &RunnerRuntimeState,
+) -> Result<(), String> {
     runtime.request_shutdown_signal();
     runtime.shutdown();
+    // Publish offline only after local workers have drained/stopped. Sending it
+    // earlier would let a final polling result or Job update refresh last_seen
+    // after the Server had already marked the Runner offline. A replacement
+    // process never waits for this cleanup because registration takeover is
+    // immediate and the delayed notice is instance-scoped.
+    if registered {
+        send_polling_offline_best_effort(client, cfg, runner_instance_id);
+    }
     Ok(())
 }
 
@@ -655,7 +738,7 @@ fn server_log_label(server_url: &str) -> String {
     }
 }
 
-fn enabled_projects_count(projects: &[ShellAgentProjectSummary]) -> usize {
+fn enabled_projects_count(projects: &[RunnerProjectSummary]) -> usize {
     projects.iter().filter(|project| !project.disabled).count()
 }
 
@@ -704,7 +787,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(unix)]
-fn install_reload_listener(
+pub(crate) fn install_reload_listener(
     runtime: Arc<ReloadableRunnerConfig>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     let signal_runtime = tokio::runtime::Builder::new_current_thread()
@@ -734,625 +817,6 @@ fn install_reload_listener(
         .map_err(|_| "failed to start config reload signal listener".to_string())
 }
 
-/// Minimal HTTP send configuration used by the polling `RunnerSink`. We do not
-/// store the whole `RunnerConfig` here: policy and concurrency limits stay
-/// with the Runner config and are passed alongside the sink.
-#[derive(Debug, Clone)]
-pub(crate) struct HttpSendConfig {
-    pub(crate) client: Client,
-    pub(crate) server_url: String,
-    pub(crate) token: String,
-    pub(crate) client_id: String,
-    pub(crate) agent_instance_id: String,
-    pub(crate) shutdown: Arc<AtomicBool>,
-}
-
-/// Transport-neutral outgoing channel for an agent. Both the polling loop and
-/// the WebSocket loop build an `RunnerSink` and hand it to the shared
-/// `dispatch_request` / `JobManager` execution path. This shared boundary lets
-/// the Runner speak either transport without duplicating execution logic.
-#[derive(Debug, Clone)]
-pub(crate) enum RunnerSink {
-    /// Polling transport: POST results/job_updates to the HTTP endpoints.
-    Http(HttpSendConfig),
-    /// WebSocket transport: push envelopes through an mpsc that a writer task
-    /// drains onto the socket.
-    WebSocket {
-        tx: tokio::sync::mpsc::Sender<AgentEnvelope>,
-        client_id: String,
-        agent_instance_id: String,
-    },
-    /// QUIC transport: push envelopes through an mpsc that a single writer
-    /// task drains onto the bidirectional stream.
-    Quic {
-        tx: tokio::sync::mpsc::Sender<AgentEnvelope>,
-        client_id: String,
-        agent_instance_id: String,
-    },
-}
-
-/// Outcome of a result submission that no longer needs the payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResultSubmission {
-    /// The server accepted the result.
-    Accepted,
-    /// The server permanently rejected this exact payload (e.g. the request
-    /// expired, was cancelled, or this instance lost the lease). The payload
-    /// has been logged once (bounded, redacted) and released; the caller must
-    /// keep polling instead of retrying it.
-    RejectedPermanent,
-    /// A transient HTTP failure persisted through every bounded retry. The
-    /// payload has been logged once (bounded, redacted) and released so the
-    /// polling runner remains live without retrying forever or entering the
-    /// unrelated re-registration recovery path.
-    DroppedAfterRetryExhaustion,
-}
-
-/// Structured result failures that require the current agent/session to stop.
-/// Polling HTTP transients never reach this type: they are retried in place
-/// and become `DroppedAfterRetryExhaustion` if the bounded budget is exhausted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SubmitResultError {
-    /// 401/403: credentials are wrong or revoked. Never retried.
-    FatalAuth(String),
-    /// 404: endpoint missing or incompatible server. Never retried.
-    FatalProtocol(String),
-    /// Invalid HTTP URL or non-recoverable TLS configuration. Never retried.
-    FatalConfig(String),
-    /// A WebSocket/QUIC outgoing channel closed before the result could be
-    /// queued. This is a transport-session failure, not an HTTP retry outcome.
-    TransportClosed(String),
-    /// Process shutdown interrupted an HTTP retry backoff. The polling loop
-    /// handles this as a clean shutdown rather than an operational failure.
-    Shutdown(String),
-}
-
-impl fmt::Display for SubmitResultError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FatalAuth(message)
-            | Self::FatalProtocol(message)
-            | Self::FatalConfig(message)
-            | Self::TransportClosed(message)
-            | Self::Shutdown(message) => f.write_str(message),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResultHttpErrorDisposition {
-    RetryTransient,
-    RejectPermanent,
-    FatalAuth,
-    FatalProtocol,
-    FatalConfig,
-}
-
-fn result_http_error_disposition(kind: &RunnerHttpErrorKind) -> ResultHttpErrorDisposition {
-    match kind {
-        RunnerHttpErrorKind::ServerUnavailable
-        | RunnerHttpErrorKind::Status
-        | RunnerHttpErrorKind::RequestTimeout
-        | RunnerHttpErrorKind::Request
-        | RunnerHttpErrorKind::DecodeTransient => ResultHttpErrorDisposition::RetryTransient,
-        RunnerHttpErrorKind::ClientRejected => ResultHttpErrorDisposition::RejectPermanent,
-        RunnerHttpErrorKind::Auth => ResultHttpErrorDisposition::FatalAuth,
-        RunnerHttpErrorKind::NotFound | RunnerHttpErrorKind::ProtocolDecode => {
-            ResultHttpErrorDisposition::FatalProtocol
-        }
-        RunnerHttpErrorKind::Config => ResultHttpErrorDisposition::FatalConfig,
-    }
-}
-
-/// One bounded, redacted diagnostic line for a permanently rejected result.
-/// Emitted exactly once per payload: permanent rejections are never retried,
-/// so this cannot repeat for the same result.
-fn permanent_result_rejection_log_line(request_id: &str, error: &str, token: &str) -> String {
-    format!(
-        "webcodex-runner result permanently rejected request_id={} error={}; dropping this result and continuing to poll",
-        concise_log_error(request_id, token),
-        concise_log_error(error, token)
-    )
-}
-
-/// One bounded, redacted warning after all transient submission attempts have
-/// failed. It makes the possible result loss explicit without exposing raw
-/// response bodies, credentials, or multiline request errors.
-fn dropped_result_log_line(request_id: &str, attempts: usize, error: &str, token: &str) -> String {
-    format!(
-        "webcodex-runner result submission retries exhausted request_id={} attempts={} error={}; dropping this result and continuing to poll",
-        concise_log_error(request_id, token),
-        attempts,
-        concise_log_error(error, token)
-    )
-}
-
-/// Submit one result over the polling HTTP transport. Transient failures are
-/// retried in place with bounded backoff; permanent rejections release the
-/// payload after a single bounded log line; exhausted transient failures also
-/// release it with an explicit dropped outcome; only auth/protocol failures
-/// surface as errors that terminate the polling agent.
-fn submit_result_http(
-    h: &HttpSendConfig,
-    body: &ShellAgentResultPayload,
-) -> Result<ResultSubmission, SubmitResultError> {
-    let mut attempt = 0usize;
-    loop {
-        let error = match post_json_raw::<_, ShellAgentResultResponse>(
-            &h.client,
-            &h.server_url,
-            &h.token,
-            AGENT_RESULT_PATH,
-            body,
-        ) {
-            Ok(resp) if resp.success => return Ok(ResultSubmission::Accepted),
-            Ok(resp) => {
-                // A structured `success: false` answer is an explicit server
-                // decision about this payload; resending it cannot succeed.
-                let reason = resp
-                    .error
-                    .unwrap_or_else(|| "result submission failed without error".to_string());
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(&body.result.request_id, &reason, &h.token,)
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            Err(error) => error,
-        };
-        match result_http_error_disposition(&error.kind) {
-            ResultHttpErrorDisposition::RejectPermanent => {
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(
-                        &body.result.request_id,
-                        &error.to_string(),
-                        &h.token
-                    )
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            ResultHttpErrorDisposition::FatalAuth => {
-                return Err(SubmitResultError::FatalAuth(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalProtocol => {
-                return Err(SubmitResultError::FatalProtocol(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalConfig => {
-                return Err(SubmitResultError::FatalConfig(error.to_string()));
-            }
-            ResultHttpErrorDisposition::RetryTransient => {
-                let Some(delay) = RESULT_SUBMIT_RETRY_BACKOFF.get(attempt).copied() else {
-                    eprintln!(
-                        "{}",
-                        dropped_result_log_line(
-                            &body.result.request_id,
-                            attempt + 1,
-                            &error.to_string(),
-                            &h.token
-                        )
-                    );
-                    return Ok(ResultSubmission::DroppedAfterRetryExhaustion);
-                };
-                attempt += 1;
-                if sleep_or_shutdown(delay, h.shutdown.as_ref()) {
-                    return Err(SubmitResultError::Shutdown(
-                        "result submission retry interrupted by process shutdown".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-impl RunnerSink {
-    pub(crate) fn client_id(&self) -> &str {
-        match self {
-            RunnerSink::Http(h) => &h.client_id,
-            RunnerSink::WebSocket { client_id, .. } => client_id,
-            RunnerSink::Quic { client_id, .. } => client_id,
-        }
-    }
-
-    /// Active Runner process identity carried by this sink so every result /
-    /// job_update submission includes it.
-    pub(crate) fn agent_instance_id(&self) -> &str {
-        match self {
-            RunnerSink::Http(h) => &h.agent_instance_id,
-            RunnerSink::WebSocket {
-                agent_instance_id, ..
-            } => agent_instance_id,
-            RunnerSink::Quic {
-                agent_instance_id, ..
-            } => agent_instance_id,
-        }
-    }
-
-    /// Submit the result of a synchronous shell/file request. Mirrors the old
-    /// `submit_result` free function but routes over the active transport.
-    pub(crate) fn submit_result(
-        &self,
-        request_id: String,
-        result: CommandResult,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        self.submit_result_payload(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
-                client_id: self.client_id().to_string(),
-                agent_instance_id: self.agent_instance_id().to_string(),
-                request_id,
-                exit_code: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                duration_ms: result.duration_ms,
-                error: result.error,
-            },
-            command_execution_state: None,
-            mcp_gateway: None,
-            coding_agent: None,
-        })
-    }
-
-    /// Submit one closed MCP gateway response. The response is typed separately
-    /// from stdout/stderr so provider data cannot become a shell-result tunnel.
-    pub(crate) fn submit_mcp_gateway_result(
-        &self,
-        request_id: String,
-        response: crate::mcp_gateway::McpGatewayResponse,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        self.submit_result_payload(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
-                client_id: self.client_id().to_string(),
-                agent_instance_id: self.agent_instance_id().to_string(),
-                request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: None,
-                error: None,
-            },
-            command_execution_state: None,
-            mcp_gateway: Some(response),
-            coding_agent: None,
-        })
-    }
-
-    /// Submit one closed CodingAgentRun response. ACP JSON-RPC remains local to
-    /// the Runner and never crosses this typed transport result boundary.
-    pub(crate) fn submit_coding_agent_result(
-        &self,
-        request_id: String,
-        response: webcodex_core::coding_agent::CodingAgentResponse,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        self.submit_result_payload(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
-                client_id: self.client_id().to_string(),
-                agent_instance_id: self.agent_instance_id().to_string(),
-                request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: None,
-                error: None,
-            },
-            command_execution_state: None,
-            mcp_gateway: None,
-            coding_agent: Some(response),
-        })
-    }
-
-    fn submit_result_payload(
-        &self,
-        body: ShellAgentResultPayload,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let request_id = body.result.request_id.clone();
-        if super::dispatch::runner_tool_trace_enabled() {
-            tracing::info!(
-                event = "runner_tool_result_submit_started",
-                runner_request_id = %request_id,
-                runner_client_id = self.client_id(),
-                runner_agent_instance_id = self.agent_instance_id(),
-                "runner_tool_result_submit_started"
-            );
-        }
-        let submitted = match self {
-            RunnerSink::Http(h) => submit_result_http(h, &body),
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                let env = AgentEnvelope::Result { payload: body };
-                tx.blocking_send(env).map_err(|_| {
-                    SubmitResultError::TransportClosed(
-                        "agent transport result channel closed".to_string(),
-                    )
-                })?;
-                Ok(ResultSubmission::Accepted)
-            }
-        };
-        if super::dispatch::runner_tool_trace_enabled() {
-            match &submitted {
-                Ok(outcome) => tracing::info!(
-                    event = "runner_tool_result_submit_finished",
-                    runner_request_id = %request_id,
-                    outcome = ?outcome,
-                    "runner_tool_result_submit_finished"
-                ),
-                Err(error) => tracing::warn!(
-                    event = "runner_tool_result_submit_finished",
-                    runner_request_id = %request_id,
-                    error = %error,
-                    "runner_tool_result_submit_finished"
-                ),
-            }
-        }
-        submitted
-    }
-
-    pub(crate) fn submit_shell_result_with_metadata(
-        &self,
-        request_id: String,
-        shell_result: ShellCommandResult,
-        config: &HotRunnerConfig,
-        runtime: &ReloadableRunnerConfig,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let ShellCommandResult {
-            result,
-            execution_state,
-        } = shell_result;
-        let body = ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
-                client_id: self.client_id().to_string(),
-                agent_instance_id: self.agent_instance_id().to_string(),
-                request_id,
-                exit_code: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-                duration_ms: result.duration_ms,
-                error: result.error,
-            },
-            command_execution_state: Some(execution_state),
-            mcp_gateway: None,
-            coding_agent: None,
-        };
-        let submitted = self.submit_result_payload(body);
-        if matches!(&submitted, Ok(ResultSubmission::Accepted)) {
-            self.send_provider_metadata_best_effort(config.generation, runtime);
-        }
-        submitted
-    }
-
-    pub(crate) fn submit_result_with_metadata(
-        &self,
-        request_id: String,
-        result: CommandResult,
-        config: &HotRunnerConfig,
-        runtime: &ReloadableRunnerConfig,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let submitted = self.submit_result(request_id, result);
-        // Provider metadata is a best-effort follow-up on push transports, not
-        // proof that a rejected or dropped result was accepted. Send it only
-        // after the result reached the transport successfully.
-        if matches!(&submitted, Ok(ResultSubmission::Accepted)) {
-            self.send_provider_metadata_best_effort(config.generation, runtime);
-        }
-        submitted
-    }
-
-    /// Submit one Runner-authoritative persistent-shell lifecycle result. It
-    /// has its own envelope and HTTP endpoint because PersistentShell is not a
-    /// synchronous one-shot shell result and is never represented as a Job.
-    pub(crate) fn submit_persistent_shell_result(
-        &self,
-        request_id: String,
-        result: crate::shell_protocol::PersistentShellResult,
-    ) -> Result<ResultSubmission, SubmitResultError> {
-        let body = ShellAgentPersistentShellResultRequest {
-            client_id: self.client_id().to_string(),
-            agent_instance_id: self.agent_instance_id().to_string(),
-            request_id,
-            result,
-        };
-        match self {
-            RunnerSink::Http(h) => submit_persistent_shell_result_http(h, &body),
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                tx.blocking_send(AgentEnvelope::PersistentShellResult { payload: body })
-                    .map_err(|_| {
-                        SubmitResultError::TransportClosed(
-                            "agent transport persistent shell result channel closed".to_string(),
-                        )
-                    })?;
-                Ok(ResultSubmission::Accepted)
-            }
-        }
-    }
-
-    fn send_provider_metadata_best_effort(
-        &self,
-        generation: u64,
-        runtime: &ReloadableRunnerConfig,
-    ) {
-        let (RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. }) = self else {
-            return;
-        };
-        send_provider_metadata(tx, runtime, Some(generation));
-    }
-
-    pub(crate) fn same_job_update_target(&self, other: &Self) -> bool {
-        match (self, other) {
-            (RunnerSink::Http(left), RunnerSink::Http(right)) => {
-                left.server_url == right.server_url
-                    && left.client_id == right.client_id
-                    && left.agent_instance_id == right.agent_instance_id
-            }
-            (RunnerSink::WebSocket { tx: left, .. }, RunnerSink::WebSocket { tx: right, .. })
-            | (RunnerSink::Quic { tx: left, .. }, RunnerSink::Quic { tx: right, .. }) => {
-                left.same_channel(right)
-            }
-            _ => false,
-        }
-    }
-
-    /// Non-blocking stream enqueue used by the JobManager's single bounded
-    /// delivery worker. HTTP remains a bounded synchronous request, but only
-    /// that delivery worker waits for it; child output capture never does.
-    /// `Ok(false)` means the live WS/QUIC queue is full and the caller must
-    /// retain the update for a later retry rather than drop it.
-    pub(crate) fn try_send_job_update(
-        &self,
-        body: &ShellAgentJobUpdateRequest,
-    ) -> Result<bool, String> {
-        match self {
-            RunnerSink::Http(h) => {
-                let resp: ShellAgentJobUpdateResponse = post_json_raw(
-                    &h.client,
-                    &h.server_url,
-                    &h.token,
-                    "/api/shell/agent/job_update",
-                    body,
-                )
-                .map_err(|e| e.to_string())?;
-                if resp.success {
-                    Ok(true)
-                } else {
-                    Err(resp
-                        .error
-                        .unwrap_or_else(|| "job_update failed without error".to_string()))
-                }
-            }
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                let env = AgentEnvelope::JobUpdate {
-                    payload: body.clone(),
-                };
-                match tx.try_send(env) {
-                    Ok(()) => Ok(true),
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        Err("agent transport send failed".to_string())
-                    }
-                }
-            }
-        }
-    }
-
-    /// Push an incremental/final job update. Mirrors the old `send_job_update`
-    /// free function. Job updates stay best-effort: callers ignore failures
-    /// and the terminal state is still resolved by the final result path.
-    pub(crate) fn send_job_update(&self, body: &ShellAgentJobUpdateRequest) -> Result<(), String> {
-        match self {
-            RunnerSink::Http(h) => {
-                let resp: ShellAgentJobUpdateResponse = post_json_raw(
-                    &h.client,
-                    &h.server_url,
-                    &h.token,
-                    "/api/shell/agent/job_update",
-                    body,
-                )
-                .map_err(|e| e.to_string())?;
-                if resp.success {
-                    Ok(())
-                } else {
-                    Err(resp
-                        .error
-                        .unwrap_or_else(|| "job_update failed without error".to_string()))
-                }
-            }
-            RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                let env = AgentEnvelope::JobUpdate {
-                    payload: body.clone(),
-                };
-                tx.blocking_send(env)
-                    .map_err(|_| "agent transport send failed".to_string())
-            }
-        }
-    }
-}
-
-fn submit_persistent_shell_result_http(
-    h: &HttpSendConfig,
-    body: &ShellAgentPersistentShellResultRequest,
-) -> Result<ResultSubmission, SubmitResultError> {
-    let mut attempt = 0usize;
-    loop {
-        let error = match post_json_raw::<_, ShellAgentPersistentShellResultResponse>(
-            &h.client,
-            &h.server_url,
-            &h.token,
-            AGENT_PERSISTENT_SHELL_RESULT_PATH,
-            body,
-        ) {
-            Ok(response) if response.success => return Ok(ResultSubmission::Accepted),
-            Ok(response) => {
-                let reason = response.error.unwrap_or_else(|| {
-                    "persistent shell result submission failed without error".to_string()
-                });
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(&body.request_id, &reason, &h.token)
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            Err(error) => error,
-        };
-        match result_http_error_disposition(&error.kind) {
-            ResultHttpErrorDisposition::RejectPermanent => {
-                eprintln!(
-                    "{}",
-                    permanent_result_rejection_log_line(
-                        &body.request_id,
-                        &error.to_string(),
-                        &h.token,
-                    )
-                );
-                return Ok(ResultSubmission::RejectedPermanent);
-            }
-            ResultHttpErrorDisposition::FatalAuth => {
-                return Err(SubmitResultError::FatalAuth(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalProtocol => {
-                return Err(SubmitResultError::FatalProtocol(error.to_string()));
-            }
-            ResultHttpErrorDisposition::FatalConfig => {
-                return Err(SubmitResultError::FatalConfig(error.to_string()));
-            }
-            ResultHttpErrorDisposition::RetryTransient => {
-                let Some(delay) = RESULT_SUBMIT_RETRY_BACKOFF.get(attempt).copied() else {
-                    eprintln!(
-                        "{}",
-                        dropped_result_log_line(
-                            &body.request_id,
-                            attempt + 1,
-                            &error.to_string(),
-                            &h.token,
-                        )
-                    );
-                    return Ok(ResultSubmission::DroppedAfterRetryExhaustion);
-                };
-                attempt += 1;
-                if sleep_or_shutdown(delay, h.shutdown.as_ref()) {
-                    return Err(SubmitResultError::Shutdown(
-                        "persistent shell result retry interrupted by process shutdown".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-}
-
-/// Send a JSON POST to the server and decode the response. Same wire behavior
-/// as `post_json` but takes the raw connection bits so it can be used from
-/// `RunnerSink::Http` without an `RunnerConfig`. Preserves the structured
-/// `RunnerHttpError` classification for callers that must act on it.
-fn post_json_raw<T, R>(
-    client: &Client,
-    server_url: &str,
-    token: &str,
-    path: &str,
-    body: &T,
-) -> Result<R, RunnerHttpError>
-where
-    T: serde::Serialize + ?Sized,
-    R: serde::de::DeserializeOwned,
-{
-    crate::post_json_with_auth(client, server_url, token, path, body)
-}
-
 pub(crate) fn non_empty_token(token: &str) -> Option<String> {
     let token = token.trim();
     if token.is_empty() {
@@ -1366,13 +830,14 @@ pub(crate) fn run_runner(
     cfg: RunnerConfig,
     config_path: PathBuf,
     once: bool,
+    stop_on_stdin_eof: bool,
 ) -> Result<(), String> {
     // Generate the per-process agent instance identity once. It is stable for
     // the whole process lifetime, including across WebSocket reconnects, so the
     // server can treat this process as a single active lease for `client_id`.
     // It is not a secret and is never persisted to disk. Windows exit diagnostics
     // use a separate local diagnostic id and therefore preserve that boundary.
-    let agent_instance_id = uuid::Uuid::new_v4().to_string();
+    let runner_instance_id = uuid::Uuid::new_v4().to_string();
     let transport = cfg
         .transport
         .as_deref()
@@ -1416,7 +881,7 @@ pub(crate) fn run_runner(
         Ok(root) => match runtime.jobs.recover_detached_jobs(
             DetachedJobStore::new(root),
             &cfg.client_id,
-            &agent_instance_id,
+            &runner_instance_id,
         ) {
             Ok(count) if count > 0 => {
                 tracing::info!(count, "recovered detached Jobs before Runner registration");
@@ -1431,6 +896,15 @@ pub(crate) fn run_runner(
         },
         Err(error) => {
             tracing::error!(error = %error, "detached Job state root is unavailable");
+        }
+    }
+    if stop_on_stdin_eof {
+        if let Err(error) = install_parent_liveness_listener(runtime.clone()) {
+            #[cfg(windows)]
+            if let Some(diagnostics) = exit_diagnostics.as_ref() {
+                diagnostics.mark_terminal(false, "parent_liveness_listener_install_failed", None);
+            }
+            return Err(error);
         }
     }
     let shutdown_listener = match install_shutdown_listener(runtime.clone()) {
@@ -1457,10 +931,10 @@ pub(crate) fn run_runner(
         }
     }
     let result = match transport.as_str() {
-        TRANSPORT_WEBSOCKET => run_websocket_runner(cfg, once, &agent_instance_id, &runtime),
-        TRANSPORT_QUIC => run_quic_runner(cfg, once, &agent_instance_id, &runtime),
-        TRANSPORT_AUTO => run_auto_runner(cfg, once, &agent_instance_id, &runtime),
-        _ => run_polling_runner(cfg, once, &agent_instance_id, &runtime),
+        TRANSPORT_WEBSOCKET => run_websocket_runner(cfg, once, &runner_instance_id, &runtime),
+        TRANSPORT_QUIC => run_quic_runner(cfg, once, &runner_instance_id, &runtime),
+        TRANSPORT_AUTO => run_auto_runner(cfg, once, &runner_instance_id, &runtime),
+        _ => run_polling_runner(cfg, once, &runner_instance_id, &runtime),
     };
     #[cfg(windows)]
     if let Some(diagnostics) = exit_diagnostics.as_ref() {
@@ -1547,204 +1021,6 @@ fn polling_idle_delay(backoff: &mut PollingIdleBackoff, ran_request: bool) -> Op
     } else {
         Some(backoff.next_delay())
     }
-}
-
-static NEXT_PROJECT_INVENTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-fn next_project_inventory_sequence() -> u64 {
-    NEXT_PROJECT_INVENTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-}
-
-#[derive(Debug, Clone)]
-struct PendingProjectInventoryPage {
-    page: ShellProjectInventoryPage,
-    next_cursor: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ProjectInventorySync {
-    generation: String,
-    snapshot_sequence: u64,
-    projects: Vec<ShellAgentProjectSummary>,
-    cursor: usize,
-    page_index: u32,
-    pending: Option<PendingProjectInventoryPage>,
-}
-
-impl ProjectInventorySync {
-    fn new(projects: Vec<ShellAgentProjectSummary>) -> Self {
-        Self {
-            generation: uuid::Uuid::new_v4().simple().to_string(),
-            snapshot_sequence: next_project_inventory_sequence(),
-            projects,
-            cursor: 0,
-            page_index: 0,
-            pending: None,
-        }
-    }
-
-    fn generation(&self) -> &str {
-        &self.generation
-    }
-
-    fn total_reported(&self) -> usize {
-        self.projects.len()
-    }
-
-    fn current_page(&mut self) -> Result<Option<ShellProjectInventoryPage>, &'static str> {
-        if let Some(pending) = &self.pending {
-            return Ok(Some(pending.page.clone()));
-        }
-        if self.cursor >= self.projects.len() && !(self.projects.is_empty() && self.page_index == 0)
-        {
-            return Ok(None);
-        }
-        if self.projects.is_empty() {
-            let page = ShellProjectInventoryPage {
-                generation: self.generation.clone(),
-                snapshot_sequence: self.snapshot_sequence,
-                page_index: 0,
-                total_reported: 0,
-                complete: true,
-                projects: Vec::new(),
-            };
-            self.pending = Some(PendingProjectInventoryPage {
-                page: page.clone(),
-                next_cursor: 0,
-            });
-            return Ok(Some(page));
-        }
-
-        let mut summaries = Vec::new();
-        for project in self.projects[self.cursor..].iter() {
-            if summaries.len() == PROJECT_INVENTORY_PAGE_MAX_SUMMARIES {
-                break;
-            }
-            summaries.push(project.clone());
-            let next_cursor = self.cursor + summaries.len();
-            let candidate = ShellProjectInventoryPage {
-                generation: self.generation.clone(),
-                snapshot_sequence: self.snapshot_sequence,
-                page_index: self.page_index,
-                total_reported: self.projects.len(),
-                complete: next_cursor == self.projects.len(),
-                projects: summaries.clone(),
-            };
-            let bytes = serde_json::to_vec(&candidate)
-                .map_err(|_| "project_inventory_serialization_failed")?;
-            if bytes.len() > PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES {
-                summaries.pop();
-                if summaries.is_empty() {
-                    return Err("project_inventory_summary_too_large");
-                }
-                break;
-            }
-        }
-        if summaries.is_empty() {
-            return Err("project_inventory_empty_page");
-        }
-        let next_cursor = self.cursor + summaries.len();
-        let page = ShellProjectInventoryPage {
-            generation: self.generation.clone(),
-            snapshot_sequence: self.snapshot_sequence,
-            page_index: self.page_index,
-            total_reported: self.projects.len(),
-            complete: next_cursor == self.projects.len(),
-            projects: summaries,
-        };
-        if serde_json::to_vec(&page)
-            .map_err(|_| "project_inventory_serialization_failed")?
-            .len()
-            > PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES
-        {
-            return Err("project_inventory_page_too_large");
-        }
-        self.pending = Some(PendingProjectInventoryPage {
-            page: page.clone(),
-            next_cursor,
-        });
-        Ok(Some(page))
-    }
-
-    fn acknowledge(&mut self, status: &ShellProjectInventoryStatus) -> Result<bool, String> {
-        // Explicit Server failure status owns error classification before any
-        // local pending-state or success-ack correlation. In particular,
-        // staging-capacity rejection can legitimately carry the previous
-        // authoritative generation because page 0 was not admitted.
-        if status.sync_state == "degraded" || status.sync_state == "failed" {
-            return Err(status
-                .last_error_code
-                .clone()
-                .unwrap_or_else(|| "project_inventory_sync_degraded".to_string()));
-        }
-        let Some(pending) = self.pending.as_ref() else {
-            return Ok(self.cursor >= self.projects.len());
-        };
-        // Successful in-progress/complete acknowledgements remain strictly
-        // fenced by generation, total, and exact cursor progress below.
-        if status.generation.as_deref() != Some(self.generation()) {
-            return Err("project_inventory_ack_generation_mismatch".to_string());
-        }
-        if status.total_reported != Some(self.projects.len()) {
-            return Err("project_inventory_ack_total_mismatch".to_string());
-        }
-        if status.total_synced != pending.next_cursor {
-            return Err("project_inventory_ack_progress_mismatch".to_string());
-        }
-        let final_page = pending.page.complete;
-        let valid_ack = (final_page && status.sync_state == "complete")
-            || (!final_page && status.sync_state == "in_progress");
-        if !valid_ack {
-            return Err("project_inventory_ack_state_mismatch".to_string());
-        }
-        self.cursor = pending.next_cursor;
-        self.page_index = self.page_index.saturating_add(1);
-        self.pending = None;
-        Ok(final_page)
-    }
-}
-
-fn log_project_inventory_degraded(transport: &str, projects: usize, reason_code: &str) {
-    eprintln!(
-        "webcodex-runner project inventory sync degraded transport={} projects={} reason_code={}; runner remains online",
-        transport, projects, reason_code
-    );
-}
-
-fn paged_sync_after_registration(projects: Vec<ShellAgentProjectSummary>) -> ProjectInventorySync {
-    ProjectInventorySync::new(projects)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PollingProjectRefresh {
-    last_sent_at: Instant,
-}
-
-impl PollingProjectRefresh {
-    fn new(now: Instant) -> Self {
-        Self { last_sent_at: now }
-    }
-
-    fn mark_sent(&mut self, now: Instant) {
-        self.last_sent_at = now;
-    }
-
-    fn should_refresh(&self, project_cache: &RunnerProjectCache, now: Instant) -> bool {
-        project_cache.needs_refresh()
-            || now.saturating_duration_since(self.last_sent_at) >= POLLING_PROJECT_REFRESH_INTERVAL
-    }
-}
-
-fn polling_projects_for_poll(
-    refresh: &PollingProjectRefresh,
-    project_cache: &mut RunnerProjectCache,
-    cfg: &RunnerConfig,
-    shutdown: &AtomicBool,
-    now: Instant,
-) -> Option<Vec<ShellAgentProjectSummary>> {
-    refresh
-        .should_refresh(project_cache, now)
-        .then(|| project_cache.get_with_shutdown(cfg, Some(shutdown)))
 }
 
 #[derive(Debug, Clone)]
@@ -1916,16 +1192,16 @@ fn stream_transport_plan(cfg: &RunnerConfig, mode: StreamSupervisorMode) -> Vec<
 async fn run_stream_session(
     transport: StreamTransport,
     cfg: &RunnerConfig,
-    projects: Vec<ShellAgentProjectSummary>,
-    agent_instance_id: &str,
+    projects: Vec<RunnerProjectSummary>,
+    runner_instance_id: &str,
     once: bool,
     runtime: &RunnerRuntimeState,
 ) -> Result<RunnerSessionExit, RunnerTransportError> {
     match transport {
         StreamTransport::WebSocket => {
-            websocket_session_classified(cfg, projects, agent_instance_id, runtime).await
+            websocket_session_classified(cfg, projects, runner_instance_id, runtime).await
         }
-        StreamTransport::Quic => quic_session(cfg, projects, agent_instance_id, once, runtime)
+        StreamTransport::Quic => quic_session(cfg, projects, runner_instance_id, once, runtime)
             .await
             .map_err(classify_session_error),
     }
@@ -1934,7 +1210,7 @@ async fn run_stream_session(
 async fn supervise_stream_transports(
     cfg: &RunnerConfig,
     once: bool,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
     mode: StreamSupervisorMode,
 ) -> Result<StreamSupervisorExit, String> {
@@ -1951,7 +1227,7 @@ async fn supervise_stream_transports(
             let projects = runtime.project_summaries(&mut project_cache, cfg);
             let session_started = Instant::now();
             let result =
-                run_stream_session(transport, cfg, projects, agent_instance_id, once, runtime)
+                run_stream_session(transport, cfg, projects, runner_instance_id, once, runtime)
                     .await;
             project_cache.invalidate();
             match decide_stream_session(mode, transport, once, result) {
@@ -2017,7 +1293,7 @@ async fn supervise_stream_transports(
 fn run_stream_transport_runner(
     cfg: &RunnerConfig,
     once: bool,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
     mode: StreamSupervisorMode,
 ) -> Result<StreamSupervisorExit, String> {
@@ -2029,7 +1305,7 @@ fn run_stream_transport_runner(
     let result = rt.block_on(supervise_stream_transports(
         cfg,
         once,
-        agent_instance_id,
+        runner_instance_id,
         runtime,
         mode,
     ));
@@ -2040,19 +1316,19 @@ fn run_stream_transport_runner(
 fn run_auto_runner(
     cfg: RunnerConfig,
     once: bool,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
 ) -> Result<(), String> {
     match run_stream_transport_runner(
         &cfg,
         once,
-        agent_instance_id,
+        runner_instance_id,
         runtime,
         StreamSupervisorMode::Auto,
     )? {
         StreamSupervisorExit::Completed => Ok(()),
         StreamSupervisorExit::PollingFallback => {
-            run_polling_runner(cfg, once, agent_instance_id, runtime)
+            run_polling_runner(cfg, once, runner_instance_id, runtime)
         }
     }
 }
@@ -2060,11 +1336,11 @@ fn run_auto_runner(
 fn run_polling_runner(
     cfg: RunnerConfig,
     once: bool,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
 ) -> Result<(), String> {
     let shutdown = runtime.shutdown_flag();
-    run_polling_runner_with_shutdown(cfg, once, agent_instance_id, shutdown, runtime)
+    run_polling_runner_with_shutdown(cfg, once, runner_instance_id, shutdown, runtime)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2134,6 +1410,10 @@ fn handle_poll_failure(
 }
 
 fn complete_polling_after_shutdown(
+    client: &Client,
+    cfg: &RunnerConfig,
+    runner_instance_id: &str,
+    registered: bool,
     runtime: &RunnerRuntimeState,
     polling_dispatches: &mut PollingDispatchSupervisor,
     project_cache: &mut RunnerProjectCache,
@@ -2148,13 +1428,13 @@ fn complete_polling_after_shutdown(
             return Err(error.into_message());
         }
     }
-    complete_polling_shutdown(runtime)
+    complete_polling_shutdown(client, cfg, runner_instance_id, registered, runtime)
 }
 
 fn run_polling_runner_with_shutdown(
     cfg: RunnerConfig,
     once: bool,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     shutdown: Arc<AtomicBool>,
     runtime: &RunnerRuntimeState,
 ) -> Result<(), String> {
@@ -2179,6 +1459,10 @@ fn run_polling_runner_with_shutdown(
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return complete_polling_after_shutdown(
+                &client,
+                &cfg,
+                runner_instance_id,
+                registered,
                 runtime,
                 &mut polling_dispatches,
                 &mut project_cache,
@@ -2198,6 +1482,10 @@ fn run_polling_runner_with_shutdown(
                 PollFailureDirective::Continue => continue,
                 PollFailureDirective::Shutdown => {
                     return complete_polling_after_shutdown(
+                        &client,
+                        &cfg,
+                        runner_instance_id,
+                        registered,
                         runtime,
                         &mut polling_dispatches,
                         &mut project_cache,
@@ -2212,7 +1500,7 @@ fn run_polling_runner_with_shutdown(
                 &runtime.config,
                 &mut project_cache,
                 Some(shutdown.as_ref()),
-                agent_instance_id,
+                runner_instance_id,
                 jobs.prepared_profiles.len(),
                 &jobs,
             ) {
@@ -2229,7 +1517,7 @@ fn run_polling_runner_with_shutdown(
                         server_url: cfg.server_url.clone(),
                         token: cfg.token.clone(),
                         client_id: cfg.client_id.clone(),
-                        agent_instance_id: agent_instance_id.to_string(),
+                        runner_instance_id: runner_instance_id.to_string(),
                         shutdown: Arc::clone(&shutdown),
                     });
                     jobs.install_sink(sink);
@@ -2258,6 +1546,10 @@ fn run_polling_runner_with_shutdown(
                         );
                         if sleep_or_shutdown(delay, shutdown.as_ref()) {
                             return complete_polling_after_shutdown(
+                                &client,
+                                &cfg,
+                                runner_instance_id,
+                                registered,
                                 runtime,
                                 &mut polling_dispatches,
                                 &mut project_cache,
@@ -2283,6 +1575,10 @@ fn run_polling_runner_with_shutdown(
                         );
                         if sleep_or_shutdown(delay, shutdown.as_ref()) {
                             return complete_polling_after_shutdown(
+                                &client,
+                                &cfg,
+                                runner_instance_id,
+                                registered,
                                 runtime,
                                 &mut polling_dispatches,
                                 &mut project_cache,
@@ -2310,6 +1606,10 @@ fn run_polling_runner_with_shutdown(
                     PollFailureDirective::Continue => continue,
                     PollFailureDirective::Shutdown => {
                         return complete_polling_after_shutdown(
+                            &client,
+                            &cfg,
+                            runner_instance_id,
+                            registered,
                             runtime,
                             &mut polling_dispatches,
                             &mut project_cache,
@@ -2320,6 +1620,10 @@ fn run_polling_runner_with_shutdown(
         }
         if shutdown.load(Ordering::SeqCst) {
             return complete_polling_after_shutdown(
+                &client,
+                &cfg,
+                runner_instance_id,
+                registered,
                 runtime,
                 &mut polling_dispatches,
                 &mut project_cache,
@@ -2368,7 +1672,7 @@ fn run_polling_runner_with_shutdown(
             &runtime.persistent_shells,
             &mut project_cache,
             project_inventory_page,
-            agent_instance_id,
+            runner_instance_id,
             &runtime.lsp,
             &shutdown,
             &runtime.dispatches,
@@ -2437,17 +1741,31 @@ fn run_polling_runner_with_shutdown(
                             shutdown.as_ref(),
                         ) {
                             return complete_polling_after_shutdown(
+                                &client,
+                                &cfg,
+                                runner_instance_id,
+                                registered,
                                 runtime,
                                 &mut polling_dispatches,
                                 &mut project_cache,
                             );
                         }
                     }
-                    return Ok(());
+                    return complete_polling_shutdown(
+                        &client,
+                        &cfg,
+                        runner_instance_id,
+                        registered,
+                        runtime,
+                    );
                 }
                 if let Some(delay) = polling_idle_delay(&mut idle_backoff, ran_request) {
                     if sleep_or_shutdown(delay, shutdown.as_ref()) {
                         return complete_polling_after_shutdown(
+                            &client,
+                            &cfg,
+                            runner_instance_id,
+                            registered,
                             runtime,
                             &mut polling_dispatches,
                             &mut project_cache,
@@ -2468,6 +1786,10 @@ fn run_polling_runner_with_shutdown(
                 PollFailureDirective::Continue => {}
                 PollFailureDirective::Shutdown => {
                     return complete_polling_after_shutdown(
+                        &client,
+                        &cfg,
+                        runner_instance_id,
+                        registered,
                         runtime,
                         &mut polling_dispatches,
                         &mut project_cache,
@@ -2493,7 +1815,7 @@ type RunnerWebSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 enum StreamRead {
-    Envelope(AgentEnvelope),
+    Envelope(RunnerEnvelope),
     Closed,
 }
 
@@ -2563,7 +1885,7 @@ impl RegisteredStream {
                     Ok(text) => text,
                     Err(_) => continue,
                 };
-                match AgentEnvelope::from_slice(text.as_bytes()) {
+                match RunnerEnvelope::from_slice(text.as_bytes()) {
                     Ok(envelope) => return Ok(StreamRead::Envelope(envelope)),
                     Err(error) => {
                         eprintln!("webcodex-runner websocket malformed envelope: {}", error);
@@ -2713,20 +2035,20 @@ where
     let _ = tokio::time::timeout(timeout, peer_closed).await;
 }
 
-fn registered_ack(ack: AgentEnvelope) -> Result<ShellProjectInventoryStatus, String> {
+fn registered_ack(ack: RunnerEnvelope) -> Result<ShellProjectInventoryStatus, String> {
     match ack {
-        AgentEnvelope::Registered {
+        RunnerEnvelope::Registered {
             success: true,
             client,
             ..
         } => client
             .and_then(|client| client.project_inventory)
             .ok_or_else(|| "register acknowledgement missing canonical project_inventory status; Server is incompatible with this 0.4 Runner".to_string()),
-        AgentEnvelope::Registered { error, .. } => Err(format!(
+        RunnerEnvelope::Registered { error, .. } => Err(format!(
             "register rejected by server: {}",
             error.unwrap_or_else(|| "no server error message".to_string())
         )),
-        AgentEnvelope::Error { code, message } => Err(format!(
+        RunnerEnvelope::Error { code, message } => Err(format!(
             "server error during register {}: {}",
             code, message
         )),
@@ -2734,258 +2056,24 @@ fn registered_ack(ack: AgentEnvelope) -> Result<ShellProjectInventoryStatus, Str
     }
 }
 
-fn try_queue_project_inventory_page(
-    transport: StreamTransport,
-    sync: &mut Option<ProjectInventorySync>,
-    out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
-) {
-    let next = sync
-        .as_mut()
-        .map(|state| (state.total_reported(), state.current_page()));
-    match next {
-        Some((_, Ok(Some(page)))) => {
-            let _ = out_tx.try_send(AgentEnvelope::ProjectInventoryPage { page });
-        }
-        Some((_, Ok(None))) => {
-            *sync = None;
-        }
-        Some((projects, Err(reason_code))) => {
-            log_project_inventory_degraded(transport.name(), projects, reason_code);
-            *sync = None;
-        }
-        None => {}
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectInventoryStatusAction {
-    None,
-    IgnoreDelayedAck,
-    RetryExactAfter(Duration),
-    FreshResnapshot,
-}
-
-fn project_inventory_status_requests_fresh_resnapshot(
-    status: &ShellProjectInventoryStatus,
-) -> bool {
-    matches!(
-        status.last_error_code.as_deref(),
-        Some(
-            "project_inventory_stale_generation" | "project_inventory_missing_or_stale_generation"
-        )
-    )
-}
-
-fn project_inventory_status_is_delayed_success_ack(
-    state: &ProjectInventorySync,
-    status: &ShellProjectInventoryStatus,
-) -> bool {
-    if status.last_error_code.is_some()
-        || !matches!(status.sync_state.as_str(), "in_progress" | "complete")
-    {
-        return false;
-    }
-    if status.generation.as_deref() != Some(state.generation()) {
-        return true;
-    }
-    state.pending.as_ref().is_some_and(|pending| {
-        status.total_reported == Some(state.total_reported())
-            && status.total_synced < pending.next_cursor
-    })
-}
-
-fn handle_project_inventory_status(
-    transport: StreamTransport,
-    status: ShellProjectInventoryStatus,
-    sync: &mut Option<ProjectInventorySync>,
-    out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
-    retry_backoff: &mut RetryBackoff,
-) -> ProjectInventoryStatusAction {
-    // Stale-generation statuses can retain the last authoritative sync state
-    // and generation while carrying the actual recovery reason only in
-    // `last_error_code`. Those explicit reasons invalidate the current logical
-    // snapshot before ordinary success-ack correlation is attempted.
-    if project_inventory_status_requests_fresh_resnapshot(&status) {
-        if let Some(state) = sync.as_ref() {
-            log_project_inventory_degraded(
-                transport.name(),
-                state.total_reported(),
-                status
-                    .last_error_code
-                    .as_deref()
-                    .unwrap_or("project_inventory_stale_generation"),
-            );
-        }
-        *sync = None;
-        retry_backoff.reset();
-        return ProjectInventoryStatusAction::FreshResnapshot;
-    }
-
-    let Some(state) = sync.as_mut() else {
-        retry_backoff.reset();
-        return ProjectInventoryStatusAction::None;
-    };
-    if project_inventory_status_is_delayed_success_ack(state, &status) {
-        tracing::debug!(
-            transport = transport.name(),
-            current_generation = state.generation(),
-            ack_generation = status.generation.as_deref(),
-            ack_total_synced = status.total_synced,
-            "ignoring delayed project inventory success acknowledgement"
-        );
-        return ProjectInventoryStatusAction::IgnoreDelayedAck;
-    }
-    let projects = state.total_reported();
-    match state.acknowledge(&status) {
-        Ok(true) => {
-            *sync = None;
-            retry_backoff.reset();
-            ProjectInventoryStatusAction::None
-        }
-        Ok(false) => {
-            retry_backoff.reset();
-            try_queue_project_inventory_page(transport, sync, out_tx);
-            ProjectInventoryStatusAction::None
-        }
-        Err(reason_code) if reason_code == "project_inventory_staging_capacity" => {
-            let delay = retry_backoff.next_delay();
-            log_project_inventory_degraded(transport.name(), projects, &reason_code);
-            eprintln!(
-                "webcodex-runner project inventory retry scheduled transport={} reason_code={} delay={}",
-                transport.name(),
-                reason_code,
-                format_delay(delay)
-            );
-            // Keep the exact pending page/generation/snapshot_sequence. The
-            // Server rejected page 0 before advancing its high-water fence, so
-            // replaying this exact page after bounded delay is safe.
-            ProjectInventoryStatusAction::RetryExactAfter(delay)
-        }
-        Err(reason_code) => {
-            log_project_inventory_degraded(transport.name(), projects, &reason_code);
-            *sync = None;
-            retry_backoff.reset();
-            ProjectInventoryStatusAction::None
-        }
-    }
-}
-
-struct StreamingProjectInventoryCoordinator {
-    supported: bool,
-    sync: Option<ProjectInventorySync>,
-    project_cache: RunnerProjectCache,
-    retry_backoff: RetryBackoff,
-    retry_at: Option<tokio::time::Instant>,
-}
-
-impl StreamingProjectInventoryCoordinator {
-    fn new(sync: Option<ProjectInventorySync>) -> Self {
-        Self {
-            supported: sync.is_some(),
-            sync,
-            project_cache: RunnerProjectCache::default(),
-            retry_backoff: RetryBackoff::new(&PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS),
-            retry_at: None,
-        }
-    }
-
-    fn retry_at(&self) -> Option<tokio::time::Instant> {
-        self.retry_at
-    }
-
-    fn queue_pending(
-        &mut self,
-        transport: StreamTransport,
-        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
-    ) {
-        try_queue_project_inventory_page(transport, &mut self.sync, out_tx);
-    }
-
-    fn retry_pending_now(
-        &mut self,
-        transport: StreamTransport,
-        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
-    ) {
-        self.retry_at = None;
-        self.queue_pending(transport, out_tx);
-    }
-
-    fn refresh_from_current_projects(
-        &mut self,
-        transport: StreamTransport,
-        cfg: &RunnerConfig,
-        runtime: &RunnerRuntimeState,
-        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
-        reason_code: &str,
-    ) {
-        if !self.supported {
-            return;
-        }
-        self.project_cache.invalidate();
-        let projects = runtime.project_summaries(&mut self.project_cache, cfg);
-        let projects_count = projects.len();
-        self.sync = Some(ProjectInventorySync::new(projects));
-        self.retry_backoff.reset();
-        self.retry_at = None;
-        eprintln!(
-            "webcodex-runner project inventory resnapshot transport={} projects={} reason_code={}",
-            transport.name(),
-            projects_count,
-            reason_code
-        );
-        self.queue_pending(transport, out_tx);
-    }
-
-    fn handle_status(
-        &mut self,
-        transport: StreamTransport,
-        status: ShellProjectInventoryStatus,
-        cfg: &RunnerConfig,
-        runtime: &RunnerRuntimeState,
-        out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
-    ) {
-        match handle_project_inventory_status(
-            transport,
-            status,
-            &mut self.sync,
-            out_tx,
-            &mut self.retry_backoff,
-        ) {
-            ProjectInventoryStatusAction::None => self.retry_at = None,
-            ProjectInventoryStatusAction::IgnoreDelayedAck => {}
-            ProjectInventoryStatusAction::RetryExactAfter(delay) => {
-                self.retry_at = Some(tokio::time::Instant::now() + delay);
-            }
-            ProjectInventoryStatusAction::FreshResnapshot => self.refresh_from_current_projects(
-                transport,
-                cfg,
-                runtime,
-                out_tx,
-                "project_inventory_server_invalidated_snapshot",
-            ),
-        }
-    }
-}
-
 fn handle_stream_envelope(
     transport: StreamTransport,
-    envelope: AgentEnvelope,
+    envelope: RunnerEnvelope,
     cfg: &RunnerConfig,
     sink: &RunnerSink,
-    out_tx: &tokio::sync::mpsc::Sender<AgentEnvelope>,
+    out_tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
     project_inventory: &mut StreamingProjectInventoryCoordinator,
     project_inventory_refresh_tx: &tokio::sync::mpsc::Sender<()>,
     runtime: &RunnerRuntimeState,
 ) -> Option<String> {
     match envelope {
-        AgentEnvelope::Request { request } => {
-            let project_op = is_project_op(&request.kind);
+        RunnerEnvelope::Request { request } => {
             let sink = sink.clone();
             let config = Arc::clone(&runtime.config);
             let hot = config.snapshot();
             let jobs = runtime.jobs.clone();
             let persistent_shells = runtime.persistent_shells.clone();
-            let projects_dir = match projects_dir(cfg) {
+            let project_registry_dir = match project_registry_dir(cfg) {
                 Ok(dir) => dir,
                 Err(error) => return Some(error),
             };
@@ -2994,17 +2082,20 @@ fn handle_stream_envelope(
             let project_inventory_refresh_tx = project_inventory_refresh_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let _dispatch_guard = dispatch_guard;
-                let dispatch_result = dispatch_request(
+                let dispatch_result = dispatch_request_with_outcome(
                     &sink,
                     &hot,
                     &config,
                     &jobs,
                     &persistent_shells,
-                    &projects_dir,
+                    &project_registry_dir,
                     &lsp,
                     request,
                 );
-                if project_op && dispatch_result.is_ok() {
+                if dispatch_result
+                    .as_ref()
+                    .is_ok_and(|outcome| outcome.project_cache_invalidation_required)
+                {
                     // Capacity one deliberately coalesces multiple project
                     // mutations. A queued dirty signal already guarantees a
                     // fresh full observation; never block request completion on
@@ -3014,17 +2105,17 @@ fn handle_stream_envelope(
             });
             None
         }
-        AgentEnvelope::Ping { ts } => {
-            let _ = out_tx.try_send(AgentEnvelope::Pong { ts });
+        RunnerEnvelope::Ping { ts } => {
+            let _ = out_tx.try_send(RunnerEnvelope::Pong { ts });
             None
         }
-        AgentEnvelope::Pong { .. } => None,
-        AgentEnvelope::ProjectInventoryStatus { status } => {
+        RunnerEnvelope::Pong { .. } => None,
+        RunnerEnvelope::ProjectInventoryStatus { status } => {
             project_inventory.handle_status(transport, status, cfg, runtime, out_tx);
             None
         }
-        AgentEnvelope::Registered { .. } if transport == StreamTransport::Quic => None,
-        AgentEnvelope::Error { code, message } => {
+        RunnerEnvelope::Registered { .. } if transport == StreamTransport::Quic => None,
+        RunnerEnvelope::Error { code, message } => {
             Some(format!("server error {}: {}", code, message))
         }
         other => {
@@ -3041,9 +2132,9 @@ fn handle_stream_envelope(
 async fn serve_registered_stream<F>(
     transport: StreamTransport,
     cfg: &RunnerConfig,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     registered_jobs: &ShellJobInventory,
-    out_tx: tokio::sync::mpsc::Sender<AgentEnvelope>,
+    out_tx: tokio::sync::mpsc::Sender<RunnerEnvelope>,
     mut stream: RegisteredStream,
     mut writer_task: tokio::task::JoinHandle<StreamWriterExit>,
     project_inventory_sync: Option<ProjectInventorySync>,
@@ -3057,12 +2148,12 @@ where
         StreamTransport::WebSocket => RunnerSink::WebSocket {
             tx: out_tx.clone(),
             client_id: cfg.client_id.clone(),
-            agent_instance_id: agent_instance_id.to_string(),
+            runner_instance_id: runner_instance_id.to_string(),
         },
         StreamTransport::Quic => RunnerSink::Quic {
             tx: out_tx.clone(),
             client_id: cfg.client_id.clone(),
-            agent_instance_id: agent_instance_id.to_string(),
+            runner_instance_id: runner_instance_id.to_string(),
         },
     };
     let jobs = runtime.jobs.clone();
@@ -3157,7 +2248,7 @@ where
                 if project_inventory.retry_at().is_none() {
                     project_inventory.queue_pending(transport, &out_tx);
                 }
-                let _ = out_tx.try_send(AgentEnvelope::Ping {
+                let _ = out_tx.try_send(RunnerEnvelope::Ping {
                     ts: chrono::Utc::now().timestamp(),
                 });
             }
@@ -3167,7 +2258,7 @@ where
     if shutdown_requested {
         let _ = tokio::time::timeout(
             TRANSPORT_CONTROL_SEND_TIMEOUT,
-            out_tx.send(AgentEnvelope::Goodbye {
+            out_tx.send(RunnerEnvelope::Goodbye {
                 reason: Some("process shutdown".to_string()),
             }),
         )
@@ -3208,13 +2299,13 @@ where
 fn run_quic_runner(
     cfg: RunnerConfig,
     once: bool,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
 ) -> Result<(), String> {
     run_stream_transport_runner(
         &cfg,
         once,
-        agent_instance_id,
+        runner_instance_id,
         runtime,
         StreamSupervisorMode::Strict(StreamTransport::Quic),
     )
@@ -3224,10 +2315,9 @@ fn run_quic_runner(
 /// Validate the `[quic]` config section. Returns a cloned, resolved config so
 /// the session owns a concrete value (defaults applied).
 pub(crate) fn resolve_quic_config(cfg: &RunnerConfig) -> Result<QuicClientConfig, String> {
-    let quic = cfg
-        .quic
-        .clone()
-        .ok_or_else(|| "transport=quic requires a [quic] section in agent.toml".to_string())?;
+    let quic = cfg.quic.clone().ok_or_else(|| {
+        "transport=quic requires a [quic] section in the Runner config".to_string()
+    })?;
     validate_quic_config(&quic)?;
     Ok(quic)
 }
@@ -3330,8 +2420,8 @@ fn classify_quic_runner_connect_error(error: &str) -> &'static str {
 /// completes one ping/pong after the ack then returns.
 async fn quic_session(
     cfg: &RunnerConfig,
-    projects: Vec<ShellAgentProjectSummary>,
-    agent_instance_id: &str,
+    projects: Vec<RunnerProjectSummary>,
+    runner_instance_id: &str,
     once: bool,
     runtime: &RunnerRuntimeState,
 ) -> Result<RunnerSessionExit, String> {
@@ -3427,7 +2517,7 @@ async fn quic_session(
         build_register_request_with_provider_status(
             cfg,
             &runtime.config,
-            agent_instance_id,
+            runner_instance_id,
             0,
             registered_jobs.clone(),
         );
@@ -3469,7 +2559,7 @@ async fn quic_session(
     if once {
         // Complete one ping/pong round trip then exit, mirroring the websocket
         // `--once` semantics.
-        let ping = AgentEnvelope::Ping {
+        let ping = RunnerEnvelope::Ping {
             ts: chrono::Utc::now().timestamp(),
         };
         let Some(ping_write) =
@@ -3494,10 +2584,10 @@ async fn quic_session(
             .map_err(|_| "quic once pong timed out".to_string())?
             .map_err(|e| format!("quic once pong read failed: {}", e))?;
         match resp {
-            AgentEnvelope::Pong { .. } => {}
+            RunnerEnvelope::Pong { .. } => {}
             other => return Err(format!("expected pong, got {}", other.kind())),
         }
-        let goodbye = AgentEnvelope::Goodbye {
+        let goodbye = RunnerEnvelope::Goodbye {
             reason: Some("once complete".to_string()),
         };
         let close_started = tokio::time::Instant::now();
@@ -3529,11 +2619,11 @@ async fn quic_session(
 
     // Outgoing envelopes share one writer so future QUIC multistream work can
     // change the transport adapter without duplicating the session lifecycle.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
     try_queue_project_inventory_page(StreamTransport::Quic, &mut project_inventory_sync, &out_tx);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
-            let graceful = matches!(env, AgentEnvelope::Goodbye { .. });
+            let graceful = matches!(env, RunnerEnvelope::Goodbye { .. });
             if write_quic_frame(&mut send, &env).await.is_err() {
                 return StreamWriterExit::TransportFailed;
             }
@@ -3554,7 +2644,7 @@ async fn quic_session(
     serve_registered_stream(
         StreamTransport::Quic,
         cfg,
-        agent_instance_id,
+        runner_instance_id,
         &registered_jobs,
         out_tx,
         RegisteredStream::Quic {
@@ -3579,387 +2669,16 @@ async fn quic_session(
 // `dispatch_request` path the polling loop uses, and sends `Result` /
 // `JobUpdate` envelopes back. Polling is unchanged and remains the fallback.
 
-/// Convert an `http(s)://` server URL into a `ws(s)://` URL plus path.
-pub(crate) fn server_url_to_ws(server_url: &str, path: &str) -> Result<String, String> {
-    let base = server_url.trim_end_matches('/');
-    let ws = if let Some(rest) = base.strip_prefix("https://") {
-        format!("wss://{}{}", rest, path)
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{}{}", rest, path)
-    } else if base.starts_with("ws://") || base.starts_with("wss://") {
-        format!("{}{}", base, path)
-    } else {
-        return Err(format!(
-            "server_url must be http(s)://... for websocket transport; got {}",
-            server_log_label(server_url)
-        ));
-    };
-    Ok(ws)
-}
-
-/// Build a WebSocket handshake request, carrying a Bearer token only when the
-/// configured token is non-empty. Open-mode agents intentionally send no
-/// credential so the server must have explicit anonymous mode enabled.
-pub(crate) fn build_ws_request(
-    ws_url: &str,
-    token: &str,
-) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = ws_url.into_client_request().map_err(|e| {
-        format!(
-            "invalid websocket url for {}: {}",
-            server_log_label(ws_url),
-            e
-        )
-    })?;
-    if let Some(token) = non_empty_token(token) {
-        let value = format!("Bearer {}", token);
-        let header_value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&value)
-            .map_err(|e| format!("invalid token header value: {}", e))?;
-        request.headers_mut().insert(
-            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-            header_value,
-        );
-    }
-    Ok(request)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HttpProxyEndpoint {
-    host: String,
-    port: u16,
-}
-
-fn first_nonempty_env_value_with<F>(names: &[&str], get_env: &mut F) -> Option<std::ffi::OsString>
-where
-    F: FnMut(&str) -> Option<std::ffi::OsString>,
-{
-    names
-        .iter()
-        .find_map(|name| get_env(name).filter(|value| !value.as_os_str().is_empty()))
-}
-
-fn split_no_proxy_host_port(entry: &str) -> (&str, Option<u16>) {
-    if let Some(rest) = entry.strip_prefix('[') {
-        if let Some(end) = rest.find(']') {
-            let host = &rest[..end];
-            let suffix = &rest[end + 1..];
-            if suffix.is_empty() {
-                return (host, None);
-            }
-            if let Some(port) = suffix
-                .strip_prefix(':')
-                .and_then(|value| value.parse().ok())
-            {
-                return (host, Some(port));
-            }
-            return (entry, None);
-        }
-    }
-    if entry.bytes().filter(|byte| *byte == b':').count() == 1 {
-        if let Some((host, port)) = entry.rsplit_once(':') {
-            if let Ok(port) = port.parse::<u16>() {
-                return (host, Some(port));
-            }
-        }
-    }
-    (entry, None)
-}
-
-fn no_proxy_entry_matches(entry: &str, target_host: &str, target_port: u16) -> bool {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return false;
-    }
-    if entry == "*" {
-        return true;
-    }
-    let (pattern, port) = split_no_proxy_host_port(entry);
-    if port.is_some_and(|port| port != target_port) {
-        return false;
-    }
-    let pattern = pattern
-        .trim()
-        .trim_end_matches('.')
-        .strip_prefix("*.")
-        .unwrap_or(pattern.trim().trim_end_matches('.'))
-        .trim_start_matches('.');
-    if pattern.is_empty() {
-        return false;
-    }
-    let target_host = target_host.trim_end_matches('.');
-    if let Ok(pattern_ip) = pattern.parse::<std::net::IpAddr>() {
-        return target_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|target_ip| target_ip == pattern_ip);
-    }
-    if pattern.eq_ignore_ascii_case("localhost") {
-        return target_host.eq_ignore_ascii_case("localhost");
-    }
-    let target = target_host.to_ascii_lowercase();
-    let pattern = pattern.to_ascii_lowercase();
-    target == pattern
-        || target
-            .strip_suffix(&pattern)
-            .is_some_and(|prefix| prefix.ends_with('.'))
-}
-
-fn no_proxy_matches(no_proxy: &str, target_host: &str, target_port: u16) -> bool {
-    no_proxy
-        .split(',')
-        .any(|entry| no_proxy_entry_matches(entry, target_host, target_port))
-}
-
-fn canonical_url_host(parsed: &url::Url) -> Option<String> {
-    match parsed.host()? {
-        url::Host::Domain(host) => (!host.is_empty()).then(|| host.to_string()),
-        url::Host::Ipv4(host) => Some(host.to_string()),
-        url::Host::Ipv6(host) => Some(host.to_string()),
-    }
-}
-
-fn parse_http_proxy_endpoint(raw: &str) -> Result<HttpProxyEndpoint, RunnerTransportError> {
-    let parsed = url::Url::parse(raw.trim()).map_err(|_| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    if parsed.scheme() != "http" {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy scheme is unsupported",
-        ));
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy authentication is unsupported",
-        ));
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() || !matches!(parsed.path(), "" | "/")
-    {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy URL options are unsupported",
-        ));
-    }
-    let host = canonical_url_host(&parsed).ok_or_else(|| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    let port = parsed.port_or_known_default().ok_or_else(|| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    Ok(HttpProxyEndpoint { host, port })
-}
-
-fn websocket_proxy_from_env_with<F>(
-    ws_url: &str,
-    mut get_env: F,
-) -> Result<Option<HttpProxyEndpoint>, RunnerTransportError>
-where
-    F: FnMut(&str) -> Option<std::ffi::OsString>,
-{
-    let target = url::Url::parse(ws_url).map_err(|_| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let proxy_names: &[&str] = match target.scheme() {
-        "wss" => &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"],
-        "ws" => &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"],
-        _ => {
-            return Err(RunnerTransportError::fatal(
-                "websocket connect failed: websocket target scheme is invalid",
-            ));
-        }
-    };
-    let Some(proxy_raw) = first_nonempty_env_value_with(proxy_names, &mut get_env) else {
-        return Ok(None);
-    };
-    let target_host = canonical_url_host(&target).ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let target_port = target.port_or_known_default().ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    if let Some(no_proxy_raw) =
-        first_nonempty_env_value_with(&["NO_PROXY", "no_proxy"], &mut get_env)
-    {
-        let no_proxy = no_proxy_raw.into_string().map_err(|_| {
-            RunnerTransportError::proxy_configuration(
-                "websocket connect failed: NO_PROXY configuration is invalid",
-            )
-        })?;
-        if no_proxy_matches(&no_proxy, &target_host, target_port) {
-            return Ok(None);
-        }
-    }
-    let proxy = proxy_raw.into_string().map_err(|_| {
-        RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy configuration is invalid",
-        )
-    })?;
-    parse_http_proxy_endpoint(&proxy).map(Some)
-}
-
-fn websocket_proxy_from_env(
-    ws_url: &str,
-) -> Result<Option<HttpProxyEndpoint>, RunnerTransportError> {
-    websocket_proxy_from_env_with(ws_url, |name| std::env::var_os(name))
-}
-
-fn target_authority(host: &str, port: u16) -> String {
-    if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-fn websocket_target_endpoint(ws_url: &str) -> Result<(String, u16), RunnerTransportError> {
-    let target = url::Url::parse(ws_url).map_err(|_| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let host = canonical_url_host(&target).ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    let port = target.port_or_known_default().ok_or_else(|| {
-        RunnerTransportError::fatal("websocket connect failed: websocket target is invalid")
-    })?;
-    Ok((host, port))
-}
-
-async fn http_proxy_connect_tunnel(
-    proxy: &HttpProxyEndpoint,
-    target_host: &str,
-    target_port: u16,
-) -> Result<tokio::net::TcpStream, RunnerTransportError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
-        .await
-        .map_err(|_| {
-            RunnerTransportError::transient("websocket connect failed: proxy TCP connect failed")
-        })?;
-    let authority = target_authority(target_host, target_port);
-    let request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes()).await.map_err(|_| {
-        RunnerTransportError::transient("websocket connect failed: proxy CONNECT write failed")
-    })?;
-
-    let mut headers = Vec::with_capacity(1024);
-    loop {
-        if headers.len() >= WS_PROXY_CONNECT_HEADER_MAX_BYTES {
-            return Err(RunnerTransportError::transient(format!(
-                "websocket connect failed: proxy CONNECT response headers exceeded {} bytes",
-                WS_PROXY_CONNECT_HEADER_MAX_BYTES
-            )));
-        }
-        let mut byte = [0u8; 1];
-        let read = stream.read(&mut byte).await.map_err(|_| {
-            RunnerTransportError::transient("websocket connect failed: proxy CONNECT read failed")
-        })?;
-        if read == 0 {
-            return Err(RunnerTransportError::transient(
-                "websocket connect failed: proxy CONNECT response was malformed",
-            ));
-        }
-        headers.push(byte[0]);
-        if headers.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
-    let headers = std::str::from_utf8(&headers).map_err(|_| {
-        RunnerTransportError::transient(
-            "websocket connect failed: proxy CONNECT response was malformed",
-        )
-    })?;
-    let status_line = headers.split("\r\n").next().ok_or_else(|| {
-        RunnerTransportError::transient(
-            "websocket connect failed: proxy CONNECT response was malformed",
-        )
-    })?;
-    let mut parts = status_line.split_whitespace();
-    let version = parts
-        .next()
-        .filter(|version| version.starts_with("HTTP/"))
-        .ok_or_else(|| {
-            RunnerTransportError::transient(
-                "websocket connect failed: proxy CONNECT response was malformed",
-            )
-        })?;
-    let _ = version;
-    let status = parts
-        .next()
-        .and_then(|status| status.parse::<u16>().ok())
-        .ok_or_else(|| {
-            RunnerTransportError::transient(
-                "websocket connect failed: proxy CONNECT response was malformed",
-            )
-        })?;
-    if status == 407 {
-        return Err(RunnerTransportError::proxy_configuration(
-            "websocket connect failed: proxy CONNECT returned HTTP 407",
-        ));
-    }
-    if !(200..300).contains(&status) {
-        return Err(RunnerTransportError::transient(format!(
-            "websocket connect failed: proxy CONNECT returned HTTP {status}"
-        )));
-    }
-    Ok(stream)
-}
-
-async fn connect_websocket_request_with_proxy(
-    request: tokio_tungstenite::tungstenite::http::Request<()>,
-    ws_url: &str,
-    proxy: Option<&HttpProxyEndpoint>,
-    token: &str,
-) -> Result<RunnerWebSocket, RunnerTransportError> {
-    let Some(proxy) = proxy else {
-        return tokio_tungstenite::connect_async(request)
-            .await
-            .map(|(stream, _)| stream)
-            .map_err(|error| {
-                classify_session_error(format!(
-                    "websocket connect failed: {}",
-                    concise_log_error(&error.to_string(), token)
-                ))
-            });
-    };
-    let (target_host, target_port) = websocket_target_endpoint(ws_url)?;
-    let stream = http_proxy_connect_tunnel(proxy, &target_host, target_port).await?;
-    tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
-        .await
-        .map(|(stream, _)| stream)
-        .map_err(|error| {
-            classify_session_error(format!(
-                "websocket connect failed: {}",
-                concise_log_error(&error.to_string(), token)
-            ))
-        })
-}
-
-async fn connect_websocket_request(
-    request: tokio_tungstenite::tungstenite::http::Request<()>,
-    ws_url: &str,
-    token: &str,
-) -> Result<RunnerWebSocket, RunnerTransportError> {
-    let proxy = websocket_proxy_from_env(ws_url)?;
-    connect_websocket_request_with_proxy(request, ws_url, proxy.as_ref(), token).await
-}
-
 fn run_websocket_runner(
     cfg: RunnerConfig,
     once: bool,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
 ) -> Result<(), String> {
     run_stream_transport_runner(
         &cfg,
         once,
-        agent_instance_id,
+        runner_instance_id,
         runtime,
         StreamSupervisorMode::Strict(StreamTransport::WebSocket),
     )
@@ -3971,25 +2690,25 @@ fn run_websocket_runner(
 #[cfg(test)]
 pub(crate) async fn websocket_session(
     cfg: &RunnerConfig,
-    projects: Vec<ShellAgentProjectSummary>,
-    agent_instance_id: &str,
+    projects: Vec<RunnerProjectSummary>,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
 ) -> Result<RunnerSessionExit, String> {
-    websocket_session_classified(cfg, projects, agent_instance_id, runtime)
+    websocket_session_classified(cfg, projects, runner_instance_id, runtime)
         .await
         .map_err(RunnerTransportError::into_message)
 }
 
 async fn websocket_session_classified(
     cfg: &RunnerConfig,
-    projects: Vec<ShellAgentProjectSummary>,
-    agent_instance_id: &str,
+    projects: Vec<RunnerProjectSummary>,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
 ) -> Result<RunnerSessionExit, RunnerTransportError> {
     websocket_session_with_shutdown(
         cfg,
         projects,
-        agent_instance_id,
+        runner_instance_id,
         runtime,
         runtime.wait_for_shutdown(),
     )
@@ -3998,8 +2717,8 @@ async fn websocket_session_classified(
 
 async fn websocket_session_with_shutdown<F>(
     cfg: &RunnerConfig,
-    projects: Vec<ShellAgentProjectSummary>,
-    agent_instance_id: &str,
+    projects: Vec<RunnerProjectSummary>,
+    runner_instance_id: &str,
     runtime: &RunnerRuntimeState,
     shutdown: F,
 ) -> Result<RunnerSessionExit, RunnerTransportError>
@@ -4038,11 +2757,11 @@ where
         build_register_request_with_provider_status(
             cfg,
             &runtime.config,
-            agent_instance_id,
+            runner_instance_id,
             0,
             registered_jobs.clone(),
         );
-    let reg_env = AgentEnvelope::Register {
+    let reg_env = RunnerEnvelope::Register {
         payload: register_payload,
     };
     let reg_json =
@@ -4071,7 +2790,7 @@ where
     let ack_text = ack_msg
         .into_text()
         .map_err(|_| "register ack was not text".to_string())?;
-    let ack = AgentEnvelope::from_slice(ack_text.as_bytes())
+    let ack = RunnerEnvelope::from_slice(ack_text.as_bytes())
         .map_err(|e| format!("register ack is not a valid envelope: {}", e))?;
     let _inventory_status = registered_ack(ack)?;
     let mut project_inventory_sync = Some(paged_sync_after_registration(projects));
@@ -4083,7 +2802,7 @@ where
 
     // Split socket into writer (drains outgoing envelopes) and reader.
     let (mut sink, stream) = ws_stream.split();
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
     try_queue_project_inventory_page(
         StreamTransport::WebSocket,
         &mut project_inventory_sync,
@@ -4091,7 +2810,7 @@ where
     );
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
-            let is_goodbye = matches!(env, AgentEnvelope::Goodbye { .. });
+            let is_goodbye = matches!(env, RunnerEnvelope::Goodbye { .. });
             let Ok(json) = serde_json::to_string(&env) else {
                 return StreamWriterExit::TransportFailed;
             };
@@ -4114,7 +2833,7 @@ where
     serve_registered_stream(
         StreamTransport::WebSocket,
         cfg,
-        agent_instance_id,
+        runner_instance_id,
         &registered_jobs,
         out_tx,
         RegisteredStream::WebSocket { reader: stream },

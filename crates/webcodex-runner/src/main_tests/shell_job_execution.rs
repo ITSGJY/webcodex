@@ -1,16 +1,46 @@
 use super::*;
 
+#[test]
+fn cwd_allowed_skips_missing_unrelated_root_when_later_root_matches() {
+    let allowed = tempfile::tempdir().unwrap();
+    let missing = allowed.path().join("deleted-project");
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: false,
+        allowed_roots: vec![missing, allowed.path().to_path_buf()],
+        ..RunnerPolicy::default()
+    };
+
+    cwd_allowed(&policy, allowed.path())
+        .expect("a missing unrelated root must not block a later matching root");
+}
+
+#[test]
+fn cwd_allowed_remains_fail_closed_when_no_existing_root_matches() {
+    let allowed = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let missing = allowed.path().join("deleted-project");
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: false,
+        allowed_roots: vec![missing, allowed.path().to_path_buf()],
+        ..RunnerPolicy::default()
+    };
+
+    let error = cwd_allowed(&policy, outside.path()).unwrap_err();
+    assert!(error.contains("outside allowed_roots"), "{error}");
+}
+
 #[cfg(windows)]
 #[test]
 fn shell_job_filters_sensitive_env_case_insensitive() {
     let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     // The plain (non-profile) path removes sensitive keys from the child
     // environment; Windows removal must be case-insensitive like the OS.
     for spelling in [
         "WEBCODEX_TOKEN",
+        "WebCodex_Pat",
         "WebCodex_User_Token",
         "Authorization",
         "webcodex_agent_token",
@@ -32,7 +62,12 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
     // A configured shell env must not be able to re-insert a secret after the
     // inherited environment was scrubbed. Exercise canonical and mixed-case
     // spellings because Windows environment names are case-insensitive.
-    for spelling in ["WEBCODEX_TOKEN", "WebCodex_User_Token", "authorization"] {
+    for spelling in [
+        "WEBCODEX_TOKEN",
+        "webcodex_pat",
+        "WebCodex_User_Token",
+        "authorization",
+    ] {
         let shell = ShellConfig {
             env: HashMap::from([(spelling.to_string(), "configured-secret".to_string())]),
             ..ShellConfig::default()
@@ -52,6 +87,13 @@ fn shell_job_filters_sensitive_env_case_insensitive() {
             Some("absent"),
             "configured sensitive env leaked: {result:?}"
         );
+    }
+}
+
+fn decoded_job_operation(request: RunnerRequest) -> RunnerJobOperation {
+    match request.decode_operation().expect("valid typed Job fixture") {
+        RunnerOperation::Job(operation) => operation,
+        _ => panic!("expected Job operation"),
     }
 }
 
@@ -81,29 +123,41 @@ fn raw_shell_job_lifecycle_distinguishes_terminal_truth_without_error_text_match
 
 #[test]
 fn raw_shell_job_prestart_rejection_is_explicitly_not_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let operation = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
     assert_eq!(
-        job_prestart_lifecycle_for_kind("start_job"),
+        job_prestart_lifecycle(&operation),
         Some(ShellCommandExecutionState::NotStarted)
     );
-    assert_eq!(job_prestart_lifecycle_for_kind("run_shell"), None);
 }
 
 #[test]
 fn raw_shell_job_post_spawn_interruption_never_reuses_not_started_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
     assert_eq!(
-        post_spawn_interruption_lifecycle_for_kind("start_job"),
+        post_spawn_interruption_lifecycle(&shell),
         Some(ShellCommandExecutionState::OutcomeUnknown)
     );
-    assert_eq!(
-        post_spawn_interruption_lifecycle_for_kind("start_validation_job"),
-        None
-    );
+
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["check".to_string(), "--all-targets".to_string()],
+        env: Vec::new(),
+    };
+    let mut validation = shell_job_request(temp.path(), "");
+    validation.kind = "start_validation_job".to_string();
+    validation.command = serde_json::to_string(&[step]).unwrap();
+    validation.job_context.as_mut().unwrap().validation_steps = vec!["check".to_string()];
+    let validation = decoded_job_operation(validation);
+    assert_eq!(post_spawn_interruption_lifecycle(&validation), None);
 }
 
 #[test]
 fn shell_job_success_and_failure_results_are_structured() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
 
     let success = run_shell(
@@ -136,7 +190,7 @@ fn shell_job_success_and_failure_results_are_structured() {
 #[test]
 fn shell_job_writes_stdin_to_child() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
 
     let result = run_shell(
@@ -157,7 +211,7 @@ fn shell_job_writes_stdin_to_child() {
 #[test]
 fn shell_job_preserves_result_when_child_closes_stdin_early() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     // Larger than a pipe buffer, so write_all observes the closed reader
     // instead of winning the race by buffering the whole payload.
@@ -207,10 +261,12 @@ fn shell_job_rejects_cwd_symlink_escape() {
         .is_some_and(|error| error.contains("outside allowed_roots")));
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
-fn shell_job_timeout_returns_timeout_error() {
+#[ignore = "runner real-process lane: waits on a real shell timeout"]
+fn runner_real_process_shell_job_timeout_returns_timeout_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
 
     let result = run_shell(
@@ -239,11 +295,12 @@ fn long_lived_descendant_command(pid_file: &Path) -> String {
     )
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn shell_job_timeout_reaps_descendant_process_group() {
+#[ignore = "runner real-process lane: waits on a real shell timeout"]
+fn runner_real_process_shell_job_timeout_reaps_descendant_process_group() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     let pid_file = tmp.path().join("timeout-descendant.pid");
 
@@ -274,9 +331,10 @@ fn shell_job_timeout_reaps_descendant_process_group() {
     assert_descendant_reaped(&pid_file);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn shell_job_timeout_profile_reaps_descendant_process_group() {
+#[ignore = "runner real-process lane: waits on a real shell timeout"]
+fn runner_real_process_shell_job_timeout_profile_reaps_descendant_process_group() {
     let tmp = tempfile::tempdir().unwrap();
     let shell = shell_with_profiles(Some("test"), vec![("test", ShellProfileConfig::default())]);
     let policy = unrestricted_test_policy();
@@ -313,7 +371,7 @@ fn shell_job_timeout_profile_reaps_descendant_process_group() {
 #[test]
 fn shell_job_powershell_statement_error_is_nonzero() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     let result = run_shell(
         &cfg.policy,
@@ -332,7 +390,7 @@ fn shell_job_powershell_statement_error_is_nonzero() {
 #[test]
 fn shell_job_powershell_last_success_overrides_stale_native_exit() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     let result = run_shell(
         &cfg.policy,
@@ -354,7 +412,7 @@ fn shell_job_powershell_last_success_overrides_stale_native_exit() {
 #[test]
 fn shell_job_stop_flag_is_best_effort() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     let stop_requested = AtomicBool::new(true);
 
@@ -380,7 +438,7 @@ fn shell_job_stop_flag_is_best_effort() {
 #[test]
 fn shell_job_stop_reaps_descendant_process_group() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let cwd = tmp.path().to_string_lossy().to_string();
     let pid_file = tmp.path().join("stop-descendant.pid");
     let stop_requested = Arc::new(AtomicBool::new(false));
@@ -419,7 +477,7 @@ fn shell_job_stop_reaps_descendant_process_group() {
 #[test]
 fn shell_job_stdout_stderr_are_bounded() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     cfg.policy.max_output_bytes = 8;
     let cwd = tmp.path().to_string_lossy().to_string();
 

@@ -1,7 +1,7 @@
 use super::support::*;
 use crate::auth::scopes::{oauth_scope_policy_for_runtime_tool, OAuthToolScopePolicy};
 use crate::auth::SCOPE_PROJECT_READ;
-use crate::shell_protocol::ShellClientCapabilities;
+use crate::runner_protocol::RunnerCapabilities;
 use crate::tool_runtime::metadata::{lookup_tool_metadata, ToolRisk};
 use crate::tool_runtime::registry::output_schema_for_tool;
 use crate::tool_runtime::sessions::{
@@ -41,6 +41,7 @@ fn record_correlated_validation_invocation(
             &arguments,
             Some(project.to_string()),
             metadata,
+            crate::tool_runtime::sessions::session_tool_contract("cargo_check"),
         );
         runtime.sessions.record_tool_call_finished(
             start,
@@ -90,7 +91,12 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
         json!(["project", "session_id"])
     );
     assert_eq!(spec.input_schema["properties"]["limit"]["minimum"], 1);
-    assert_eq!(spec.input_schema["properties"]["limit"]["maximum"], 100);
+    assert!(spec.input_schema["properties"]["limit"]
+        .get("maximum")
+        .is_none());
+    assert!(spec.input_schema["properties"]["limit"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("clamped to 100")));
     assert!(spec.description.to_lowercase().contains("does not run"));
 
     let output = output_schema_for_tool("validation_summary");
@@ -141,7 +147,7 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
         .values()
         .map(|methods| methods.as_object().unwrap().len())
         .sum();
-    assert_eq!(operation_count, 22);
+    assert_eq!(operation_count, 16);
 }
 
 #[tokio::test]
@@ -149,7 +155,7 @@ async fn validation_summary_is_guard_safe_read_only_and_does_not_pollute_ledger(
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "validation-summary-safe", "demo", tmp.path())
+        register_runner_project_at_path(&runtime, "validation-summary-safe", "demo", tmp.path())
             .await;
     let session = runtime
         .sessions
@@ -217,7 +223,7 @@ async fn validation_summary_preserves_history_bounds_and_safe_diagnostics() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "validation-summary-history", "demo", tmp.path())
+        register_runner_project_at_path(&runtime, "validation-summary-history", "demo", tmp.path())
             .await;
     let session = runtime
         .sessions
@@ -354,6 +360,7 @@ fn correlated_validation_matches_the_business_start_by_call_id() {
         &json!({"project": project, "validation_target_id": recorder_target}),
         Some(project.clone()),
         recorder,
+        crate::tool_runtime::sessions::session_tool_contract("cargo_check"),
     );
     let business_start = runtime.sessions.record_tool_call_started_with_metadata(
         Some(&session.session_id),
@@ -362,6 +369,7 @@ fn correlated_validation_matches_the_business_start_by_call_id() {
         &json!({"project": project, "validation_target_id": business_target}),
         Some(project.clone()),
         business,
+        crate::tool_runtime::sessions::session_tool_contract("cargo_check"),
     );
     let output = json!({
         "exit_code": 0,
@@ -447,6 +455,7 @@ fn durable_async_validation_terminal_success_resolves_same_target_without_accept
         SessionTransport::Api,
         "cargo_check",
         &json!({"project": project, "validation_target_id": target}),
+        crate::tool_runtime::sessions::session_tool_contract("cargo_check"),
     );
     runtime.sessions.record_tool_call_finished(
         start,
@@ -483,6 +492,7 @@ fn durable_async_validation_terminal_success_resolves_same_target_without_accept
         "job-terminal-success",
         &["job-terminal-success"],
         "cargo_check",
+        crate::tool_runtime::sessions::session_tool_contract("cargo_check"),
         Some(project.clone()),
         target,
         None,
@@ -500,6 +510,7 @@ fn durable_async_validation_terminal_success_resolves_same_target_without_accept
             "job-terminal-success",
             &["job-terminal-success"],
             "cargo_check",
+            crate::tool_runtime::sessions::session_tool_contract("cargo_check"),
             Some(project),
             target,
             None,
@@ -545,7 +556,7 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "validation-summary-zero", "demo", tmp.path())
+        register_runner_project_at_path(&runtime, "validation-summary-zero", "demo", tmp.path())
             .await;
     let session = runtime
         .sessions
@@ -594,8 +605,9 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
             Some(&auth),
         )
         .await;
-    assert_eq!(result.output["validation"]["status"], "mixed");
-    assert_eq!(result.output["validation"]["latest_status"], "passed");
+    assert_eq!(result.output["validation"]["status"], "failed");
+    assert_eq!(result.output["validation"]["successes"], 0);
+    assert_eq!(result.output["validation"]["latest_status"], "inconclusive");
     assert_eq!(
         result.output["validation"]["historical_failures"]["resolved"],
         false
@@ -619,7 +631,7 @@ async fn validation_summary_rejects_unknown_mismatched_and_unauthorized_sessions
         &runtime,
         "validation-summary-auth",
         &owner,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         projects,
     )
     .await;
@@ -716,6 +728,7 @@ fn record_validation_event(
         SessionTransport::Api,
         tool_name,
         &json!({"project": project}),
+        crate::tool_runtime::sessions::session_tool_contract(tool_name),
     );
     runtime.sessions.record_tool_call_finished(
         start,

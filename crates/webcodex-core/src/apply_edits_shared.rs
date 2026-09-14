@@ -1,5 +1,5 @@
 //! Types, limits, and the sensitive-path guard shared by the `apply_text_edits`
-//! host write path (`tool_runtime::files`) and the agent-side wire boundary.
+//! host write path (`tool_runtime::files`) and the Runner-side wire boundary.
 //! Both sides consume this module from `webcodex-core`.
 //!
 //! It must stay dependency-light: only `serde` and `std`, which both binaries
@@ -332,7 +332,7 @@ impl ApplyFileChangeKind {
 }
 
 /// One file change in a transactional edit batch. Runtime validation enforces
-/// the fields allowed and required for each `kind` before the owning agent is
+/// the fields allowed and required for each `kind` before the owning Runner is
 /// contacted.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApplyFileChangeInput {
@@ -371,15 +371,16 @@ pub const MAX_APPLY_TEXT_EDIT_FIELD_BYTES: usize = 512 * 1024; // 512 KiB
 /// Matching is component-wise (split on `/`) so legitimate filenames that
 /// merely contain a sensitive substring (e.g. `targeting.md`) are NOT rejected.
 /// A component is sensitive if it equals one of the guarded names, starts with
-/// `.env` / `agent.toml` / `webcodex.env` (catching backups like `.env.local`
-/// or `agent.toml.bak`), or ends with `.env` / `.toml.bak` (catching
+/// `.env` / Runner config / `webcodex.env` (catching backups like `.env.local`
+/// or `runner.toml.bak`), or ends with `.env` / `.toml.bak` (catching
 /// `service.env` or `config.toml.bak`). This is the single source of truth for
 /// both the host write path and the agent wire boundary.
 pub fn is_sensitive_edit_path(path: &str) -> bool {
     // Edits are denied for credentials *and* for the bulk trees: writing into
     // `.git`, `target`, or `node_modules` through the tool surface is never
     // intended. Reads use the narrower `is_secret_path`.
-    crate::sensitive_paths::is_bulk_skipped_path(path)
+    crate::sensitive_paths::is_secret_path(path)
+        || crate::sensitive_paths::is_bulk_excluded_path(path)
 }
 
 #[cfg(test)]

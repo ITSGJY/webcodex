@@ -1,33 +1,85 @@
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 use super::helpers::{
     bounded_tail, command_outcome_unknown_message, command_rejected_message,
-    command_timeout_message, looks_like_command_timeout, normalize_local_status,
-    project_relative_cwd, resolve_local_cwd, resolve_sync_timeout_secs,
+    command_timeout_message, looks_like_command_timeout, resolve_sync_timeout_secs,
     sync_timeout_out_of_range_result, validate_project_relative_path,
     DEFAULT_CARGO_CHECK_TIMEOUT_SECS, DEFAULT_CARGO_FMT_TIMEOUT_SECS,
-    DEFAULT_CARGO_TEST_TIMEOUT_SECS, MAX_LOCAL_LOG_LINES, MAX_VALIDATION_TIMEOUT_SECS,
-    MIN_VALIDATION_TIMEOUT_SECS, SYNC_VALIDATION_WAIT_SECS,
+    DEFAULT_CARGO_TEST_TIMEOUT_SECS, MAX_VALIDATION_TIMEOUT_SECS, MIN_VALIDATION_TIMEOUT_SECS,
+    SYNC_VALIDATION_WAIT_SECS,
 };
-use super::local_jobs::LocalJobRecord;
 use super::shell::{command_execution_state_name, ProjectCommandOutput};
+use super::structured_execution::structured_job_observation;
 use super::tool_result::ToolResult;
-use super::validation_parser::parse_complete_cargo_test_summary_counts;
 use super::validation_profile::{
     validation_adapter_for_tool, ValidationAdapter, ValidationCommandOptions,
+    ValidationFailureEvidence,
 };
 use super::{ExecutionPurpose, ToolRuntime};
 use crate::auth::AuthContext;
-use crate::shell_client::ShellJobStartMetadata;
-use crate::shell_protocol::{
+use crate::runner_http::ShellJobStartMetadata;
+use crate::runner_protocol::{
     ShellCommandExecutionState, ShellJobOpRequest, ShellJobValidationMetadata,
     ShellJobValidationStep,
 };
+use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_core::runtime_contract::STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS;
+pub(crate) use webcodex_validation::parse_cargo_test_run_metadata;
 
 const CARGO_STDIO_TAIL_CHARS: usize = 12_000;
 const CARGO_VALIDATION_FAILURE_KIND: &str = "validation_failed";
 const VALIDATION_FAILURE_GUIDANCE: &str =
     "command was started; inspect bounded validation evidence, fix the reported issue, then rerun the same structured validation tool.";
+
+fn test_count_assertion_failure_message(tool_name: &str, payload: &Value) -> String {
+    if tool_name == "cargo_test"
+        && payload.get("zero_tests_run").and_then(Value::as_bool) == Some(true)
+    {
+        return "cargo_test completed but 0 tests executed; broaden or remove the substring filter, use the test's full qualified name if needed, or verify the selected package/target. Do not put --exact, --nocapture, or other Cargo/libtest flags in filter, and do not treat this result as validation success.".to_string();
+    }
+    if tool_name == "cargo_test" {
+        return "cargo_test test-count assertion was not proven; inspect test_count_assertion and rerun with a scope that executes enough tests.".to_string();
+    }
+    "structured test-count assertion was not proven; inspect test_count_assertion and rerun with a scope that executes enough tests.".to_string()
+}
+
+fn cargo_fmt_check_is_stable_diff(
+    adapter: &'static dyn ValidationAdapter,
+    output: &ProjectCommandOutput,
+) -> bool {
+    if output.execution_state != ShellCommandExecutionState::Completed
+        || output.exit_code == Some(0)
+    {
+        return false;
+    }
+    adapter.map_failure_kind(ValidationFailureEvidence {
+        success: false,
+        reported_failure_kind: None,
+        exit_code: output.exit_code.map(i64::from),
+        diagnostics: None,
+        stdout_excerpt: &output.stdout,
+        stderr_excerpt: &output.stderr,
+    }) == "format_diff"
+}
+
+fn annotate_cargo_fmt_effect(
+    result: &mut ToolResult,
+    changed: Option<bool>,
+    state_changed: Option<bool>,
+) {
+    result.output["changed"] = changed.map(Value::Bool).unwrap_or(Value::Null);
+    result.output["state_changed"] = state_changed.map(Value::Bool).unwrap_or(Value::Null);
+}
+
+fn append_cargo_fmt_uncertainty_guidance(result: &mut ToolResult) {
+    let guidance =
+        "cargo fmt mutation may have changed source; inspect the worktree before retrying.";
+    result.error = Some(match result.error.take() {
+        Some(error) => format!("{error} {guidance}"),
+        None => guidance.to_string(),
+    });
+}
 
 fn validate_cwd(cwd: Option<String>) -> Result<Option<String>, String> {
     match cwd {
@@ -53,91 +105,6 @@ pub(crate) fn count_rustc_diagnostics(text: &str, prefix: &str) -> usize {
             line.starts_with(prefix) || line.starts_with(&coded_prefix)
         })
         .count()
-}
-
-/// Aggregate passed/failed counts across every Cargo test harness summary line.
-///
-/// Uses the same multi-harness aggregation as diagnostics `test_summary` so
-/// top-level `tests_passed` / `tests_failed` stay consistent when the bounded
-/// tails still contain every summary.
-#[cfg(test)]
-pub(crate) fn parse_cargo_test_counts(text: &str) -> (Option<u64>, Option<u64>) {
-    let metadata = parse_cargo_test_run_metadata(text);
-    (metadata.tests_passed, metadata.tests_failed)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CargoTestRunMetadata {
-    pub(crate) tests_detected: bool,
-    pub(crate) tests_run_count: Option<u64>,
-    pub(crate) tests_passed: Option<u64>,
-    pub(crate) tests_failed: Option<u64>,
-    pub(crate) zero_tests_run: Option<bool>,
-}
-
-pub(crate) fn parse_cargo_test_run_metadata(text: &str) -> CargoTestRunMetadata {
-    let mut tests_run_count = 0_u64;
-    let mut tests_passed = 0_u64;
-    let mut tests_failed = 0_u64;
-    let mut complete_summary_found = false;
-    let mut incomplete_summary_found = false;
-    let mut tests_detected = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("running ") {
-            let mut parts = rest.split_whitespace();
-            if parts
-                .next()
-                .is_some_and(|count| count.parse::<u64>().is_ok())
-                && parts
-                    .next()
-                    .is_some_and(|label| label == "test" || label == "tests")
-            {
-                // `running N tests` includes ignored items. It is useful only
-                // as a harness-detection signal, never as executed-count proof.
-                tests_detected = true;
-            }
-        }
-
-        if !line.contains("test result:") {
-            continue;
-        }
-        tests_detected = true;
-        match parse_complete_cargo_test_summary_counts(line) {
-            Some((passed, failed)) => {
-                complete_summary_found = true;
-                tests_passed = tests_passed.saturating_add(passed);
-                tests_failed = tests_failed.saturating_add(failed);
-                tests_run_count = tests_run_count
-                    .saturating_add(passed)
-                    .saturating_add(failed);
-            }
-            None => {
-                // A partial/malformed summary makes the aggregate unproven;
-                // do not promote counts observed in other retained sections.
-                incomplete_summary_found = true;
-            }
-        }
-    }
-
-    if complete_summary_found && !incomplete_summary_found {
-        CargoTestRunMetadata {
-            tests_detected,
-            tests_run_count: Some(tests_run_count),
-            tests_passed: Some(tests_passed),
-            tests_failed: Some(tests_failed),
-            zero_tests_run: Some(tests_run_count == 0),
-        }
-    } else {
-        CargoTestRunMetadata {
-            tests_detected,
-            tests_run_count: None,
-            tests_passed: None,
-            tests_failed: None,
-            zero_tests_run: None,
-        }
-    }
 }
 
 fn is_cargo_validation_failure(output: &ProjectCommandOutput, timeout_secs: u64) -> bool {
@@ -181,18 +148,20 @@ struct ValidationBudget {
 /// Resolve a read-only structured validation budget.
 ///
 /// `timeout_secs` is the total runtime budget of the command, not the tool
-/// call's synchronous wait. When the caller omits it, the tool default is
-/// used. The internal sync wait is the smaller of `SYNC_VALIDATION_WAIT_SECS`
-/// and the effective budget: a budget smaller than the sync window means there
-/// is no headroom to promote the same execution to a Job, so the command runs
-/// to a normal terminal timeout instead.
+/// call's synchronous wait. Positive values above the supported ceilings are
+/// caller preferences and are clamped before dispatch. Explicit
+/// `sync_wait_secs` is likewise clamped to both 60 seconds and the effective
+/// total budget. When omitted, compatibility keeps
+/// `min(SYNC_VALIDATION_WAIT_SECS, effective_timeout)`; equal grace and total
+/// budget leaves no Cargo handoff headroom.
 fn resolve_validation_budget(
     tool_name: &str,
     timeout_secs: Option<u64>,
+    sync_wait_secs: Option<u64>,
     default: u64,
 ) -> Result<ValidationBudget, ToolResult> {
-    let value = timeout_secs.unwrap_or(default);
-    if !(MIN_VALIDATION_TIMEOUT_SECS..=MAX_VALIDATION_TIMEOUT_SECS).contains(&value) {
+    let requested_timeout_secs = timeout_secs.unwrap_or(default);
+    if requested_timeout_secs < MIN_VALIDATION_TIMEOUT_SECS {
         return Err(sync_timeout_out_of_range_result_with_range(
             tool_name,
             MIN_VALIDATION_TIMEOUT_SECS,
@@ -200,11 +169,69 @@ fn resolve_validation_budget(
             default,
         ));
     }
-    let sync_wait_secs = SYNC_VALIDATION_WAIT_SECS.min(value);
+    let effective_timeout_secs = requested_timeout_secs.min(MAX_VALIDATION_TIMEOUT_SECS);
+    let sync_wait_secs = match sync_wait_secs {
+        Some(0) => {
+            return Err(validation_sync_wait_rejection(
+                tool_name,
+                format!("{tool_name} sync_wait_secs must be at least 1"),
+                "pass a positive sync_wait_secs, or omit it for the existing synchronous grace.",
+            ));
+        }
+        Some(sync_wait) => sync_wait
+            .min(STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS)
+            .min(effective_timeout_secs),
+        None => SYNC_VALIDATION_WAIT_SECS.min(effective_timeout_secs),
+    };
     Ok(ValidationBudget {
-        effective_timeout_secs: value,
+        effective_timeout_secs,
         sync_wait_secs,
     })
+}
+
+#[cfg(test)]
+mod validation_budget_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_validation_preferences_are_clamped_and_zero_is_rejected() {
+        let oversized =
+            resolve_validation_budget("cargo_check", Some(4_000), Some(600), 600).unwrap();
+        assert_eq!(
+            oversized.effective_timeout_secs,
+            MAX_VALIDATION_TIMEOUT_SECS
+        );
+        assert_eq!(
+            oversized.sync_wait_secs,
+            STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS
+        );
+
+        let over_total =
+            resolve_validation_budget("cargo_check", Some(30), Some(600), 600).unwrap();
+        assert_eq!(over_total.effective_timeout_secs, 30);
+        assert_eq!(over_total.sync_wait_secs, 30);
+
+        assert!(resolve_validation_budget("cargo_check", Some(0), None, 600).is_err());
+        assert!(resolve_validation_budget("cargo_check", Some(600), Some(0), 600).is_err());
+    }
+}
+
+fn validation_sync_wait_rejection(
+    tool_name: &str,
+    reason: impl Into<String>,
+    guidance: impl Into<String>,
+) -> ToolResult {
+    ToolResult::err_with_output(
+        command_rejected_message(reason.into(), guidance.into()),
+        json!({
+            "execution_source": tool_name,
+            "execution_state": "not_started",
+            "command_started": false,
+            "command_completed": false,
+            "failure_kind": "invalid_arguments",
+            "tool_failure": true,
+        }),
+    )
 }
 
 fn sync_timeout_out_of_range_result_with_range(
@@ -251,11 +278,11 @@ fn resolve_cargo_test_minimum(
     no_run: Option<bool>,
 ) -> Result<Option<u64>, ToolResult> {
     if let Some(minimum) = min_tests {
-        if !(1..=crate::shell_protocol::CARGO_TEST_MIN_TESTS_MAX).contains(&minimum) {
+        if !(1..=crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX).contains(&minimum) {
             return Err(cargo_test_assertion_rejection(
                 format!(
                     "cargo_test min_tests must be between 1 and {}",
-                    crate::shell_protocol::CARGO_TEST_MIN_TESTS_MAX
+                    crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX
                 ),
                 "pass a bounded positive min_tests value, or omit it.",
             ));
@@ -293,7 +320,7 @@ impl ToolRuntime {
         check: Option<bool>,
         timeout_secs: Option<u64>,
     ) -> ToolResult {
-        self.cargo_fmt_with_context_inner(project, cwd, check, timeout_secs, None, None, None)
+        self.cargo_fmt_with_context_inner(project, cwd, check, timeout_secs, None, None, None, None)
             .await
     }
 
@@ -307,6 +334,7 @@ impl ToolRuntime {
         cwd: Option<String>,
         check: Option<bool>,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
@@ -316,6 +344,7 @@ impl ToolRuntime {
             cwd,
             check,
             timeout_secs,
+            sync_wait_secs,
             session_id,
             ssh_resource,
             auth,
@@ -330,20 +359,25 @@ impl ToolRuntime {
         cwd: Option<String>,
         check: Option<bool>,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         let check = check.unwrap_or(false);
+        // `sync_wait_secs` controls read-only Job handoff only. Ensure-format accepts
+        // the field for caller-shape compatibility but intentionally ignores it:
+        // mutation remains synchronous and `timeout_secs` remains the full budget.
         // Both read-only and mutating structured Cargo formatting reject named
         // SSH resources before selecting an execution path. In particular, the
-        // mutating sync path must never fall back to the Agent project root.
+        // mutating sync path must never fall back to the Runner project root.
         if let Some(result) = reject_structured_validation_ssh_resource(ssh_resource) {
             return result;
         }
-        // Non-check `cargo fmt` mutates source and keeps the existing explicit
-        // synchronous semantics: it never auto-promotes to a Job after the
-        // tool has returned. Only `check=true` gets the read-only handoff path.
+        // Non-check `cargo_fmt` is an ensure-formatted operation. It first runs
+        // the read-only rustfmt check, mutating only when that check proves a
+        // stable formatting diff. The mutation stays synchronous and never
+        // continues after this ToolResult returns.
         if !check {
             let timeout =
                 match resolve_sync_timeout_secs(timeout_secs, DEFAULT_CARGO_FMT_TIMEOUT_SECS) {
@@ -364,17 +398,173 @@ impl ToolRuntime {
                     ))
                 }
             };
+            let config = match self.resolve_project(&project).await {
+                Ok(config) => config,
+                Err(e) => {
+                    return ToolResult::err(command_rejected_message(
+                        e.to_message(),
+                        "verify the project id/cwd and agent connectivity, then retry.",
+                    ))
+                }
+            };
             let adapter = validation_adapter_for_tool("cargo_fmt")
                 .expect("Rust validation profile must register cargo_fmt");
+            let check_command = adapter
+                .build_command(ValidationCommandOptions {
+                    check: true,
+                    ..ValidationCommandOptions::default()
+                })
+                .expect("cargo_fmt check command builder is infallible");
+            let started = Instant::now();
+            let check_output = match self
+                .run_project_command_capture(&project, check_command.clone(), timeout, cwd.clone())
+                .await
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    return ToolResult::err(command_rejected_message(
+                        e,
+                        "verify the project id/cwd and agent connectivity, then retry.",
+                    ))
+                }
+            };
+            let already_formatted = check_output.execution_state
+                == ShellCommandExecutionState::Completed
+                && check_output.exit_code == Some(0);
+            if already_formatted {
+                let mut result = self
+                    .build_cargo_result(
+                        &project,
+                        &check_command,
+                        cwd.as_deref(),
+                        &config,
+                        adapter,
+                        check_output,
+                        timeout,
+                        0,
+                        false,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                annotate_cargo_fmt_effect(&mut result, Some(false), Some(false));
+                return result;
+            }
+            if !cargo_fmt_check_is_stable_diff(adapter, &check_output) {
+                let mut result = self
+                    .build_cargo_result(
+                        &project,
+                        &check_command,
+                        cwd.as_deref(),
+                        &config,
+                        adapter,
+                        check_output,
+                        timeout,
+                        0,
+                        false,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                annotate_cargo_fmt_effect(&mut result, Some(false), Some(false));
+                if let Some(error) = result.error.take() {
+                    result.error = Some(format!(
+                        "{error} No source formatting was attempted because the precheck did not prove a stable rustfmt diff."
+                    ));
+                }
+                return result;
+            }
+
+            let total_budget = Duration::from_secs(timeout);
+            let elapsed = started.elapsed();
+            let remaining_budget = total_budget.saturating_sub(elapsed);
+            if remaining_budget < Duration::from_secs(1) {
+                let mut result = self
+                    .build_cargo_result(
+                        &project,
+                        &check_command,
+                        cwd.as_deref(),
+                        &config,
+                        adapter,
+                        check_output,
+                        timeout,
+                        0,
+                        false,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                annotate_cargo_fmt_effect(&mut result, Some(false), Some(false));
+                result.output["failure_kind"] = json!("timeout");
+                result.error = Some(
+                    "cargo_fmt found formatting differences but exhausted its synchronous timeout before mutation; no source formatting was attempted."
+                        .to_string(),
+                );
+                return result;
+            }
+            let remaining = remaining_budget.as_secs();
             let command = adapter
                 .build_command(ValidationCommandOptions {
                     check: false,
                     ..ValidationCommandOptions::default()
                 })
                 .expect("cargo_fmt command builder is infallible");
-            // `cargo fmt` (mutating) uses the plain sync path.
-            self.run_cargo_command_sync(project, cwd, command, timeout, adapter)
+            let mutation_output = match self
+                .run_project_command_capture(&project, command.clone(), remaining, cwd.clone())
                 .await
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    return ToolResult::err(command_rejected_message(
+                        e,
+                        "the formatting precheck proved a diff but the mutation command could not be dispatched; inspect the worktree before retrying.",
+                    ))
+                }
+            };
+            let mutation_state = mutation_output.execution_state;
+            let mutation_exit_code = mutation_output.exit_code;
+            let mut result = self
+                .build_cargo_result(
+                    &project,
+                    &command,
+                    cwd.as_deref(),
+                    &config,
+                    adapter,
+                    mutation_output,
+                    remaining,
+                    0,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            result.output["effective_timeout_secs"] = json!(timeout);
+            result.output["duration_ms"] = json!(started.elapsed().as_millis() as u64);
+            match (mutation_state, mutation_exit_code) {
+                (ShellCommandExecutionState::Completed, Some(0)) => {
+                    annotate_cargo_fmt_effect(&mut result, Some(true), Some(true));
+                }
+                (ShellCommandExecutionState::NotStarted, _) => {
+                    annotate_cargo_fmt_effect(&mut result, Some(false), Some(false));
+                }
+                _ => {
+                    annotate_cargo_fmt_effect(&mut result, None, None);
+                    append_cargo_fmt_uncertainty_guidance(&mut result);
+                }
+            }
+            result
         } else {
             self.run_readonly_validation(
                 "cargo_fmt",
@@ -383,15 +573,18 @@ impl ToolRuntime {
                     cwd,
                     check: true,
                     filter: None,
+                    lib: None,
                     all_targets: None,
                     all_features: None,
                     no_default_features: None,
                     features: None,
                     package: None,
                     no_run: None,
+                    require_tests: None,
                     minimum_tests: None,
                     go_packages: None,
                     timeout_secs,
+                    sync_wait_secs,
                     session_id,
                     ssh_resource,
                     auth,
@@ -426,6 +619,7 @@ impl ToolRuntime {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -441,6 +635,7 @@ impl ToolRuntime {
         features: Option<String>,
         package: Option<String>,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
@@ -454,6 +649,7 @@ impl ToolRuntime {
             features,
             package,
             timeout_secs,
+            sync_wait_secs,
             session_id,
             ssh_resource,
             auth,
@@ -472,6 +668,7 @@ impl ToolRuntime {
         features: Option<String>,
         package: Option<String>,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
@@ -483,15 +680,18 @@ impl ToolRuntime {
                 cwd,
                 check: false,
                 filter: None,
+                lib: None,
                 all_targets,
                 all_features,
                 no_default_features,
                 features,
                 package,
                 no_run: None,
+                require_tests: None,
                 minimum_tests: None,
                 go_packages: None,
                 timeout_secs,
+                sync_wait_secs,
                 session_id,
                 ssh_resource,
                 auth,
@@ -519,6 +719,7 @@ impl ToolRuntime {
             project,
             cwd,
             filter,
+            None,
             all_targets,
             all_features,
             no_default_features,
@@ -528,6 +729,7 @@ impl ToolRuntime {
             None,
             None,
             timeout_secs,
+            None,
             None,
             None,
             None,
@@ -541,6 +743,7 @@ impl ToolRuntime {
         project: String,
         cwd: Option<String>,
         filter: Option<String>,
+        lib: Option<bool>,
         all_targets: Option<bool>,
         all_features: Option<bool>,
         no_default_features: Option<bool>,
@@ -550,6 +753,7 @@ impl ToolRuntime {
         require_tests: Option<bool>,
         min_tests: Option<u64>,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
@@ -558,6 +762,7 @@ impl ToolRuntime {
             project,
             cwd,
             filter,
+            lib,
             all_targets,
             all_features,
             no_default_features,
@@ -567,6 +772,7 @@ impl ToolRuntime {
             require_tests,
             min_tests,
             timeout_secs,
+            sync_wait_secs,
             session_id,
             ssh_resource,
             auth,
@@ -580,6 +786,7 @@ impl ToolRuntime {
         project: String,
         cwd: Option<String>,
         filter: Option<String>,
+        lib: Option<bool>,
         all_targets: Option<bool>,
         all_features: Option<bool>,
         no_default_features: Option<bool>,
@@ -589,6 +796,7 @@ impl ToolRuntime {
         require_tests: Option<bool>,
         min_tests: Option<u64>,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
@@ -604,15 +812,18 @@ impl ToolRuntime {
                 cwd,
                 check: false,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
                 features,
                 package,
                 no_run,
+                require_tests,
                 minimum_tests,
                 go_packages: None,
                 timeout_secs,
+                sync_wait_secs,
                 session_id,
                 ssh_resource,
                 auth,
@@ -628,7 +839,7 @@ impl ToolRuntime {
         cwd: Option<String>,
         timeout_secs: Option<u64>,
     ) -> ToolResult {
-        self.go_test_with_context(project, cwd, None, timeout_secs, None, None, None)
+        self.go_test_with_context(project, cwd, None, timeout_secs, None, None, None, None)
             .await
     }
 
@@ -638,6 +849,7 @@ impl ToolRuntime {
         cwd: Option<String>,
         packages: Option<Vec<String>>,
         timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
         session_id: Option<String>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
@@ -649,15 +861,18 @@ impl ToolRuntime {
                 cwd,
                 check: false,
                 filter: None,
+                lib: None,
                 all_targets: None,
                 all_features: None,
                 no_default_features: None,
                 features: None,
                 package: None,
                 no_run: None,
+                require_tests: None,
                 minimum_tests: None,
                 go_packages: packages,
                 timeout_secs,
+                sync_wait_secs,
                 session_id,
                 ssh_resource,
                 auth,
@@ -667,8 +882,8 @@ impl ToolRuntime {
     }
 
     /// Run one read-only structured validation exactly once, synchronously
-    /// waiting for up to the internal sync window, then promoting the *same*
-    /// execution to a queryable Job if it is still running.
+    /// waiting for up to the effective synchronous grace, then promoting the
+    /// *same* execution to a queryable Job if it is still running.
     async fn run_readonly_validation(
         &self,
         tool_name: &str,
@@ -680,7 +895,12 @@ impl ToolRuntime {
             "cargo_fmt" => DEFAULT_CARGO_FMT_TIMEOUT_SECS,
             _ => unreachable!("unknown read-only validation tool"),
         };
-        let budget = match resolve_validation_budget(tool_name, request.timeout_secs, default) {
+        let budget = match resolve_validation_budget(
+            tool_name,
+            request.timeout_secs,
+            request.sync_wait_secs,
+            default,
+        ) {
             Ok(budget) => budget,
             Err(result) => return result,
         };
@@ -695,18 +915,23 @@ impl ToolRuntime {
         };
         let adapter = validation_adapter_for_tool(tool_name)
             .expect("structured validation profile must register the read-only tool");
+        let validation_identity_kind =
+            webcodex_tool_contracts::runtime_tool_session_evidence_policy(tool_name)
+                .validation_identity;
         let validation_target_id = super::tool_audit::structured_validation_target_identity(
-            tool_name,
+            validation_identity_kind,
             &json!({
                 "cwd": cwd.as_deref(),
                 "check": request.check,
                 "filter": request.filter.as_deref(),
+                "lib": request.lib,
                 "all_targets": request.all_targets,
                 "all_features": request.all_features,
                 "no_default_features": request.no_default_features,
                 "features": request.features.as_deref(),
                 "package": request.package.as_deref(),
                 "no_run": request.no_run,
+                "require_tests": request.require_tests,
                 "min_tests": request.minimum_tests,
                 "packages": request.go_packages.as_ref(),
             }),
@@ -714,6 +939,7 @@ impl ToolRuntime {
         let options = ValidationCommandOptions {
             check: request.check,
             filter: request.filter,
+            lib: request.lib,
             all_targets: request.all_targets,
             all_features: request.all_features,
             no_default_features: request.no_default_features,
@@ -757,44 +983,45 @@ impl ToolRuntime {
         let session_id = request.session_id.clone();
         let ssh_resource = request.ssh_resource.map(str::to_string);
 
-        if resolved.is_agent() {
-            // Structured validation tools never execute through a named SSH resource.
-            // Reject at the shared Agent entry so direct sync, short sync, and
-            // long Job handoff paths cannot silently fall back to the project root.
-            if let Some(result) = reject_structured_validation_ssh_resource(ssh_resource.as_deref())
-            {
-                return result;
-            }
-            if tool_name == "go_test" || timeout_secs > SYNC_VALIDATION_WAIT_SECS {
-                // The budget exceeds the internal sync window, so there is
-                // headroom to promote the same execution to a Job. The agent
-                // path enqueues exactly one structured validation Job, waits
-                // up to `sync_wait_secs`, and hands off if still running.
-                self.run_readonly_validation_agent(
-                    tool_name,
-                    &request.project,
-                    &resolved,
-                    cwd.as_deref(),
-                    &command,
-                    adapter,
-                    options,
-                    purpose,
-                    timeout_secs,
-                    sync_wait_secs,
-                    session_id,
-                    validation_target_id,
-                    request.minimum_tests,
-                    ssh_resource.as_deref(),
-                    request.auth,
-                )
-                .await
-            } else {
-                // No handoff headroom: the requested budget is at most the
-                // sync window, so there is no remaining runtime for a Job to
-                // continue. Run synchronously through the existing capture
-                // path and report a real terminal timeout at the budget
-                // boundary. The command still starts exactly once.
-                let output = match self
+        // Structured validation tools never execute through a named SSH resource.
+        // Reject at the shared Agent entry so direct sync, short sync, and
+        // long Job handoff paths cannot silently fall back to the project root.
+        if let Some(result) = reject_structured_validation_ssh_resource(ssh_resource.as_deref()) {
+            return result;
+        }
+        if tool_name == "go_test" || sync_wait_secs < timeout_secs {
+            // The effective synchronous grace is shorter than the total
+            // validation budget, so there is headroom to expose the same
+            // execution as a Job. The agent path enqueues exactly one
+            // structured validation Job, waits up to `sync_wait_secs`, and
+            // hands off if it is still running.
+            self.run_readonly_validation_agent(
+                tool_name,
+                &request.project,
+                &resolved,
+                cwd.as_deref(),
+                &command,
+                adapter,
+                options,
+                purpose,
+                timeout_secs,
+                sync_wait_secs,
+                session_id,
+                validation_target_id,
+                request.minimum_tests,
+                request.require_tests,
+                request.no_run,
+                ssh_resource.as_deref(),
+                request.auth,
+            )
+            .await
+        } else {
+            // No handoff headroom: the requested budget is at most the
+            // sync window, so there is no remaining runtime for a Job to
+            // continue. Run synchronously through the existing capture
+            // path and report a real terminal timeout at the budget
+            // boundary. The command still starts exactly once.
+            let output = match self
                     .run_project_command_capture(
                         &request.project,
                         command.clone(),
@@ -811,37 +1038,21 @@ impl ToolRuntime {
                         ))
                     }
                 };
-                self.build_cargo_result(
-                    &request.project,
-                    &command,
-                    cwd.as_deref(),
-                    &resolved,
-                    adapter,
-                    output,
-                    timeout_secs,
-                    sync_wait_secs,
-                    false,
-                    false,
-                    false,
-                    request.minimum_tests,
-                )
-                .await
-            }
-        } else {
-            self.run_readonly_validation_local(
-                tool_name,
+            self.build_cargo_result(
                 &request.project,
-                &resolved,
-                cwd.as_deref(),
                 &command,
+                cwd.as_deref(),
+                &resolved,
                 adapter,
-                options,
-                purpose,
+                output,
                 timeout_secs,
                 sync_wait_secs,
-                session_id,
-                validation_target_id,
+                false,
+                false,
+                false,
                 request.minimum_tests,
+                request.require_tests,
+                request.no_run,
             )
             .await
         }
@@ -867,19 +1078,13 @@ impl ToolRuntime {
         session_id: Option<String>,
         validation_target_id: Option<String>,
         minimum_tests: Option<u64>,
+        require_tests: Option<bool>,
+        no_run: Option<bool>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let client_id = match config.agent_client_id() {
-            Ok(id) => id.to_string(),
-            Err(e) => {
-                return ToolResult::err(command_rejected_message(
-                    e,
-                    "refresh the agent project registry with list_projects, then retry.",
-                ))
-            }
-        };
-        let effective_cwd = match super::helpers::resolve_agent_cwd(config, cwd) {
+        let client_id = config.client_id.clone();
+        let effective_cwd = match super::helpers::resolve_runner_cwd(config, cwd) {
             Ok(cwd) => cwd,
             Err(error) => {
                 return ToolResult::err(command_rejected_message(
@@ -888,7 +1093,7 @@ impl ToolRuntime {
                 ))
             }
         };
-        let resolved_cwd = super::helpers::project_relative_agent_cwd(config, &effective_cwd)
+        let resolved_cwd = super::helpers::project_relative_runner_cwd(config, &effective_cwd)
             .unwrap_or_else(|_| ".".to_string());
         let actual_shell = "configured";
         // The validation step is derived from the same options the tool would
@@ -913,9 +1118,10 @@ impl ToolRuntime {
                 ))
             }
         };
+        let access = crate::runner_http::runner_access_from_auth(auth);
         let job = match self
-            .shell_clients
-            .start_job_with_metadata_for_auth(
+            .runner_registry
+            .start_job_with_metadata_for_access(
                 ShellJobOpRequest {
                     op: "start".to_string(),
                     client_id: Some(client_id),
@@ -947,8 +1153,10 @@ impl ToolRuntime {
                         adapter: adapter.tool_identity().to_string(),
                         validation_target_id: validation_target_id.clone(),
                         minimum_tests,
+                        require_tests,
+                        no_run,
                     }),
-                    visibility: crate::shell_client::ShellJobVisibility::HiddenUntilHandoff,
+                    visibility: crate::runner_http::ShellJobVisibility::HiddenUntilHandoff,
                     validation_identity: None,
                     validation_tool: None,
                     assertion_name: None,
@@ -956,7 +1164,8 @@ impl ToolRuntime {
                     stdin: None,
                     detached_idempotency_key: None,
                 },
-                auth,
+                access.as_ref(),
+                None,
             )
             .await
         {
@@ -979,543 +1188,14 @@ impl ToolRuntime {
             cwd: resolved_cwd,
             shell: actual_shell.to_string(),
             executor: "agent".to_string(),
-            command_summary: crate::shell_client::command_preview(command),
+            command_summary: crate::runner_http::command_preview(command),
             minimum_tests,
-            auth: auth.cloned(),
+            require_tests,
+            no_run,
+            auth: access,
         };
         self.await_validation_job(job_id, sync_wait_secs, adapter, handoff)
             .await
-    }
-
-    /// Local-backed read-only validation. Long validations may hand off to the
-    /// existing local Job path; the command still executes exactly once.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_readonly_validation_local(
-        &self,
-        _tool_name: &str,
-        project: &str,
-        config: &crate::projects::ProjectConfig,
-        cwd: Option<&str>,
-        command: &str,
-        adapter: &'static dyn ValidationAdapter,
-        options: ValidationCommandOptions,
-        purpose: ExecutionPurpose,
-        timeout_secs: u64,
-        sync_wait_secs: u64,
-        session_id: Option<String>,
-        validation_target_id: Option<String>,
-        minimum_tests: Option<u64>,
-    ) -> ToolResult {
-        if local_validation_should_handoff(timeout_secs, sync_wait_secs) {
-            return self
-                .run_readonly_validation_local_job_with_context(
-                    _tool_name,
-                    project,
-                    config,
-                    cwd,
-                    command,
-                    adapter,
-                    options,
-                    purpose,
-                    timeout_secs,
-                    sync_wait_secs,
-                    session_id,
-                    validation_target_id,
-                    minimum_tests,
-                )
-                .await;
-        }
-        let _cwd_path = match resolve_local_cwd(config, cwd) {
-            Ok(path) => path,
-            Err(error) => return ToolResult::err(command_rejected_message(
-                error,
-                "choose '.', an existing project-relative cwd, or a path inside the project root.",
-            )),
-        };
-        let output = match self
-            .run_project_command_capture(
-                project,
-                command.to_string(),
-                timeout_secs,
-                cwd.map(str::to_string),
-            )
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                return ToolResult::err(command_rejected_message(
-                    e,
-                    "verify the project id/cwd and agent connectivity, then retry or use run_shell for custom diagnostics.",
-                ))
-            }
-        };
-        self.build_cargo_result(
-            project,
-            command,
-            cwd,
-            config,
-            adapter,
-            output,
-            timeout_secs,
-            sync_wait_secs,
-            false,
-            false,
-            false,
-            minimum_tests,
-        )
-        .await
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_readonly_validation_local_job(
-        &self,
-        tool_name: &str,
-        project: &str,
-        config: &crate::projects::ProjectConfig,
-        cwd: Option<&str>,
-        command: &str,
-        adapter: &'static dyn ValidationAdapter,
-        options: ValidationCommandOptions,
-        purpose: ExecutionPurpose,
-        timeout_secs: u64,
-        sync_wait_secs: u64,
-        minimum_tests: Option<u64>,
-    ) -> ToolResult {
-        self.run_readonly_validation_local_job_with_context(
-            tool_name,
-            project,
-            config,
-            cwd,
-            command,
-            adapter,
-            options,
-            purpose,
-            timeout_secs,
-            sync_wait_secs,
-            None,
-            None,
-            minimum_tests,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_readonly_validation_local_job_with_context(
-        &self,
-        tool_name: &str,
-        project: &str,
-        config: &crate::projects::ProjectConfig,
-        cwd: Option<&str>,
-        command: &str,
-        adapter: &'static dyn ValidationAdapter,
-        options: ValidationCommandOptions,
-        purpose: ExecutionPurpose,
-        timeout_secs: u64,
-        sync_wait_secs: u64,
-        session_id: Option<String>,
-        validation_target_id: Option<String>,
-        minimum_tests: Option<u64>,
-    ) -> ToolResult {
-        let cwd_path = match resolve_local_cwd(config, cwd) {
-            Ok(path) => path,
-            Err(error) => {
-                return ToolResult::err(command_rejected_message(
-                    error,
-                    "choose '.', an existing project-relative cwd, or a path inside the project root.",
-                ));
-            }
-        };
-        let resolved_cwd =
-            project_relative_cwd(config, &cwd_path).unwrap_or_else(|_| ".".to_string());
-        let step = match validation_step(tool_name, &options) {
-            Ok(step) => step,
-            Err(error) => {
-                return ToolResult::err(command_rejected_message(
-                    error,
-                    "fix the cargo argument format, then retry.",
-                ));
-            }
-        };
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let dir = config.root().join(format!(".codex/jobs/{job_id}"));
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            return ToolResult::err(format!("Failed to create job dir: {error}"));
-        }
-        let now = chrono::Utc::now().timestamp();
-        let stdout_file = match std::fs::File::create(dir.join("stdout.log")) {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return ToolResult::err(format!("Failed to create validation stdout log: {error}"));
-            }
-        };
-        let stderr_file = match std::fs::File::create(dir.join("stderr.log")) {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return ToolResult::err(format!("Failed to create validation stderr log: {error}"));
-            }
-        };
-        #[cfg(unix)]
-        let mut process = {
-            use std::os::unix::process::CommandExt;
-            let mut process = std::process::Command::new(&step.program);
-            process.args(&step.args).process_group(0);
-            process
-        };
-        #[cfg(not(unix))]
-        let mut process = {
-            let mut process = std::process::Command::new("setsid");
-            process
-                .arg("timeout")
-                .arg("--signal=TERM")
-                .arg("--kill-after=2s")
-                .arg(format!("{timeout_secs}s"))
-                .arg(&step.program)
-                .args(&step.args);
-            process
-        };
-        process
-            .current_dir(&cwd_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::from(stdout_file))
-            .stderr(std::process::Stdio::from(stderr_file));
-        for (key, value) in &step.env {
-            process.env(key, value);
-        }
-        #[cfg(unix)]
-        let spawn_time = std::time::Instant::now();
-        let child = match process.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return ToolResult::err(format!("Failed to spawn validation job: {error}"));
-            }
-        };
-        #[cfg(unix)]
-        let validation_deadline = spawn_time + std::time::Duration::from_secs(timeout_secs);
-        let pid = child.id();
-        let pgid = i64::from(pid);
-        // No await occurs between successful spawn and this guard taking the
-        // Child, so cancellation cannot leave either the process group or its
-        // reap responsibility unowned.
-        let mut spawned_guard = SpawnedValidationGuard::new(child, self.job_killer.clone(), pgid)
-            .with_job_dir(dir.clone());
-        let metadata = json!({
-            "job_id": job_id,
-            "project": project,
-            "command": command,
-            "status": "running",
-            "created_at": now,
-            "started_at": now,
-            // Validation execution enforces the exact budget. The local Job
-            // watchdog gets a small publication grace so it does not race the
-            // terminal publication and misclassify a real timeout as lost.
-            "max_runtime_secs": timeout_secs.saturating_add(3),
-            "executor": "local",
-            "path": config.path,
-            "kind": "validation",
-            "purpose": purpose.as_str(),
-            "cwd": resolved_cwd,
-            "shell": "direct_argv",
-            "process_group_id": pgid,
-            "validation_tool": tool_name,
-            "validation_kind": adapter.validation_kind(),
-            "validation_steps": [step],
-            "effective_timeout_secs": timeout_secs,
-            "sync_wait_secs": sync_wait_secs,
-            "validation_adapter": adapter.tool_identity(),
-            "session_id": session_id,
-            "validation_target_id": validation_target_id,
-            "minimum_tests": minimum_tests,
-            "visibility": "hidden_until_handoff",
-        });
-        if let Err(error) = std::fs::write(
-            dir.join("metadata.json"),
-            serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-        ) {
-            spawned_guard.cleanup_now();
-            let _ = std::fs::remove_dir_all(&dir);
-            return ToolResult::err(format!("Failed to write validation job metadata: {error}"));
-        }
-        if let Err(error) = std::fs::write(dir.join("pid"), pid.to_string()) {
-            spawned_guard.cleanup_now();
-            let _ = std::fs::remove_dir_all(&dir);
-            return ToolResult::err(format!("Failed to write validation job pid: {error}"));
-        }
-        if let Err(error) = std::fs::write(dir.join("status"), "running") {
-            spawned_guard.cleanup_now();
-            let _ = std::fs::remove_dir_all(&dir);
-            return ToolResult::err(format!("Failed to write validation job status: {error}"));
-        }
-        let (record, _) = match LocalJobRecord::initialize_hidden(project.to_string(), dir.clone())
-        {
-            Ok(value) => value,
-            Err(error) => {
-                spawned_guard.cleanup_now();
-                let _ = std::fs::remove_dir_all(&dir);
-                return ToolResult::err(error);
-            }
-        };
-        self.local_jobs
-            .lock()
-            .await
-            .insert(job_id.clone(), record.clone());
-        let watcher_record = record.clone();
-        let watcher_jobs = self.local_jobs.clone();
-        let watcher_job_id = job_id.clone();
-        let watcher_dir = dir.clone();
-        #[cfg(unix)]
-        let watcher_killer = self.job_killer.clone();
-        let watcher_handle = tokio::runtime::Handle::current();
-        let (child_sender, child_receiver) =
-            std::sync::mpsc::sync_channel::<std::process::Child>(0);
-        let watcher = std::thread::Builder::new()
-            .name("webcodex-local-validation".to_string())
-            .spawn(move || {
-                let mut child = match child_receiver.recv() {
-                    Ok(child) => child,
-                    Err(_) => return,
-                };
-                #[cfg(unix)]
-                let (exit_code, timed_out) = {
-                    let mut timed_out = false;
-                    let exit = loop {
-                        match child.try_wait() {
-                            Ok(Some(status)) => break Some(status),
-                            Ok(None) if std::time::Instant::now() >= validation_deadline => {
-                                timed_out = true;
-                                let _ = watcher_killer.terminate_group(pgid, pgid);
-                                break child.wait().ok();
-                            }
-                            Ok(None) => {
-                                std::thread::sleep(std::time::Duration::from_millis(25));
-                            }
-                            Err(_) => {
-                                let _ = watcher_killer.terminate_group(pgid, pgid);
-                                break child.wait().ok();
-                            }
-                        }
-                    };
-                    if !timed_out {
-                        let _ = watcher_killer.terminate_group(pgid, pgid);
-                    }
-                    (
-                        exit.and_then(|status| status.code()).unwrap_or(-1),
-                        timed_out,
-                    )
-                };
-                #[cfg(not(unix))]
-                let (exit_code, timed_out) = {
-                    let exit_code = child
-                        .wait()
-                        .ok()
-                        .and_then(|status| status.code())
-                        .unwrap_or(-1);
-                    (exit_code, matches!(exit_code, 124 | 137))
-                };
-                let cleanup_pending_at_exit = watcher_record.cleanup_pending();
-                let recorded_status = normalize_local_status(
-                    &watcher_record
-                        .read_text("status")
-                        .unwrap_or_else(|| "running".to_string()),
-                );
-                let terminal_status =
-                    if crate::tool_runtime::jobs::is_terminal_job_status(&recorded_status) {
-                        recorded_status
-                    } else if cleanup_pending_at_exit {
-                        "stopped".to_string()
-                    } else if timed_out {
-                        "timeout".to_string()
-                    } else if exit_code == 0 {
-                        "completed".to_string()
-                    } else {
-                        "failed".to_string()
-                    };
-                let _ = std::fs::write(watcher_dir.join("exit_code"), exit_code.to_string());
-                let _ = std::fs::write(
-                    watcher_dir.join("finished_at"),
-                    chrono::Utc::now().timestamp().to_string(),
-                );
-                let _ = std::fs::write(watcher_dir.join("status"), &terminal_status);
-                if let Err(error) = watcher_record.observe() {
-                    tracing::error!(
-                        job_id = %watcher_job_id,
-                        error = %error,
-                        "failed to persist local validation terminal observation"
-                    );
-                }
-                watcher_record.mark_terminal();
-                if watcher_record.cleanup_pending() {
-                    watcher_handle.spawn(async move {
-                        watcher_jobs.lock().await.remove(&watcher_job_id);
-                        let _ = std::fs::remove_dir_all(&watcher_dir);
-                    });
-                }
-            });
-        let _watcher = match watcher {
-            Ok(handle) => handle,
-            Err(error) => {
-                spawned_guard.cleanup_now();
-                self.local_jobs.lock().await.remove(&job_id);
-                let _ = std::fs::remove_dir_all(&dir);
-                return ToolResult::err(format!("Failed to start validation job watcher: {error}"));
-            }
-        };
-        let child = match spawned_guard.take_child_for_handoff() {
-            Some(child) => child,
-            None => {
-                drop(child_sender);
-                self.local_jobs.lock().await.remove(&job_id);
-                let _ = std::fs::remove_dir_all(&dir);
-                return ToolResult::err(
-                    "validation child ownership was lost before watcher handoff".to_string(),
-                );
-            }
-        };
-        if let Err(error) = child_sender.send(child) {
-            let child = error.0;
-            if let Err(child) = spawned_guard.restore_child_after_failed_handoff(child) {
-                let mut fallback_guard =
-                    SpawnedValidationGuard::new(child, self.job_killer.clone(), pgid);
-                fallback_guard.cleanup_now();
-            }
-            spawned_guard.cleanup_now();
-            self.local_jobs.lock().await.remove(&job_id);
-            let _ = std::fs::remove_dir_all(&dir);
-            return ToolResult::err("Failed to hand off validation child to watcher".to_string());
-        }
-        // sync_channel(0) is a rendezvous: successful send means the watcher has
-        // received the Child. No await occurs before the hidden-job cancellation
-        // guard is established.
-        spawned_guard.disarm_after_handoff();
-        let mut guard = LocalValidationCleanupGuard::new(
-            self.local_jobs.clone(),
-            record.clone(),
-            self.job_killer.clone(),
-            job_id.clone(),
-        );
-        let wait = self
-            .validation_sync_wait
-            .min(std::time::Duration::from_secs(sync_wait_secs));
-        let deadline = std::time::Instant::now() + wait;
-        let promoted_observation = loop {
-            let status = normalize_local_status(
-                &record
-                    .read_text("status")
-                    .unwrap_or_else(|| "running".to_string()),
-            );
-            if crate::tool_runtime::jobs::is_terminal_job_status(&status) {
-                let (stdout, _, _, stdout_source_truncated) =
-                    record.read_log_lines("stdout.log", None, Some(MAX_LOCAL_LOG_LINES));
-                let (stderr, _, _, stderr_source_truncated) =
-                    record.read_log_lines("stderr.log", None, Some(MAX_LOCAL_LOG_LINES));
-                let exit_code = record
-                    .read_text("exit_code")
-                    .and_then(|value| value.trim().parse::<i32>().ok());
-                let ended_at = record
-                    .read_text("finished_at")
-                    .and_then(|value| value.trim().parse::<i64>().ok())
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp());
-                let output = ProjectCommandOutput {
-                    exit_code,
-                    stdout,
-                    stderr,
-                    duration_ms: ended_at.saturating_sub(now) as u64 * 1000,
-                    error: None,
-                    execution_state: ShellCommandExecutionState::Completed,
-                };
-                self.local_jobs.lock().await.remove(&job_id);
-                let _ = std::fs::remove_dir_all(&dir);
-                guard.disarm();
-                let mut result = self
-                    .build_cargo_result(
-                        project,
-                        command,
-                        cwd,
-                        config,
-                        adapter,
-                        output,
-                        timeout_secs,
-                        sync_wait_secs,
-                        false,
-                        stdout_source_truncated,
-                        stderr_source_truncated,
-                        minimum_tests,
-                    )
-                    .await;
-                result.output["cwd"] = json!(resolved_cwd.clone());
-                result.output["shell"] = json!("direct_argv");
-                result.output["executor"] = json!("local");
-                return result;
-            }
-            if std::time::Instant::now() >= deadline {
-                let promoted = {
-                    let jobs = self.local_jobs.lock().await;
-                    let Some(record) = jobs.get(&job_id) else {
-                        return ToolResult::err(
-                            "local validation job disappeared before handoff".to_string(),
-                        );
-                    };
-                    record.promote_if_active()
-                };
-                match promoted {
-                    Ok(Some(observation)) => break observation,
-                    Ok(None) => {}
-                    Err(error) => {
-                        return ToolResult::err(format!(
-                            "local validation job observation failed before handoff: {error}"
-                        ));
-                    }
-                }
-                // The watcher linearized terminal publication before promotion.
-                // Re-enter the loop and return the structured terminal result.
-                continue;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        };
-        let observation_token = match promoted_observation.token(&job_id) {
-            Ok(token) => token,
-            Err(error) => {
-                return ToolResult::err(format!(
-                    "local validation job has no canonical observation token: {error}"
-                ));
-            }
-        };
-        let job_status = normalize_local_status(&promoted_observation.status);
-        let mut public_metadata = metadata;
-        public_metadata["visibility"] = json!("public");
-        let _ = std::fs::write(
-            dir.join("metadata.json"),
-            serde_json::to_string_pretty(&public_metadata).unwrap_or_default(),
-        );
-        guard.disarm();
-        ToolResult::ok(json!({
-            "execution_source": tool_name,
-            "purpose": purpose.as_str(),
-            "execution_state": "running",
-            "job_id": job_id,
-            "job_status": job_status,
-            "observation_token": observation_token,
-            "promoted_to_job": true,
-            "command_started": true,
-            "command_completed": false,
-            "effective_timeout_secs": timeout_secs,
-            "sync_wait_secs": sync_wait_secs,
-            "project": project,
-            "cwd": resolved_cwd,
-            "shell": "direct_argv",
-            "executor": "local",
-            "command_summary": crate::shell_client::command_preview(command),
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "stdout_lines": 0,
-            "stderr_lines": 0,
-            "stdout_truncated": false,
-            "stderr_truncated": false,
-            "terminal": false,
-        }))
     }
 
     /// Wait up to `sync_wait_secs` for a structured validation Job to reach a
@@ -1537,20 +1217,20 @@ impl ToolRuntime {
         handoff: ValidationHandoff,
     ) -> ToolResult {
         let mut guard = ValidationCleanupGuard::new(
-            self.shell_clients.clone(),
+            self.runner_registry.clone(),
             job_id.clone(),
             handoff.auth.clone(),
         );
-        // Poll the job status up to the internal sync wait. Each poll is cheap
-        // and the total sleep is bounded by the sync window. The wait is taken
-        // from the runtime's injectable clock so tests can shrink it.
+        // Poll the job status up to the effective synchronous grace. Each poll
+        // is cheap and total sleep stays bounded by that grace. The wait is
+        // taken from the runtime's injectable clock so tests can shrink it.
         let wait = self
             .validation_sync_wait
             .min(std::time::Duration::from_secs(sync_wait_secs));
         let deadline = std::time::Instant::now() + wait;
         loop {
             let status = self
-                .shell_clients
+                .runner_registry
                 .get_hidden_job_for_auth(handoff.auth.as_ref(), &job_id)
                 .await;
             let (terminal, observed_status) = match status {
@@ -1577,12 +1257,12 @@ impl ToolRuntime {
         // deadline; promote_hidden_job deliberately leaves such a record hidden
         // so the original Cargo call can still return its structured terminal
         // result instead of handing off an already-finished Job.
-        let promoted = match self.shell_clients.promote_hidden_job(&job_id).await {
+        let promoted = match self.runner_registry.promote_hidden_job(&job_id).await {
             Ok(job) => job,
             Err(error) => {
                 return ToolResult::err(command_rejected_message(
                     error,
-                    "query list_jobs and retry the validation if the job could not be handed off.",
+                    "use list_jobs only to recover Job identity/state when the handoff itself failed; do not retry the validation until the original execution is proven safe to retry.",
                 ));
             }
         };
@@ -1594,7 +1274,30 @@ impl ToolRuntime {
             guard.disarm();
             return result;
         }
-        let observation_token = match promoted.observation_token {
+        let observation = match structured_job_observation(
+            &self.runner_registry,
+            handoff.auth.as_ref(),
+            &job_id,
+        )
+        .await
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                return ToolResult::err(command_rejected_message(
+                    error,
+                    "observe the exact returned Job directly when its job_id is retained; use list_jobs only if that identity is no longer available before deciding whether any retry is safe.",
+                ));
+            }
+        };
+        let latest_status = observation.job.status.clone();
+        if crate::tool_runtime::jobs::is_terminal_job_status(&latest_status) {
+            let result = self
+                .validation_terminal_result(job_id, adapter, &latest_status, handoff)
+                .await;
+            guard.disarm();
+            return result;
+        }
+        let observation_token = match observation.job.observation_token.clone() {
             Some(token) => token,
             None => {
                 return ToolResult::err(
@@ -1602,11 +1305,23 @@ impl ToolRuntime {
                 );
             }
         };
-        let queued = matches!(
+        let (execution_state, command_started) = validation_handoff_execution_state(
             latest_status.as_str(),
-            "queued" | "agent_queued" | "started"
+            observation.job.started_at.is_some(),
         );
-        let execution_state = if queued { "queued" } else { "running" };
+        let detected_summary = crate::tool_runtime::jobs::detected_job_summary_with_activity(
+            Some(&handoff.command_summary),
+            Some(&handoff.purpose),
+            &latest_status,
+            observation.job.exit_code.map(i64::from),
+            &observation.stdout_tail,
+            &observation.stderr_tail,
+            observation.job.activity.as_ref(),
+        );
+        let continuation = crate::tool_runtime::jobs::observe_job_continuation(
+            &handoff.job_id,
+            Some(&observation_token),
+        );
         let payload = json!({
             "execution_source": handoff.execution_source,
             "purpose": handoff.purpose,
@@ -1614,8 +1329,10 @@ impl ToolRuntime {
             "job_id": handoff.job_id,
             "job_status": latest_status,
             "observation_token": observation_token,
+            "continuation_semantics": crate::tool_runtime::jobs::job_observation_continuation_semantics(),
+            "activity": observation.job.activity,
             "promoted_to_job": true,
-            "command_started": !queued,
+            "command_started": command_started,
             "command_completed": false,
             "effective_timeout_secs": handoff.effective_timeout_secs,
             "sync_wait_secs": handoff.sync_wait_secs,
@@ -1624,13 +1341,15 @@ impl ToolRuntime {
             "shell": handoff.shell,
             "executor": handoff.executor,
             "command_summary": handoff.command_summary,
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "stdout_lines": 0,
-            "stderr_lines": 0,
-            "stdout_truncated": false,
-            "stderr_truncated": false,
+            "stdout_tail": observation.stdout_tail,
+            "stderr_tail": observation.stderr_tail,
+            "stdout_lines": observation.stdout_lines,
+            "stderr_lines": observation.stderr_lines,
+            "stdout_truncated": observation.stdout_truncated,
+            "stderr_truncated": observation.stderr_truncated,
+            "detected_summary": detected_summary,
             "terminal": false,
+            "continuation": continuation,
         });
         guard.disarm();
         ToolResult::ok(payload)
@@ -1645,7 +1364,7 @@ impl ToolRuntime {
         handoff: ValidationHandoff,
     ) -> ToolResult {
         let log = self
-            .shell_clients
+            .runner_registry
             .hidden_job_log_for_auth(handoff.auth.as_ref(), &job_id, Some(200))
             .await;
         let (job, stdout, stderr, stdout_source_truncated, stderr_source_truncated) = match log {
@@ -1673,8 +1392,10 @@ impl ToolRuntime {
         let stdout_truncated = stdout_source_truncated || bounded_stdout_truncated;
         let stderr_truncated = stderr_source_truncated || bounded_stderr_truncated;
         let exit_code = job.as_ref().and_then(|job| job.exit_code);
-        let timed_out = matches!(job_status, "timeout" | "timed_out");
-        let process_passed = job_status == "completed" && exit_code == Some(0);
+        let lifecycle = RunnerJobLifecycle::from_wire(job_status).ok();
+        let timed_out = lifecycle.is_some_and(RunnerJobLifecycle::is_timed_out);
+        let process_passed =
+            lifecycle == Some(RunnerJobLifecycle::Completed) && exit_code == Some(0);
         let mut payload = json!({
             "project": handoff.project,
             "command_summary": handoff.command_summary,
@@ -1700,7 +1421,7 @@ impl ToolRuntime {
             "sync_wait_secs": handoff.sync_wait_secs,
             "terminal": true,
         });
-        if let Some(projection) = crate::tool_runtime::jobs::validation_job_projection(
+        if let Some(projection) = crate::tool_runtime::jobs::validation_job_projection_with_policy(
             Some(adapter.tool_identity()),
             Some(adapter.validation_kind()),
             job_status,
@@ -1709,6 +1430,8 @@ impl ToolRuntime {
             &stderr_tail,
             stdout_truncated || stderr_truncated,
             handoff.minimum_tests,
+            handoff.require_tests,
+            handoff.no_run,
         ) {
             apply_validation_projection_fields(&mut payload, &projection);
         }
@@ -1719,7 +1442,7 @@ impl ToolRuntime {
         if validation_passed {
             // Discard the hidden Job record so a fast validation never leaves a
             // redundant visible job in list_jobs.
-            self.shell_clients
+            self.runner_registry
                 .remove_projected_hidden_terminal_job_record(&job_id)
                 .await;
             ToolResult::ok(payload)
@@ -1730,26 +1453,19 @@ impl ToolRuntime {
                 CARGO_VALIDATION_FAILURE_KIND
             };
             payload["failure_kind"] = json!(failure_kind);
+            let error = if timed_out {
+                command_timeout_message(handoff.effective_timeout_secs, &stdout_tail, &stderr_tail)
+            } else if process_passed {
+                test_count_assertion_failure_message(adapter.tool_identity(), &payload)
+            } else {
+                format!("structured validation command failed; {VALIDATION_FAILURE_GUIDANCE}")
+            };
             let result = ToolResult {
                 success: false,
                 output: payload,
-                error: Some(if timed_out {
-                    command_timeout_message(
-                        handoff.effective_timeout_secs,
-                        &stdout_tail,
-                        &stderr_tail,
-                    )
-                } else {
-                    if process_passed {
-                        "cargo_test test-count assertion was not proven; inspect test_count_assertion and rerun with a scope that executes enough tests.".to_string()
-                    } else {
-                        format!(
-                            "structured validation command failed; {VALIDATION_FAILURE_GUIDANCE}"
-                        )
-                    }
-                }),
+                error: Some(error),
             };
-            self.shell_clients
+            self.runner_registry
                 .remove_projected_hidden_terminal_job_record(&job_id)
                 .await;
             result
@@ -1773,6 +1489,8 @@ impl ToolRuntime {
         source_stdout_truncated: bool,
         source_stderr_truncated: bool,
         minimum_tests: Option<u64>,
+        require_tests: Option<bool>,
+        no_run: Option<bool>,
     ) -> ToolResult {
         let execution_state = output.execution_state;
         let (stdout_tail, bounded_stdout_truncated) =
@@ -1784,17 +1502,11 @@ impl ToolRuntime {
         let process_passed =
             execution_state == ShellCommandExecutionState::Completed && output.exit_code == Some(0);
         let validation_failed = is_cargo_validation_failure(&output, timeout_secs);
-        let (resolved_cwd, shell, executor) = if config.is_agent() {
-            let resolved = super::helpers::resolve_agent_cwd(config, cwd)
-                .and_then(|path| super::helpers::project_relative_agent_cwd(config, &path))
-                .unwrap_or_else(|_| ".".to_string());
-            (resolved, "configured", "agent")
-        } else {
-            let resolved = super::helpers::resolve_local_cwd(config, cwd)
-                .and_then(|path| super::helpers::project_relative_cwd(config, &path))
-                .unwrap_or_else(|_| ".".to_string());
-            (resolved, "sh", "local")
-        };
+        let resolved_cwd = super::helpers::resolve_runner_cwd(config, cwd)
+            .and_then(|path| super::helpers::project_relative_runner_cwd(config, &path))
+            .unwrap_or_else(|_| ".".to_string());
+        let shell = "configured";
+        let executor = "agent";
         let purpose = match adapter.validation_kind() {
             "test" => "test",
             "format" => "format",
@@ -1802,7 +1514,7 @@ impl ToolRuntime {
         };
         let mut payload = json!({
             "project": project,
-            "command_summary": crate::shell_client::command_preview(command),
+            "command_summary": crate::runner_http::command_preview(command),
             "cwd": resolved_cwd,
             "shell": shell,
             "executor": executor,
@@ -1833,7 +1545,7 @@ impl ToolRuntime {
             ShellCommandExecutionState::Completed if process_passed => "completed",
             ShellCommandExecutionState::Completed => "failed",
         };
-        if let Some(projection) = crate::tool_runtime::jobs::validation_job_projection(
+        if let Some(projection) = crate::tool_runtime::jobs::validation_job_projection_with_policy(
             Some(adapter.tool_identity()),
             Some(adapter.validation_kind()),
             terminal_status,
@@ -1842,6 +1554,8 @@ impl ToolRuntime {
             &stderr_tail,
             stdout_truncated || stderr_truncated,
             minimum_tests,
+            require_tests,
+            no_run,
         ) {
             apply_validation_projection_fields(&mut payload, &projection);
         }
@@ -1898,78 +1612,19 @@ impl ToolRuntime {
                 } else {
                     "process_exit"
                 });
+                let error = if process_passed {
+                    test_count_assertion_failure_message(adapter.tool_identity(), &payload)
+                } else {
+                    format!("structured validation command failed; {VALIDATION_FAILURE_GUIDANCE}")
+                };
                 ToolResult {
                     success: false,
                     output: payload,
-                    error: Some(if process_passed {
-                        "cargo_test test-count assertion was not proven; inspect test_count_assertion and rerun with a scope that executes enough tests.".to_string()
-                    } else {
-                        format!(
-                            "structured validation command failed; {VALIDATION_FAILURE_GUIDANCE}"
-                        )
-                    }),
+                    error: Some(error),
                 }
             }
         }
     }
-
-    /// The previous synchronous cargo path, used by mutating `cargo fmt` (and
-    /// the old `run_cargo_command`). Kept separate so the read-only tools go
-    /// through the shared exactly-once validation path.
-    async fn run_cargo_command_sync(
-        &self,
-        project: String,
-        cwd: Option<String>,
-        command: String,
-        timeout_secs: u64,
-        adapter: &'static dyn ValidationAdapter,
-    ) -> ToolResult {
-        let config = match self.resolve_project(&project).await {
-            Ok(config) => config,
-            Err(e) => {
-                return ToolResult::err(command_rejected_message(
-                    e.to_message(),
-                    "verify the project id/cwd and agent connectivity, then retry or use run_shell for custom diagnostics.",
-                ))
-            }
-        };
-        let output = match self
-            .run_project_command_capture(
-                &project,
-                command.clone(),
-                timeout_secs,
-                cwd.clone(),
-            )
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                return ToolResult::err(command_rejected_message(
-                    e,
-                    "verify the project id/cwd and agent connectivity, then retry or use run_shell for custom diagnostics.",
-                ))
-            }
-        };
-        self.build_cargo_result(
-            &project,
-            &command,
-            cwd.as_deref(),
-            &config,
-            adapter,
-            output,
-            timeout_secs,
-            0,
-            false,
-            false,
-            false,
-            None,
-        )
-        .await
-    }
-}
-
-pub(crate) fn local_validation_should_handoff(timeout_secs: u64, sync_wait_secs: u64) -> bool {
-    timeout_secs > sync_wait_secs
 }
 
 /// Structured validation request carried through the read-only tool path.
@@ -1978,15 +1633,18 @@ struct ValidationRunRequest<'a> {
     cwd: Option<String>,
     check: bool,
     filter: Option<String>,
+    lib: Option<bool>,
     all_targets: Option<bool>,
     all_features: Option<bool>,
     no_default_features: Option<bool>,
     features: Option<String>,
     package: Option<String>,
     no_run: Option<bool>,
+    require_tests: Option<bool>,
     minimum_tests: Option<u64>,
     go_packages: Option<Vec<String>>,
     timeout_secs: Option<u64>,
+    sync_wait_secs: Option<u64>,
     session_id: Option<String>,
     ssh_resource: Option<&'a str>,
     auth: Option<&'a AuthContext>,
@@ -2005,7 +1663,9 @@ struct ValidationHandoff {
     executor: String,
     command_summary: String,
     minimum_tests: Option<u64>,
-    auth: Option<AuthContext>,
+    require_tests: Option<bool>,
+    no_run: Option<bool>,
+    auth: Option<webcodex_runner_registry::RunnerAccess>,
 }
 
 /// Build the canonical structured validation step for a read-only validation tool
@@ -2044,10 +1704,14 @@ fn validation_step(
                 // Whitespace-only filter means "no filter", matching the
                 // synchronous path. Option-like filters are rejected by the
                 // shared filter contract before any argv is built.
-                if let Some(normalized) = crate::shell_protocol::normalize_rust_test_filter(filter)?
+                if let Some(normalized) =
+                    crate::runner_protocol::normalize_rust_test_filter(filter)?
                 {
                     args.push(normalized);
                 }
+            }
+            if options.lib.unwrap_or(false) {
+                args.push("--lib".to_string());
             }
             if options.all_targets.unwrap_or(false) {
                 args.push("--all-targets".to_string());
@@ -2067,7 +1731,7 @@ fn validation_step(
         }
         "go_test" => {
             let packages =
-                crate::shell_protocol::normalize_go_test_packages(options.go_packages.as_deref())
+                crate::runner_protocol::normalize_go_test_packages(options.go_packages.as_deref())
                     .map_err(|reason| format!("packages {reason}"))?;
             let mut args = vec!["test".to_string(), "-json".to_string()];
             args.extend(packages);
@@ -2097,7 +1761,7 @@ fn push_paired_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) -> R
     let Some(value) = value else {
         return Ok(());
     };
-    let Some(normalized) = crate::shell_protocol::normalize_cargo_value(value)? else {
+    let Some(normalized) = crate::runner_protocol::normalize_cargo_value(value)? else {
         return Ok(());
     };
     args.push(flag.to_string());
@@ -2126,172 +1790,6 @@ fn apply_validation_projection_fields(payload: &mut Value, projection: &Value) {
     }
 }
 
-struct SpawnedValidationGuard {
-    child: Option<std::process::Child>,
-    killer: std::sync::Arc<dyn super::local_jobs::LocalJobKiller>,
-    pid: i64,
-    pgid: i64,
-    job_dir: Option<std::path::PathBuf>,
-    armed: bool,
-}
-
-impl SpawnedValidationGuard {
-    fn new(
-        child: std::process::Child,
-        killer: std::sync::Arc<dyn super::local_jobs::LocalJobKiller>,
-        pgid: i64,
-    ) -> Self {
-        let pid = i64::from(child.id());
-        Self {
-            child: Some(child),
-            killer,
-            pid,
-            pgid,
-            job_dir: None,
-            armed: true,
-        }
-    }
-
-    fn with_job_dir(mut self, job_dir: std::path::PathBuf) -> Self {
-        self.job_dir = Some(job_dir);
-        self
-    }
-
-    fn cleanup_now(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Some(mut child) = self.child.take() {
-            let _ = self.killer.terminate_group(self.pid, self.pgid);
-            match child.try_wait() {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => {
-                    // The group killer is best-effort and may not prove the
-                    // leader exited. Kill the direct child as a final fallback,
-                    // then explicitly wait so this owner never drops a zombie.
-                    let _ = child.kill();
-                    loop {
-                        match child.wait() {
-                            Ok(_) => break,
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(job_dir) = self.job_dir.take() {
-            let _ = std::fs::remove_dir_all(job_dir);
-        }
-        self.armed = false;
-    }
-
-    fn take_child_for_handoff(&mut self) -> Option<std::process::Child> {
-        if self.armed {
-            self.child.take()
-        } else {
-            None
-        }
-    }
-
-    fn restore_child_after_failed_handoff(
-        &mut self,
-        child: std::process::Child,
-    ) -> Result<(), std::process::Child> {
-        if self.armed && self.child.is_none() {
-            self.child = Some(child);
-            Ok(())
-        } else {
-            Err(child)
-        }
-    }
-
-    fn disarm_after_handoff(&mut self) {
-        debug_assert!(self.child.is_none());
-        self.job_dir = None;
-        self.armed = false;
-    }
-}
-
-impl Drop for SpawnedValidationGuard {
-    fn drop(&mut self) {
-        self.cleanup_now();
-    }
-}
-
-struct LocalValidationCleanupGuard {
-    jobs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, LocalJobRecord>>>,
-    record: LocalJobRecord,
-    killer: std::sync::Arc<dyn super::local_jobs::LocalJobKiller>,
-    job_id: String,
-    armed: bool,
-}
-
-impl LocalValidationCleanupGuard {
-    fn new(
-        jobs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, LocalJobRecord>>>,
-        record: LocalJobRecord,
-        killer: std::sync::Arc<dyn super::local_jobs::LocalJobKiller>,
-        job_id: String,
-    ) -> Self {
-        Self {
-            jobs,
-            record,
-            killer,
-            job_id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for LocalValidationCleanupGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Record cleanup intent and synchronously terminate the process group.
-        // The watcher owns terminal publication and only then removes the
-        // hidden record, so cancellation never relies on a detached Tokio task
-        // as its sole process-safety guarantee.
-        self.record.mark_cleanup_pending();
-        let metadata = self.record.read_json("metadata.json");
-        let pid = self
-            .record
-            .read_text("pid")
-            .and_then(|value| value.trim().parse::<i64>().ok());
-        let pgid = metadata
-            .get("process_group_id")
-            .and_then(serde_json::Value::as_i64);
-        if let (Some(pid), Some(pgid)) = (pid, pgid) {
-            let _ = self.killer.terminate_group(pid, pgid);
-        }
-        // Cleanup of the registry entry is secondary to the synchronous stop.
-        // If the runtime remains alive, remove the hidden record only after the
-        // watcher has published a terminal state. If this task cannot run during
-        // shutdown, the record remains available for tracking rather than being
-        // deleted prematurely.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let jobs = self.jobs.clone();
-            let record = self.record.clone();
-            let job_id = self.job_id.clone();
-            handle.spawn(async move {
-                loop {
-                    if record.is_terminal() {
-                        jobs.lock().await.remove(&job_id);
-                        let _ = std::fs::remove_dir_all(&record.dir);
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-            });
-        }
-    }
-}
-
 /// Cancellation guard for a hidden structured validation Job during its
 /// synchronous wait window.
 ///
@@ -2302,17 +1800,17 @@ impl Drop for LocalValidationCleanupGuard {
 /// Once the tool has produced a terminal result or public handoff, the guard is
 /// disarmed.
 struct ValidationCleanupGuard {
-    clients: std::sync::Arc<crate::shell_client::ShellClientRegistry>,
+    clients: std::sync::Arc<crate::runner_http::RunnerRegistry>,
     job_id: String,
-    auth: Option<AuthContext>,
+    auth: Option<webcodex_runner_registry::RunnerAccess>,
     armed: bool,
 }
 
 impl ValidationCleanupGuard {
     fn new(
-        clients: std::sync::Arc<crate::shell_client::ShellClientRegistry>,
+        clients: std::sync::Arc<crate::runner_http::RunnerRegistry>,
         job_id: String,
-        auth: Option<AuthContext>,
+        auth: Option<webcodex_runner_registry::RunnerAccess>,
     ) -> Self {
         Self {
             clients,
@@ -2348,6 +1846,45 @@ impl Drop for ValidationCleanupGuard {
     }
 }
 
+fn validation_handoff_execution_state(status: &str, started: bool) -> (&'static str, bool) {
+    let pending_status = matches!(
+        RunnerJobLifecycle::from_wire(status),
+        Ok(RunnerJobLifecycle::Queued
+            | RunnerJobLifecycle::RunnerQueued
+            | RunnerJobLifecycle::StartedLegacy)
+    );
+    let command_started = !pending_status || started;
+    (
+        if command_started { "running" } else { "queued" },
+        command_started,
+    )
+}
+
+#[cfg(test)]
+mod validation_handoff_projection_tests {
+    use super::validation_handoff_execution_state;
+
+    #[test]
+    fn fresh_started_evidence_prevents_false_queued_validation_handoff() {
+        assert_eq!(
+            validation_handoff_execution_state("agent_queued", false),
+            ("queued", false)
+        );
+        assert_eq!(
+            validation_handoff_execution_state("agent_queued", true),
+            ("running", true)
+        );
+        assert_eq!(
+            validation_handoff_execution_state("started", true),
+            ("running", true)
+        );
+        assert_eq!(
+            validation_handoff_execution_state("running", true),
+            ("running", true)
+        );
+    }
+}
+
 #[cfg(test)]
 mod structured_cargo_arg_parity_tests {
     use super::*;
@@ -2375,7 +1912,7 @@ mod structured_cargo_arg_parity_tests {
             resolve_cargo_test_minimum(None, Some(0), None),
             resolve_cargo_test_minimum(
                 None,
-                Some(crate::shell_protocol::CARGO_TEST_MIN_TESTS_MAX + 1),
+                Some(crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX + 1),
                 None,
             ),
             resolve_cargo_test_minimum(Some(true), None, Some(true)),
@@ -2387,135 +1924,6 @@ mod structured_cargo_arg_parity_tests {
             assert_eq!(rejection.output["command_started"], false);
             assert_eq!(rejection.output["failure_kind"], "invalid_arguments");
         }
-    }
-
-    #[derive(Default)]
-    struct RecordingJobKiller {
-        calls: std::sync::Mutex<Vec<(i64, i64)>>,
-    }
-
-    impl super::super::local_jobs::LocalJobKiller for RecordingJobKiller {
-        fn terminate_group(
-            &self,
-            pid: i64,
-            pgid: i64,
-        ) -> super::super::local_jobs::TerminateOutcome {
-            self.calls.lock().unwrap().push((pid, pgid));
-            super::super::local_jobs::TerminateOutcome::AlreadyGone
-        }
-    }
-
-    #[cfg(unix)]
-    fn spawn_owned_validation_test_child() -> std::process::Child {
-        use std::os::unix::process::CommandExt;
-
-        let mut command = std::process::Command::new("sleep");
-        command
-            .arg("30")
-            .process_group(0)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        command.spawn().expect("spawn validation guard test child")
-    }
-
-    #[cfg(unix)]
-    fn unix_process_is_alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn spawned_validation_guard_cancellation_drop_terminates_owned_group() {
-        let killer = std::sync::Arc::new(RecordingJobKiller::default());
-        let child = spawn_owned_validation_test_child();
-        let pid = child.id();
-        {
-            let _guard = SpawnedValidationGuard::new(child, killer.clone(), i64::from(pid));
-        }
-        assert_eq!(
-            killer.calls.lock().unwrap().as_slice(),
-            &[(i64::from(pid), i64::from(pid))]
-        );
-        assert!(
-            !unix_process_is_alive(pid),
-            "guard Drop must terminate and reap its owned Child"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn spawned_validation_guard_disarm_transfers_cleanup_ownership() {
-        let killer = std::sync::Arc::new(RecordingJobKiller::default());
-        let child = spawn_owned_validation_test_child();
-        let pid = child.id();
-        let mut guard = SpawnedValidationGuard::new(child, killer.clone(), i64::from(pid));
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<std::process::Child>(0);
-        let watcher = std::thread::spawn(move || {
-            let mut child = receiver.recv().expect("receive handed-off Child");
-            assert_eq!(child.id(), pid);
-            let _ = child.kill();
-            child.wait().expect("watcher reaps handed-off Child");
-        });
-
-        let child = guard
-            .take_child_for_handoff()
-            .expect("temporary owner holds Child before handoff");
-        sender.send(child).expect("rendezvous Child handoff");
-        guard.disarm_after_handoff();
-        drop(guard);
-        watcher.join().expect("watcher joins");
-
-        assert!(killer.calls.lock().unwrap().is_empty());
-        assert!(
-            !unix_process_is_alive(pid),
-            "watcher must reap the Child after acknowledged handoff"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn spawned_validation_guard_recovers_failed_handoff_and_reaps_child() {
-        let killer = std::sync::Arc::new(RecordingJobKiller::default());
-        let child = spawn_owned_validation_test_child();
-        let pid = child.id();
-        let mut guard = SpawnedValidationGuard::new(child, killer.clone(), i64::from(pid));
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<std::process::Child>(0);
-        drop(receiver);
-
-        let child = guard
-            .take_child_for_handoff()
-            .expect("temporary owner holds Child before failed handoff");
-        let child = sender
-            .send(child)
-            .expect_err("disconnected receiver returns Child ownership")
-            .0;
-        match guard.restore_child_after_failed_handoff(child) {
-            Ok(()) => {}
-            Err(mut child) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("temporary owner must accept recovered Child");
-            }
-        }
-        guard.cleanup_now();
-        drop(guard);
-
-        assert_eq!(
-            killer.calls.lock().unwrap().as_slice(),
-            &[(i64::from(pid), i64::from(pid))]
-        );
-        assert!(
-            !unix_process_is_alive(pid),
-            "failed handoff must terminate and reap the recovered Child"
-        );
     }
 
     /// The structured Job argv builder must normalize a value-taking Cargo
@@ -2541,6 +1949,7 @@ mod structured_cargo_arg_parity_tests {
                 "cargo_test",
                 ValidationCommandOptions {
                     filter: Some("  module::nested::test  ".to_string()),
+                    lib: Some(true),
                     all_targets: Some(true),
                     all_features: Some(true),
                     no_default_features: Some(true),
@@ -2568,6 +1977,14 @@ mod structured_cargo_arg_parity_tests {
                     sync.contains("module::nested::test"),
                     "cargo_test sync missing normalized filter: {sync}"
                 );
+                assert!(
+                    sync.contains("--lib"),
+                    "cargo_test sync missing --lib: {sync}"
+                );
+                assert!(
+                    sync.contains("--all-targets") && sync.contains("--no-run"),
+                    "cargo_test sync must preserve native lib/all-targets/no-run composition: {sync}"
+                );
             }
 
             // Job path: validation_step writes normalized values into the
@@ -2592,9 +2009,31 @@ mod structured_cargo_arg_parity_tests {
                     step.args.iter().any(|arg| arg == "module::nested::test"),
                     "cargo_test job argv must contain the normalized filter: {joined:?}"
                 );
+                assert!(step.args.iter().any(|arg| arg == "--lib"));
+                assert!(step.args.iter().any(|arg| arg == "--all-targets"));
+                assert!(step.args.iter().any(|arg| arg == "--no-run"));
             }
             assert!(step.is_canonical(), "{tool_name} step must be canonical");
         }
+    }
+
+    #[test]
+    fn cargo_test_lib_false_and_omission_are_command_equivalent() {
+        let adapter = validation_adapter_for_tool("cargo_test").unwrap();
+        let omitted = ValidationCommandOptions::default();
+        let explicit_false = ValidationCommandOptions {
+            lib: Some(false),
+            ..ValidationCommandOptions::default()
+        };
+
+        assert_eq!(
+            adapter.build_command(omitted.clone()).unwrap(),
+            adapter.build_command(explicit_false.clone()).unwrap()
+        );
+        let omitted_step = validation_step("cargo_test", &omitted).unwrap();
+        let false_step = validation_step("cargo_test", &explicit_false).unwrap();
+        assert_eq!(omitted_step.args, false_step.args);
+        assert!(!omitted_step.args.iter().any(|arg| arg == "--lib"));
     }
 
     #[test]
@@ -2650,7 +2089,7 @@ mod structured_cargo_arg_parity_tests {
             (
                 "cargo_check",
                 ValidationCommandOptions {
-                    features: Some("a".repeat(crate::shell_protocol::CARGO_VALUE_MAX_BYTES + 1)),
+                    features: Some("a".repeat(crate::runner_protocol::CARGO_VALUE_MAX_BYTES + 1)),
                     ..ValidationCommandOptions::default()
                 },
             ),

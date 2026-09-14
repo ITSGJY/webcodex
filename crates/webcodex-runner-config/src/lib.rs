@@ -13,21 +13,28 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use webcodex_core::shell_protocol::ShellClientCapabilities;
+use webcodex_core::runner_protocol::RunnerCapabilities;
 
 pub mod paths;
 
-/// Default projects directory written into generated Runner configs.
-pub const DEFAULT_INIT_PROJECTS_DIR: &str = "/etc/webcodex/projects.d";
+/// Default Runner project registry selected for a new system-level install.
+pub const DEFAULT_INIT_PROJECT_REGISTRY_DIR: &str = "/etc/webcodex/project-registry";
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+/// Largest idle polling floor allowed when polling can be selected. The Server
+/// currently considers a Runner offline after 60 seconds without a keepalive;
+/// 30 seconds leaves one full interval of scheduling/network slack.
+pub const MAX_POLL_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 3600;
+/// Default Runner policy for captured/presented bytes in each stdout or stderr
+/// stream. It is a per-stream execution-retention policy, not a protocol
+/// request/body/frame ceiling and not the model-facing ToolResult ceiling.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Config value selecting the polling transport (HTTP `/api/shell/agent/poll`).
 pub const TRANSPORT_POLLING: &str = "polling";
 /// Config value selecting the WebSocket transport.
 pub const TRANSPORT_WEBSOCKET: &str = "websocket";
 /// Config value selecting the supported custom QUIC stream transport.
-/// Requires a `[quic]` section in `agent.toml` with `server_addr` / `server_name`.
+/// Requires a `[quic]` section in the Runner config with `server_addr` / `server_name`.
 pub const TRANSPORT_QUIC: &str = "quic";
 /// Recommended fallback mode for new deployments: try QUIC when `[quic]` is
 /// configured, then WebSocket, then polling.
@@ -43,7 +50,7 @@ pub struct RunnerInitOptions {
     pub display_name: Option<String>,
     pub transport: String,
     pub poll_interval_ms: u64,
-    pub projects_dir: PathBuf,
+    pub project_registry_dir: PathBuf,
     pub output: PathBuf,
     pub allowed_roots: Vec<PathBuf>,
     pub allow_cwd_anywhere: bool,
@@ -111,8 +118,15 @@ pub fn validate_runner_init_options(opts: &RunnerInitOptions) -> Result<(), Stri
     ) {
         return Err("--transport must be websocket, polling, quic, or auto".to_string());
     }
-    if opts.projects_dir.as_os_str().is_empty() {
-        return Err("--projects-dir cannot be empty".to_string());
+    if matches!(opts.transport.as_str(), TRANSPORT_POLLING | TRANSPORT_AUTO)
+        && opts.poll_interval_ms > MAX_POLL_INTERVAL_MS
+    {
+        return Err(format!(
+            "--poll-interval-ms must be <= {MAX_POLL_INTERVAL_MS} when polling may be used"
+        ));
+    }
+    if opts.project_registry_dir.as_os_str().is_empty() {
+        return Err("--project-registry-dir cannot be empty".to_string());
     }
     if opts.output.as_os_str().is_empty() {
         return Err("--output is required".to_string());
@@ -167,8 +181,8 @@ struct GeneratedRunnerConfig {
     owner: String,
     transport: String,
     poll_interval_ms: u64,
-    projects_dir: PathBuf,
-    capabilities: ShellClientCapabilities,
+    project_registry_dir: PathBuf,
+    capabilities: RunnerCapabilities,
     policy: GeneratedRunnerPolicy,
 }
 
@@ -191,8 +205,8 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
         owner: opts.owner.clone(),
         transport: opts.transport.clone(),
         poll_interval_ms: opts.poll_interval_ms,
-        projects_dir: opts.projects_dir.clone(),
-        capabilities: ShellClientCapabilities {
+        project_registry_dir: opts.project_registry_dir.clone(),
+        capabilities: RunnerCapabilities {
             shell: true,
             file_read: true,
             file_write: true,
@@ -214,8 +228,14 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Codex Patch is a running-binary request kind and must not be
             // inferred from generated config or generic file-write support.
             apply_patch: false,
+            // The current patch success metadata contract is runtime-only and
+            // must be advertised by the binary that actually implements it.
+            apply_patch_match_metadata: false,
+            // Enum-based matching semantics are runtime-only and current
+            // Servers require an explicit registration capability.
+            apply_patch_matching_mode: false,
             // Strict patch matching is also runtime-only and must be explicitly
-            // advertised by a binary that enforces it before mutation.
+            // advertised for rolling compatibility with older Servers.
             apply_patch_strict_matching: false,
             git: true,
             jobs: true,
@@ -232,6 +252,13 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Durable assertion metadata is advertised by the running binary,
             // not inferred from generic validation argv support.
             structured_cargo_test_count_assertion: false,
+            // Explicit Cargo execution policy is a separate running-binary
+            // rolling-upgrade capability and is never inferred from the older
+            // count-assertion bit or protocol generation.
+            structured_cargo_test_execution_policy: false,
+            // Cargo test --lib argv is accepted only by the running binary that
+            // advertises the additive structured Cargo selector capability.
+            structured_cargo_test_lib: false,
             // The running binary advertises this process-lifetime protocol
             // capability after installing its exact Go argv boundary.
             structured_go_test_json: false,
@@ -243,6 +270,13 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             structured_go_test_packages: false,
             structured_process_argv: true,
             structured_script_payload: true,
+            // JavaScript is an additive typed-script semantic implemented by
+            // the running binary. Static config must not make an older binary
+            // appear to understand the newer language variant.
+            structured_script_javascript: false,
+            // TypeScript is another additive running-binary semantic. Generated
+            // static config must not claim that older Runners understand it.
+            structured_script_typescript: false,
             // Internal generated-program execution is a running-binary
             // capability and must fail closed across mixed-version rollout.
             internal_posix_script: false,
@@ -254,10 +288,11 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             lsp_call_hierarchy: true,
             project_lifecycle: false,
             project_path_registration: false,
-            // Runner-global Skill store support is runtime-only and never
-            // inferred from project/file capabilities in generated config.
-            skill_store_read: false,
-            skill_store_manage: false,
+            managed_worktree: false,
+            // Runner-local Skill runtime and management are implemented by the
+            // running binary and are never inferred from project/file capabilities.
+            skill_runtime: false,
+            skill_management: false,
             // Desktop observation is a runtime/platform capability and is never
             // claimed by generated static config.
             computer_observe: false,
@@ -299,6 +334,16 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // ACP autonomous coding is a runtime-only capability and must not be
             // silently enabled by generated legacy agent config.
             coding_agent_runs: false,
+            // Native Tool Plugins are likewise advertised only by a Runner
+            // binary that implements the typed local Plugin lifecycle.
+            native_tool_plugins: false,
+            // Managed SSH resource lifecycle is likewise a running-binary
+            // capability and is never implied by generated static SSH config.
+            managed_ssh_resources: false,
+            // First-class config control is implemented by the running binary
+            // against its startup-bound path and must never be inferred from a
+            // generated static runner.toml capability block.
+            runner_config_control: false,
         },
         policy: GeneratedRunnerPolicy {
             allow_raw_shell: true,
@@ -428,7 +473,7 @@ mod tests {
             display_name: Some("Alice Laptop".to_string()),
             transport: TRANSPORT_WEBSOCKET.to_string(),
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
-            projects_dir: PathBuf::from("/etc/webcodex/projects.d"),
+            project_registry_dir: PathBuf::from("/etc/webcodex/project-registry"),
             output,
             allowed_roots: vec![PathBuf::from("/srv/projects")],
             allow_cwd_anywhere: false,
@@ -493,5 +538,22 @@ mod tests {
             assert!(!content.contains("structured_go_test_tool"));
             assert!(!content.contains("job_state_reconciliation"));
         }
+    }
+
+    #[test]
+    fn polling_capable_init_rejects_interval_beyond_online_window_slack() {
+        for transport in [TRANSPORT_POLLING, TRANSPORT_AUTO] {
+            let mut opts = init_opts(PathBuf::from("-"));
+            opts.transport = transport.to_string();
+            opts.poll_interval_ms = MAX_POLL_INTERVAL_MS + 1;
+            let error = validate_runner_init_options(&opts).unwrap_err();
+            assert!(error.contains("must be <= 30000"), "{transport}: {error}");
+            opts.poll_interval_ms = MAX_POLL_INTERVAL_MS;
+            validate_runner_init_options(&opts).unwrap();
+        }
+
+        let mut websocket = init_opts(PathBuf::from("-"));
+        websocket.poll_interval_ms = MAX_POLL_INTERVAL_MS + 1;
+        validate_runner_init_options(&websocket).unwrap();
     }
 }

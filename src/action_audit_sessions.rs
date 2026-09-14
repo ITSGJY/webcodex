@@ -1,3 +1,4 @@
+use crate::models::ActionEventWorkflowLinkRecord;
 use crate::{ActionEventRecord, ActionSessionRecord, Database};
 use salvo::prelude::*;
 use serde::Serialize;
@@ -79,6 +80,28 @@ pub struct ActionEventView {
     pub response_bytes: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowSessionRelation {
+    Recording,
+    WorkOnProject,
+}
+
+impl WorkflowSessionRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recording => "recording",
+            Self::WorkOnProject => "work_on_project",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionAuditWorkflowLinkInput {
+    pub workflow_session_id: String,
+    pub relation: WorkflowSessionRelation,
+    pub project: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActionAuditEventInput {
     pub explicit_session_id: Option<String>,
@@ -102,6 +125,31 @@ pub struct ActionAuditEventInput {
     pub summary: Value,
     pub request_bytes: Option<i64>,
     pub response_bytes: Option<i64>,
+    pub client_window_key: Option<String>,
+    pub client_window_source: Option<String>,
+    pub server_trace_id: Option<String>,
+    pub principal_correlation_kind: Option<String>,
+    pub principal_correlation_id: Option<String>,
+    pub window_started_at_ms: Option<i64>,
+    pub window_ended_at_ms: Option<i64>,
+    /// Canonical adapter timing for ordinary completed responses. These are
+    /// distinct from the legacy ActionAudit record window above.
+    pub request_observed_at_ms: Option<i64>,
+    pub response_handed_at_ms: Option<i64>,
+    /// Process-local continuity classification captured at request arrival.
+    /// `None` means the event predates this projection or had no eligible
+    /// Window/principal continuity identity.
+    pub window_transition_kind: Option<String>,
+    /// `None` for legacy rows; true streams are excluded from ordinary response
+    /// completion/gap semantics.
+    pub response_streaming: Option<bool>,
+    /// Whether this completed adapter response may become the previous
+    /// meaningful call for a later Window transition. Hard timeouts and streams
+    /// are deliberately false.
+    pub window_continuity_eligible: Option<bool>,
+    pub window_meaningful: bool,
+    pub recorder_gap_session_id: Option<String>,
+    pub workflow_links: Vec<ActionAuditWorkflowLinkInput>,
 }
 
 pub fn trim_and_truncate(value: &str, max_len: usize) -> String {
@@ -207,29 +255,7 @@ pub fn secret_like_key(key: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-const WEBCODEX_SECRET_PREFIXES: &[&str] = &[
-    "wc_pat_",
-    "wc_agent_",
-    "wc_acct_",
-    "wc_oat_",
-    "wc_ort_",
-    "wc_csec_",
-    "wc_pair_",
-    "wc_boot_",
-];
-
-pub fn secret_like_value(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("-----begin")
-        || lower.contains("bearer ")
-        || lower.contains("api_key")
-        || lower.contains("token=")
-        || lower.contains("id_rsa")
-        || lower.contains("id_ed25519")
-        || WEBCODEX_SECRET_PREFIXES
-            .iter()
-            .any(|prefix| lower.contains(prefix))
-}
+pub use webcodex_core::sensitive_text::secret_like_value;
 
 pub fn summarize_command_text(kind: &str, text: &str) -> Value {
     let mut hasher = Sha256::new();
@@ -346,8 +372,13 @@ fn record_action_event_inner(db: &Database, input: ActionAuditEventInput) -> any
         .map(|s| !s.is_empty())
         .unwrap_or(false) as i64;
 
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let window_ended_at_ms = input
+        .window_ended_at_ms
+        .or(input.window_started_at_ms)
+        .map(|ended| ended.max(input.window_started_at_ms.unwrap_or(ended)));
     let event = ActionEventRecord {
-        event_id: uuid::Uuid::new_v4().to_string(),
+        event_id: event_id.clone(),
         session_id: session.session_id,
         started_at: input.started_at,
         ended_at: input.ended_at,
@@ -355,7 +386,7 @@ fn record_action_event_inner(db: &Database, input: ActionAuditEventInput) -> any
         endpoint: input.endpoint,
         operation: input.operation.map(|v| trim_and_truncate(&v, 80)),
         action_name: trim_and_truncate(&input.action_name, 120),
-        project: input.project.map(|v| trim_and_truncate(&v, 120)),
+        project: input.project.map(|v| trim_and_truncate(&v, 512)),
         principal_kind: input.principal_kind,
         principal_user_id: input.principal_user_id,
         oauth_client_id: input.oauth_client_id,
@@ -368,7 +399,46 @@ fn record_action_event_inner(db: &Database, input: ActionAuditEventInput) -> any
         summary_json: serde_json::to_string(&summary)?,
         request_bytes: input.request_bytes,
         response_bytes: input.response_bytes,
+        client_window_key: input
+            .client_window_key
+            .map(|value| trim_and_truncate(&value, 128)),
+        client_window_source: input
+            .client_window_source
+            .map(|value| trim_and_truncate(&value, 64)),
+        server_trace_id: input
+            .server_trace_id
+            .map(|value| trim_and_truncate(&value, 128)),
+        principal_correlation_kind: input
+            .principal_correlation_kind
+            .map(|value| trim_and_truncate(&value, 64)),
+        principal_correlation_id: input
+            .principal_correlation_id
+            .map(|value| trim_and_truncate(&value, 512)),
+        window_started_at_ms: input.window_started_at_ms,
+        window_ended_at_ms,
+        request_observed_at_ms: input.request_observed_at_ms,
+        response_handed_at_ms: input.response_handed_at_ms,
+        window_transition_kind: input
+            .window_transition_kind
+            .map(|value| trim_and_truncate(&value, 32)),
+        response_streaming: input.response_streaming,
+        window_continuity_eligible: input.window_continuity_eligible,
+        window_meaningful: input.window_meaningful,
+        recorder_gap_session_id: input
+            .recorder_gap_session_id
+            .map(|value| trim_and_truncate(&value, 128)),
     };
+    let workflow_links = input
+        .workflow_links
+        .into_iter()
+        .map(|link| ActionEventWorkflowLinkRecord {
+            event_id: event_id.clone(),
+            workflow_session_id: trim_and_truncate(&link.workflow_session_id, 128),
+            workflow_session_relation: link.relation.as_str().to_string(),
+            project: link.project.map(|project| trim_and_truncate(&project, 512)),
+            linked_at_ms: window_ended_at_ms.unwrap_or_else(|| event.ended_at.saturating_mul(1000)),
+        })
+        .collect::<Vec<_>>();
 
     let (success_inc, failed_inc, timeout_inc) = match event.status.as_str() {
         "success" => (1, 0, 0),
@@ -377,6 +447,7 @@ fn record_action_event_inner(db: &Database, input: ActionAuditEventInput) -> any
     };
     db.append_action_event_and_update_session(
         &event,
+        &workflow_links,
         success_inc,
         failed_inc,
         timeout_inc,
@@ -560,6 +631,7 @@ pub fn compute_stats(events: &[ActionEventView]) -> ActionSessionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use webcodex_core::sensitive_text::WEBCODEX_SECRET_PREFIXES;
 
     #[test]
     fn audit_sanitize_value_redacts_webcodex_token_prefixes_in_strings() {

@@ -22,6 +22,10 @@ REPO = "yyjeqhc/webcodex"
 PACKAGE = "@yyjeqhc/webcodex"
 PLATFORMS = ("linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
 BINARIES = ("webcodex", "webcodex-server", "webcodex-runner")
+LEGACY_DESKTOP_PLATFORMS = ("darwin-x64", "darwin-arm64", "win32-x64")
+DESKTOP_PLATFORMS = (*LEGACY_DESKTOP_PLATFORMS, "win32-arm64")
+DESKTOP_FIRST_VERSION = "0.4.0"
+WINDOWS_ARM64_DESKTOP_FIRST_VERSION = "0.4.2"
 SERVER_IMAGE = "ghcr.io/yyjeqhc/webcodex-server"
 SERVER_IMAGE_METADATA = "webcodex-server-image.json"
 SERVER_BOOTSTRAP_ASSET = "webcodex-server-bootstrap.sh"
@@ -44,6 +48,7 @@ SERVER_IMAGE_BASE_METADATA_KEYS = frozenset(
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_NPM_TARBALL_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+MAX_DESKTOP_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 MAX_MEMBER_BYTES = 96 * 1024 * 1024
 MAX_DYNAMIC_BYTES = 1024 * 1024
@@ -86,11 +91,46 @@ def canonical_archive_name(version: str, platform: str) -> str:
     return f"webcodex-v{version}-{platform}.tar.gz"
 
 
+def canonical_desktop_name(version: str, platform: str) -> str:
+    if platform not in DESKTOP_PLATFORMS:
+        raise VerificationError(f"unsupported Desktop platform: {platform!r}")
+    suffix = "-setup.exe" if platform.startswith("win32-") else ".dmg"
+    return f"webcodex-desktop-v{version}-{platform}{suffix}"
+
+
 def expected_artifact_url(version: str, platform: str) -> str:
     return (
         f"https://github.com/{REPO}/releases/download/v{version}/"
         f"{canonical_archive_name(version, platform)}"
     )
+
+
+def expected_desktop_url(version: str, platform: str) -> str:
+    return f"https://github.com/{REPO}/releases/download/v{version}/{canonical_desktop_name(version, platform)}"
+
+
+def _semver_parts(value: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
+    normalized = normalize_version(value)
+    core_and_pre = normalized.split("+", 1)[0]
+    core, separator, prerelease = core_and_pre.partition("-")
+    major, minor, patch = (int(part) for part in core.split("."))
+    return (major, minor, patch), tuple(prerelease.split(".")) if separator else None
+
+
+def desktop_required(version: str) -> bool:
+    version_core, _ = _semver_parts(version)
+    desktop_first_core, _ = _semver_parts(DESKTOP_FIRST_VERSION)
+    return version_core >= desktop_first_core
+
+
+def desktop_platforms_for_version(version: str) -> tuple[str, ...]:
+    if not desktop_required(version):
+        return ()
+    version_core, _ = _semver_parts(version)
+    arm64_first_core, _ = _semver_parts(WINDOWS_ARM64_DESKTOP_FIRST_VERSION)
+    if version_core >= arm64_first_core:
+        return DESKTOP_PLATFORMS
+    return LEGACY_DESKTOP_PLATFORMS
 
 
 def expected_binary_names(platform: str) -> set[str]:
@@ -259,6 +299,9 @@ def validate_public_manifest(manifest: dict, version: str) -> dict[str, dict[str
 
 def parse_sha256sums(text: str, version: str) -> dict[str, str]:
     expected_names = {canonical_archive_name(version, platform) for platform in PLATFORMS}
+    expected_names.update(
+        canonical_desktop_name(version, platform) for platform in desktop_platforms_for_version(version)
+    )
     result: dict[str, str] = {}
     for raw_line in text.splitlines():
         if not raw_line:
@@ -272,7 +315,7 @@ def parse_sha256sums(text: str, version: str) -> dict[str, str]:
         result[name] = digest
     if set(result) != expected_names:
         raise VerificationError(
-            f"SHA256SUMS must contain exactly the six release archives: {sorted(result)}"
+            f"SHA256SUMS has an unexpected downloadable release artifact set: {sorted(result)}"
         )
     return result
 
@@ -371,6 +414,9 @@ def validate_github_assets(release: dict, version: str) -> dict[str, dict]:
         raise VerificationError("GitHub Release is missing, draft/prerelease, or attached to the wrong tag")
     required = {canonical_archive_name(version, platform) for platform in PLATFORMS}
     required.add("SHA256SUMS")
+    required.update(
+        canonical_desktop_name(version, platform) for platform in desktop_platforms_for_version(version)
+    )
     server_assets = {SERVER_IMAGE_METADATA, *SERVER_DEPLOYMENT_ASSETS}
     assets = release.get("assets")
     if not isinstance(assets, list):
@@ -636,6 +682,35 @@ def _asset_digest(asset: dict) -> str | None:
     return digest
 
 
+def verify_desktop_asset(
+    version: str,
+    platform: str,
+    asset: dict,
+    sums: dict[str, str],
+    root: Path,
+    timeout: float,
+) -> tuple[int, str]:
+    desktop_name = canonical_desktop_name(version, platform)
+    desktop_url = asset.get("browser_download_url")
+    if desktop_url != expected_desktop_url(version, platform):
+        raise VerificationError(f"unexpected GitHub Desktop asset URL: {desktop_url!r}")
+    if desktop_name not in sums:
+        raise VerificationError(f"SHA256SUMS is missing the Desktop artifact for {platform}")
+    desktop_path = root / desktop_name
+    desktop_size, desktop_digest = download_file(
+        desktop_url,
+        desktop_path,
+        MAX_DESKTOP_ARTIFACT_BYTES,
+        timeout,
+    )
+    if desktop_size <= 0 or desktop_digest != sums[desktop_name]:
+        raise VerificationError(f"Desktop artifact SHA-256 disagreement for {platform}")
+    github_desktop_digest = _asset_digest(asset)
+    if github_desktop_digest is not None and desktop_digest != github_desktop_digest:
+        raise VerificationError(f"GitHub Desktop artifact digest mismatch for {platform}")
+    return desktop_size, desktop_digest
+
+
 def verify_public_release(version: str, timeout: float) -> None:
     encoded_package = urllib.parse.quote(PACKAGE, safe="@")
     npm_url = f"https://registry.npmjs.org/{encoded_package}/{version}"
@@ -671,6 +746,18 @@ def verify_public_release(version: str, timeout: float) -> None:
         except UnicodeDecodeError as exc:
             raise VerificationError("SHA256SUMS is not ASCII") from exc
         sums = parse_sha256sums(sums_text, version)
+
+        for platform in desktop_platforms_for_version(version):
+            desktop_name = canonical_desktop_name(version, platform)
+            desktop_size, desktop_digest = verify_desktop_asset(
+                version,
+                platform,
+                assets[desktop_name],
+                sums,
+                root,
+                timeout,
+            )
+            print(f"desktop_{platform.replace('-', '_')} sha256={desktop_digest} bytes={desktop_size}")
 
         image_identity = None
         image_asset = assets.get(SERVER_IMAGE_METADATA)

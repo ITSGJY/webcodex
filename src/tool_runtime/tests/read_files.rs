@@ -2,7 +2,7 @@
 
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{ShellAgentPollRequest, ShellAgentResultRequest};
+use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -18,14 +18,14 @@ fn item(path: &str, start_line: Option<usize>, limit: Option<usize>) -> ReadFile
 async fn next_read_request(
     runtime: &ToolRuntime,
     client_id: &str,
-) -> crate::shell_protocol::ShellAgentShellRequest {
+) -> crate::runner_protocol::RunnerRequest {
     wait_for_patch_agent_request(runtime, client_id).await
 }
 
 async fn complete_read(
     runtime: &ToolRuntime,
     client_id: &str,
-    request: &crate::shell_protocol::ShellAgentShellRequest,
+    request: &crate::runner_protocol::RunnerRequest,
     content: &str,
 ) {
     complete_agent_ranged_file_read_request(runtime, client_id, request, content).await;
@@ -61,23 +61,36 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
         schema["properties"]["max_result_bytes"]["default"],
         64 * 1024
     );
-    assert_eq!(
-        schema["properties"]["max_result_bytes"]["maximum"],
-        256 * 1024
-    );
-    assert!(schema["properties"]["max_result_bytes"]["description"]
+    assert_eq!(schema["properties"]["max_result_bytes"]["minimum"], 0);
+    assert!(schema["properties"]["max_result_bytes"]
+        .get("maximum")
+        .is_none());
+    let budget_description = schema["properties"]["max_result_bytes"]["description"]
         .as_str()
-        .unwrap()
-        .contains("protocol overlays"));
+        .unwrap();
+    assert!(budget_description.contains("runtime-clamped"));
+    assert!(budget_description.contains("protocol overlays"));
     assert!(validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs"}],
         "max_result_bytes": 128 * 1024
     })));
+    for max_result_bytes in [0, 1, 512 * 1024 + 1, 1024 * 1024] {
+        assert!(validates(&json!({
+            "project": "demo",
+            "items": [{"path": "a.rs"}],
+            "max_result_bytes": max_result_bytes
+        })));
+    }
     assert!(!validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs"}],
-        "max_result_bytes": 256 * 1024 + 1
+        "max_result_bytes": -1
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "items": [{"path": "a.rs"}],
+        "max_result_bytes": "65536"
     })));
     assert!(!validates(&json!({
         "project": "demo",
@@ -121,14 +134,6 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
     ] {
         assert!(ToolCall::from_tool_name("read_files", invalid).is_err());
     }
-
-    let read_file = spec_named(&specs, "read_file");
-    assert!(read_file.input_schema["properties"].get("items").is_none());
-    assert_eq!(
-        read_file.input_schema["required"],
-        json!(["project", "path"]),
-        "read_file remains the single-path contract"
-    );
 }
 
 #[tokio::test]
@@ -137,7 +142,7 @@ async fn read_files_returns_ordered_normalized_successes_after_out_of_order_comp
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-success";
     let runtime_project =
-        register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+        register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let first_content = "one\ntwo\nthree\nfour\n";
     let second_content = "main\n";
 
@@ -207,7 +212,7 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-sparse-single";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("sparse read".to_string()));
@@ -223,13 +228,16 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "src/lib.rs".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -242,13 +250,14 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "one\ntwo");
-    assert_eq!(result.output["path"], "src/lib.rs");
+    let item = &result.output["items"][0];
+    assert_eq!(item["output"]["text"], "one\ntwo");
+    assert_eq!(item["path"], "src/lib.rs");
     assert_eq!(
-        result.output["sha256"],
+        item["output"]["sha256"],
         format!("{:x}", Sha256::digest(content.as_bytes()))
     );
-    assert_eq!(result.output["total_lines"], 2);
+    assert_eq!(item["output"]["total_lines"], 2);
     for omitted in [
         "format",
         "start_line",
@@ -257,24 +266,26 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
         "end_line",
         "has_more",
         "next_start_line",
+        "continuation",
     ] {
         assert!(
-            result.output.get(omitted).is_none(),
-            "complete full-file read field {omitted} should be omitted: {}",
-            result.output
+            item["output"].get(omitted).is_none(),
+            "complete full-file read item field {omitted} should be omitted: {item}"
         );
     }
     let sparse_bytes = serde_json::to_vec(&result.output).unwrap().len();
     assert!(
-        sparse_bytes <= 400,
-        "complete sparse read_file regressed above model-facing budget: {sparse_bytes} bytes"
+        sparse_bytes <= 600,
+        "complete sparse one-item read_files regressed above model-facing budget: {sparse_bytes} bytes"
     );
-    eprintln!("read_file_sparse_complete_bytes={sparse_bytes}");
+    eprintln!("read_files_sparse_complete_one_item_bytes={sparse_bytes}");
 
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
-        .unwrap_or_else(|error| panic!("sparse read_file success must match schema: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("sparse one-item read_files success must match schema: {error}")
+        });
 
     let summary = runtime
         .sessions
@@ -284,8 +295,8 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
         .events
         .iter()
         .rev()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "read_file")
-        .expect("recorded read_file completion");
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "read_files")
+        .expect("recorded read_files completion");
     assert!(
         finished
             .observed_paths
@@ -300,7 +311,12 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-partial-visible";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("read continuation session".to_string()),
+    );
+    let session_id = session.session_id.clone();
     let auth = auth_context(None, true);
     let content = "one\ntwo\nthree";
 
@@ -308,16 +324,20 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
         let runtime = runtime.clone();
         let project = project.clone();
         let auth = auth.clone();
+        let session_id = session_id.clone();
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "src/lib.rs".to_string(),
-                        session_id: None,
-                        start_line: Some(2),
-                        limit: Some(1),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: Some(2),
+                            limit: Some(1),
+                        }],
+                        session_id: Some(session_id),
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -329,21 +349,127 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "two");
-    assert_eq!(result.output["format"], "plain");
-    assert_eq!(result.output["path"], "src/lib.rs");
-    assert_eq!(result.output["start_line"], 2);
-    assert_eq!(result.output["limit"], 1);
-    assert_eq!(result.output["total_lines"], 3);
-    assert_eq!(result.output["returned_lines"], 1);
-    assert_eq!(result.output["end_line"], 2);
-    assert_eq!(result.output["has_more"], true);
-    assert_eq!(result.output["next_start_line"], 3);
+    let item = &result.output["items"][0];
+    assert_eq!(item["output"]["text"], "two");
+    assert_eq!(item["output"]["format"], "plain");
+    assert_eq!(item["path"], "src/lib.rs");
+    assert_eq!(item["output"]["start_line"], 2);
+    assert_eq!(item["output"]["limit"], 1);
+    assert_eq!(item["output"]["total_lines"], 3);
+    assert_eq!(item["output"]["returned_lines"], 1);
+    assert_eq!(item["output"]["end_line"], 2);
+    assert_eq!(item["output"]["has_more"], true);
+    assert_eq!(item["output"]["next_start_line"], 3);
+    let continuation = &item["continuation"];
+    assert_eq!(continuation["kind"], "read_range");
+    assert_eq!(continuation["safe_cursor"], true);
+    assert_eq!(continuation["snapshot_stable"], false);
+    assert_eq!(continuation["continuation_semantics"]["kind"], "page");
+    assert_eq!(
+        continuation["continuation_semantics"]["carrier"],
+        "position"
+    );
+    assert_eq!(
+        continuation["source_sha256"],
+        format!("{:x}", Sha256::digest(content.as_bytes()))
+    );
+    assert_eq!(continuation["suggested_call"]["tool"], "read_files");
+    assert_eq!(
+        continuation["suggested_call"]["arguments"]["session_id"],
+        session_id
+    );
+    let next_call = ToolCall::from_tool_name(
+        continuation["suggested_call"]["tool"].as_str().unwrap(),
+        continuation["suggested_call"]["arguments"].clone(),
+    )
+    .expect("read_files continuation suggested_call must parse");
+    assert!(matches!(
+        next_call,
+        ToolCall::ReadFiles {
+            project: ref next_project,
+            ref items,
+            session_id: Some(ref next_session_id),
+            with_line_numbers: None,
+            max_result_bytes: None,
+        } if next_project == &project
+            && items.len() == 1
+            && items[0].path == "src/lib.rs"
+            && items[0].start_line == Some(3)
+            && items[0].limit == Some(1)
+            && next_session_id == &session_id
+    ));
 
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
-        .unwrap_or_else(|error| panic!("partial read_file success must match schema: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("partial one-item read_files success must match schema: {error}")
+        });
+}
+
+#[tokio::test]
+async fn read_files_continuation_is_positional_not_snapshot_stable() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "read-source-change";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let auth = auth_context(None, true);
+    let first_content = "one\ntwo\nthree";
+
+    let first = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: Some(1),
+                            limit: Some(1),
+                        }],
+                        session_id: None,
+                        with_line_numbers: None,
+                        max_result_bytes: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = next_read_request(&runtime, client_id).await;
+    complete_read(&runtime, client_id, &request, first_content).await;
+    let first = first.await.unwrap();
+    let first_item = &first.output["items"][0];
+    let first_sha = first_item["output"]["sha256"].as_str().unwrap().to_string();
+    let suggested = &first_item["continuation"]["suggested_call"];
+    let next_call = ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("positional continuation must parse");
+
+    // Insert a line before the cursor between calls. The next read is still a
+    // deterministic absolute line read, but it is intentionally not frozen to
+    // the first file snapshot.
+    let changed_content = "zero\none\ntwo\nthree";
+    let second = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move { runtime.dispatch_with_auth(next_call, Some(&auth)).await }
+    });
+    let request = next_read_request(&runtime, client_id).await;
+    assert_eq!(request.start_line, Some(2));
+    complete_read(&runtime, client_id, &request, changed_content).await;
+    let second = second.await.unwrap();
+    assert!(second.success, "{:?}", second.error);
+    let second_item = &second.output["items"][0];
+    assert_eq!(second_item["output"]["text"], "one");
+    assert_ne!(second_item["output"]["sha256"], first_sha);
+    assert_eq!(first_item["continuation"]["source_sha256"], first_sha);
+    assert_eq!(first_item["continuation"]["snapshot_stable"], false);
 }
 
 #[tokio::test]
@@ -351,7 +477,7 @@ async fn read_file_dispatch_complete_explicit_range_keeps_full_range_metadata() 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-explicit-range-visible";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let auth = auth_context(None, true);
     let content = "one\ntwo";
 
@@ -362,13 +488,16 @@ async fn read_file_dispatch_complete_explicit_range_keeps_full_range_metadata() 
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "src/lib.rs".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "src/lib.rs".to_string(),
+                            start_line: Some(1),
+                            limit: Some(2),
+                        }],
                         session_id: None,
-                        start_line: Some(1),
-                        limit: Some(2),
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -380,22 +509,24 @@ async fn read_file_dispatch_complete_explicit_range_keeps_full_range_metadata() 
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "one\ntwo");
-    assert_eq!(result.output["format"], "plain");
-    assert_eq!(result.output["path"], "src/lib.rs");
-    assert_eq!(result.output["start_line"], 1);
-    assert_eq!(result.output["limit"], 2);
-    assert_eq!(result.output["total_lines"], 2);
-    assert_eq!(result.output["returned_lines"], 2);
-    assert_eq!(result.output["end_line"], 2);
-    assert_eq!(result.output["has_more"], false);
-    assert!(result.output["next_start_line"].is_null());
+    let item = &result.output["items"][0];
+    assert_eq!(item["output"]["text"], "one\ntwo");
+    assert_eq!(item["output"]["format"], "plain");
+    assert_eq!(item["path"], "src/lib.rs");
+    assert_eq!(item["output"]["start_line"], 1);
+    assert_eq!(item["output"]["limit"], 2);
+    assert_eq!(item["output"]["total_lines"], 2);
+    assert_eq!(item["output"]["returned_lines"], 2);
+    assert_eq!(item["output"]["end_line"], 2);
+    assert_eq!(item["output"]["has_more"], false);
+    assert!(item["output"]["next_start_line"].is_null());
+    assert!(item.get("continuation").is_none());
 
-    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_file");
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
         .unwrap_or_else(|error| {
-            panic!("explicit-range read_file success must match schema: {error}")
+            panic!("explicit-range one-item read_files success must match schema: {error}")
         });
 }
 
@@ -404,7 +535,7 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-sparse-batch";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let auth = auth_context(None, true);
 
     let task = tokio::spawn({
@@ -496,11 +627,96 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
 }
 
 #[tokio::test]
+async fn read_files_partial_item_has_actionable_item_continuation() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "read-batch-item-continuation";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("batch read continuation session".to_string()),
+    );
+    let session_id = session.session_id.clone();
+    let auth = auth_context(None, true);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        let session_id = session_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::ReadFiles {
+                        project,
+                        items: vec![
+                            item("src/lib.rs", Some(2), Some(1)),
+                            item("src/main.rs", None, None),
+                        ],
+                        session_id: Some(session_id),
+                        with_line_numbers: Some(true),
+                        max_result_bytes: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    for _ in 0..2 {
+        let request = next_read_request(&runtime, client_id).await;
+        let content = match request.path.as_deref() {
+            Some("src/lib.rs") => "one\ntwo\nthree",
+            Some("src/main.rs") => "main",
+            other => panic!("unexpected read path: {other:?}"),
+        };
+        complete_read(&runtime, client_id, &request, content).await;
+    }
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["output_truncated"], false);
+    assert!(result.output.get("continuation").is_none());
+    let items = result.output["items"].as_array().unwrap();
+    let continuation = &items[0]["continuation"];
+    assert_eq!(continuation["kind"], "read_range");
+    assert_eq!(continuation["safe_cursor"], true);
+    assert_eq!(continuation["snapshot_stable"], false);
+    let suggested = &continuation["suggested_call"];
+    assert_eq!(suggested["arguments"]["session_id"], session_id);
+    let next_call = ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("item continuation must parse");
+    assert!(matches!(
+        next_call,
+        ToolCall::ReadFiles {
+            project: ref next_project,
+            ref items,
+            session_id: Some(ref next_session_id),
+            with_line_numbers: Some(true),
+            max_result_bytes: None,
+        } if next_project == &project
+            && items.len() == 1
+            && items[0].path == "src/lib.rs"
+            && items[0].start_line == Some(3)
+            && items[0].limit == Some(1)
+            && next_session_id == &session_id
+    ));
+    assert!(items[1].get("continuation").is_none());
+
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
+    let serialized = serde_json::to_value(&result).unwrap();
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
+        .unwrap_or_else(|error| panic!("partial read_files item must match schema: {error}"));
+}
+
+#[tokio::test]
 async fn read_files_dispatch_large_default_batch_uses_sparse_fit_before_budget() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-sparse-budget-order";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let auth = auth_context(None, true);
     let paths = (0..8)
         .map(|index| format!("src/{index}.rs"))
@@ -558,7 +774,7 @@ async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-sparse-mixed";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let expected_project = project.clone();
     let auth = auth_context(None, true);
 
@@ -571,7 +787,7 @@ async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
                         project,
-                        items: vec![item("good.txt", None, None), item(".env", None, None)],
+                        items: vec![item("good.txt", None, Some(1)), item(".env", None, None)],
                         session_id: None,
                         with_line_numbers: None,
                         max_result_bytes: None,
@@ -583,7 +799,7 @@ async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
     });
     let request = next_read_request(&runtime, client_id).await;
     assert_eq!(request.path.as_deref(), Some("good.txt"));
-    complete_read(&runtime, client_id, &request, "ok").await;
+    complete_read(&runtime, client_id, &request, "ok\nmore").await;
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
@@ -599,9 +815,15 @@ async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
     assert_eq!(items[0]["success"], true);
     assert_eq!(items[0]["path"], "good.txt");
     assert_eq!(items[0]["output"]["text"], "ok");
-    assert!(items[0]["output"].get("path").is_none());
-    assert!(items[0]["output"].get("format").is_none());
-    assert!(items[0]["output"].get("has_more").is_none());
+    assert_eq!(items[0]["output"]["has_more"], true);
+    assert_eq!(items[0]["output"]["next_start_line"], 2);
+    assert_eq!(items[0]["continuation"]["kind"], "read_range");
+    let suggested = &items[0]["continuation"]["suggested_call"];
+    ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("successful mixed-batch item continuation must remain parseable");
     assert_eq!(items[1]["success"], false);
     assert_eq!(items[1]["path"], ".env");
     assert_eq!(items[1]["output"]["error_kind"], "read_file_failed");
@@ -620,7 +842,7 @@ async fn read_files_isolates_mixed_failures_without_leaking_absolute_paths() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-mixed";
-    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -685,11 +907,11 @@ async fn read_files_isolates_mixed_failures_without_leaking_absolute_paths() {
 }
 
 #[tokio::test]
-async fn read_files_runner_in_flight_is_concurrent_and_never_exceeds_four() {
+async fn read_files_max_batch_can_enqueue_all_eight_independent_reads() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-concurrency";
-    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -706,43 +928,30 @@ async fn read_files_runner_in_flight_is_concurrent_and_never_exceeds_four() {
     });
 
     let mut active = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..8 {
         active.push(next_read_request(&runtime, client_id).await);
     }
-    let mut max_in_flight = active.len();
-    let fifth_before_completion = runtime
-        .shell_clients
-        .poll(ShellAgentPollRequest {
+    assert_eq!(active.len(), 8);
+    let extra_before_completion = runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
         })
         .await
         .unwrap();
     assert!(
-        fifth_before_completion.is_none(),
-        "fifth read was enqueued before a slot opened"
+        extra_before_completion.is_none(),
+        "max-size read batch enqueued work beyond its eight-item bound"
     );
 
-    let mut dispatched = 4;
-    while dispatched < 8 {
-        let finished = active.remove(0);
-        complete_read(&runtime, client_id, &finished, "value\n").await;
-        active.push(next_read_request(&runtime, client_id).await);
-        dispatched += 1;
-        max_in_flight = max_in_flight.max(active.len());
-        assert!(active.len() <= 4);
-    }
-    for request in active {
+    for request in active.into_iter().rev() {
         complete_read(&runtime, client_id, &request, "value\n").await;
     }
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["succeeded_count"], 8);
-    assert!(
-        max_in_flight > 1,
-        "batch unexpectedly degraded to serial reads"
-    );
-    assert!(max_in_flight <= 4);
+    assert_eq!(result.output["items"].as_array().unwrap().len(), 8);
 }
 
 #[tokio::test]
@@ -750,7 +959,7 @@ async fn read_files_deadline_preserves_completed_results_and_cancels_unfinished_
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests().with_read_files_deadline(Duration::from_millis(75));
     let client_id = "batch-deadline";
-    register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -793,10 +1002,10 @@ async fn read_files_deadline_preserves_completed_results_and_cancels_unfinished_
         .filter(|request| request.path.as_deref() != Some("fast.txt"))
     {
         let late = runtime
-            .shell_clients
-            .complete(ShellAgentResultRequest {
+            .runner_registry
+            .complete(RunnerResultRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id: request.request_id.clone(),
                 exit_code: Some(0),
                 stdout: Some(canonical_agent_file_read_output("late\n", 1)),
@@ -814,7 +1023,7 @@ async fn read_files_records_one_outer_session_event_and_keeps_metadata_outer_onl
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-session";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("batch read".to_string()));
@@ -844,8 +1053,9 @@ async fn read_files_records_one_outer_session_event_and_keeps_metadata_outer_onl
     }
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_recorded"], true);
-    assert!(result.output["session_event_id"].as_str().is_some());
+    assert!(result.output.get("session_recorded").is_none());
+    assert!(result.output.get("session_event_id").is_none());
+    assert!(result.output.get("session_id").is_none());
     assert!(result.output.get("permission").is_none());
     for item in result.output["items"].as_array().unwrap() {
         let serialized = serde_json::to_string(item).unwrap();
@@ -875,12 +1085,12 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
     use crate::tool_runtime::sessions::{
         SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
     };
-    use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
+    use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-direct-final-cap";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("direct final cap".to_string()));
@@ -900,7 +1110,12 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
                 .dispatch_with_auth_transport_options_and_metadata(
                     ToolCall::ReadFiles {
                         project,
-                        items: vec![item("a.rs", None, None), item("b.rs", None, None)],
+                        items: vec![
+                            item("a.rs", None, None),
+                            item("b.rs", None, None),
+                            item("c.rs", None, None),
+                            item("d.rs", None, None),
+                        ],
                         session_id: Some(session_id),
                         with_line_numbers: None,
                         max_result_bytes: Some(MAX_SERIALIZED_OUTPUT_BYTES),
@@ -915,51 +1130,44 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
                 .await
         }
     });
-    let content = "x".repeat(122 * 1024);
-    for _ in 0..2 {
+    let content = "x".repeat(150 * 1024);
+    for _ in 0..4 {
         let request = next_read_request(&runtime, client_id).await;
         complete_read(&runtime, client_id, &request, &content).await;
     }
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
-    assert_eq!(
-        result.output["session_recovery"]["model_facing_events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
-    assert_eq!(result.output["output_truncated"], true);
-    assert_eq!(result.output["truncation_reason"], "hard_result_cap");
+    assert!(result.output.get("session_continuity").is_none());
+    assert!(result.output.get("session_recovery").is_none());
+    assert!(result.output.get("session_context_revision").is_none());
     let serialized_len = serde_json::to_vec(&result).unwrap().len();
     assert!(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,
-        "direct Session overlays pushed read_files final response above the 256 KiB hard cap: {serialized_len} bytes"
+        "direct Session overlays pushed read_files final response above the 512 KiB inspection hard cap: {serialized_len} bytes"
     );
 }
 
 #[tokio::test]
 async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
     use crate::tool_runtime::kernel::{
-        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolTransport,
+        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+        ToolProtocolCapabilities, ToolTransport,
     };
-    use crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD;
+    use crate::tool_runtime::sessions::SessionContextRevisionAck;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-outer-sparse";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some("outer sparse read".to_string()));
     let auth = auth_context(None, true);
-    let mut arguments = json!({
+    let arguments = json!({
         "project": project,
         "items": [{"path": "a.rs"}]
     });
-    arguments[TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD] = json!(0);
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -967,7 +1175,7 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
         let auth = auth.clone();
         async move {
             runtime
-                .call_tool_with_context_protocol_capability(
+                .call_tool_with_invocation_metadata(
                     ToolCallRequest {
                         tool_name: "read_files".to_string(),
                         arguments,
@@ -980,8 +1188,15 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
                         record_oauth_scope_denials: false,
                         host_file_import_trust: HostFileImportTrust::Untrusted,
                     },
-                    true,
-                    true,
+                    ToolInvocationMetadata {
+                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
+                        ..Default::default()
+                    },
+                    ToolProtocolCapabilities {
+                        context_continuity: true,
+                        context_sidecar: true,
+                        ..Default::default()
+                    },
                 )
                 .await
         }
@@ -993,7 +1208,8 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
     assert!(result.success, "{:?}", result.error);
     assert!(result.output.get("session_recorded").is_none());
     assert!(result.output.get("session_event_id").is_none());
-    assert_eq!(result.output["session_context_revision"], 0);
+    assert!(result.output.get("session_id").is_none());
+    assert!(result.output.get("session_context_revision").is_none());
     assert!(result.output.get("session_continuity").is_none());
     assert!(result.output.get("session_recovery").is_none());
     for omitted in [
@@ -1017,20 +1233,113 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
 }
 
 #[tokio::test]
-async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
+async fn read_files_outer_recorder_observes_canonical_batch_before_primary_projection() {
     use crate::tool_runtime::kernel::{
-        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolTransport,
+        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+        ToolProtocolCapabilities, ToolTransport,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "batch-canonical-before-projection";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let recording_session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("canonical batch evidence".to_string()),
+    );
+    let business_session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("inner business read".to_string()),
+    );
+    let auth = auth_context(None, true);
+    let arguments = json!({
+        "project": project,
+        "items": [{"path": "a.rs"}, {"path": "b.rs"}],
+        "session_id": business_session.session_id,
+        "max_result_bytes": 8192
+    });
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let session_id = recording_session.session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .call_tool_with_invocation_metadata(
+                    ToolCallRequest {
+                        tool_name: "read_files".to_string(),
+                        arguments,
+                    },
+                    ToolCallContext {
+                        transport: ToolTransport::Mcp,
+                        session_id: Some(&session_id),
+                        auth: Some(&auth),
+                        window: None,
+                        record_oauth_scope_denials: false,
+                        host_file_import_trust: HostFileImportTrust::Untrusted,
+                    },
+                    ToolInvocationMetadata::default(),
+                    ToolProtocolCapabilities::default(),
+                )
+                .await
+        }
+    });
+    let content = format!("{}\n", "x".repeat(3_000));
+    for _ in 0..2 {
+        let request = next_read_request(&runtime, client_id).await;
+        complete_read(&runtime, client_id, &request, &content).await;
+    }
+
+    let result = task.await.unwrap().result.expect("model-facing result");
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["output_truncated"], true);
+    assert_eq!(result.output["truncation_reason"], "batch_response_budget");
+    assert_eq!(result.output["returned_count"], 1);
+    assert_eq!(result.output["next_index"], 1);
+    assert_eq!(
+        result.output["continuation"]["suggested_call"]["arguments"]["session_id"],
+        business_session.session_id,
+        "model continuation must preserve the concrete business Session rather than inherit the outer recorder"
+    );
+
+    let recording_summary = runtime
+        .sessions
+        .summary(&recording_session.session_id, Some(20))
+        .unwrap();
+    let recording_event = finished_event(&recording_summary, "read_files");
+    assert_eq!(
+        recording_event.observed_paths,
+        vec!["a.rs".to_string(), "b.rs".to_string()],
+        "outer recorder must consume canonical batch evidence before the terminal model budget"
+    );
+    let business_summary = runtime
+        .sessions
+        .summary(&business_session.session_id, Some(20))
+        .unwrap();
+    let business_event = finished_event(&business_summary, "read_files");
+    assert_eq!(
+        business_event.observed_paths,
+        vec!["a.rs".to_string(), "b.rs".to_string()],
+        "concrete business Session must remain independently recorded with canonical evidence"
+    );
+}
+
+#[tokio::test]
+async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
+    use crate::tool_runtime::kernel::{
+        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+        ToolProtocolCapabilities, ToolTransport,
     };
     use crate::tool_runtime::sessions::{
-        PostSessionMessageInput, SessionMessageKind, SessionMessagePriority,
-        TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD,
+        PostSessionMessageInput, SessionContextRevisionAck, SessionMessageKind,
+        SessionMessagePriority,
     };
     use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-overlay-bound";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let session = runtime.sessions.start_session(
         Some(project.clone()),
         Some("bounded recovery overlays".to_string()),
@@ -1110,6 +1419,7 @@ async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
         &audited,
         Some(project.clone()),
         recorder_metadata,
+        crate::tool_runtime::sessions::session_tool_contract("run_process"),
     );
     runtime.sessions.record_tool_call_finished(
         validation_start,
@@ -1128,13 +1438,10 @@ async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
     );
 
     let auth = auth_context(None, true);
-    let mut arguments = json!({
+    let arguments = json!({
         "project": project,
         "items": [{"path": "a.rs"}]
     });
-    arguments[TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD] = json!(0);
-    arguments[crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD] =
-        json!(["webcodex.workflow"]);
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -1142,7 +1449,7 @@ async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
         let auth = auth.clone();
         async move {
             runtime
-                .call_tool_with_context_protocol_capability(
+                .call_tool_with_invocation_metadata(
                     ToolCallRequest {
                         tool_name: "read_files".to_string(),
                         arguments,
@@ -1155,8 +1462,16 @@ async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
                         record_oauth_scope_denials: false,
                         host_file_import_trust: HostFileImportTrust::Untrusted,
                     },
-                    true,
-                    true,
+                    ToolInvocationMetadata {
+                        context_request: vec!["webcodex.workflow".to_string()],
+                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
+                        ..Default::default()
+                    },
+                    ToolProtocolCapabilities {
+                        context_continuity: true,
+                        context_sidecar: true,
+                        ..Default::default()
+                    },
                 )
                 .await
         }
@@ -1166,43 +1481,13 @@ async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
 
     let result = task.await.unwrap().result.expect("model-facing result");
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
-    assert_eq!(result.output["session_recovery"]["truncated"], true);
-    assert!(result.output["session_recovery"]["current_handoff"].is_object());
-    let recovery_validation = &result.output["session_recovery"]["current_handoff"]["validation"];
-    assert_eq!(recovery_validation["unresolved_failures"]["count"], 1);
-    let unresolved = &recovery_validation["unresolved_failures"]["events"][0];
-    assert_eq!(unresolved["assertion_name"], assertion_name);
-    assert_eq!(
-        unresolved["identity"],
-        crate::tool_runtime::tool_audit::assertion_validation_identity(assertion_name)
-    );
-    assert!(
-        result.output["session_recovery"]["current_handoff"]["suggested_next_actions"]
-            .as_array()
-            .is_some_and(|actions| actions.iter().any(|action| {
-                action
-                    .as_str()
-                    .is_some_and(|action| action.contains("reuse the original assertion_name"))
-            }))
-    );
-    let recovery_events = result.output["session_recovery"]["model_facing_events"]
-        .as_array()
-        .unwrap();
-    assert!(recovery_events.len() < 20);
-    assert!(
-        serde_json::to_vec(recovery_events).unwrap().len()
-            <= crate::tool_runtime::session_context::SESSION_CONTINUITY_RECOVERY_EVENT_BYTES
-    );
-    let recovery_changed_paths = result.output["session_recovery"]["current_handoff"]
-        ["changed_paths"]
-        .as_array()
-        .unwrap();
-    assert_eq!(recovery_changed_paths.len(), 40);
-    assert!(recovery_changed_paths
-        .iter()
-        .filter_map(Value::as_str)
-        .all(|path| path.len() <= 512));
+    for field in [
+        "session_context_revision",
+        "session_continuity",
+        "session_recovery",
+    ] {
+        assert!(result.output.get(field).is_none(), "{field}");
+    }
     assert_eq!(result.output["session_attention"]["requires_ack"], true);
     let attention_messages = result.output["session_attention"]["messages"]
         .as_array()
@@ -1233,15 +1518,16 @@ async fn read_files_recovery_handoff_and_attention_overlays_stay_bounded() {
 #[tokio::test]
 async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap() {
     use crate::tool_runtime::kernel::{
-        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolTransport,
+        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+        ToolProtocolCapabilities, ToolTransport,
     };
-    use crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD;
-    use webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES;
+    use crate::tool_runtime::sessions::SessionContextRevisionAck;
+    use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-final-cap";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
     let session = runtime.sessions.start_session(
         Some(project.clone()),
         Some("final response cap".to_string()),
@@ -1251,12 +1537,16 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
         20
     );
     let auth = auth_context(None, true);
-    let mut arguments = json!({
+    let arguments = json!({
         "project": project,
-        "items": [{"path": "a.rs"}, {"path": "b.rs"}],
+        "items": [
+            {"path": "a.rs"},
+            {"path": "b.rs"},
+            {"path": "c.rs"},
+            {"path": "d.rs"}
+        ],
         "max_result_bytes": MAX_SERIALIZED_OUTPUT_BYTES
     });
-    arguments[TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD] = json!(0);
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -1264,7 +1554,7 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
         let auth = auth.clone();
         async move {
             runtime
-                .call_tool_with_context_protocol_capability(
+                .call_tool_with_invocation_metadata(
                     ToolCallRequest {
                         tool_name: "read_files".to_string(),
                         arguments,
@@ -1277,14 +1567,21 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
                         record_oauth_scope_denials: false,
                         host_file_import_trust: HostFileImportTrust::Untrusted,
                     },
-                    true,
-                    true,
+                    ToolInvocationMetadata {
+                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
+                        ..Default::default()
+                    },
+                    ToolProtocolCapabilities {
+                        context_continuity: true,
+                        context_sidecar: true,
+                        ..Default::default()
+                    },
                 )
                 .await
         }
     });
-    let content = "x".repeat(122 * 1024);
-    for _ in 0..2 {
+    let content = "x".repeat(150 * 1024);
+    for _ in 0..4 {
         let request = next_read_request(&runtime, client_id).await;
         complete_read(&runtime, client_id, &request, &content).await;
     }
@@ -1293,21 +1590,19 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
     assert!(outcome.success);
     let result = outcome.result.expect("model-facing result");
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_continuity"]["status"], "behind");
-    assert_eq!(
-        result.output["session_recovery"]["model_facing_events"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
+    assert!(result.output.get("session_continuity").is_none());
+    assert!(result.output.get("session_recovery").is_none());
+    assert!(result.output.get("session_context_revision").is_none());
+
     assert_eq!(result.output["output_truncated"], true);
     assert_eq!(result.output["truncation_reason"], "hard_result_cap");
-    assert_eq!(result.output["returned_count"], 1);
-    assert_eq!(result.output["next_index"], 1);
+    let returned_count = result.output["returned_count"].as_u64().unwrap();
+    let next_index = result.output["next_index"].as_u64().unwrap();
+    assert!(returned_count < 4);
+    assert_eq!(next_index, returned_count);
     let serialized_len = serde_json::to_vec(&result).unwrap().len();
     assert!(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,
-        "outer Session overlays pushed read_files final response above the 256 KiB hard cap: {serialized_len} bytes"
+        "outer Session overlays pushed read_files final response above the 512 KiB inspection hard cap: {serialized_len} bytes"
     );
 }

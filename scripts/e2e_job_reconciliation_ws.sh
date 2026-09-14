@@ -215,8 +215,8 @@ TMP_ROOT="$(mktemp -d -t webcodex-jobrecon-e2e-XXXXXX)"
 COOKIE_JAR="$TMP_ROOT/cookies.txt"
 : >"$COOKIE_JAR"
 DATA_DIR="$TMP_ROOT/data"
-PROJECTS_DIR="$TMP_ROOT/projects.d"
-AGENT_TOML="$TMP_ROOT/agent.toml"
+PROJECTS_DIR="$TMP_ROOT/project-registry"
+AGENT_TOML="$TMP_ROOT/runner.toml"
 TEST_REPO="$TMP_ROOT/jobrecon-repo"
 SERVER_LOG="$TMP_ROOT/server.log"
 RUNNER_LOG="$TMP_ROOT/agent.log"
@@ -274,7 +274,7 @@ token = "${TOKEN}"
 client_id = "${CLIENT_ID}"
 display_name = "JobRecon E2E Agent"
 owner = "e2e"
-projects_dir = "${PROJECTS_DIR}"
+project_registry_dir = "${PROJECTS_DIR}"
 poll_interval_ms = 500
 transport = "websocket"
 
@@ -365,18 +365,18 @@ observe_job_call() {
     tool_call "observe_jobs" "{\"items\":[{\"job_id\":\"${job_id}\",\"after_observation_token\":${encoded_token}}],\"tail_lines\":40,\"wait_secs\":${wait_secs}}"
 }
 
+observe_one_job_compat() {
+    local job_id="$1"; local tail_lines="$2"
+    tool_call "observe_jobs" "{\"items\":[{\"job_id\":\"${job_id}\"}],\"tail_lines\":${tail_lines}}" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin); item=d["output"]["items"][0]; print(json.dumps({"success":item["success"],"output":item.get("output",{}),"error":item.get("error")}))'
+}
+
 job_status_call() {
-    local job_id="$1"
-    tool_call "job_status" "{\"job_id\":\"${job_id}\"}"
+    observe_one_job_compat "$1" 1
 }
 
 job_log_call() {
-    local job_id="$1"; local offset="${2:-}"
-    local extra=""
-    if [ -n "$offset" ]; then
-        extra=",\"offset\":${offset}"
-    fi
-    tool_call "job_log" "{\"job_id\":\"${job_id}\"${extra}}"
+    observe_one_job_compat "$1" 40
 }
 
 stop_job_call() {

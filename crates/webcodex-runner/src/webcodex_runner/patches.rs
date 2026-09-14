@@ -1,13 +1,14 @@
 use super::config::RunnerPolicy;
 use super::files::{resolve_requested_path, sha256_hex_bytes};
 use super::output::{line_edit_stdout, CommandResult};
-use crate::shell_protocol::ShellAgentShellRequest;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use webcodex_core::runner_operation::RunnerFilePayload;
 
+#[cfg(test)]
 pub(crate) fn is_structured_edit_request_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -36,6 +37,34 @@ pub(crate) fn validate_structured_edit_runner_path(path: &str) -> Result<(), Str
         return Err("refusing to edit sensitive path".to_string());
     }
     Ok(())
+}
+
+fn checked_structured_edit_target(cwd: Option<&str>, resolved: &Path) -> Result<PathBuf, String> {
+    let root = cwd.ok_or_else(|| "structured edit request missing project root".to_string())?;
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| format!("project root does not exist: {error}"))?;
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| "target path has no parent directory".to_string())?;
+    let name = resolved
+        .file_name()
+        .ok_or_else(|| "target path has no file name".to_string())?;
+    // Resolve parent aliases before planning or creating directories, including
+    // any not-yet-created suffix. Keep the final component so batch operations
+    // retain their existing rejection of symlink files.
+    let target = canonical_batch_identity(parent)?.join(name);
+    let identity = canonical_batch_identity(&target)?;
+    // Check both the directory entry that will be changed and the target that
+    // a content/hash read would follow if the final component is a symlink.
+    for candidate in [&target, &identity] {
+        let relative = candidate
+            .strip_prefix(&root)
+            .map_err(|_| "structured edit path escapes project root".to_string())?;
+        if is_sensitive_edit_path(&relative.to_string_lossy()) {
+            return Err("refusing to edit sensitive path".to_string());
+        }
+    }
+    Ok(target)
 }
 
 fn write_file_atomic_strict(path: &Path, content: &str, tmp_prefix: &str) -> Result<(), String> {
@@ -91,7 +120,19 @@ fn write_file_atomic(path: &Path, content: &str) -> Result<(), String> {
     write_file_atomic_strict(path, content, ".pd-line")
 }
 
-fn parse_json_payload(request: &ShellAgentShellRequest) -> Result<serde_json::Value, String> {
+fn write_project_file_atomic(
+    path: &Path,
+    content: &str,
+    overwrite_existing: bool,
+) -> Result<(), String> {
+    if overwrite_existing {
+        write_file_atomic_strict(path, content, ".pd-write")
+    } else {
+        write_new_file_atomic(path, content)
+    }
+}
+
+fn parse_json_payload(request: &RunnerFilePayload) -> Result<serde_json::Value, String> {
     serde_json::from_str(request.content.as_deref().unwrap_or_default())
         .map_err(|e| format!("invalid json: {}", e))
 }
@@ -159,11 +200,11 @@ fn write_project_file_apply_error(
 }
 
 pub(crate) fn handle_write_project_file_request(
-    request: &ShellAgentShellRequest,
+    request: &RunnerFilePayload,
     resolved: &Path,
     start: Instant,
 ) -> CommandResult {
-    let path = request.path.as_deref().unwrap_or_default();
+    let path = request.path.as_str();
     let payload = match parse_json_payload(request) {
         Ok(payload) => payload,
         Err(e) => {
@@ -221,6 +262,16 @@ pub(crate) fn handle_write_project_file_request(
             )
         }
     };
+    let target = match checked_structured_edit_target(request.cwd.as_deref(), resolved) {
+        Ok(target) => target,
+        Err(error) => {
+            return line_edit_stdout(
+                write_project_file_error(serde_json::json!(path), error),
+                start,
+            )
+        }
+    };
+    let resolved = target.as_path();
     let exists = std::fs::symlink_metadata(resolved).is_ok();
     if exists && !overwrite {
         return line_edit_stdout(
@@ -292,7 +343,7 @@ pub(crate) fn handle_write_project_file_request(
     let changed = current.as_deref() != Some(content);
     if changed {
         if let Err(failure) = apply_write_project_file_change(resolved, content, |path, content| {
-            write_file_atomic_strict(path, content, ".pd-write")
+            write_project_file_atomic(path, content, exists)
         }) {
             return line_edit_stdout(
                 write_project_file_apply_error(serde_json::json!(path), failure),
@@ -332,7 +383,8 @@ use crate::apply_edits_shared::{
     MAX_APPLY_TEXT_EDIT_FIELD_BYTES as APPLY_TEXT_EDITS_MAX_FIELD_BYTES,
 };
 use crate::apply_patch_shared::{
-    derive_codex_patch_update_with_matches, parse_codex_patch, CodexPatchChunkMatch, CodexPatchHunk,
+    derive_codex_patch_update_with_matching_mode, parse_codex_patch, ApplyPatchMatchingMode,
+    CodexPatchChunkMatch, CodexPatchError, CodexPatchHunk, CodexPatchMatchDiagnostic,
 };
 
 #[derive(Debug, Deserialize)]
@@ -351,7 +403,26 @@ struct ApplyPatchPayload {
     #[serde(default)]
     dry_run: Option<bool>,
     #[serde(default)]
+    matching_mode: Option<ApplyPatchMatchingMode>,
+    /// Rolling-wire compatibility for older Servers only. Current model-facing
+    /// requests use matching_mode and never emit this field.
+    #[serde(default)]
     strict_matching: Option<bool>,
+}
+
+fn apply_patch_matching_mode(
+    payload: &ApplyPatchPayload,
+) -> Result<ApplyPatchMatchingMode, String> {
+    if payload.matching_mode.is_some() && payload.strict_matching.is_some() {
+        return Err("matching_mode and legacy strict_matching cannot be combined".to_string());
+    }
+    Ok(match (payload.matching_mode, payload.strict_matching) {
+        (Some(mode), None) => mode,
+        (None, Some(true)) => ApplyPatchMatchingMode::ExactUnique,
+        // Preserve the old Server wire default when rolling a new Runner first.
+        (None, Some(false) | None) => ApplyPatchMatchingMode::FirstMatch,
+        (Some(_), Some(_)) => unreachable!(),
+    })
 }
 
 #[derive(Debug)]
@@ -480,13 +551,9 @@ fn edit_plan(
                     .ok_or_else(|| {
                         EditPlanError::plain(index, kind.as_str(), "anchor_text must be non-empty")
                     })?;
-                let new_text = edit
-                    .new_text
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        EditPlanError::plain(index, kind.as_str(), "new_text must be non-empty")
-                    })?;
+                let new_text = edit.new_text.as_deref().ok_or_else(|| {
+                    EditPlanError::plain(index, kind.as_str(), "new_text is required")
+                })?;
                 if edit.old_text.is_some() {
                     return Err(EditPlanError::plain(
                         index,
@@ -518,6 +585,13 @@ fn edit_plan(
         let replacement = canonicalize_apply_text_line_endings(&replacement, line_ending)
             .map_err(|error| EditPlanError::plain(index, kind.as_str(), error))?
             .into_owned();
+        if matches!(
+            kind,
+            ApplyTextEditKind::InsertBefore | ApplyTextEditKind::InsertAfter
+        ) && replacement.is_empty()
+        {
+            continue;
+        }
         let needle = needle.as_ref();
         let (start, end) =
             resolve_apply_text_match(original, needle, edit.occurrence, edit.line_scope.as_ref())
@@ -899,6 +973,9 @@ fn write_new_file_atomic(path: &Path, content: &str) -> Result<(), String> {
         match std::fs::hard_link(&temporary, path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temporary);
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
                 return Ok(());
             }
             Err(error) => {
@@ -1053,6 +1130,8 @@ fn apply_change(plan: &PlannedFileChange) -> Result<Vec<PathBuf>, ApplyChangeFai
 fn execute_planned_file_changes(
     plans: Vec<PlannedFileChange>,
     dry_run: bool,
+    requested_matching_mode: Option<ApplyPatchMatchingMode>,
+    ignored_noop_count: usize,
     start: Instant,
 ) -> CommandResult {
     let mut changed_paths = Vec::new();
@@ -1127,24 +1206,26 @@ fn execute_planned_file_changes(
             })
         })
         .collect::<Vec<_>>();
-    line_edit_stdout(
-        serde_json::json!({
-            "dry_run": dry_run,
-            "applied_count": plans.len(),
-            "changed": !dry_run && would_change,
-            "state_changed": !dry_run && would_change,
-            "execution_state": "completed",
-            "would_change": would_change,
-            "files": files,
-            "changed_paths": changed_paths,
-        }),
-        start,
-    )
+    let mut output = serde_json::json!({
+        "dry_run": dry_run,
+        "applied_count": plans.len(),
+        "ignored_noop_count": ignored_noop_count,
+        "changed": !dry_run && would_change,
+        "state_changed": !dry_run && would_change,
+        "execution_state": "completed",
+        "would_change": would_change,
+        "files": files,
+        "changed_paths": changed_paths,
+    });
+    if let Some(mode) = requested_matching_mode {
+        output["requested_matching_mode"] = serde_json::json!(mode.as_str());
+    }
+    line_edit_stdout(output, start)
 }
 
 fn resolve_unique_patch_path(
     policy: &RunnerPolicy,
-    request: &ShellAgentShellRequest,
+    request: &RunnerFilePayload,
     touched: &mut HashSet<PathBuf>,
     index: usize,
     kind: &str,
@@ -1161,8 +1242,9 @@ fn resolve_unique_patch_path(
             start,
         ));
     }
-    let resolved =
-        resolve_requested_path(policy, request.cwd.as_deref(), path).map_err(|error| {
+    let resolved = resolve_requested_path(policy, request.cwd.as_deref(), path)
+        .and_then(|resolved| checked_structured_edit_target(request.cwd.as_deref(), &resolved))
+        .map_err(|error| {
             batch_error(
                 Some(index),
                 Some(kind),
@@ -1198,51 +1280,94 @@ fn resolve_unique_patch_path(
 fn apply_patch_conflict(
     index: usize,
     path: &str,
-    error_kind: &str,
-    message: impl Into<String>,
+    error: &CodexPatchError,
     start: Instant,
 ) -> CommandResult {
-    line_edit_stdout(
-        serde_json::json!({
-            "changed": false,
-            "state_changed": false,
-            "execution_state": "not_started",
-            "error_kind": error_kind,
-            "change_index": index,
-            "path": path,
-            "recovery_action": "reread_or_regenerate_patch",
-            "retry_guidance": "reread the current file, regenerate the Codex patch against that content, and retry the whole batch",
-            "error": format!("Rejected Codex patch before write: {}. No files were modified.", message.into()),
-        }),
-        start,
-    )
+    let mut result = serde_json::json!({
+        "changed": false,
+        "state_changed": false,
+        "execution_state": "not_started",
+        "error_kind": error.kind,
+        "change_index": index,
+        "path": path,
+        "recovery_action": "reread_or_regenerate_patch",
+        "retry_guidance": "use match_diagnostic to target the stale chunk when present; reread the current file, regenerate the Codex patch against that content, and retry the whole batch",
+        "error": format!("Rejected Codex patch before write: {}. No files were modified.", error.message),
+    });
+    if let Some(diagnostic) = error.match_diagnostic.as_ref() {
+        result["match_diagnostic"] = apply_patch_match_diagnostic_json(diagnostic);
+    }
+    line_edit_stdout(result, start)
 }
 
-fn apply_patch_strict_match_rejection(
+fn apply_patch_match_diagnostic_json(diagnostic: &CodexPatchMatchDiagnostic) -> serde_json::Value {
+    serde_json::json!({
+        "chunk_index": diagnostic.chunk_index,
+        "match_source": diagnostic.match_source.as_str(),
+        "search_start_line": diagnostic.search_start_line,
+        "expected_line_count": diagnostic.expected_line_count,
+        "available_line_count": diagnostic.available_line_count,
+        "closest_start_line": diagnostic.closest_start_line,
+        "closest_exact_line_matches": diagnostic.closest_exact_line_matches,
+        "closest_trim_end_line_matches": diagnostic.closest_trim_end_line_matches,
+        "closest_trim_line_matches": diagnostic.closest_trim_line_matches,
+        "first_exact_mismatch_offset": diagnostic.first_exact_mismatch_offset,
+    })
+}
+
+fn apply_patch_matching_mode_rejection(
     index: usize,
     path: &str,
     matched: &CodexPatchChunkMatch,
     start: Instant,
 ) -> CommandResult {
+    let Some(rejection) = matched.match_rejection.as_ref() else {
+        return batch_error(
+            Some(index),
+            Some("edit"),
+            Some(path),
+            "invalid_match_metadata",
+            "matching-mode rejection was missing its bounded rejection fact",
+            start,
+        );
+    };
+    let ambiguous = rejection.candidate_count > 1;
+    let retry_guidance = match (rejection.requested_matching_mode, ambiguous) {
+        (ApplyPatchMatchingMode::Unique, true) => {
+            "add a stable parent/function/test/module anchor or small surrounding context and retry with matching_mode=unique; candidate positions are equal observation targets, never a winner"
+        }
+        (ApplyPatchMatchingMode::ExactUnique, true) => {
+            "expand exact context until every textual positioning decision is exact and unique, then retry with matching_mode=exact_unique"
+        }
+        (ApplyPatchMatchingMode::ExactUnique, false) => {
+            "reread the current source and regenerate exact context, then retry with matching_mode=exact_unique"
+        }
+        _ => "regenerate the patch with unambiguous context and retry",
+    };
     line_edit_stdout(
         serde_json::json!({
             "changed": false,
             "state_changed": false,
             "execution_state": "not_started",
-            "error_kind": "strict_match_rejected",
+            "error_kind": "matching_mode_rejected",
             "change_index": index,
             "path": path,
             "chunk_index": matched.chunk_index,
-            "match_mode": matched.match_mode.map(|mode| mode.as_str()),
-            "match_source": matched.match_source.as_str(),
-            "matched_start_line": matched.matched_start_line,
-            "candidate_count": matched.candidate_count,
-            "strict_match": false,
-            "recovery_action": "refine_patch_or_relax_strict_matching",
-            "retry_guidance": "add exact unique context and retry strict_matching=true; use strict_matching=false only when ordinary Codex fuzzy/first-match positioning is acceptable",
+            "requested_matching_mode": rejection.requested_matching_mode.as_str(),
+            "match_mode": rejection.match_mode.as_str(),
+            "match_source": rejection.match_source.as_str(),
+            "matched_start_line": (!ambiguous).then_some(rejection.matched_start_line),
+            "candidate_count": rejection.candidate_count,
+            "candidate_start_lines": rejection.candidate_start_lines,
+            "candidate_positions_truncated": rejection.candidate_positions_truncated,
+            "search_start_line": rejection.search_start_line,
+            "source_line_count": rejection.source_line_count,
+            "matching_mode_satisfied": false,
+            "recovery_action": "refine_patch_context",
+            "retry_guidance": retry_guidance,
             "error": format!(
-                "Rejected strict Codex patch before write: {path} chunk {} was not positioned by exact unique matching. No files were modified.",
-                matched.chunk_index
+                "Rejected Codex patch before write: {path} chunk {} did not satisfy matching_mode={}. No files were modified.",
+                matched.chunk_index, rejection.requested_matching_mode.as_str()
             ),
         }),
         start,
@@ -1251,7 +1376,7 @@ fn apply_patch_strict_match_rejection(
 
 pub(crate) fn handle_apply_patch_file_request(
     policy: &RunnerPolicy,
-    request: &ShellAgentShellRequest,
+    request: &RunnerFilePayload,
     start: Instant,
 ) -> CommandResult {
     let payload: ApplyPatchPayload =
@@ -1287,7 +1412,10 @@ pub(crate) fn handle_apply_patch_file_request(
         }
     };
     let dry_run = payload.dry_run.unwrap_or(false);
-    let strict_matching = payload.strict_matching.unwrap_or(false);
+    let matching_mode = match apply_patch_matching_mode(&payload) {
+        Ok(mode) => mode,
+        Err(error) => return batch_error(None, None, None, "invalid_payload", error, start),
+    };
     let mut touched = HashSet::new();
     let mut plans = Vec::with_capacity(patch.hunks.len());
 
@@ -1394,30 +1522,25 @@ pub(crate) fn handle_apply_patch_file_request(
                 let (replacement, chunk_matches) = if chunks.is_empty() {
                     (original.clone(), Vec::new())
                 } else {
-                    match derive_codex_patch_update_with_matches(&original, path, chunks) {
+                    match derive_codex_patch_update_with_matching_mode(
+                        &original,
+                        path,
+                        chunks,
+                        matching_mode,
+                    ) {
                         Ok(update) => {
-                            if strict_matching {
-                                if let Some(matched) = update
-                                    .chunk_matches
-                                    .iter()
-                                    .find(|matched| !matched.strict_match)
-                                {
-                                    return apply_patch_strict_match_rejection(
-                                        index, path, matched, start,
-                                    );
-                                }
+                            if let Some(matched) = update
+                                .chunk_matches
+                                .iter()
+                                .find(|matched| matched.match_rejection.is_some())
+                            {
+                                return apply_patch_matching_mode_rejection(
+                                    index, path, matched, start,
+                                );
                             }
                             (update.content, update.chunk_matches)
                         }
-                        Err(error) => {
-                            return apply_patch_conflict(
-                                index,
-                                path,
-                                error.kind,
-                                error.message,
-                                start,
-                            )
-                        }
+                        Err(error) => return apply_patch_conflict(index, path, &error, start),
                     }
                 };
                 if replacement.contains('\0') || replacement.len() > APPLY_TEXT_EDITS_MAX_FILE_BYTES
@@ -1446,6 +1569,7 @@ pub(crate) fn handle_apply_patch_file_request(
                             "match_source": chunk_match.match_source.as_str(),
                             "matched_start_line": chunk_match.matched_start_line,
                             "candidate_count": chunk_match.candidate_count,
+                            "unique_match": chunk_match.unique_match,
                             "strict_match": chunk_match.strict_match,
                         })
                     })
@@ -1516,12 +1640,12 @@ pub(crate) fn handle_apply_patch_file_request(
         plans.push(planned);
     }
 
-    execute_planned_file_changes(plans, dry_run, start)
+    execute_planned_file_changes(plans, dry_run, Some(matching_mode), 0, start)
 }
 
 pub(crate) fn handle_apply_text_edits_file_request(
     policy: &RunnerPolicy,
-    request: &ShellAgentShellRequest,
+    request: &RunnerFilePayload,
     start: Instant,
 ) -> CommandResult {
     let payload: ApplyTextEditsPayload =
@@ -1549,6 +1673,17 @@ pub(crate) fn handle_apply_text_edits_file_request(
         );
     }
     let dry_run = payload.dry_run.unwrap_or(false);
+    let ignored_noop_count = payload
+        .changes
+        .iter()
+        .flat_map(|change| change.edits.iter())
+        .filter(|edit| {
+            matches!(
+                edit.kind,
+                ApplyTextEditKind::InsertBefore | ApplyTextEditKind::InsertAfter
+            ) && edit.new_text.as_deref() == Some("")
+        })
+        .count();
     let mut touched = HashSet::new();
     let mut plans = Vec::with_capacity(payload.changes.len());
     for (index, change) in payload.changes.iter().enumerate() {
@@ -1562,7 +1697,9 @@ pub(crate) fn handle_apply_text_edits_file_request(
                 start,
             );
         }
-        let resolved = match resolve_requested_path(policy, request.cwd.as_deref(), &change.path) {
+        let resolved = match resolve_requested_path(policy, request.cwd.as_deref(), &change.path)
+            .and_then(|resolved| checked_structured_edit_target(request.cwd.as_deref(), &resolved))
+        {
             Ok(path) => path,
             Err(error) => {
                 return batch_error(
@@ -1609,7 +1746,9 @@ pub(crate) fn handle_apply_text_edits_file_request(
                     start,
                 );
             }
-            match resolve_requested_path(policy, request.cwd.as_deref(), to_path) {
+            match resolve_requested_path(policy, request.cwd.as_deref(), to_path).and_then(
+                |resolved| checked_structured_edit_target(request.cwd.as_deref(), &resolved),
+            ) {
                 Ok(path) => {
                     let identity = match canonical_batch_identity(&path) {
                         Ok(identity) => identity,
@@ -1907,12 +2046,39 @@ pub(crate) fn handle_apply_text_edits_file_request(
         plans.push(planned);
     }
 
-    execute_planned_file_changes(plans, dry_run, start)
+    execute_planned_file_changes(plans, dry_run, None, ignored_noop_count, start)
 }
 
 #[cfg(test)]
 mod write_project_file_effect_tests {
     use super::*;
+
+    #[test]
+    fn file_write_project_file_create_commit_preserves_concurrent_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("new.txt");
+        let existed_at_preflight = std::fs::symlink_metadata(&target).is_ok();
+        assert!(!existed_at_preflight);
+
+        // Another writer creates the target after the request's absence check.
+        std::fs::write(&target, "concurrent content").unwrap();
+        let failure =
+            apply_write_project_file_change(&target, "request content", |path, content| {
+                write_project_file_atomic(path, content, existed_at_preflight)
+            })
+            .unwrap_err();
+
+        assert!(failure.rollback_complete);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "concurrent content"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        let output = write_project_file_apply_error(serde_json::json!("new.txt"), failure);
+        assert_eq!(output["created"], false);
+        assert_eq!(output["changed"], false);
+        assert_eq!(output["state_changed"], false);
+    }
 
     #[test]
     fn parent_creation_write_failure_reports_rollback_truth() {

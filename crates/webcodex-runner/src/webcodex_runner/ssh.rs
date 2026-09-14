@@ -28,7 +28,7 @@ const SSH_REMOTE_CWD_MAX_BYTES: usize = 4096;
 /// It is transport headroom, not a smaller Windows product limit.
 #[cfg(any(test, windows))]
 const WINDOWS_DIRECT_PROGRAM_MAX_BYTES: usize =
-    crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES + SSH_REMOTE_CWD_MAX_BYTES * 5 + 512;
+    crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES + SSH_REMOTE_CWD_MAX_BYTES * 5 + 512;
 /// Windows Direct transports a shell-quoted `eval <program>` frame over stdin.
 /// POSIX single-quote encoding expands each input byte by at most 5x; the fixed
 /// `eval ` prefix and surrounding quotes add seven bytes. This is internal
@@ -757,7 +757,7 @@ fn apply_transport_failure_policy(
 ) {
     if !matches!(
         result.execution_state,
-        crate::shell_protocol::ShellCommandExecutionState::Completed
+        crate::runner_protocol::ShellCommandExecutionState::Completed
     ) || !is_transport_failure(
         transport,
         result.result.exit_code,
@@ -777,7 +777,7 @@ fn apply_transport_failure_policy(
         result.result.error =
             Some("ssh_transport_failed: command may have started and was not retried".to_string());
     }
-    result.execution_state = crate::shell_protocol::ShellCommandExecutionState::OutcomeUnknown;
+    result.execution_state = crate::runner_protocol::ShellCommandExecutionState::OutcomeUnknown;
 }
 
 /// Used by async job handling to apply the same conservative invalidation
@@ -1478,7 +1478,15 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    fn test_ssh_server_start_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     struct TestSshServer {
         _temp: tempfile::TempDir,
@@ -1498,7 +1506,14 @@ mod tests {
     impl TestSshServer {
         #[cfg(target_os = "linux")]
         fn start() -> Option<Self> {
+            // Reserve/start/readiness is one critical section. Without this,
+            // parallel fixtures can reuse the same ephemeral port after the
+            // reservation listener is dropped but before this sshd binds it.
+            let _startup_guard = test_ssh_server_start_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let sshd = executable_on_path("sshd")?;
+            let ssh = executable_on_path("ssh")?;
             if Command::new(&sshd)
                 .arg("-V")
                 .stdout(Stdio::null())
@@ -1574,15 +1589,6 @@ mod tests {
                 .expect("start SSH test daemon");
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    return Some(Self {
-                        _temp: temp,
-                        child,
-                        client_config,
-                        alias,
-                        remote_cwd,
-                    });
-                }
                 if let Some(status) = child.try_wait().expect("poll SSH test daemon") {
                     let mut stderr = String::new();
                     if let Some(mut pipe) = child.stderr.take() {
@@ -1590,6 +1596,29 @@ mod tests {
                         let _ = pipe.read_to_string(&mut stderr);
                     }
                     panic!("SSH test daemon exited early ({status}): {stderr}");
+                }
+                if TcpStream::connect(("127.0.0.1", port)).is_ok()
+                    && Command::new(&ssh)
+                        .arg("-F")
+                        .arg(&client_config)
+                        .arg("-o")
+                        .arg("BatchMode=yes")
+                        .arg("-o")
+                        .arg("ConnectTimeout=1")
+                        .arg(&alias)
+                        .arg("true")
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success())
+                {
+                    return Some(Self {
+                        _temp: temp,
+                        child,
+                        client_config,
+                        alias,
+                        remote_cwd,
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -2344,25 +2373,25 @@ mod tests {
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
             client_id: "ssh-agent".to_string(),
-            agent_instance_id: "ssh-instance".to_string(),
+            runner_instance_id: "ssh-instance".to_string(),
         };
         manager.enqueue(
             sink.clone(),
-            crate::PendingJobStart {
-                generation: 11,
-                policy: RunnerPolicy::default(),
-                shell: crate::webcodex_runner::ShellConfig::default(),
-                ssh: config.clone(),
-                projects_dir: PathBuf::new(),
-                request: ssh_job_request("ssh-job-complete", "tmp", "printf job-ok"),
-            },
+            crate::PendingJobStart::from_wire(
+                11,
+                RunnerPolicy::default(),
+                crate::webcodex_runner::ShellConfig::default(),
+                config.clone(),
+                PathBuf::new(),
+                ssh_job_request("ssh-job-complete", "tmp", "printf job-ok"),
+            ),
         );
         let completed = wait_for_job_update(&mut rx, "ssh-job-complete", |update| update.finished);
         assert_eq!(completed.status, "completed", "{completed:?}");
         assert_eq!(completed.exit_code, Some(0), "{completed:?}");
         assert_eq!(
             completed.command_execution_state,
-            Some(crate::shell_protocol::ShellCommandExecutionState::Completed),
+            Some(crate::runner_protocol::ShellCommandExecutionState::Completed),
             "{completed:?}"
         );
         assert!(
@@ -2375,14 +2404,14 @@ mod tests {
 
         manager.enqueue(
             sink.clone(),
-            crate::PendingJobStart {
-                generation: 11,
-                policy: RunnerPolicy::default(),
-                shell: crate::webcodex_runner::ShellConfig::default(),
-                ssh: config.clone(),
-                projects_dir: PathBuf::new(),
-                request: ssh_job_request("ssh-job-stop", "tmp", "sleep 30"),
-            },
+            crate::PendingJobStart::from_wire(
+                11,
+                RunnerPolicy::default(),
+                crate::webcodex_runner::ShellConfig::default(),
+                config.clone(),
+                PathBuf::new(),
+                ssh_job_request("ssh-job-stop", "tmp", "sleep 30"),
+            ),
         );
         let running =
             wait_for_job_update(&mut rx, "ssh-job-stop", |update| update.status == "running");
@@ -2393,7 +2422,7 @@ mod tests {
         assert_eq!(stopped.exit_code, None, "{stopped:?}");
         assert_eq!(
             stopped.command_execution_state,
-            Some(crate::shell_protocol::ShellCommandExecutionState::OutcomeUnknown),
+            Some(crate::runner_protocol::ShellCommandExecutionState::OutcomeUnknown),
             "{stopped:?}"
         );
         assert!(
@@ -2406,20 +2435,20 @@ mod tests {
 
         manager.enqueue(
             sink,
-            crate::PendingJobStart {
-                generation: 11,
-                policy: RunnerPolicy::default(),
-                shell: crate::webcodex_runner::ShellConfig::default(),
-                ssh: config,
-                projects_dir: PathBuf::new(),
-                request: ssh_job_request("ssh-job-missing", "missing", "printf never-started"),
-            },
+            crate::PendingJobStart::from_wire(
+                11,
+                RunnerPolicy::default(),
+                crate::webcodex_runner::ShellConfig::default(),
+                config,
+                PathBuf::new(),
+                ssh_job_request("ssh-job-missing", "missing", "printf never-started"),
+            ),
         );
         let missing = wait_for_job_update(&mut rx, "ssh-job-missing", |update| update.finished);
         assert_eq!(missing.status, "failed", "{missing:?}");
         assert_eq!(
             missing.command_execution_state,
-            Some(crate::shell_protocol::ShellCommandExecutionState::NotStarted),
+            Some(crate::runner_protocol::ShellCommandExecutionState::NotStarted),
             "{missing:?}"
         );
         assert!(
@@ -2466,7 +2495,7 @@ mod tests {
         job_id: &str,
         resource: &str,
         command: &str,
-    ) -> crate::shell_protocol::ShellAgentShellRequest {
+    ) -> crate::runner_protocol::RunnerRequest {
         serde_json::from_value(serde_json::json!({
             "request_id": format!("request-{job_id}"),
             "client_id": "ssh-agent",
@@ -2491,14 +2520,14 @@ mod tests {
     }
 
     fn wait_for_job_update(
-        rx: &mut tokio::sync::mpsc::Receiver<crate::shell_protocol::AgentEnvelope>,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::runner_protocol::RunnerEnvelope>,
         job_id: &str,
-        predicate: impl Fn(&crate::shell_protocol::ShellAgentJobUpdateRequest) -> bool,
-    ) -> crate::shell_protocol::ShellAgentJobUpdateRequest {
+        predicate: impl Fn(&crate::runner_protocol::RunnerJobUpdateRequest) -> bool,
+    ) -> crate::runner_protocol::RunnerJobUpdateRequest {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             match rx.try_recv() {
-                Ok(crate::shell_protocol::AgentEnvelope::JobUpdate { payload })
+                Ok(crate::runner_protocol::RunnerEnvelope::JobUpdate { payload })
                     if payload.job_id == job_id && predicate(&payload) =>
                 {
                     return payload;
@@ -2514,11 +2543,11 @@ mod tests {
         panic!("timed out waiting for remote SSH job {job_id}");
     }
 
-    /// A projects.d directory with a registered `remote-project` owned by the
+    /// A project-registry directory with a registered `remote-project` owned by the
     /// `ssh-agent` Runner. SSH persistent shells still require the project to
     /// be registered on the Runner (it owns the Runner + resource binding);
     /// only execution happens remotely.
-    fn ssh_projects_dir() -> tempfile::TempDir {
+    fn ssh_project_registry_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("create ssh projects dir");
         std::fs::write(
             dir.path().join("remote-project.toml"),
@@ -2533,7 +2562,7 @@ mod tests {
         shell_id: &str,
         resource: &str,
         command: Option<&str>,
-    ) -> crate::shell_protocol::ShellAgentShellRequest {
+    ) -> crate::runner_protocol::RunnerRequest {
         ssh_persistent_shell_request_at_cwd(action, shell_id, resource, None, command)
     }
 
@@ -2543,7 +2572,7 @@ mod tests {
         resource: &str,
         cwd: Option<&str>,
         command: Option<&str>,
-    ) -> crate::shell_protocol::ShellAgentShellRequest {
+    ) -> crate::runner_protocol::RunnerRequest {
         serde_json::from_value(serde_json::json!({
             "request_id": format!("req-{action}-{shell_id}"),
             "client_id": "ssh-agent",
@@ -2602,8 +2631,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
 
         let opened = manager.handle(
             &policy,
@@ -2714,8 +2743,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
 
         let opened = manager.handle(
             &policy,
@@ -2763,8 +2792,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
         let shell_id = "wc_shell_rps_gen";
         let resource = "tmp";
 
@@ -2873,8 +2902,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
 
         // The resource default_cwd is server.remote_cwd; an explicit cwd must
         // win.
@@ -2937,8 +2966,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
         let session_cwd = server.remote_cwd.join("session-dir");
         std::fs::create_dir(&session_cwd).expect("create session cwd");
         let session_cwd = session_cwd.to_string_lossy().into_owned();
@@ -3002,8 +3031,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
         let resource_cwd = server.remote_cwd.to_string_lossy().into_owned();
 
         let opened = manager.handle(
@@ -3051,8 +3080,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
 
         // The remote login directory: what a plain `ssh host pwd -P` reports
         // when no cd is issued.
@@ -3154,8 +3183,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
         let physical = server.remote_cwd.join("physical");
         let logical = server.remote_cwd.join("logical");
         std::fs::create_dir(&physical).expect("create physical remote cwd");
@@ -3240,8 +3269,8 @@ mod tests {
             pool,
         );
         let policy = RunnerPolicy::default();
-        let projects_dir = ssh_projects_dir();
-        let projects = projects_dir.path().to_path_buf();
+        let project_registry_dir = ssh_project_registry_dir();
+        let projects = project_registry_dir.path().to_path_buf();
         let missing = server
             .remote_cwd
             .join("does-not-exist")
@@ -3296,7 +3325,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use crate::shell_protocol::ShellCommandExecutionState;
+    use crate::runner_protocol::ShellCommandExecutionState;
     use crate::webcodex_runner::config::{RunnerPolicy, SshResourceConfig};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -3581,6 +3610,7 @@ fn main() {
         SshConnectionPool::with_test_executable(fake_ssh().path.clone())
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn grandchild_pid(text: &str) -> u32 {
         text.lines()
             .find_map(|line| line.trim().strip_prefix("GRANDCHILD_PID="))
@@ -3588,6 +3618,7 @@ fn main() {
             .unwrap_or_else(|| panic!("missing GRANDCHILD_PID in {text:?}"))
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn wait_for_process_exit(pid: u32) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -3603,7 +3634,7 @@ fn main() {
         job_id: &str,
         command: &str,
         timeout_secs: u64,
-    ) -> crate::shell_protocol::ShellAgentShellRequest {
+    ) -> crate::runner_protocol::RunnerRequest {
         serde_json::from_value(serde_json::json!({
             "request_id": format!("request-{job_id}"),
             "client_id": "ssh-agent",
@@ -3627,15 +3658,26 @@ fn main() {
         .expect("build Windows SSH job request")
     }
 
+    fn ssh_job_operation(job_id: &str) -> webcodex_core::runner_operation::RunnerJobOperation {
+        let request = ssh_job_request(job_id, "printf ignored", 30);
+        let webcodex_core::runner_operation::RunnerOperation::Job(operation) = request
+            .decode_operation()
+            .expect("Windows SSH start_job fixture must decode")
+        else {
+            panic!("Windows SSH start_job fixture decoded as a non-Job operation");
+        };
+        operation
+    }
+
     fn wait_for_job_update(
-        rx: &mut tokio::sync::mpsc::Receiver<crate::shell_protocol::AgentEnvelope>,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::runner_protocol::RunnerEnvelope>,
         job_id: &str,
-        predicate: impl Fn(&crate::shell_protocol::ShellAgentJobUpdateRequest) -> bool,
-    ) -> crate::shell_protocol::ShellAgentJobUpdateRequest {
+        predicate: impl Fn(&crate::runner_protocol::RunnerJobUpdateRequest) -> bool,
+    ) -> crate::runner_protocol::RunnerJobUpdateRequest {
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             match rx.try_recv() {
-                Ok(crate::shell_protocol::AgentEnvelope::JobUpdate { payload })
+                Ok(crate::runner_protocol::RunnerEnvelope::JobUpdate { payload })
                     if payload.job_id == job_id && predicate(&payload) =>
                 {
                     return payload;
@@ -3662,14 +3704,14 @@ fn main() {
     ) {
         manager.enqueue(
             sink,
-            crate::PendingJobStart {
-                generation: 11,
+            crate::PendingJobStart::from_wire(
+                11,
                 policy,
-                shell: crate::webcodex_runner::ShellConfig::default(),
-                ssh: config,
-                projects_dir: PathBuf::new(),
-                request: ssh_job_request(job_id, command, timeout_secs),
-            },
+                crate::webcodex_runner::ShellConfig::default(),
+                config,
+                PathBuf::new(),
+                ssh_job_request(job_id, command, timeout_secs),
+            ),
         );
     }
 
@@ -3757,10 +3799,10 @@ fn main() {
     #[test]
     fn windows_direct_large_program_and_cwd_contract_fit_bounded_argv() {
         let pool = SshConnectionPool::default();
-        let authored = "'".repeat(crate::shell_protocol::RAW_SHELL_COMMAND_MAX_BYTES);
+        let authored = "'".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES);
         let wrapped = explicit_bash_wire_command(&authored);
         assert_eq!(wrapped.len(), 64_015);
-        assert!(wrapped.len() <= crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES);
+        assert!(wrapped.len() <= crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES);
 
         let max_host = "h".repeat(512);
         let prepared = pool
@@ -3811,14 +3853,14 @@ fn main() {
         );
         assert_eq!(result.result.exit_code, Some(0), "{result:?}");
 
-        let max_wire = "x".repeat(crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES);
-        crate::shell_protocol::validate_raw_shell_wire_command(&max_wire).unwrap();
+        let max_wire = "x".repeat(crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES);
+        crate::runner_protocol::validate_raw_shell_wire_command(&max_wire).unwrap();
         assert!(
-            crate::shell_protocol::validate_raw_shell_wire_command(&format!("{max_wire}x"))
+            crate::runner_protocol::validate_raw_shell_wire_command(&format!("{max_wire}x"))
                 .is_err()
         );
         assert!(
-            crate::shell_protocol::validate_raw_shell_wire_command("printf ok\0printf never")
+            crate::runner_protocol::validate_raw_shell_wire_command("printf ok\0printf never")
                 .is_err(),
             "raw-shell NUL rejection must remain platform-neutral"
         );
@@ -3973,7 +4015,7 @@ fn main() {
 
     #[test]
     fn windows_program_writer_failure_after_spawn_is_outcome_unknown() {
-        let command = "x".repeat(crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES);
+        let command = "x".repeat(crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES);
         let cwd = "'".repeat(SSH_REMOTE_CWD_MAX_BYTES);
         let result = run_ssh_shell_with_execution_state(
             &fake_pool(),
@@ -4005,12 +4047,15 @@ fn main() {
     }
 
     #[test]
-    fn windows_blocked_program_writer_timeout_drains_output_and_returns_bounded() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: fake SSH blocks program delivery until timeout"]
+    fn runner_real_process_windows_blocked_program_writer_timeout_drains_output_and_returns_bounded(
+    ) {
         let policy = RunnerPolicy {
             max_output_bytes: 4 * 1024,
             ..RunnerPolicy::default()
         };
-        let program = "x".repeat(crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES);
+        let program = "x".repeat(crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES);
         let started = Instant::now();
         let result = run_ssh_shell_with_execution_state(
             &fake_pool(),
@@ -4036,7 +4081,10 @@ fn main() {
     }
 
     #[test]
-    fn windows_blocked_program_writer_stop_is_outcome_unknown_and_reaps_client() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: fake SSH blocked writer is stopped and reaped"]
+    fn runner_real_process_windows_blocked_program_writer_stop_is_outcome_unknown_and_reaps_client()
+    {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("blocked-writer.pid");
         let host = format!("fake-never-read-stop={}", marker.display());
@@ -4054,7 +4102,7 @@ fn main() {
             );
             stop_signal.store(true, Ordering::SeqCst);
         });
-        let program = "x".repeat(crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES);
+        let program = "x".repeat(crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES);
         let started = Instant::now();
         let result = run_ssh_shell_with_execution_state(
             &fake_pool(),
@@ -4206,7 +4254,9 @@ fn main() {
     }
 
     #[test]
-    fn windows_one_shot_post_dispatch_stop_is_outcome_unknown_and_reaps_tree() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: one-shot fake SSH stop reaps a real process"]
+    fn runner_real_process_windows_one_shot_post_dispatch_stop_is_outcome_unknown_and_reaps_tree() {
         let temp = tempfile::tempdir().unwrap();
         let started_marker = temp.path().join("one-shot-stop.started");
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -4305,7 +4355,7 @@ fn main() {
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
             client_id: "ssh-agent".to_string(),
-            agent_instance_id: "ssh-instance".to_string(),
+            runner_instance_id: "ssh-instance".to_string(),
         };
         enqueue_job(
             &manager,
@@ -4335,6 +4385,7 @@ fn main() {
 
     #[test]
     fn windows_background_ssh_post_spawn_rejections_are_outcome_unknown() {
+        let operation = ssh_job_operation("post-spawn-rejection");
         for (shutting_down, stop_requested, job_record_present, expected_error) in [
             (
                 true,
@@ -4357,7 +4408,7 @@ fn main() {
             )
             .expect("post-spawn interruption is rejected");
             assert_eq!(error, expected_error);
-            let delta = crate::post_spawn_interruption_delta("start_job", 7, error);
+            let delta = crate::post_spawn_interruption_delta(&operation, 7, error);
             assert_eq!(delta.status, "failed");
             assert_eq!(delta.exit_code, None);
             assert_eq!(delta.duration_ms, Some(7));
@@ -4371,8 +4422,12 @@ fn main() {
     }
 
     #[test]
-    fn windows_background_ssh_post_spawn_rejection_reaps_owned_tree() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: post-spawn rejection terminates a fake SSH process tree"]
+    fn runner_real_process_windows_background_ssh_post_spawn_rejection_reaps_owned_tree() {
         use std::io::{BufRead, BufReader};
+
+        let operation = ssh_job_operation("post-spawn-real-process-rejection");
 
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("post-spawn-grandchild.marker");
@@ -4411,7 +4466,7 @@ fn main() {
         );
         assert!(!marker.exists(), "terminated grandchild reached marker");
 
-        let delta = crate::post_spawn_interruption_delta("start_job", 0, error);
+        let delta = crate::post_spawn_interruption_delta(&operation, 0, error);
         assert_eq!(
             delta.command_execution_state,
             Some(ShellCommandExecutionState::OutcomeUnknown)
@@ -4421,7 +4476,9 @@ fn main() {
     }
 
     #[test]
-    fn windows_one_shot_timeout_reaps_the_managed_ssh_tree() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: one-shot fake SSH timeout reaps a real process tree"]
+    fn runner_real_process_windows_one_shot_timeout_reaps_the_managed_ssh_tree() {
         let temp = tempfile::tempdir().unwrap();
         let delayed_marker = temp.path().join("one-shot-grandchild.marker");
         let result = run_ssh_shell_with_execution_state(
@@ -4454,7 +4511,9 @@ fn main() {
     }
 
     #[test]
-    fn windows_background_ssh_reuses_job_manager_lifecycle_and_bounds_output() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: background fake SSH exercises repeated child-process lifecycle"]
+    fn runner_real_process_windows_background_ssh_reuses_job_manager_lifecycle_and_bounds_output() {
         let config = ssh_config("spe", None);
         let mut manager = crate::JobManager::new(1);
         manager.ssh_pool = fake_pool();
@@ -4462,7 +4521,7 @@ fn main() {
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
             client_id: "ssh-agent".to_string(),
-            agent_instance_id: "ssh-instance".to_string(),
+            runner_instance_id: "ssh-instance".to_string(),
         };
 
         enqueue_job(
@@ -4526,7 +4585,7 @@ fn main() {
             "background direct exit 255 was retried"
         );
 
-        let long_authored = "'".repeat(crate::shell_protocol::RAW_SHELL_COMMAND_MAX_BYTES);
+        let long_authored = "'".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES);
         let long_wire = explicit_bash_wire_command(&long_authored);
         enqueue_job(
             &manager,
@@ -4586,7 +4645,9 @@ fn main() {
     }
 
     #[test]
-    fn windows_background_ssh_stop_and_timeout_reap_owned_trees() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: background fake SSH stop and timeout reap process trees"]
+    fn runner_real_process_windows_background_ssh_stop_and_timeout_reap_owned_trees() {
         let temp = tempfile::tempdir().unwrap();
         let config = ssh_config("spe", None);
         let mut manager = crate::JobManager::new(1);
@@ -4595,7 +4656,7 @@ fn main() {
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
             client_id: "ssh-agent".to_string(),
-            agent_instance_id: "ssh-instance".to_string(),
+            runner_instance_id: "ssh-instance".to_string(),
         };
 
         let stop_marker = temp.path().join("stop-grandchild.marker");
@@ -4663,7 +4724,9 @@ fn main() {
     }
 
     #[test]
-    fn windows_background_ssh_shutdown_drain_is_bounded_and_reaps_tree() {
+    #[cfg(feature = "runner-real-process-tests")]
+    #[ignore = "runner real-process lane: Runner shutdown drains and reaps a fake SSH tree"]
+    fn runner_real_process_windows_background_ssh_shutdown_drain_is_bounded_and_reaps_tree() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("shutdown-grandchild.marker");
         let mut manager = crate::JobManager::new(1);
@@ -4672,7 +4735,7 @@ fn main() {
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
             client_id: "ssh-agent".to_string(),
-            agent_instance_id: "ssh-instance".to_string(),
+            runner_instance_id: "ssh-instance".to_string(),
         };
         enqueue_job(
             &manager,
@@ -4947,11 +5010,11 @@ fn main() {
         let prefix = "printf wc-max-wire; #";
         let max_wire = format!(
             "{prefix}{}",
-            "x".repeat(crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES - prefix.len())
+            "x".repeat(crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES - prefix.len())
         );
         assert_eq!(
             max_wire.len(),
-            crate::shell_protocol::RAW_SHELL_WIRE_MAX_BYTES
+            crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES
         );
         let max_wire_result = run(None, &max_wire);
         assert_eq!(
@@ -4974,7 +5037,7 @@ fn main() {
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
             client_id: "ssh-agent".to_string(),
-            agent_instance_id: "ssh-instance".to_string(),
+            runner_instance_id: "ssh-instance".to_string(),
         };
         enqueue_job(
             &manager,

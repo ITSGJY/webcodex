@@ -15,7 +15,7 @@ from scripts import collect_release_bundle as collector
 
 SOURCE_SHA = "a" * 40
 RUN_ID = 123456
-VERSION = "0.3.8"
+VERSION = "0.4.0"
 
 
 def _archive_bytes(platform: str) -> bytes:
@@ -47,6 +47,21 @@ def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str,
         artifact_hashes[platform] = digest
         artifact_payload[platform] = {"filename": filename, "sha256": digest}
         checksum_lines.append(f"{digest}  {filename}")
+
+    desktop_artifacts: dict[str, dict[str, str]] = {}
+    for platform in collector.DESKTOP_PLATFORMS:
+        desktop_name = collector.desktop_artifact_filename(
+            VERSION,
+            platform,
+            build_kind=build_kind,
+            tag=tag,
+            source_sha=SOURCE_SHA,
+        )
+        desktop_payload = f"synthetic-{platform}-desktop-artifact".encode("ascii")
+        (root / desktop_name).write_bytes(desktop_payload)
+        desktop_digest = hashlib.sha256(desktop_payload).hexdigest()
+        checksum_lines.append(f"{desktop_digest}  {desktop_name}")
+        desktop_artifacts[platform] = {"filename": desktop_name, "sha256": desktop_digest}
     (root / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="ascii")
     (root / "linux-x64-elf.txt").write_text("ELF x64\n", encoding="utf-8")
     (root / "linux-arm64-elf.txt").write_text("ELF arm64\n", encoding="utf-8")
@@ -59,6 +74,7 @@ def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str,
         "workflow_run_id": RUN_ID,
         "archive_stem": stem,
         "artifacts": artifact_payload,
+        "desktop_artifacts": desktop_artifacts,
     }
     (root / "release-build.json").write_text(json.dumps(release_build) + "\n", encoding="utf-8")
     if build_kind == "release":
@@ -165,6 +181,78 @@ class BundleTests(unittest.TestCase):
             )
             self.assertEqual(summary["artifacts"], hashes)
             self.assertEqual(summary["build_kind"], "release")
+            self.assertEqual(
+                summary["desktop_artifacts"]["darwin-x64"]["filename"],
+                f"webcodex-desktop-v{VERSION}-darwin-x64.dmg",
+            )
+            self.assertEqual(
+                summary["desktop_artifacts"]["darwin-arm64"]["filename"],
+                f"webcodex-desktop-v{VERSION}-darwin-arm64.dmg",
+            )
+            self.assertEqual(
+                summary["desktop_artifacts"]["win32-x64"]["filename"],
+                f"webcodex-desktop-v{VERSION}-win32-x64-setup.exe",
+            )
+            self.assertEqual(
+                summary["desktop_artifacts"]["win32-arm64"]["filename"],
+                f"webcodex-desktop-v{VERSION}-win32-arm64-setup.exe",
+            )
+
+    def test_release_bundle_rejects_missing_desktop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stem, _hashes = _write_bundle(root, f"v{VERSION}", "release")
+            metadata = json.loads((root / "release-build.json").read_text(encoding="utf-8"))
+            desktop_name = metadata["desktop_artifacts"]["darwin-arm64"]["filename"]
+            (root / desktop_name).unlink()
+            with self.assertRaises(collector.CollectionError):
+                collector.verify_bundle_directory(
+                    root,
+                    repo=collector.DEFAULT_REPO,
+                    run_id=RUN_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_tag=f"v{VERSION}",
+                    artifact_name=f"{stem}-bundle",
+                )
+
+    def test_release_bundle_rejects_desktop_digest_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stem, _hashes = _write_bundle(root, f"v{VERSION}", "release")
+            metadata = json.loads((root / "release-build.json").read_text(encoding="utf-8"))
+            desktop_name = metadata["desktop_artifacts"]["darwin-x64"]["filename"]
+            (root / desktop_name).write_bytes(b"drifted-dmg")
+            with self.assertRaises(collector.CollectionError):
+                collector.verify_bundle_directory(
+                    root,
+                    repo=collector.DEFAULT_REPO,
+                    run_id=RUN_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_tag=f"v{VERSION}",
+                    artifact_name=f"{stem}-bundle",
+                )
+
+    def test_release_bundle_rejects_unexpected_desktop_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stem, _hashes = _write_bundle(root, f"v{VERSION}", "release")
+            metadata_path = root / "release-build.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            item = metadata["desktop_artifacts"]["darwin-x64"]
+            old_name = item["filename"]
+            bad_name = "webcodex-desktop-v0.4.0-macos-x64.dmg"
+            (root / old_name).rename(root / bad_name)
+            item["filename"] = bad_name
+            metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            with self.assertRaises(collector.CollectionError):
+                collector.verify_bundle_directory(
+                    root,
+                    repo=collector.DEFAULT_REPO,
+                    run_id=RUN_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_tag=f"v{VERSION}",
+                    artifact_name=f"{stem}-bundle",
+                )
 
     def test_verification_bundle_has_no_manifest(self) -> None:
         tag = "release-build-test-collector"

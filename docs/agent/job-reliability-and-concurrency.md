@@ -16,10 +16,10 @@ Three identities have different lifetimes:
 | Thing | Meaning | Expected across Control Server restart |
 |---|---|---|
 | MCP / HTTP request | One transport request or bounded wait | No. The connection/request may fail immediately. |
-| `job_id` | Identity of one already-dispatched execution | Yes, when the same reconciliation-capable Runner process survives and reports the Job in inventory. |
+| `job_id` | Identity of one already-dispatched execution | Active: when the same reconciliation-capable Runner process survives and reports inventory. Terminal public ordinary Jobs: also via the Server receipt within its original bounded retention window. |
 | `after_observation_token` | Opaque lifecycle and bounded log-delta state for one observed Job snapshot | No. Its Server epoch is process-local; a surviving Job should return a reset baseline and fresh token immediately after restart. |
 
-A dropped `observe_jobs`, `job_log`, or other MCP request therefore does **not**
+A dropped `observe_jobs`, `job_tail`, or other observation request therefore does **not**
 mean that the underlying Job was lost. The caller should keep the original
 `job_id` and observe authoritative Job state again before considering any retry.
 
@@ -60,6 +60,22 @@ the original command.
 A command that finishes while the Server is down is also recoverable when its
 terminal snapshot is still in the Runner's bounded retained inventory.
 
+The production Server also hydrates accepted public ordinary terminal receipts
+from `wc_job_receipts` before accepting traffic. Receipt writes happen after the
+registry lock is released and cannot change a terminal verdict. The receipt
+reuses the safe Job snapshot, excludes executable validation metadata, and fixes
+`terminal_observed_at` / `expires_at` at the first accepted terminal observation.
+SQLite retains at most 64 receipts per logical Runner for 15 minutes. Expired
+receipts are pruned on database open, writes, reads, and the existing recovery
+sweep. Historical owner attribution is independent of replacement registration.
+A new observation epoch resets old tokens without granting execution authority.
+
+Only Server-admitted Jobs with proven public visibility are receipt candidates.
+Inventory-only reconstruction retains its existing reconciliation behavior; it
+cannot prove whether an unknown Job was previously a hidden synchronous result,
+so it does not independently create a durable receipt. Receipt hydration never
+creates a pending request, execution mapping, waiter, or stop/retry/adopt lease.
+
 ### What is expected and what is a bug
 
 Expected:
@@ -91,11 +107,11 @@ both as “retry the command” risks duplicate effects.
 
 Before retrying work, collect safe runtime facts:
 
-1. Use `runtime_status` / `list_agents` to establish the current Server build,
+1. Use `runtime_status` / `list_runners` to establish the current Server build,
    Runner connection state, `client_id`, process-scoped `agent_instance_id`,
    reconciliation capability, and Job concurrency state. If reconciliation logs
    are available, cross-check `process_started_at` there; it is not part of the
-   current `runtime_status` / `list_agents` projection.
+   current `runtime_status` / `list_runners` projection.
 2. Determine whether the Runner process changed. If it changed, do not claim the
    same-process Server-restart recovery contract was violated.
 3. If the Runner process is unchanged, inspect the registration/reconciliation
@@ -116,9 +132,9 @@ credentials, and private paths are not required.
 
 ## 4. Runner Job capacity is shared across windows and projects
 
-`max_concurrent_jobs` is a Runner-process execution limit (default 4, effective
-range 1..64). It is not allocated per ChatGPT window, Workflow Session, or
-Project.
+`max_concurrent_jobs` is a Runner-process execution limit (default 4, valid
+range 1..64; out-of-range configuration is rejected). It is not allocated per
+ChatGPT window, Workflow Session, or Project.
 
 Opening multiple model windows consumes no Job slot by itself. A slot is consumed
 while a Job-backed execution owns Runner execution capacity. Therefore several
@@ -150,7 +166,7 @@ Do not conflate the Job execution pool with other limits. In particular:
 - polling request dispatch has its own in-flight bound;
 - persistent shells have their own bounded population/lifecycle.
 
-Changing one does not redefine the others. `runtime_status` / `list_agents`
+Changing one does not redefine the others. `runtime_status` / `list_runners`
 should be used for current `job_concurrency { limit, running, queued }` facts
 instead of inferring capacity from the number of browser/model windows. These
 are bounded lifecycle-status counts, not an exact free-slot calculation:
@@ -171,13 +187,16 @@ choices, and any lifecycle fact that changes retry safety. Put detailed numeric
 bounds, wire rules, and field-specific behavior on the relevant input/output
 schema instead of repeating them in every top-level description.
 
-For ordinary tools, aim for roughly 80–220 characters of high-signal text. This
-is a review target rather than a wire limit; longer descriptions need a concrete
-selection reason. Avoid naming sibling tools merely to restate implementation or
-fallback details, because exact-name discovery may otherwise retrieve unrelated
-tools whose descriptions happen to mention the queried name. Prefer capability
-phrasing such as “shell command tool”, “structured validation”, or “asynchronous
-execution” unless the sibling tool name is itself needed to choose correctly.
+For ordinary tools, keep the top-level description as short as its selection and
+lifecycle semantics allow. There is no secondary numeric density limit below the
+repository hard ceiling (`MODEL_TOOL_DESCRIPTION_MAX_CHARS`, currently 900);
+using more of that budget is appropriate when it preserves selection, authority,
+retry, continuation, uncertainty, safety, or recovery semantics. Avoid naming
+sibling tools merely to restate implementation or fallback details, because
+exact-name discovery may otherwise retrieve unrelated tools whose descriptions
+happen to mention the queried name. Prefer capability phrasing such as “shell
+command tool”, “structured validation”, or “asynchronous execution” unless the
+sibling tool name is itself needed to choose correctly.
 
 Generic lifecycle words such as `Job` should be concentrated on actual Job
 creation/observation tools. Structured validators and process adapters can say
@@ -205,8 +224,8 @@ consulting structured lifecycle state.
 
 ### Job observation tools
 
-For `job_status`, `job_log`, `job_tail`, and `observe_jobs`, the top-level
-description plus observation-field schemas should make clear that:
+For `job_tail` and `observe_jobs`, the top-level description plus
+observation-field schemas should make clear that:
 
 - observation never launches or retries the Job;
 - `wait_secs` is one bounded wait, not a subscription;
@@ -223,9 +242,31 @@ description plus observation-field schemas should make clear that:
 - `unknown_job` after same-process reconciliation is a diagnostic signal, not an
   automatic instruction to create a replacement Job.
 
+`observe_jobs` adds an optional `wake_on` policy: `change` is the compatible
+wire default and wakes on any observable update. `terminal` coalesces ordinary
+stdout/stderr/progress/activity changes until any watched Job is terminal, an
+item errors, or one shared absolute deadline expires. It never returns an
+`updated` wake reason: at the deadline `wait.outcome=timeout` can coexist with
+`changed=true`. Item errors take precedence over terminal, then timeout.
+
+Canonical execution handoffs suggest `wait_secs=60, wake_on=terminal`. This is
+a maximum wait, so terminal completion wakes immediately. Any missing token
+still gives an immediate baseline, and omitting `wait_secs` gives an immediate
+observation. Each Job waiter advances a private opaque cursor on non-terminal
+updates; final bounded deltas always use the caller's original token. Waiters
+use canonical Notify/revision rechecks, without a periodic polling heartbeat;
+updates neither recreate other Jobs' waiters nor extend the batch deadline.
+
+Workflow Session records retain every `observe_jobs` interaction for audit and
+validation evidence. Runtime Console treats these calls as observation
+transport: they are excluded from current/last Activity, the detail timeline,
+and work run counts. `running_call` still reports an unfinished transport call.
+Original Job handoff Activities remain historical snapshots; observing a
+terminal Job does not rewrite them or join live Registry state into Activity.
+
 ### Runtime/operator observation tools
 
-Descriptions for `runtime_status`, `list_agents`, and related operator surfaces
+Descriptions for `runtime_status`, `list_runners`, and related operator surfaces
 should distinguish connection health from execution capacity and expose safe
 facts needed to diagnose recovery:
 

@@ -1,8 +1,9 @@
 use super::*;
 use crate::webcodex_runner::config::validate_shell_config;
+use crate::webcodex_runner::projects::{project_root_fingerprint, RunnerProjectFile};
 use crate::webcodex_runner::run_shell_with_profiles;
 use crate::webcodex_runner::{
-    handle_project_lifecycle_op, handle_project_op_with_temporary_projects_root,
+    handle_prepare_managed_worktree, handle_project_lifecycle_op, handle_project_op,
     handle_resolve_or_register_project,
 };
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -67,7 +68,7 @@ fn unrestricted_test_policy() -> RunnerPolicy {
     }
 }
 
-fn test_config(projects_dir: PathBuf) -> RunnerConfig {
+fn test_config(project_registry_dir: PathBuf) -> RunnerConfig {
     RunnerConfig {
         server_url: "http://127.0.0.1:8000".to_string(),
         token: "test-token".to_string(),
@@ -76,19 +77,21 @@ fn test_config(projects_dir: PathBuf) -> RunnerConfig {
         owner: Some("alice".to_string()),
         hostname: None,
         host_context: None,
-        projects_dir: Some(projects_dir),
-        temporary_projects_root: None,
+        project_registry_dir: Some(project_registry_dir),
+        legacy_projects_dir: None,
         poll_interval_ms: 1000,
         capabilities: None,
         max_concurrent_jobs: None,
         policy: unrestricted_test_policy(),
         shell: ShellConfig::default(),
+        skills: crate::webcodex_runner::config::SkillsConfig::default(),
         ssh: SshConfig::default(),
         transport: None,
         websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
         quic: None,
         tool_providers: Default::default(),
         mcp_gateway: Default::default(),
+        plugins: Default::default(),
         acp: Default::default(),
     }
 }
@@ -100,6 +103,12 @@ fn detached_process_capability_matches_supported_native_backends() {
         capabilities.detached_process_jobs,
         cfg!(any(target_os = "linux", target_os = "macos", windows))
     );
+}
+
+#[test]
+fn runner_config_control_capability_is_platform_neutral() {
+    let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
+    assert!(capabilities.runner_config_control);
 }
 
 #[test]
@@ -143,8 +152,6 @@ mod dispatch_shell;
 mod file_read;
 #[path = "main_tests/http_recovery.rs"]
 mod http_recovery;
-#[path = "main_tests/managed_temporary_projects.rs"]
-mod managed_temporary_projects;
 #[path = "main_tests/profile_process_lifecycle.rs"]
 mod profile_process_lifecycle;
 #[path = "main_tests/project_creation.rs"]
@@ -171,6 +178,11 @@ mod shell_job_tree;
 mod shell_profiles;
 #[path = "main_tests/structured_delete.rs"]
 mod structured_delete;
+#[cfg(unix)]
+#[path = "main_tests/structured_write_paths.rs"]
+mod structured_write_paths;
+#[path = "main_tests/workspace_checkpoints.rs"]
+mod workspace_checkpoints;
 #[path = "main_tests/write_project_file.rs"]
 mod write_project_file;
 
@@ -290,13 +302,18 @@ fn profile_env(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn write_runner_project(projects_dir: &Path, id: &str, path: &Path, shell_profile: Option<&str>) {
-    std::fs::create_dir_all(projects_dir).unwrap();
+fn write_runner_project(
+    project_registry_dir: &Path,
+    id: &str,
+    path: &Path,
+    shell_profile: Option<&str>,
+) {
+    std::fs::create_dir_all(project_registry_dir).unwrap();
     let shell_profile = shell_profile
         .map(|profile| format!("shell_profile = {:?}\n", profile))
         .unwrap_or_default();
     std::fs::write(
-        projects_dir.join(format!("{}.toml", id)),
+        project_registry_dir.join(format!("{}.toml", id)),
         format!(
             "id = {:?}\npath = {:?}\nname = {:?}\n{}",
             id,
@@ -311,7 +328,7 @@ fn write_runner_project(projects_dir: &Path, id: &str, path: &Path, shell_profil
 fn run_profile_shell(
     policy: &RunnerPolicy,
     shell: &ShellConfig,
-    projects_dir: &Path,
+    project_registry_dir: &Path,
     cache: &PreparedShellProfileCache,
     cwd: &Path,
     command: &str,
@@ -321,7 +338,7 @@ fn run_profile_shell(
         1,
         policy,
         shell,
-        projects_dir,
+        project_registry_dir,
         cache,
         Some(&cwd),
         command,
@@ -331,8 +348,8 @@ fn run_profile_shell(
     )
 }
 
-fn shell_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
-    ShellAgentShellRequest {
+fn shell_job_request(cwd: &Path, command: &str) -> RunnerRequest {
+    RunnerRequest {
         request_id: "req-job".to_string(),
         client_id: "ws-client".to_string(),
         kind: "start_job".to_string(),
@@ -357,6 +374,7 @@ fn shell_job_request(cwd: &Path, command: &str) -> ShellAgentShellRequest {
         lsp: None,
         job_context: Some(test_job_context(cwd, Vec::new())),
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     }
@@ -377,7 +395,7 @@ fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
     let context = request.job_context.as_mut().unwrap();
     context.purpose = Some("validation".to_string());
     context.validation_steps = vec!["test".to_string()];
-    context.validation = Some(shell_protocol::ShellJobValidationMetadata {
+    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
         tool: "go_test".to_string(),
         kind: "test".to_string(),
         steps: vec![cargo_step],
@@ -386,6 +404,8 @@ fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
         adapter: "go_test".to_string(),
         validation_target_id: None,
         minimum_tests: None,
+        require_tests: None,
+        no_run: None,
     });
     let context = context.clone();
 
@@ -398,7 +418,7 @@ fn runner_recovery_context_accepts_server_validation_identity_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let mut request = shell_job_request(temp.path(), "");
     request.kind = "start_process_job".to_string();
-    request.process = Some(shell_protocol::ShellProcessArgv {
+    request.process = Some(runner_protocol::ShellProcessArgv {
         executable: "cargo".to_string(),
         args: vec!["test".to_string(), "focused".to_string()],
     });
@@ -406,7 +426,7 @@ fn runner_recovery_context_accepts_server_validation_identity_metadata() {
     context.purpose = Some("test".to_string());
     context.shell = Some("direct_argv".to_string());
     context.command_preview = "cargo test focused".to_string();
-    context.structured_execution = Some(shell_protocol::ShellJobStructuredExecutionMetadata {
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
         execution_source: "run_process".to_string(),
         language: None,
         script_bytes: None,
@@ -443,10 +463,89 @@ fn runner_recovery_context_accepts_server_validation_identity_metadata() {
     );
 }
 
+#[test]
+fn runner_recovery_context_accepts_javascript_script_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Javascript,
+        script: "console.log('recovered');\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("javascript".to_string());
+    context.command_preview = format!(
+        "javascript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Javascript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+
+    let mut invalid = context;
+    invalid.shell = Some("node".to_string());
+    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+    assert!(error.contains("shell is invalid"), "{error}");
+}
+
+#[test]
+fn runner_recovery_context_accepts_typescript_semantic_identity_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Typescript,
+        script: "const recovered: string = 'ok';\nvoid recovered;\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("typescript".to_string());
+    context.command_preview = format!(
+        "typescript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Typescript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+    for concrete_runtime in ["node", "tsx"] {
+        let mut invalid = context.clone();
+        invalid.shell = Some(concrete_runtime.to_string());
+        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
+    }
+}
+
 fn wait_for_job_envelope(
-    rx: &mut tokio::sync::mpsc::Receiver<AgentEnvelope>,
+    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
     message: &str,
-) -> AgentEnvelope {
+) -> RunnerEnvelope {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         match rx.try_recv() {
@@ -477,8 +576,8 @@ fn json_file_op_request(
     kind: &str,
     path: &str,
     payload: serde_json::Value,
-) -> ShellAgentShellRequest {
-    ShellAgentShellRequest {
+) -> RunnerRequest {
+    RunnerRequest {
         request_id: format!("req-{kind}"),
         client_id: "agent-1".to_string(),
         kind: kind.to_string(),
@@ -503,6 +602,7 @@ fn json_file_op_request(
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     }
@@ -721,14 +821,17 @@ fn assert_descendant_reaped(pid_file: &Path) {
 /// Compiled copy of the `validation_tree_helper` fixture, kept alive for the
 /// whole test process so its binary path never disappears under a running
 /// descendant (same pattern as the validation lifecycle tests).
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 struct ShellTreeHelper {
     _temp: tempfile::TempDir,
     path: PathBuf,
 }
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 static SHELL_TREE_HELPER: std::sync::OnceLock<std::sync::Arc<ShellTreeHelper>> =
     std::sync::OnceLock::new();
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 fn shell_tree_helper() -> PathBuf {
     SHELL_TREE_HELPER
         .get_or_init(|| {
@@ -779,6 +882,7 @@ fn shell_tree_quote(value: &str) -> String {
 /// cmd.exe quote-parsing pitfalls) and appends `exit $LASTEXITCODE` so the
 /// helper's exit status becomes the shell's exit status. Unix uses the POSIX
 /// shell directly.
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 fn shell_tree_command(helper: &Path, args: &[String]) -> String {
     let mut parts: Vec<String> = vec![shell_tree_quote(&helper.to_string_lossy())];
     parts.extend(args.iter().map(|arg| shell_tree_quote(arg)));
@@ -796,6 +900,7 @@ fn shell_tree_command(helper: &Path, args: &[String]) -> String {
 /// Test shell that can actually run on this platform: PowerShell on Windows
 /// (cmd.exe quote parsing and missing `sleep` make POSIX-style commands
 /// unusable), the default `sh -c` on Unix.
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 #[cfg(windows)]
 fn shell_tree_test_shell() -> ShellConfig {
     ShellConfig {
@@ -805,6 +910,7 @@ fn shell_tree_test_shell() -> ShellConfig {
     }
 }
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 #[cfg(not(windows))]
 fn shell_tree_test_shell() -> ShellConfig {
     ShellConfig::default()
@@ -812,6 +918,7 @@ fn shell_tree_test_shell() -> ShellConfig {
 
 /// Shell timeout used by the tree tests: Windows needs headroom for
 /// PowerShell startup, Unix shells start instantly.
+#[cfg(feature = "runner-real-process-tests")]
 fn shell_tree_test_timeout_secs() -> u64 {
     if cfg!(windows) {
         5
@@ -887,6 +994,7 @@ fn wait_until_process_dead(pid: u32, timeout: Duration, tag: &str) -> bool {
 }
 
 /// Parse `KEY=<pid>` from a marker file written by the fixture helper.
+#[cfg(feature = "runner-real-process-tests")]
 fn read_marker_pid(marker: &Path, key: &str) -> u32 {
     let text = std::fs::read_to_string(marker).expect("read pid marker");
     text.lines()
@@ -900,11 +1008,13 @@ fn read_marker_pid(marker: &Path, key: &str) -> u32 {
 
 /// Marker paths and the keepalive command for the two-argument
 /// `spawn-descendant-keepalive` / `spawn-descendant` fixtures.
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 struct ShellTreeMarkers {
     parent: PathBuf,
     alive: PathBuf,
 }
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 impl ShellTreeMarkers {
     fn in_dir(tmp: &std::path::Path, tag: &str) -> Self {
         Self {
@@ -927,6 +1037,7 @@ impl ShellTreeMarkers {
 
     /// Both pids must be dead after cancellation; `PARENT_PID` and
     /// `DESCENDANT_PID` are both written to the parent marker.
+    #[cfg(feature = "runner-real-process-tests")]
     fn assert_tree_dead(&self, tag: &str) {
         let parent = read_marker_pid(&self.parent, "PARENT_PID");
         let descendant = read_marker_pid(&self.parent, "DESCENDANT_PID");
@@ -979,7 +1090,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
 fn shell_job_unicode_stdout_stderr_env_and_cwd() {
     let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let unicode_cwd = tmp.path().join("unicode cwd 测试");
     std::fs::create_dir_all(&unicode_cwd).unwrap();
     let cwd = unicode_cwd.to_string_lossy().to_string();
@@ -1096,7 +1207,7 @@ fn server_url_to_ws_converts_http_https_and_rejects_bare() {
 }
 
 #[test]
-fn generated_agent_instance_id_is_non_empty_uuid_like() {
+fn generated_runner_instance_id_is_non_empty_uuid_like() {
     // `run_runner` generates the instance id the same way; verify the
     // format here without driving the full agent loop.
     let id = uuid::Uuid::new_v4().to_string();
@@ -1107,35 +1218,35 @@ fn generated_agent_instance_id_is_non_empty_uuid_like() {
     assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
     // The register builder carries it through unchanged.
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let body = build_register_request(&cfg, &id, 0);
-    assert_eq!(body.agent_instance_id, id);
-    assert!(!body.agent_instance_id.is_empty());
+    assert_eq!(body.runner_instance_id, id);
+    assert!(!body.runner_instance_id.is_empty());
     assert_eq!(
-        body.agent_protocol_generation, AGENT_PROTOCOL_GENERATION_V2,
+        body.runner_protocol_generation, RUNNER_PROTOCOL_GENERATION_V2,
         "current Runner registration must explicitly declare protocol generation 2"
     );
 }
 
-fn ws_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<AgentEnvelope>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+fn ws_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
     (
         RunnerSink::WebSocket {
             tx,
             client_id: client_id.to_string(),
-            agent_instance_id: "ws-inst".to_string(),
+            runner_instance_id: "ws-inst".to_string(),
         },
         rx,
     )
 }
 
-fn quic_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<AgentEnvelope>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<AgentEnvelope>(WS_OUTGOING_CAPACITY);
+fn quic_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
     (
         RunnerSink::Quic {
             tx,
             client_id: client_id.to_string(),
-            agent_instance_id: "quic-inst".to_string(),
+            runner_instance_id: "quic-inst".to_string(),
         },
         rx,
     )
@@ -1145,7 +1256,7 @@ fn quic_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<AgentE
 #[test]
 fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let jobs = JobManager::new(1);
     let stop_requested = Arc::new(AtomicBool::new(false));
     let mut running_command =
@@ -1162,7 +1273,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         "running-job".to_string(),
         RunningJob {
             client_id: "ws-client".to_string(),
-            agent_instance_id: "ws-instance".to_string(),
+            runner_instance_id: "ws-instance".to_string(),
             snapshot: test_job_snapshot("running-job"),
             child: Some(Arc::clone(&running_child)),
             stop_requested: stop_requested.clone(),
@@ -1170,7 +1281,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         },
     );
     let (sink, mut rx) = ws_sink("ws-client");
-    let request = ShellAgentShellRequest {
+    let request = RunnerRequest {
         request_id: "req-queued".to_string(),
         client_id: "ws-client".to_string(),
         kind: "start_job".to_string(),
@@ -1195,6 +1306,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
         lsp: None,
         job_context: Some(test_job_context(tmp.path(), Vec::new())),
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     };
@@ -1204,17 +1316,17 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
 
     jobs.enqueue(
         sink,
-        PendingJobStart {
-            generation: 1,
-            policy: cfg.policy.clone(),
-            shell: cfg.shell.clone(),
-            ssh: cfg.ssh.clone(),
-            projects_dir: projects_dir(&cfg).unwrap(),
+        PendingJobStart::from_wire(
+            1,
+            cfg.policy.clone(),
+            cfg.shell.clone(),
+            cfg.ssh.clone(),
+            project_registry_dir(&cfg).unwrap(),
             request,
-        },
+        ),
     );
     match wait_for_job_envelope(&mut rx, "queued status was sent") {
-        AgentEnvelope::JobUpdate { payload } => {
+        RunnerEnvelope::JobUpdate { payload } => {
             assert_eq!(payload.job_id, "queued-job");
             assert_eq!(payload.status, "agent_queued");
         }
@@ -1236,21 +1348,21 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     let (rejected_sink, mut rejected_rx) = ws_sink("ws-client");
     jobs.enqueue(
         rejected_sink,
-        PendingJobStart {
-            generation: 1,
-            policy: cfg.policy.clone(),
-            shell: cfg.shell.clone(),
-            ssh: cfg.ssh.clone(),
-            projects_dir: projects_dir(&cfg).unwrap(),
-            request: rejected_request,
-        },
+        PendingJobStart::from_wire(
+            1,
+            cfg.policy.clone(),
+            cfg.shell.clone(),
+            cfg.ssh.clone(),
+            project_registry_dir(&cfg).unwrap(),
+            rejected_request,
+        ),
     );
     assert!(jobs.queued.lock().unwrap().is_empty());
     let rejected = (0..2)
         .find_map(
             |_| match wait_for_job_envelope(&mut rejected_rx, "shutdown update was sent") {
-                AgentEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
-                AgentEnvelope::JobUpdate { .. } => None,
+                RunnerEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
+                RunnerEnvelope::JobUpdate { .. } => None,
                 other => panic!("expected job_update, got {:?}", other.kind()),
             },
         )
@@ -1269,8 +1381,8 @@ fn project_policy(root: &Path) -> RunnerPolicy {
     }
 }
 
-fn project_request(kind: &str, payload: serde_json::Value) -> ShellAgentShellRequest {
-    ShellAgentShellRequest {
+fn project_request(kind: &str, payload: serde_json::Value) -> RunnerRequest {
+    RunnerRequest {
         request_id: format!("req-{}", kind),
         client_id: "oe".to_string(),
         kind: kind.to_string(),
@@ -1295,6 +1407,7 @@ fn project_request(kind: &str, payload: serde_json::Value) -> ShellAgentShellReq
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     }
@@ -1338,13 +1451,433 @@ fn project_error_value(result: CommandResult) -> serde_json::Value {
     serde_json::from_str(result.stdout.as_deref().expect("error json")).unwrap()
 }
 
+fn managed_git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git fixture command");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn seed_managed_worktree_repo(source: &Path) -> (String, String) {
+    std::fs::create_dir_all(source).unwrap();
+    managed_git(source, &["init"]);
+    managed_git(
+        source,
+        &["config", "user.email", "webcodex@example.invalid"],
+    );
+    managed_git(source, &["config", "user.name", "WebCodex Test"]);
+    std::fs::write(source.join("hello.txt"), "first\n").unwrap();
+    managed_git(source, &["add", "hello.txt"]);
+    managed_git(source, &["commit", "-m", "first"]);
+    let first = managed_git(source, &["rev-parse", "HEAD"]);
+    std::fs::write(source.join("hello.txt"), "second\n").unwrap();
+    managed_git(source, &["add", "hello.txt"]);
+    managed_git(source, &["commit", "-m", "second"]);
+    let second = managed_git(source, &["rev-parse", "HEAD"]);
+    (first, second)
+}
+
+fn register_managed_source_project(registry: &Path, source: &Path) {
+    std::fs::create_dir_all(registry).unwrap();
+    let source = source.canonicalize().unwrap();
+    let project = RunnerProjectFile {
+        id: "source".to_string(),
+        path: source.to_string_lossy().into_owned(),
+        shell_profile: None,
+        allow_patch: true,
+        name: Some("Source".to_string()),
+        kind: Some("repo".to_string()),
+        registration_source: None,
+        description: None,
+        disabled: false,
+        hooks: HashMap::new(),
+        managed_worktree: false,
+        managed_source: None,
+        managed_source_project_id: None,
+        managed_source_root_fingerprint: None,
+        managed_base_ref: None,
+        managed_base_sha: None,
+        managed_operation_id: None,
+    };
+    std::fs::write(
+        registry.join("source.toml"),
+        toml::to_string(&project).unwrap(),
+    )
+    .unwrap();
+}
+
+fn managed_worktree_request(
+    source: &Path,
+    base_ref: serde_json::Value,
+    operation_id: &str,
+    resume_project_id: Option<&str>,
+) -> RunnerRequest {
+    project_request(
+        "prepare_managed_worktree",
+        serde_json::json!({
+            "path": source.to_string_lossy(),
+            "base_ref": base_ref,
+            "operation_id": operation_id,
+            "resume_project_id": resume_project_id,
+        }),
+    )
+}
+
+#[test]
+fn project_root_fingerprint_uses_platform_path_identity_rules() {
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            project_root_fingerprint(Path::new(r"C:\Foo\Repo")),
+            project_root_fingerprint(Path::new(r"\\?\c:\foo\repo\"))
+        );
+        assert_eq!(
+            project_root_fingerprint(Path::new(r"\\SERVER\Share\Repo")),
+            project_root_fingerprint(Path::new(r"\\?\UNC\server\share\repo"))
+        );
+    }
+    #[cfg(unix)]
+    {
+        assert_ne!(
+            project_root_fingerprint(Path::new("/tmp/Repo")),
+            project_root_fingerprint(Path::new("/tmp/repo"))
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn managed_worktree_network_source_requires_runner_authority_before_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = tmp.path().join("project-registry");
+    let source = Path::new(r"\\untrusted-host\share\webcodex-unreachable-repo");
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        allowed_roots: Vec::new(),
+        ..RunnerPolicy::default()
+    };
+    let request = managed_worktree_request(
+        source,
+        serde_json::Value::Null,
+        "77777777-7777-4777-8777-777777777777",
+        None,
+    );
+
+    let result = handle_prepare_managed_worktree(&policy, &registry, &request);
+    assert_eq!(project_err(result), "path_outside_allowed_roots");
+    assert!(!registry.exists());
+}
+
+#[test]
+fn managed_worktree_bootstrap_is_detached_registered_and_same_operation_recovers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    let (_first, head) = seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(tmp.path());
+    let request = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "11111111-1111-4111-8111-111111111111",
+        None,
+    );
+
+    let first = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    assert_eq!(first["managed"], true);
+    assert_eq!(first["base_ref"], "HEAD");
+    assert_eq!(first["base_sha"], head);
+    assert_eq!(first["source_dirty"], false);
+    assert_eq!(first["outcome"], "managed_worktree_created");
+    assert_eq!(first["registered"], true);
+    let worktree = PathBuf::from(first["path"].as_str().unwrap());
+    assert_ne!(
+        worktree.canonicalize().unwrap(),
+        source.canonicalize().unwrap()
+    );
+    assert_eq!(managed_git(&worktree, &["rev-parse", "HEAD"]), head);
+    let detached = std::process::Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(&worktree)
+        .status()
+        .unwrap();
+    assert!(!detached.success(), "managed worktree must start detached");
+
+    let projects = load_runner_project_summaries_from_dir(&registry);
+    assert_eq!(projects.len(), 2);
+    let managed_id = first["agent_project_id"].as_str().unwrap();
+    let managed = projects
+        .iter()
+        .find(|project| project.id == managed_id)
+        .unwrap();
+    assert_eq!(Path::new(&managed.path), worktree.as_path());
+    assert_eq!(first["lineage"]["kind"], "managed_worktree_source");
+    assert_eq!(first["lineage"]["source_project_id"], "source");
+    assert_eq!(first["lineage"]["base_sha"], head);
+    assert!(first["lineage"]["source_root_fingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("wc_projroot_"));
+
+    let recovered = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    assert_eq!(recovered["id"], first["id"]);
+    assert_eq!(recovered["path"], first["path"]);
+    assert_eq!(recovered["outcome"], "managed_worktree_recovered");
+    assert_eq!(recovered["registered"], false);
+    assert_eq!(recovered["changed"], false);
+}
+
+#[test]
+fn managed_worktree_explicit_ref_preserves_dirty_source_and_resume_survives_source_head_move() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    let (first_sha, _second_sha) = seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    std::fs::write(source.join("hello.txt"), "dirty source\n").unwrap();
+    std::fs::write(source.join("untracked.txt"), "keep me\n").unwrap();
+    let status_before = managed_git(&source, &["status", "--porcelain"]);
+    let source_before = std::fs::read_to_string(source.join("hello.txt")).unwrap();
+    let policy = project_policy(tmp.path());
+    let request = managed_worktree_request(
+        &source,
+        serde_json::json!("HEAD~1"),
+        "22222222-2222-4222-8222-222222222222",
+        None,
+    );
+
+    let created = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    assert_eq!(created["base_ref"], "HEAD~1");
+    assert_eq!(created["base_sha"], first_sha);
+    assert_eq!(created["source_dirty"], true);
+    let worktree = PathBuf::from(created["path"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("hello.txt"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["first"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("hello.txt")).unwrap(),
+        source_before
+    );
+    assert_eq!(
+        managed_git(&source, &["status", "--porcelain"]),
+        status_before
+    );
+
+    std::fs::write(source.join("hello.txt"), "third committed\n").unwrap();
+    managed_git(&source, &["add", "hello.txt"]);
+    managed_git(&source, &["commit", "-m", "third"]);
+    let moved_head = managed_git(&source, &["rev-parse", "HEAD"]);
+    assert_ne!(moved_head, first_sha);
+    let resume = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "33333333-3333-4333-8333-333333333333",
+        created["agent_project_id"].as_str(),
+    );
+    let resumed = project_ok(handle_prepare_managed_worktree(&policy, &registry, &resume));
+    assert_eq!(resumed["path"], created["path"]);
+    assert_eq!(resumed["base_sha"], first_sha);
+    assert_eq!(resumed["outcome"], "managed_worktree_recovered");
+    assert_eq!(resumed["registered"], false);
+    assert_eq!(load_runner_project_summaries_from_dir(&registry).len(), 2);
+}
+
+#[test]
+fn managed_worktree_resume_fails_closed_when_persisted_source_lineage_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(tmp.path());
+    let create = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "12121212-1212-4212-8212-121212121212",
+        None,
+    );
+    let created = project_ok(handle_prepare_managed_worktree(&policy, &registry, &create));
+    let managed_id = created["agent_project_id"].as_str().unwrap();
+    let managed_config_path = registry.join(format!("{managed_id}.toml"));
+    let original_managed = std::fs::read_to_string(&managed_config_path).unwrap();
+    let mut managed_project = parse_runner_project_toml(&original_managed).unwrap();
+    assert_eq!(
+        managed_project.managed_source_project_id.as_deref(),
+        Some("source")
+    );
+    managed_project.managed_source_root_fingerprint =
+        Some(format!("wc_projroot_{}", "f".repeat(64)));
+    std::fs::write(
+        &managed_config_path,
+        toml::to_string(&managed_project).unwrap(),
+    )
+    .unwrap();
+    let resume = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "13131313-1313-4313-8313-131313131313",
+        Some(managed_id),
+    );
+    assert_eq!(
+        project_err(handle_prepare_managed_worktree(&policy, &registry, &resume)),
+        "managed_worktree_resume_mismatch"
+    );
+
+    std::fs::write(&managed_config_path, original_managed).unwrap();
+    let source_config_path = registry.join("source.toml");
+    let mut source_project =
+        parse_runner_project_toml(&std::fs::read_to_string(&source_config_path).unwrap()).unwrap();
+    source_project.id = "replacement-source".to_string();
+    std::fs::write(
+        &source_config_path,
+        toml::to_string(&source_project).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        project_err(handle_prepare_managed_worktree(&policy, &registry, &resume)),
+        "managed_worktree_resume_mismatch"
+    );
+}
+
+#[test]
+fn managed_project_explicit_lineage_cannot_self_associate() {
+    let root_fingerprint = format!("wc_projroot_{}", "1".repeat(64));
+    let config = format!(
+        "id = \"self\"\npath = \"/tmp/self\"\nmanaged_worktree = true\nmanaged_source = \"/tmp/source\"\nmanaged_source_project_id = \"self\"\nmanaged_source_root_fingerprint = \"{root_fingerprint}\"\nmanaged_base_sha = \"{}\"\nmanaged_operation_id = \"op\"\n",
+        "a".repeat(40)
+    );
+    assert_eq!(
+        parse_runner_project_toml(&config).unwrap_err(),
+        "managed source project cannot equal target project"
+    );
+}
+
+#[test]
+fn managed_worktree_non_git_source_fails_without_registration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("plain");
+    let registry = tmp.path().join("project-registry");
+    std::fs::create_dir_all(&source).unwrap();
+    let request = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "44444444-4444-4444-8444-444444444444",
+        None,
+    );
+    let result = handle_prepare_managed_worktree(&project_policy(tmp.path()), &registry, &request);
+    assert_eq!(project_err(result), "source_not_git_repository");
+    assert!(load_runner_project_summaries_from_dir(&registry).is_empty());
+}
+
+#[test]
+fn concurrent_managed_worktree_bootstraps_choose_distinct_runner_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(tmp.path());
+    let first_request = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "55555555-5555-4555-8555-555555555555",
+        None,
+    );
+    let second_request = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "66666666-6666-4666-8666-666666666666",
+        None,
+    );
+    let first_policy = policy.clone();
+    let first_registry = registry.clone();
+    let first = std::thread::spawn(move || {
+        project_ok(handle_prepare_managed_worktree(
+            &first_policy,
+            &first_registry,
+            &first_request,
+        ))
+    });
+    let second_policy = policy.clone();
+    let second_registry = registry.clone();
+    let second = std::thread::spawn(move || {
+        project_ok(handle_prepare_managed_worktree(
+            &second_policy,
+            &second_registry,
+            &second_request,
+        ))
+    });
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    assert_ne!(first["path"], second["path"]);
+    assert_ne!(first["id"], second["id"]);
+    assert_eq!(load_runner_project_summaries_from_dir(&registry).len(), 3);
+}
+
+#[test]
+fn managed_worktree_git_source_without_registered_project_does_not_infer_lineage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    let request = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "99999999-9999-4999-8999-999999999999",
+        None,
+    );
+    let result = handle_prepare_managed_worktree(&project_policy(tmp.path()), &registry, &request);
+    assert_eq!(
+        project_err(result),
+        "managed_worktree_source_project_unavailable"
+    );
+    assert!(load_runner_project_summaries_from_dir(&registry).is_empty());
+}
+
+#[test]
+fn legacy_managed_project_without_explicit_lineage_stays_unassociated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let worktree = tmp.path().join("legacy-worktree");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    let legacy = format!(
+        "id = \"legacy\"\npath = {:?}\nmanaged_worktree = true\nmanaged_source = {:?}\nmanaged_base_sha = \"{}\"\nmanaged_operation_id = \"legacy-op\"\n",
+        worktree.to_string_lossy(),
+        source.to_string_lossy(),
+        "a".repeat(40)
+    );
+    let parsed = parse_runner_project_toml(&legacy).unwrap();
+    assert!(parsed.managed_worktree);
+    assert!(parsed.managed_source_project_id.is_none());
+    assert!(parsed.managed_source_root_fingerprint.is_none());
+    assert!(runner_project_summary(&parsed, 1, false).lineage.is_none());
+}
+
 #[test]
 fn runner_project_cache_invalidate_refreshes_after_project_op() {
     let tmp = tempfile::tempdir().unwrap();
     let project_dir = tmp.path().join("repo");
-    let projects_dir = tmp.path().join("projects.d");
+    let project_registry_dir = tmp.path().join("project-registry");
     std::fs::create_dir(&project_dir).unwrap();
-    let mut cfg = test_config(projects_dir.clone());
+    let mut cfg = test_config(project_registry_dir.clone());
     cfg.policy = project_policy(tmp.path());
     let mut cache = RunnerProjectCache::default();
     assert!(cache.get(&cfg).is_empty());
@@ -1357,7 +1890,7 @@ fn runner_project_cache_invalidate_refreshes_after_project_op() {
             "path": project_dir.to_string_lossy()
         }),
     );
-    project_ok(handle_project_op(&cfg.policy, &projects_dir, &req));
+    project_ok(handle_project_op(&cfg.policy, &project_registry_dir, &req));
 
     assert!(
         cache.get(&cfg).is_empty(),
@@ -1372,18 +1905,18 @@ fn runner_project_cache_invalidate_refreshes_after_project_op() {
 #[test]
 fn http_sink_client_id_matches_config() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/projects.d"));
+    let cfg = test_config(tmp.path().join("config/project-registry"));
     let client = Client::new();
     let sink = RunnerSink::Http(HttpSendConfig {
         client,
         server_url: cfg.server_url.clone(),
         token: cfg.token.clone(),
         client_id: cfg.client_id.clone(),
-        agent_instance_id: "inst-1".to_string(),
+        runner_instance_id: "inst-1".to_string(),
         shutdown: Arc::new(AtomicBool::new(false)),
     });
     assert_eq!(sink.client_id(), "oe");
-    assert_eq!(sink.agent_instance_id(), "inst-1");
+    assert_eq!(sink.runner_instance_id(), "inst-1");
 }
 
 #[test]
@@ -1423,7 +1956,7 @@ fn canonical_registered_client_json(instance_id: &str, transport: &str) -> serde
         "pending_requests": 0,
         "projects": [],
         "project_inventory": ShellProjectInventoryStatus::pending(0),
-        "agent_protocol_generation": AGENT_PROTOCOL_GENERATION_V2.get(),
+        "agent_protocol_generation": RUNNER_PROTOCOL_GENERATION_V2.get(),
         "transport": transport
     })
 }
@@ -1467,7 +2000,7 @@ fn empty_tokens_http_register_omits_authorization_header() {
     });
 
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("projects.d"));
+    let mut cfg = test_config(tmp.path().join("project-registry"));
     cfg.server_url = format!("http://{}", addr);
     cfg.token = "   \t".to_string();
 
@@ -1518,14 +2051,14 @@ async fn websocket_session_accepts_pong_without_error_or_disconnect() {
 
         // Read Register.
         let reg_msg = ws.next().await.unwrap().unwrap();
-        let reg_env = AgentEnvelope::from_slice(reg_msg.into_text().unwrap().as_bytes()).unwrap();
-        assert!(matches!(reg_env, AgentEnvelope::Register { .. }));
+        let reg_env = RunnerEnvelope::from_slice(reg_msg.into_text().unwrap().as_bytes()).unwrap();
+        assert!(matches!(reg_env, RunnerEnvelope::Register { .. }));
 
         // Ack register with the canonical generation-2 inventory negotiation state.
         let client =
             serde_json::from_value(canonical_registered_client_json("inst-1", "websocket"))
                 .unwrap();
-        let ack = AgentEnvelope::Registered {
+        let ack = RunnerEnvelope::Registered {
             success: true,
             client: Some(client),
             error: None,
@@ -1541,10 +2074,10 @@ async fn websocket_session_accepts_pong_without_error_or_disconnect() {
             .expect("agent did not publish startup project inventory")
             .expect("stream open for startup inventory")
             .expect("startup inventory message is valid");
-        let page = match AgentEnvelope::from_slice(inventory_msg.into_text().unwrap().as_bytes())
+        let page = match RunnerEnvelope::from_slice(inventory_msg.into_text().unwrap().as_bytes())
             .unwrap()
         {
-            AgentEnvelope::ProjectInventoryPage { page } => page,
+            RunnerEnvelope::ProjectInventoryPage { page } => page,
             other => panic!("expected project inventory page, got {:?}", other.kind()),
         };
         assert!(
@@ -1557,7 +2090,7 @@ async fn websocket_session_accepts_pong_without_error_or_disconnect() {
         status.total_reported = Some(page.total_reported);
         status.total_synced = page.total_reported;
         ws.send(WsMessage::Text(
-            AgentEnvelope::ProjectInventoryStatus { status }
+            RunnerEnvelope::ProjectInventoryStatus { status }
                 .to_json()
                 .unwrap()
                 .into(),
@@ -1567,7 +2100,7 @@ async fn websocket_session_accepts_pong_without_error_or_disconnect() {
 
         // Send a Pong — the Runner must accept it as keepalive and stay
         // connected (this is the regression we are guarding against).
-        let pong = AgentEnvelope::Pong { ts: 42 };
+        let pong = RunnerEnvelope::Pong { ts: 42 };
         ws.send(WsMessage::Text(pong.to_json().unwrap().into()))
             .await
             .unwrap();
@@ -1576,7 +2109,7 @@ async fn websocket_session_accepts_pong_without_error_or_disconnect() {
         // agent had broken out of its read loop on the Pong above, this
         // would time out.
         ws.send(WsMessage::Text(
-            AgentEnvelope::Ping { ts: 7 }.to_json().unwrap().into(),
+            RunnerEnvelope::Ping { ts: 7 }.to_json().unwrap().into(),
         ))
         .await
         .unwrap();
@@ -1585,8 +2118,8 @@ async fn websocket_session_accepts_pong_without_error_or_disconnect() {
             .expect("agent did not reply to ping after pong (session exited on pong)")
             .expect("stream open")
             .expect("ok message");
-        match AgentEnvelope::from_slice(reply.into_text().unwrap().as_bytes()).unwrap() {
-            AgentEnvelope::Pong { ts } => assert_eq!(ts, 7),
+        match RunnerEnvelope::from_slice(reply.into_text().unwrap().as_bytes()).unwrap() {
+            RunnerEnvelope::Pong { ts } => assert_eq!(ts, 7),
             other => panic!("expected pong reply, got {:?}", other.kind()),
         }
 
@@ -1597,7 +2130,7 @@ async fn websocket_session_accepts_pong_without_error_or_disconnect() {
     });
 
     let tmp = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(tmp.path().join("config/projects.d"));
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
     cfg.server_url = format!("http://{}", addr);
     cfg.transport = Some(TRANSPORT_WEBSOCKET.to_string());
     let runtime = RunnerRuntimeState::new(&cfg, PathBuf::new());

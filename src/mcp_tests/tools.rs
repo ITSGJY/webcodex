@@ -1,17 +1,17 @@
 use super::*;
 
 async fn wait_for_mcp_agent_request(
-    registry: &crate::shell_client::ShellClientRegistry,
+    registry: &crate::runner_http::RunnerRegistry,
     client_id: &str,
-    agent_instance_id: &str,
+    runner_instance_id: &str,
     label: &str,
-) -> crate::shell_protocol::ShellAgentShellRequest {
+) -> crate::runner_protocol::RunnerRequest {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Some(request) = registry
-            .poll(ShellAgentPollRequest {
+            .poll(RunnerPollRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: agent_instance_id.to_string(),
+                runner_instance_id: runner_instance_id.to_string(),
             })
             .await
             .unwrap()
@@ -33,10 +33,11 @@ async fn wait_for_mcp_agent_request(
 #[tokio::test]
 async fn mcp_tools_list_returns_same_names_as_runtime() {
     // Name parity with the runtime registry must hold for stateless-2026 under
-    // both full and compact schema modes. Legacy MCP intentionally omits the
-    // stateless-only export_project_artifact transport adapter. Schema shape is
+    // both full and compact schema modes. Legacy unauthenticated MCP intentionally
+    // omits the stateless-only export_project_artifact transport adapter and the
+    // scope-gated plugin_tool gateway. Schema shape is
     // covered by dedicated tests:
-    // `mcp_tools_list_default_retains_output_schema` and
+    // `mcp_tools_list_explicit_full_projection_retains_output_schema` and
     // `mcp_tools_list_compact_omits_output_schema_only`.
     let mut env = crate::test_support::TestEnvGuard::new();
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
@@ -44,9 +45,12 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
         .iter()
         .map(|s| s.name.clone())
         .collect();
+    assert!(runtime_names.iter().any(|name| name == "list_runners"));
+    assert!(runtime_names.iter().any(|name| name == "plugin_tool"));
+    assert!(!runtime_names.iter().any(|name| name == "list_agents"));
     let legacy_runtime_names: Vec<String> = runtime_names
         .iter()
-        .filter(|name| name.as_str() != "export_project_artifact")
+        .filter(|name| !matches!(name.as_str(), "export_project_artifact" | "plugin_tool"))
         .cloned()
         .collect();
     let stateless_runtime_names = mcp_tools_list_payload_with_features_for_auth(
@@ -67,6 +71,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
         if compact {
             env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
         } else {
+            // FullOperatorRuntime preserves the historical full-schema default
+            // when the override is unset.
             env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
         }
         let outcome = handle_mcp_request(
@@ -86,8 +92,11 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
             .collect();
         assert_eq!(
             names, legacy_runtime_names,
-            "legacy tools/list must equal runtime registry minus stateless-only tools (compact={compact})"
+            "legacy unauthenticated tools/list must equal runtime registry minus transport-only and scope-gated gateways (compact={compact})"
         );
+        assert!(names.iter().any(|name| name == "list_runners"));
+        assert!(!names.iter().any(|name| name == "plugin_tool"));
+        assert!(!names.iter().any(|name| name == "list_agents"));
 
         let stateless_outcome = handle_mcp_request(
             &runtime,
@@ -113,6 +122,8 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
             stateless_names, stateless_runtime_names,
             "stateless-2026 unauthenticated tools/list must equal the full runtime registry plus fixed Skill runtime tools; Memory tools require explicit authority (compact={compact})"
         );
+        assert!(stateless_names.iter().any(|name| name == "list_runners"));
+        assert!(!stateless_names.iter().any(|name| name == "list_agents"));
         for tool in stateless_value["result"]["tools"].as_array().unwrap() {
             let properties = tool["inputSchema"]["properties"].as_object().unwrap();
             let recorder = properties
@@ -165,7 +176,7 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
             } else {
                 assert!(
                     tool["outputSchema"].is_object(),
-                    "default env adapter must retain outputSchema for {}",
+                    "FullOperator unset env adapter must retain outputSchema for {}",
                     tool["name"]
                 );
             }
@@ -303,6 +314,7 @@ fn memory_tools_are_stateless_full_operator_only_scope_filtered_and_schema_stati
         "project.instructions",
         "webcodex.workflow",
         "skills.catalog",
+        "plugins.catalog",
         "memory.bootstrap",
     ] {
         assert!(description.contains(key));
@@ -666,6 +678,8 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         "search_project_texts",
         "tool_manifest",
         "show_changes",
+        "work_on_project",
+        "workspace_hygiene_check",
     ] {
         let tool = full["tools"]
             .as_array()
@@ -675,10 +689,10 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
             .unwrap_or_else(|| panic!("missing {name} schema"));
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();
         assert!(
-            properties.contains_key(
+            !properties.contains_key(
                 crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
             ),
-            "{name} must advertise recovery ACK even when it does not advance checkpoints"
+            "{name} must not advertise context ACK"
         );
         assert!(properties.contains_key(
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
@@ -691,7 +705,7 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
             crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD
         ));
     }
-    for name in ["work_on_project", "apply_text_edits", "run_process"] {
+    for name in ["session_handoff_summary", "apply_text_edits", "run_process"] {
         let tool = full["tools"]
             .as_array()
             .unwrap()
@@ -702,6 +716,35 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         assert!(properties.contains_key(
             crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
         ));
+        assert_eq!(
+            properties["ack_session_context_revision"]["description"],
+            "Echo the latest retained session_context_revision; omit when unknown."
+        );
+        assert!(
+            tool["outputSchema"]["properties"]["output"]["properties"]["session_continuity"]
+                ["properties"]["status"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("recovered"))
+        );
+        let suggested = &tool["outputSchema"]["properties"]["output"]["properties"]
+            ["session_continuity"]["properties"]["suggested_call"];
+        assert_eq!(
+            suggested["properties"]["tool"]["const"],
+            "session_handoff_summary"
+        );
+        assert_eq!(
+            suggested["properties"]["arguments"]["required"],
+            json!(["session_id"])
+        );
+        let continuity = &tool["outputSchema"]["properties"]["output"]["properties"]
+            ["session_continuity"]["properties"];
+        assert!(continuity.get("recovery_tool").is_none());
+        assert!(continuity.get("recovery_session_id").is_none());
+        assert!(continuity.get("recovery_required").is_none());
+        assert!(tool["outputSchema"]["properties"]["output"]["properties"]
+            .get("session_context_continuation")
+            .is_none());
         assert!(properties.contains_key(
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
         ));
@@ -723,6 +766,12 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         .find(|tool| tool["name"] == "read_files")
         .expect("full-operator read_files schema");
     let read_files_output = serde_json::to_string(&read_files["outputSchema"]).unwrap();
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("\"recovery_required\""));
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("\"session_context_continuation\""));
     assert!(read_files_output.contains("context_projection"));
     assert!(read_files_output.contains("post_tool"));
     let list_tools = full["tools"]
@@ -771,20 +820,8 @@ fn stateless_ack_wrapper_normalizes_and_is_removed_before_concrete_tool_parsing(
     assert!(arguments
         .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD)
         .is_none());
-
-    arguments[crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_INTERNAL_FIELD] =
-        json!(normalized);
-    let recorder =
-        crate::tool_runtime::sessions::ToolCallRecorderMetadata::from_arguments(&arguments);
-    assert_eq!(
-        recorder.ack_session_message_ids,
-        vec!["wc_msg_beta", "wc_msg_alpha"]
-    );
-    let concrete = crate::tool_runtime::sessions::strip_tool_call_expectation_metadata(arguments);
-    assert!(concrete
-        .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_INTERNAL_FIELD)
-        .is_none());
-    crate::tool_runtime::ToolCall::from_tool_name("list_tools", concrete)
+    assert_eq!(normalized, vec!["wc_msg_beta", "wc_msg_alpha"]);
+    crate::tool_runtime::ToolCall::from_tool_name("list_tools", arguments)
         .expect("wrapper ACK metadata must be gone before concrete parsing");
 
     let mut malformed = json!({
@@ -816,26 +853,7 @@ fn stateless_message_resolution_wrapper_is_validated_and_removed_before_concrete
     assert!(arguments
         .get(crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD)
         .is_none());
-
-    arguments.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_INTERNAL_FIELD
-            .to_string(),
-        json!(resolution),
-    );
-    let recorder =
-        crate::tool_runtime::sessions::ToolCallRecorderMetadata::from_arguments(&arguments);
-    assert_eq!(
-        recorder
-            .session_message_resolution
-            .as_ref()
-            .map(|value| value.message_id.as_str()),
-        Some("wc_msg_beta")
-    );
-    let concrete = crate::tool_runtime::sessions::strip_tool_call_expectation_metadata(arguments);
-    assert!(concrete
-        .get(crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_INTERNAL_FIELD)
-        .is_none());
-    crate::tool_runtime::ToolCall::from_tool_name("list_tools", concrete)
+    crate::tool_runtime::ToolCall::from_tool_name("list_tools", arguments)
         .expect("message resolution wrapper metadata must be gone before concrete parsing");
 
     for malformed in [
@@ -884,20 +902,7 @@ fn stateless_context_request_is_deduped_open_ended_and_removed_before_parsing() 
     assert!(arguments
         .get(crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD)
         .is_none());
-    arguments[crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD] =
-        json!(normalized);
-    assert_eq!(
-        crate::tool_runtime::context_projection::context_request_from_arguments(&arguments),
-        vec![
-            "project.instructions".to_string(),
-            "future.material".to_string()
-        ]
-    );
-    let concrete = crate::tool_runtime::sessions::strip_tool_call_expectation_metadata(arguments);
-    assert!(concrete
-        .get(crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD)
-        .is_none());
-    crate::tool_runtime::ToolCall::from_tool_name("list_tools", concrete)
+    crate::tool_runtime::ToolCall::from_tool_name("list_tools", arguments)
         .expect("context_request wrapper metadata must be gone before concrete parsing");
 
     for malformed in [
@@ -925,35 +930,15 @@ fn stateless_context_revision_ack_is_request_scoped_and_removed_before_parsing()
     assert!(arguments
         .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD)
         .is_none());
-    arguments
-        [crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD] =
-        ack;
-    let recorder = crate::tool_runtime::sessions::ToolCallRecorderMetadata::
-        from_arguments_with_context_continuity(&arguments, true);
     assert_eq!(
-        recorder.ack_session_context_revision,
+        session_context_revision_ack_from_wire(Some(ack)),
         crate::tool_runtime::sessions::SessionContextRevisionAck::Revision(41)
     );
-    let concrete = crate::tool_runtime::sessions::strip_tool_call_expectation_metadata(arguments);
-    assert!(concrete
-        .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD)
-        .is_none());
-    crate::tool_runtime::ToolCall::from_tool_name("list_tools", concrete)
+    crate::tool_runtime::ToolCall::from_tool_name("list_tools", arguments)
         .expect("context revision wrapper metadata must be gone before concrete parsing");
 
-    let unsupported =
-        crate::tool_runtime::sessions::ToolCallRecorderMetadata::from_arguments(&json!({
-            crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD: 9
-        }));
     assert_eq!(
-        unsupported.ack_session_context_revision,
-        crate::tool_runtime::sessions::SessionContextRevisionAck::Unsupported
-    );
-
-    let missing = crate::tool_runtime::sessions::ToolCallRecorderMetadata::
-        from_arguments_with_context_continuity(&json!({}), true);
-    assert_eq!(
-        missing.ack_session_context_revision,
+        session_context_revision_ack_from_wire(None),
         crate::tool_runtime::sessions::SessionContextRevisionAck::Unacknowledged
     );
 
@@ -961,19 +946,14 @@ fn stateless_context_revision_ack_is_request_scoped_and_removed_before_parsing()
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: "not-a-revision",
     });
     let malformed_ack = strip_stateless_ack_session_context_revision(&mut malformed).unwrap();
-    malformed
-        [crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD] =
-        malformed_ack;
-    let recorder = crate::tool_runtime::sessions::ToolCallRecorderMetadata::
-        from_arguments_with_context_continuity(&malformed, true);
     assert_eq!(
-        recorder.ack_session_context_revision,
+        session_context_revision_ack_from_wire(Some(malformed_ack)),
         crate::tool_runtime::sessions::SessionContextRevisionAck::Invalid
     );
 }
 
 #[test]
-fn no_checkpoint_tool_still_accepts_context_revision_ack() {
+fn reobservable_tool_strips_cached_context_ack_without_accepting_it() {
     let mut arguments = json!({
         "project": "proj",
         "items": [{"path": "src/lib.rs"}],
@@ -987,20 +967,68 @@ fn no_checkpoint_tool_still_accepts_context_revision_ack() {
 
     let accepts_ack =
         crate::tool_runtime::tool_definition::runtime_tool_accepts_context_ack("read_files");
-    assert!(accepts_ack);
-    arguments
-        [crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_INTERNAL_FIELD] =
-        ack;
-    let recorder = crate::tool_runtime::sessions::ToolCallRecorderMetadata::
-        from_arguments_with_context_continuity(&arguments, accepts_ack);
+    assert!(!accepts_ack);
     assert_eq!(
-        recorder.ack_session_context_revision,
+        session_context_revision_ack_from_wire(Some(ack)),
         crate::tool_runtime::sessions::SessionContextRevisionAck::Revision(41)
     );
 
-    let concrete = crate::tool_runtime::sessions::strip_tool_call_expectation_metadata(arguments);
-    crate::tool_runtime::ToolCall::from_tool_name("read_files", concrete)
+    crate::tool_runtime::ToolCall::from_tool_name("read_files", arguments)
         .expect("cached ACK must be stripped before concrete read_files parsing");
+}
+
+#[test]
+fn stateless_invocation_metadata_stays_typed_and_business_arguments_stay_clean() {
+    let mut arguments = json!({
+        "project": "proj",
+        "items": [{"path": "src/lib.rs"}],
+        crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_adapter",
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_alpha"],
+        crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
+            "message_id": "wc_msg_alpha",
+            "resolution": "handled"
+        },
+        crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: ["webcodex.workflow"],
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 7,
+    });
+    let recording_session_id = strip_recording_session_id(&mut arguments).unwrap();
+    let ack_session_message_ids = strip_stateless_ack_session_message_ids(&mut arguments).unwrap();
+    let session_message_resolution =
+        strip_stateless_session_message_resolution(&mut arguments).unwrap();
+    let context_request = strip_stateless_context_request(&mut arguments).unwrap();
+    let ack_session_context_revision = session_context_revision_ack_from_wire(
+        strip_stateless_ack_session_context_revision(&mut arguments),
+    );
+    let metadata = crate::tool_runtime::kernel::ToolInvocationMetadata {
+        ack_session_message_ids,
+        session_message_resolution,
+        context_request,
+        ack_session_context_revision,
+    };
+
+    assert_eq!(recording_session_id.as_deref(), Some("wc_sess_adapter"));
+    assert_eq!(metadata.ack_session_message_ids, vec!["wc_msg_alpha"]);
+    assert_eq!(metadata.context_request, vec!["webcodex.workflow"]);
+    assert_eq!(
+        metadata.ack_session_context_revision,
+        crate::tool_runtime::sessions::SessionContextRevisionAck::Revision(7)
+    );
+    assert!(metadata.session_message_resolution.is_some());
+    for field in [
+        crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+        crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+        crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD,
+    ] {
+        assert!(
+            arguments.get(field).is_none(),
+            "wrapper leaked into business args: {field}"
+        );
+    }
+    assert!(!arguments.to_string().contains("__webcodex_"));
+    crate::tool_runtime::ToolCall::from_tool_name("read_files", arguments)
+        .expect("typed invocation metadata must not be required for concrete ToolCall parsing");
 }
 
 #[test]
@@ -1258,20 +1286,20 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
     // surface; select the full operator surface for this call.
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     let client_id = "mcp-vision-agent";
-    let agent_instance_id = "inst-mcp-vision";
+    let runner_instance_id = "inst-mcp-vision";
     let project_name = "remote-images";
     runtime
-        .shell_clients
+        .runner_registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: agent_instance_id.to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: runner_instance_id.to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities {
+                capabilities: RunnerCapabilities {
                     file_read: true,
                     ..Default::default()
                 },
@@ -1287,19 +1315,22 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
-        agent_instance_id,
-        vec![ShellAgentProjectSummary {
+        runner_instance_id,
+        vec![RunnerProjectSummary {
             id: project_name.to_string(),
             name: Some(project_name.to_string()),
             path: "/remote/session-atlas".to_string(),
             allow_patch: true,
             kind: Some("repo".to_string()),
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -1308,7 +1339,7 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
         }],
     )
     .await;
-    let project = crate::tool_runtime::agent_project_runtime_id(client_id, project_name);
+    let project = crate::tool_runtime::runner_project_runtime_id(client_id, project_name);
     let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
     auth.is_bootstrap = true;
 
@@ -1347,9 +1378,9 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
     });
 
     let request = wait_for_mcp_agent_request(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
-        agent_instance_id,
+        runner_instance_id,
         "MCP image call",
     )
     .await;
@@ -1383,10 +1414,10 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
     .to_string();
     assert!(stdout.len() > 256 * 1024);
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: client_id.to_string(),
-            agent_instance_id: agent_instance_id.to_string(),
+            runner_instance_id: runner_instance_id.to_string(),
             request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(stdout),
@@ -1492,10 +1523,9 @@ fn project_connector_tools_list_is_exact_capability_registry() {
 }
 
 #[test]
-fn mcp_tools_list_default_retains_output_schema() {
-    // Pure renderer with the explicit default compact=false switch; the
-    // env-adapter path for the default is covered end-to-end by
-    // `mcp_tools_list_returns_same_names_as_runtime`.
+fn mcp_tools_list_explicit_full_projection_retains_output_schema() {
+    // Pure renderer with explicit compact=false. Exposure-specific defaults
+    // are covered through the request adapter rather than inferred here.
     let value = mcp_tools_list_payload_with_compact(ModelSurface::FullOperatorRuntime, false);
     let tools = value["tools"].as_array().expect("tools array");
     assert!(!tools.is_empty());
@@ -1505,7 +1535,7 @@ fn mcp_tools_list_default_retains_output_schema() {
         assert!(tool["inputSchema"].is_object());
         assert!(
             tool["outputSchema"].is_object(),
-            "default mode must keep outputSchema for {}",
+            "explicit full projection must keep outputSchema for {}",
             tool["name"]
         );
         assert!(tool["annotations"].is_object() || tool.get("annotations").is_some());
@@ -1520,6 +1550,26 @@ fn retired_start_coding_task_is_absent_from_mcp_discovery() {
         .unwrap()
         .iter()
         .all(|tool| tool["name"] != "start_coding_task"));
+}
+
+#[test]
+fn mcp_work_on_project_schema_exposes_managed_worktree_without_internal_operation() {
+    let payload = mcp_tools_list_payload_with_compact(ModelSurface::FullOperatorRuntime, false);
+    let tools = payload["tools"].as_array().expect("tools array");
+    let work = tools
+        .iter()
+        .find(|tool| tool["name"] == "work_on_project")
+        .expect("work_on_project MCP ToolSpec");
+    let properties = work["inputSchema"]["properties"]
+        .as_object()
+        .expect("work_on_project input properties");
+    assert_eq!(properties["mode"]["enum"], json!(["checkout", "worktree"]));
+    assert_eq!(properties["mode"]["default"], "checkout");
+    assert!(properties.contains_key("base_ref"));
+    assert!(work["outputSchema"]["properties"]["output"]["properties"]["worktree"].is_object());
+    assert!(tools
+        .iter()
+        .all(|tool| tool["name"] != "prepare_managed_worktree"));
 }
 
 #[test]
@@ -1539,7 +1589,7 @@ fn mcp_tools_list_compact_omits_output_schema_only() {
             "compact mode must omit outputSchema for {}",
             tool["name"]
         );
-        // First-version experiment keeps annotations to reduce variables.
+        // Compact projection deliberately preserves annotations; only outputSchema is omitted.
         assert!(
             tool.get("annotations").is_some(),
             "compact mode keeps annotations for {}",
@@ -1683,7 +1733,7 @@ async fn session_tools_exposed_in_registry_and_mcp() {
         validation_summary["inputSchema"]["additionalProperties"],
         false
     );
-    for name in ["read_file", "run_shell", "write_project_file"] {
+    for name in ["read_files", "run_shell", "write_project_file"] {
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == name)
@@ -1955,13 +2005,18 @@ async fn mcp_tools_list_hides_testing_metadata_while_raw_call_records_it() {
         McpOutcome::Ok(value) => value,
         other => panic!("expected tools/list Ok, got {other:?}"),
     };
-    let job_status = listed["result"]["tools"]
-        .as_array()
-        .unwrap()
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    assert!(
+        tools.iter().all(|tool| tool["name"] != "job_status"),
+        "retired job_status must stay absent from MCP tools/list"
+    );
+    let observe_jobs = tools
         .iter()
-        .find(|tool| tool["name"] == "job_status")
-        .expect("job_status must be model-visible on local_coding");
-    let properties = job_status["inputSchema"]["properties"].as_object().unwrap();
+        .find(|tool| tool["name"] == "observe_jobs")
+        .expect("observe_jobs must be model-visible on local_coding");
+    let properties = observe_jobs["inputSchema"]["properties"]
+        .as_object()
+        .unwrap();
     for field in [
         "expected_failure",
         "expected_failure_kind",
@@ -1982,12 +2037,14 @@ async fn mcp_tools_list_hides_testing_metadata_while_raw_call_records_it() {
             "tools/call",
             Some(Value::from(331)),
             mcp_2026_params(json!({
-                "name": "job_status",
+                "name": "stop_job",
                 "arguments": {
                     crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD: &session.session_id,
+                    "project": "agent:nope:nope",
                     "job_id": "missing-job",
+                    "confirm": false,
                     "expected_failure": true,
-                    "expected_failure_kind": "job_not_found",
+                    "expected_failure_kind": "confirmation_required",
                     "assertion_name": "mcp hidden metadata compatibility"
                 }
             })),
@@ -2010,11 +2067,11 @@ async fn mcp_tools_list_hides_testing_metadata_while_raw_call_records_it() {
         .iter()
         .find(|event| event.kind == "tool_call_finished")
         .expect("raw MCP call must be recorded");
-    assert_eq!(finished.tool_name, "job_status");
+    assert_eq!(finished.tool_name, "stop_job");
     assert_eq!(finished.expected_failure, Some(true));
     assert_eq!(
         finished.expected_failure_kind.as_deref(),
-        Some("job_not_found")
+        Some("confirmation_required")
     );
     assert_eq!(
         finished.assertion_name.as_deref(),
@@ -2022,7 +2079,7 @@ async fn mcp_tools_list_hides_testing_metadata_while_raw_call_records_it() {
     );
     assert_eq!(
         finished.actual_failure_kind.as_deref(),
-        Some("job_not_found")
+        Some("confirmation_required")
     );
     assert_eq!(
         finished.failure_expectation_result.as_deref(),
@@ -2032,16 +2089,15 @@ async fn mcp_tools_list_hides_testing_metadata_while_raw_call_records_it() {
 
 #[tokio::test]
 async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_id() {
-    use crate::shell_protocol::{
-        ShellAgentProjectSummary, ShellAgentResultRequest, ShellClientCapabilities,
-        ShellClientRegisterRequest,
+    use crate::runner_protocol::{
+        RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest, RunnerResultRequest,
     };
 
     let runtime = test_runtime();
     runtime
-        .shell_clients
+        .runner_registry
         .register(crate::test_support::current_runner_registration(
-            ShellClientRegisterRequest {
+            RunnerRegisterRequest {
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -2049,13 +2105,13 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: "mcp-client".to_string(),
-                agent_instance_id: "inst".to_string(),
-                agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+                runner_instance_id: "inst".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: None,
                 owner: None,
                 hostname: None,
                 host_context: None,
-                capabilities: ShellClientCapabilities {
+                capabilities: RunnerCapabilities {
                     shell: true,
                     git: true,
                     internal_posix_script: true,
@@ -2067,19 +2123,22 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         "mcp-client",
         "inst",
-        vec![ShellAgentProjectSummary {
+        vec![RunnerProjectSummary {
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: "/tmp/mcp-demo".to_string(),
             allow_patch: true,
             kind: None,
+            registration_source: None,
             description: None,
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -2101,6 +2160,7 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
         crate::tool_runtime::sessions::SessionTransport::Mcp,
         "write_project_file",
         &write_args,
+        crate::tool_runtime::sessions::session_tool_contract("write_project_file"),
     );
     runtime
         .sessions
@@ -2131,21 +2191,21 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
     );
     let complete = async {
         let req = wait_for_mcp_agent_request(
-            &runtime.shell_clients,
+            &runtime.runner_registry,
             "mcp-client",
             "inst",
             "show_changes",
         )
         .await;
-        let stdout = "## main\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nabc123\0abc123\0test head\n@@WEBCODEX_SHOW_CHANGES_SEP@@\n";
+        let stdout = crate::tool_runtime::framed_clean_show_changes_test_stdout("test head", false);
         runtime
-            .shell_clients
-            .complete(ShellAgentResultRequest {
+            .runner_registry
+            .complete(RunnerResultRequest {
                 client_id: "mcp-client".to_string(),
-                agent_instance_id: "inst".to_string(),
+                runner_instance_id: "inst".to_string(),
                 request_id: req.request_id,
                 exit_code: Some(0),
-                stdout: Some(stdout.to_string()),
+                stdout: Some(stdout),
                 stderr: Some(String::new()),
                 duration_ms: Some(1),
                 error: None,

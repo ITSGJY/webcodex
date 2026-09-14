@@ -8,11 +8,13 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 pub(crate) const TOOL_CALL_CONTEXT_REQUEST_FIELD: &str = "context_request";
-pub(crate) const TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD: &str =
-    "__webcodex_stateless_context_request";
 pub(crate) const MAX_CONTEXT_REQUEST_ITEMS: usize = 8;
 pub(crate) const MAX_CONTEXT_REQUEST_KEY_CHARS: usize = 64;
 pub(crate) const MAX_CONTEXT_PROJECTION_BYTES: usize = 20 * 1024;
+const PLUGIN_CATALOG_SCOPES: &[&str] = &[
+    crate::auth::SCOPE_PROJECT_READ,
+    crate::auth::SCOPE_PLUGIN_INSPECT,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContextMaterialScopePolicy {
@@ -62,10 +64,16 @@ pub(crate) const CONTEXT_MATERIAL_SPECS: &[ContextMaterialSpec] = &[
         surface: ContextMaterialSurface::SkillRuntime,
     },
     ContextMaterialSpec {
+        key: "plugins.catalog",
+        project_required: true,
+        scope_policy: ContextMaterialScopePolicy::RequireAll(PLUGIN_CATALOG_SCOPES),
+        surface: ContextMaterialSurface::AnySidecar,
+    },
+    ContextMaterialSpec {
         key: "memory.bootstrap",
         project_required: true,
         scope_policy: ContextMaterialScopePolicy::RequireAll(
-            crate::auth::scopes::MEMORY_READ_SCOPES,
+            webcodex_core::authority::MEMORY_READ_SCOPES,
         ),
         surface: ContextMaterialSurface::MemorySurface,
     },
@@ -109,26 +117,6 @@ fn context_material_scope_available(
     }
 }
 
-pub(crate) fn context_request_from_arguments(arguments: &Value) -> Vec<String> {
-    let Some(values) = arguments
-        .as_object()
-        .and_then(|object| object.get(TOOL_CALL_CONTEXT_REQUEST_INTERNAL_FIELD))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    let mut seen = HashSet::new();
-    values
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .filter(|key| seen.insert((*key).to_string()))
-        .take(MAX_CONTEXT_REQUEST_ITEMS)
-        .map(str::to_string)
-        .collect()
-}
-
 fn projection_envelope(materials: Vec<Value>, truncated: bool) -> Value {
     json!({
         "timing": "post_tool",
@@ -150,6 +138,14 @@ fn unavailable(key: &str, reason_code: &str) -> Value {
         "status": "unavailable",
         "reason_code": reason_code,
     })
+}
+
+fn scope_unavailable_reason(key: &str) -> &'static str {
+    if key == "plugins.catalog" {
+        "plugin_inspect_scope_unavailable"
+    } else {
+        "context_material_scope_unavailable"
+    }
 }
 
 impl ToolRuntime {
@@ -181,7 +177,7 @@ impl ToolRuntime {
                 } else if spec.project_required && resolved_project.is_none() {
                     unavailable(key, "project_target_unavailable")
                 } else if !context_material_scope_available(spec.scope_policy, auth) {
-                    unavailable(key, "context_material_scope_unavailable")
+                    unavailable(key, scope_unavailable_reason(key))
                 } else {
                     match key {
                         "project.instructions" => {
@@ -209,6 +205,21 @@ impl ToolRuntime {
                             let project =
                                 resolved_project.expect("registry requires project target");
                             match self.skills_catalog_context_projection(project, auth).await {
+                                Ok(projection) => json!({
+                                    "key": key,
+                                    "status": "available",
+                                    "projection": projection,
+                                }),
+                                Err(reason_code) => unavailable(key, reason_code),
+                            }
+                        }
+                        "plugins.catalog" => {
+                            let project =
+                                resolved_project.expect("registry requires project target");
+                            match self
+                                .plugin_project_catalog_context_projection(project, auth)
+                                .await
+                            {
                                 Ok(projection) => json!({
                                     "key": key,
                                     "status": "available",

@@ -3,15 +3,14 @@ use crate::auth::scopes::{
     COMMUNICATION_MANAGE_SCOPES, COMMUNICATION_READ_SCOPES, SCOPE_CODING_AGENT_RUN,
     SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ, SCOPE_PROJECT_WRITE,
 };
-use crate::shell_client::ShellClientRegistry;
-use crate::shell_protocol::{
-    ShellAgentResultPayload, ShellAgentResultRequest, ShellClientCapabilities,
-    ShellClientRegisterRequest,
+use crate::runner_http::RunnerRegistry;
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerRegisterRequest, RunnerResultPayload, RunnerResultRequest,
 };
 use crate::tool_runtime::metadata::{
     ToolApprovalPolicy, ToolAuthorityPolicy, ToolEffect, ToolIdempotency, ToolRisk,
 };
-use crate::tool_runtime::tool_definition::{lookup_tool_definition, AgentCapability};
+use crate::tool_runtime::tool_definition::{lookup_tool_definition, RunnerCapabilityRequirement};
 use crate::tool_runtime::{RuntimeInfo, ToolCall, ToolRuntime};
 use serde_json::json;
 use std::sync::Arc;
@@ -54,8 +53,8 @@ async fn register_coding_agent_task_runner(
     inventory: CodingAgentRunInventory,
 ) -> String {
     runtime
-        .shell_clients
-        .register(ShellClientRegisterRequest {
+        .runner_registry
+        .register(RunnerRegisterRequest {
             process_started_at: Some(1_700_000_000),
             build: None,
             job_concurrency_limit: None,
@@ -67,35 +66,33 @@ async fn register_coding_agent_task_runner(
             }]),
             coding_agent_inventory: Some(inventory),
             client_id: client_id.to_string(),
-            agent_instance_id: instance_id.to_string(),
-            agent_protocol_generation: crate::shell_protocol::AGENT_PROTOCOL_GENERATION_V2,
+            runner_instance_id: instance_id.to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: Some("A4a test runner".to_string()),
             owner: Some(owner.to_string()),
             hostname: None,
             host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(
-                ShellClientCapabilities {
-                    coding_agent_runs: true,
-                    ..Default::default()
-                },
-            ),
+            capabilities: crate::test_support::current_runner_capabilities(RunnerCapabilities {
+                coding_agent_runs: true,
+                ..Default::default()
+            }),
             policy: None,
         })
         .await
         .unwrap();
     crate::test_support::apply_project_inventory_snapshot(
-        &runtime.shell_clients,
+        &runtime.runner_registry,
         client_id,
         instance_id,
         vec![registered_project(project_id, &root.to_string_lossy())],
     )
     .await;
-    crate::tool_runtime::agent_project_runtime_id(client_id, project_id)
+    crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
 }
 
 fn runtime_with_agent_task_db(db: Arc<crate::db::Database>) -> ToolRuntime {
     ToolRuntime::new(
-        Arc::new(ShellClientRegistry::default()),
+        Arc::new(RunnerRegistry::default()),
         Arc::new(RuntimeInfo::default()),
     )
     .with_communication_database(db)
@@ -119,7 +116,10 @@ fn agent_task_tools_are_definition_owned_and_a4a_adds_execution_authority_explic
         );
         assert_eq!(definition.category, "agent_task");
         assert!(!definition.metadata.requires_project);
-        assert_eq!(definition.agent_capability, None::<AgentCapability>);
+        assert_eq!(
+            definition.runner_capability,
+            None::<RunnerCapabilityRequirement>
+        );
         assert_eq!(definition.metadata.provider_id, "control");
     }
 
@@ -128,8 +128,8 @@ fn agent_task_tools_are_definition_owned_and_a4a_adds_execution_authority_explic
     assert_eq!(start_coding.category, "agent_task");
     assert!(start_coding.metadata.requires_project);
     assert_eq!(
-        start_coding.agent_capability,
-        Some(AgentCapability::CodingAgentRuns)
+        start_coding.runner_capability,
+        Some(RunnerCapabilityRequirement::CodingAgentRuns)
     );
     assert_eq!(start_coding.metadata.provider_id, "agent");
     assert_eq!(start_coding.metadata.effect, ToolEffect::Execute);
@@ -153,7 +153,10 @@ fn agent_task_tools_are_definition_owned_and_a4a_adds_execution_authority_explic
     assert!(reconcile.model_spec.is_some());
     assert_eq!(reconcile.category, "agent_task");
     assert!(!reconcile.metadata.requires_project);
-    assert_eq!(reconcile.agent_capability, None::<AgentCapability>);
+    assert_eq!(
+        reconcile.runner_capability,
+        None::<RunnerCapabilityRequirement>
+    );
     assert_eq!(reconcile.metadata.provider_id, "agent");
     assert_eq!(reconcile.metadata.effect, ToolEffect::Mutate);
     assert_eq!(reconcile.metadata.risk, ToolRisk::WorkflowManage);
@@ -493,6 +496,66 @@ fn runtime_surface_exposes_fence_only_for_exact_start_and_never_requires_endpoin
         1
     );
     assert!(started.output["attempt"].get("attempt_fence").is_none());
+
+    let endpoint_execution = runtime.start_agent_task_endpoint_continuation(
+        None,
+        task_id.clone(),
+        attempt_id.clone(),
+        assignee.clone(),
+        fence.clone(),
+        1,
+    );
+    assert!(
+        endpoint_execution.success,
+        "{:?}",
+        endpoint_execution.output
+    );
+    assert_eq!(
+        endpoint_execution.output["execution"]["wake_state"],
+        "pending"
+    );
+    assert!(endpoint_execution.output["execution"]["endpoint_id"].is_null());
+    assert!(endpoint_execution.output["execution"]["endpoint_controller_generation"].is_null());
+    assert_eq!(endpoint_execution.output["replayed"], false);
+    assert_eq!(endpoint_execution.output["state_changed"], true);
+    let wake_id = endpoint_execution.output["execution"]["wake_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let endpoint_replay = runtime.start_agent_task_endpoint_continuation(
+        None,
+        task_id.clone(),
+        attempt_id.clone(),
+        assignee.clone(),
+        fence.clone(),
+        1,
+    );
+    assert!(endpoint_replay.success, "{:?}", endpoint_replay.output);
+    assert_eq!(endpoint_replay.output["execution"]["wake_id"], wake_id);
+    assert_eq!(endpoint_replay.output["replayed"], true);
+    assert_eq!(endpoint_replay.output["state_changed"], false);
+
+    let endpoint_bound_read = runtime.read_agent_task(None, task_id.clone());
+    assert!(endpoint_bound_read.success);
+    assert_eq!(
+        endpoint_bound_read.output["task"]["summary"]["execution_bound"],
+        true
+    );
+    assert_eq!(
+        endpoint_bound_read.output["task"]["summary"]["execution_status"],
+        "not_started"
+    );
+    assert_eq!(
+        endpoint_bound_read.output["task"]["summary"]["recovery_kind"],
+        "none"
+    );
+    assert!(endpoint_bound_read.output["task"]
+        .get("attempt_fence")
+        .is_none());
+    assert!(!endpoint_bound_read.output["task"]
+        .to_string()
+        .contains("consume_token"));
     assert_eq!(
         _db.conn_for_tests()
             .query_row(
@@ -512,6 +575,8 @@ fn runtime_surface_exposes_fence_only_for_exact_start_and_never_requires_endpoin
         assignee.clone(),
         fence.clone(),
         1,
+        None,
+        None,
     );
     assert!(heartbeat.success, "{:?}", heartbeat.output);
     assert_eq!(heartbeat.output["attempt"]["attempt_id"], attempt_id);
@@ -535,6 +600,10 @@ fn runtime_surface_exposes_fence_only_for_exact_start_and_never_requires_endpoin
     let terminal = runtime.read_agent_task(None, task_id);
     assert!(terminal.success);
     assert_eq!(terminal.output["task"]["summary"]["state"], "succeeded");
+    assert_eq!(
+        terminal.output["task"]["summary"]["execution_status"],
+        "terminal"
+    );
     assert!(terminal.output["task"].get("attempt_fence").is_none());
 }
 
@@ -639,7 +708,7 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
             let result = result.unwrap();
             panic!("A4a start returned before Runner dispatch: success={} output={:?} error={:?}", result.success, result.output, result.error);
         }
-        request = wait_for_agent_request_for_instance(&runtime, client_id, instance_id) => request,
+        request = wait_for_runner_request_for_instance(&runtime, client_id, instance_id) => request,
     };
     let start = match request
         .coding_agent
@@ -670,11 +739,11 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
         terminal: None,
     };
     runtime
-        .shell_clients
-        .complete(ShellAgentResultPayload {
-            result: ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
                 client_id: client_id.to_string(),
-                agent_instance_id: instance_id.to_string(),
+                runner_instance_id: instance_id.to_string(),
                 request_id: request.request_id,
                 exit_code: None,
                 stdout: None,
@@ -684,6 +753,7 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
             },
             command_execution_state: None,
             mcp_gateway: None,
+            plugin_gateway: None,
             coding_agent: Some(CodingAgentResponse::success(
                 CodingAgentResponsePayload::Start {
                     run: running.clone(),
@@ -739,8 +809,11 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
     .await;
     assert_eq!(fresh_project, project);
     let (_, inventory_run) = fresh_runtime
-        .shell_clients
-        .coding_agent_run_for_auth(Some(&auth), &completed.run_id)
+        .runner_registry
+        .coding_agent_run_for_auth(
+            Some(&crate::test_support::runner_access(&auth)),
+            &completed.run_id,
+        )
         .await
         .expect("fresh runtime must see the exact durable CodingAgentRun inventory entry");
     assert_eq!(inventory_run, completed);
@@ -904,7 +977,7 @@ fn foreign_runtime_task_ids_are_existence_hidden_and_project_reference_grants_no
 
     let definition = lookup_tool_definition("create_agent_task").unwrap();
     assert!(!definition.metadata.requires_project);
-    assert_eq!(definition.agent_capability, None);
+    assert_eq!(definition.runner_capability, None);
     assert!(!matches!(
         definition.metadata.risk,
         ToolRisk::ProjectWrite | ToolRisk::JobRun

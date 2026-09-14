@@ -16,11 +16,7 @@ mod admin_http;
 mod admin_project_lifecycle;
 #[cfg(test)]
 mod agent_continuation_tests;
-mod agent_quic;
-mod agent_session;
-mod agent_tokens_http;
 mod agent_wake;
-mod agent_ws;
 mod audit_http;
 mod auth;
 mod client_window;
@@ -30,6 +26,7 @@ mod console_web;
 mod db;
 mod host_console_http;
 mod job_observation;
+mod job_receipts;
 mod mcp;
 mod mcp_gateway;
 mod model_surface;
@@ -37,15 +34,21 @@ mod models;
 mod oauth_http;
 mod openapi;
 mod pairing_http;
+mod plugin_gateway;
 mod project_entry;
 mod projects;
 mod route_metadata;
+mod runner_http;
+mod runner_quic;
+mod runner_session;
+mod runner_tokens_http;
+mod runner_ws;
 mod runtime_console_http;
 mod runtime_http;
 mod server_instance;
 mod server_listener;
 mod server_shutdown;
-mod shell_client;
+mod ssh_resource_gateway;
 mod startup;
 mod task_cli;
 #[cfg(test)]
@@ -53,32 +56,37 @@ mod test_support;
 mod tool_request_trace;
 mod tool_runtime;
 mod users_http;
+mod workspace_activity_store;
 
 #[cfg(test)]
 pub(crate) use webcodex_admin as admin_cli;
 pub(crate) use webcodex_core::{
     apply_edits_shared, apply_patch_shared, artifact_policy, build_info, lsp_bridge,
-    sensitive_paths, shell_protocol, validation_bridge,
+    runner_protocol, sensitive_paths,
 };
 pub(crate) use webcodex_runner_config as runner_config;
-pub(crate) use webcodex_workspace::{project_context, project_overview, workspace_checkpoint};
+pub(crate) use webcodex_workspace::project_overview;
+#[cfg(all(test, feature = "workspace-checkpoints"))]
+pub(crate) use webcodex_workspace::workspace_checkpoint;
 
 pub(crate) use auth::{get_db, json_error, AuthMiddleware};
 pub(crate) use config::load_startup_env_files;
 #[cfg(test)]
 pub(crate) use config::parse_env_file_line;
-pub use config::CodexConfig;
 pub use config::Config;
 pub use config::OAuth2Config;
 pub use db::{Database, RotateResult};
 pub use models::{ActionEventRecord, ActionSessionRecord};
 pub(crate) use openapi::openapi_json;
-pub(crate) use shell_client::{
-    shell_agent_job_update, shell_agent_persistent_shell_result, shell_agent_poll,
-    shell_agent_register, shell_agent_result, shell_file_op, shell_job, shell_job_log,
-    shell_job_status, shell_job_stop, shell_jobs_list, shell_run, ShellClientRegistry,
+pub(crate) use runner_http::{
+    runner_job_update, runner_offline, runner_persistent_shell_result, runner_poll,
+    runner_register, runner_result, shell_file_op, shell_job, shell_job_log, shell_job_status,
+    shell_job_stop, shell_jobs_list, shell_run, RunnerRegistry,
 };
-pub use startup::{is_project_command, run_project_command, CliCommandOutput};
+pub use startup::{
+    is_project_command, run_project_command, run_regular_server_tunnel, CliCommandOutput,
+    RegularServerTunnelOptions,
+};
 
 // ============================================================================
 // Main
@@ -86,7 +94,9 @@ pub use startup::{is_project_command, run_project_command, CliCommandOutput};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerBinaryAction {
-    Run,
+    Run {
+        stop_on_stdin_eof: bool,
+    },
     Exit {
         code: i32,
         stdout: String,
@@ -104,10 +114,15 @@ where
         .map(|arg| arg.as_ref().to_string())
         .collect();
     match args.as_slice() {
-        [] => ServerBinaryAction::Run,
+        [] => ServerBinaryAction::Run {
+            stop_on_stdin_eof: false,
+        },
+        [arg] if arg == "--stop-on-stdin-eof" => ServerBinaryAction::Run {
+            stop_on_stdin_eof: true,
+        },
         [arg] if matches!(arg.as_str(), "--help" | "-h") => ServerBinaryAction::Exit {
             code: 0,
-            stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n  -h, --help       Print help and exit\n  -V, --version    Print version and exit\n".to_string(),
+            stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n      --stop-on-stdin-eof  Stop when the invoking parent closes stdin\n  -h, --help               Print help and exit\n  -V, --version            Print version and exit\n".to_string(),
             stderr: String::new(),
         },
         [arg] if matches!(arg.as_str(), "--version" | "-V") => ServerBinaryAction::Exit {
@@ -168,6 +183,13 @@ pub fn prepare_server_process_environment() -> Result<(), String> {
 }
 
 pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+    run_server_with_parent_liveness(false).await
+}
+
+#[doc(hidden)]
+pub async fn run_server_with_parent_liveness(
+    stop_on_stdin_eof: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let env_loads = match PREPARED_SERVER_ENV_LOADS.get() {
         Some(prepared) => prepared.clone(),
         None => load_startup_env_files().map_err(std::io::Error::other)?,
@@ -217,7 +239,7 @@ only for local/trusted-network demos."
     if let Some(directory) = console_asset_source.directory() {
         tracing::info!("Console assets directory: {}", directory.display());
     }
-    std::fs::create_dir_all(config.uploads_dir())?;
+    std::fs::create_dir_all(&config.data_dir)?;
     let db = Database::open(&config.db_path())?;
     let server_instance_guard = server_instance::ServerInstanceGuard::acquire(&db)?;
     db.recover_agent_wakes_for_server_takeover(
@@ -238,7 +260,7 @@ only for local/trusted-network demos."
     // login form to the consent decision. PAT/bootstrap plaintext is never
     // stored here — only the resolved user identity.
     let authorize_session_store = Arc::new(oauth_http::AuthorizeSessionStore::new());
-    let shell_registry = Arc::new(ShellClientRegistry::default());
+    let runner_registry = Arc::new(job_receipts::production_registry(db.clone()).await);
     // Root HTTP admission consults this process-local state before any
     // side-effecting handler can run. It closes the small race between the
     // authoritative drain transition and Salvo consuming its stop command.
@@ -256,14 +278,19 @@ only for local/trusted-network demos."
     ));
     let runtime_state_dir = config.runtime_state_dir();
     let mut tool_runtime_builder =
-        tool_runtime::ToolRuntime::new(shell_registry.clone(), runtime_info.clone())
+        tool_runtime::ToolRuntime::new(runner_registry.clone(), runtime_info.clone())
             .with_runtime_exposure(runtime_exposure)
+            .with_window_activity_database(db.clone())
             .with_memory_database(db.clone())
             .with_communication_database(db.clone())
-            .with_checkpoint_state_dir(runtime_state_dir.clone())
             .with_session_ledger(config.session_ledger_path())
             .with_persistent_coding_agent_observation_state(&runtime_state_dir)
             .map_err(std::io::Error::other)?;
+    #[cfg(feature = "workspace-checkpoints")]
+    {
+        tool_runtime_builder =
+            tool_runtime_builder.with_checkpoint_state_dir(runtime_state_dir.clone());
+    }
     if let Some(activity_store) = db::WorkspaceActivityStore::from_env(db.clone()) {
         tool_runtime_builder =
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));
@@ -291,7 +318,7 @@ only for local/trusted-network demos."
         );
     }
 
-    // Custom QUIC agent transport. Default disabled;
+    // Custom QUIC Runner transport. Default disabled;
     // only starts when WEBCODEX_QUIC_ENABLED=true. Runs a separate quinn UDP
     // listener in parallel with the HTTP server. HTTP/WebSocket/polling and
     // the GPT Actions / Nginx path are completely unaffected. This is NOT
@@ -311,11 +338,11 @@ only for local/trusted-network demos."
         } else {
             let quic_config = config.clone();
             let quic_db = db.clone();
-            let quic_registry = shell_registry.clone();
+            let quic_registry = runner_registry.clone();
             let quic_cfg_task = quic_cfg.clone();
             let quic_status = runtime_info.quic.clone();
             tokio::spawn(async move {
-                if let Err(e) = agent_quic::run_quic_agent_listener(
+                if let Err(e) = runner_quic::run_runner_quic_listener(
                     quic_config,
                     Some(quic_db),
                     quic_registry,
@@ -331,7 +358,7 @@ only for local/trusted-network demos."
                 }
             });
             tracing::info!(
-                "Agent QUIC configured on UDP {} ALPN {}",
+                "Runner QUIC configured on UDP {} ALPN {}",
                 quic_cfg.listen,
                 quic_cfg.alpn
             );
@@ -357,14 +384,6 @@ only for local/trusted-network demos."
                 .post(runtime_http::import_conversation_files_to_project),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsStatus))
-                .post(runtime_http::job_status),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::JobsLog))
-                .post(runtime_http::job_log),
-        )
-        .push(
             Router::with_path(route_metadata::api_path(RouteId::JobsStop))
                 .post(runtime_http::job_stop),
         )
@@ -375,6 +394,14 @@ only for local/trusted-network demos."
         .push(
             Router::with_path(route_metadata::api_path(RouteId::JobsTail))
                 .post(runtime_http::job_tail),
+        )
+        .push(
+            Router::with_path(route_metadata::api_path(RouteId::RunnerConfigCheck))
+                .post(runtime_http::runner_config_check),
+        )
+        .push(
+            Router::with_path(route_metadata::api_path(RouteId::RunnerConfigReload))
+                .post(runtime_http::runner_config_reload),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::ProjectsList))
@@ -393,28 +420,16 @@ only for local/trusted-network demos."
                 .post(runtime_http::projects_unregister),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsReadFile))
-                .post(runtime_http::projects_read_file),
+            Router::with_path(route_metadata::api_path(RouteId::ProjectsResolveOrRegister))
+                .post(runtime_http::projects_resolve_or_register),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::ProjectsGitStatus))
                 .post(runtime_http::projects_git_status),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitDiff))
-                .post(runtime_http::projects_git_diff),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsGitDiffSummary))
-                .post(runtime_http::projects_git_diff_summary),
-        )
-        .push(
             Router::with_path(route_metadata::api_path(RouteId::ProjectsListFiles))
                 .post(runtime_http::projects_list_files),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ProjectsSearchText))
-                .post(runtime_http::projects_search_text),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::ProjectsApplyUnifiedDiff))
@@ -505,19 +520,19 @@ only for local/trusted-network demos."
         // endpoints so a leaked agent token cannot mint more tokens.
         .push(
             Router::with_path(route_metadata::api_path(RouteId::AgentTokensCreate))
-                .post(agent_tokens_http::agent_tokens_create),
+                .post(runner_tokens_http::runner_tokens_create),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::AgentTokensRegisterHash))
-                .post(agent_tokens_http::agent_tokens_register_hash),
+                .post(runner_tokens_http::runner_tokens_register_hash),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::AgentTokensList))
-                .post(agent_tokens_http::agent_tokens_list),
+                .post(runner_tokens_http::runner_tokens_list),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::AgentTokensRevoke))
-                .post(agent_tokens_http::agent_tokens_revoke),
+                .post(runner_tokens_http::runner_tokens_revoke),
         )
         .push(Router::with_path(route_metadata::api_path(RouteId::ShellRun)).post(shell_run))
         .push(Router::with_path(route_metadata::api_path(RouteId::ShellFile)).post(shell_file_op))
@@ -538,32 +553,33 @@ only for local/trusted-network demos."
                 .post(shell_jobs_list),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellAgentRegister))
-                .post(shell_agent_register),
+            Router::with_path(route_metadata::api_path(RouteId::RunnerRegister))
+                .post(runner_register),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellAgentPoll))
-                .post(shell_agent_poll),
+            Router::with_path(route_metadata::api_path(RouteId::RunnerOffline))
+                .post(runner_offline),
         )
+        .push(Router::with_path(route_metadata::api_path(RouteId::RunnerPoll)).post(runner_poll))
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellAgentResult))
-                .post(shell_agent_result),
+            Router::with_path(route_metadata::api_path(RouteId::RunnerResult)).post(runner_result),
         )
         .push(
             Router::with_path(route_metadata::api_path(
-                RouteId::ShellAgentPersistentShellResult,
+                RouteId::RunnerPersistentShellResult,
             ))
-            .post(shell_agent_persistent_shell_result),
+            .post(runner_persistent_shell_result),
         )
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellAgentJobUpdate))
-                .post(shell_agent_job_update),
+            Router::with_path(route_metadata::api_path(RouteId::RunnerJobUpdate))
+                .post(runner_job_update),
         )
-        // WebSocket agent transport (preferred long-lived connection).
+        // WebSocket Runner transport (preferred long-lived connection).
         // Polling endpoints above remain as fallback. Bearer auth is
         // enforced by the shared AuthMiddleware hoop.
         .push(
-            Router::with_path(route_metadata::api_path(RouteId::AgentsWs)).get(agent_ws::agent_ws),
+            Router::with_path(route_metadata::api_path(RouteId::RunnerWs))
+                .get(runner_ws::runner_ws),
         );
 
     let api_router = Router::with_path("api")
@@ -648,7 +664,7 @@ only for local/trusted-network demos."
         // waits are <= ~122s and MCP dispatch is hard-bounded at 150s — so it
         // only fires on a genuinely unbounded hang, converting a permanently
         // silent request into an explicit 503. Long-lived work is unaffected:
-        // agent polling replies immediately and WebSocket connections live in
+        // Runner polling replies immediately and WebSocket connections live in
         // a task spawned after the (fast) upgrade handshake completes.
         .hoop(salvo::timeout::Timeout::new(
             std::time::Duration::from_secs(REQUEST_HARD_TIMEOUT_SECS),
@@ -656,7 +672,7 @@ only for local/trusted-network demos."
         .hoop(affix_state::inject(config.clone()))
         .hoop(affix_state::inject(db.clone()))
         .hoop(affix_state::inject(authorize_session_store.clone()))
-        .hoop(affix_state::inject(shell_registry.clone()))
+        .hoop(affix_state::inject(runner_registry.clone()))
         .hoop(affix_state::inject(tool_runtime.clone()))
         .hoop(affix_state::inject(connector_runtime.clone()))
         .hoop(affix_state::inject(console_asset_source))
@@ -758,14 +774,17 @@ only for local/trusted-network demos."
         "tool_request_trace"
     );
     tracing::info!(
-        mcp_compact_schemas = crate::config::mcp_compact_schemas_enabled(),
+        mcp_compact_schemas = crate::model_surface::effective_mcp_compact_schemas(
+            runtime_exposure,
+            crate::config::mcp_compact_schemas_override(),
+        ),
         "mcp_compact_schemas"
     );
     tracing::info!("OpenAPI (GPT Actions): {}/openapi.json", base);
     tracing::info!("MCP App console: {}/console", base);
     tracing::info!("Runtime status: {}/api/runtime/status", base);
-    tracing::info!("Agent WebSocket: {}/api/agents/ws", base);
-    tracing::info!("Agent polling (fallback): {}/api/shell/agent/poll", base);
+    tracing::info!("Runner WebSocket: {}/api/agents/ws", base);
+    tracing::info!("Runner polling (fallback): {}/api/shell/agent/poll", base);
     tracing::info!("Audit API (read-only): {}/api/audit/sessions", base);
     // Periodic recovery-timeout sweep for disconnected reconciliation-capable
     // runners. A job whose runner disconnected enters `recovering`; if that
@@ -776,10 +795,10 @@ only for local/trusted-network demos."
     // dies with the process. A server restart resets the in-memory registry;
     // the deadline is re-anchored only when a runner reconnects and submits its
     // inventory. See docs/RUNNER.md (reconnect and recovery).
-    let sweep_registry = shell_registry.clone();
+    let sweep_registry = runner_registry.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            shell_client::RECOVERY_SWEEP_INTERVAL_SECS,
+            runner_http::RECOVERY_SWEEP_INTERVAL_SECS,
         ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the first (immediate) tick so a sweep does not race startup
@@ -787,7 +806,7 @@ only for local/trusted-network demos."
         interval.tick().await;
         loop {
             interval.tick().await;
-            shell_client::recovery_timeout_sweep(&sweep_registry).await;
+            runner_http::recovery_timeout_sweep(&sweep_registry).await;
         }
     });
     server_shutdown::serve_until_termination(
@@ -795,6 +814,7 @@ only for local/trusted-network demos."
         router,
         shutdown_coordinator,
         std::time::Duration::from_secs(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
+        stop_on_stdin_eof,
     )
     .await?;
     Ok(())
@@ -803,6 +823,22 @@ only for local/trusted-network demos."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_parent_liveness_is_explicit_opt_in() {
+        assert_eq!(
+            server_binary_action(std::iter::empty::<&str>()),
+            ServerBinaryAction::Run {
+                stop_on_stdin_eof: false,
+            }
+        );
+        assert_eq!(
+            server_binary_action(["--stop-on-stdin-eof"]),
+            ServerBinaryAction::Run {
+                stop_on_stdin_eof: true,
+            }
+        );
+    }
 
     #[test]
     fn test_parse_env_file_line_basic() {
@@ -856,11 +892,6 @@ mod tests {
         env.remove("WEBCODEX_ADDR");
         env.remove("WEBCODEX_DATA");
         env.remove("WEBCODEX_TOKEN");
-        env.remove("CODEX_BIN");
-        env.remove("CODEX_APPROVAL_MODE");
-        env.remove("CODEX_DEFAULT_TIMEOUT_SECS");
-        env.remove("CODEX_MAX_PROMPT_BYTES");
-        env.remove("CODEX_ALLOWED_EXTRA_ARGS");
 
         let config = Config::from_env();
         assert_eq!(config.addr, "0.0.0.0:8080");
@@ -868,12 +899,6 @@ mod tests {
         assert_eq!(config.token, None);
         assert!(!config.is_auth_enabled());
         assert_eq!(config.max_text_size, 2 * 1024 * 1024);
-        assert_eq!(config.max_file_size, 100 * 1024 * 1024);
-        assert_eq!(config.codex.bin, "codex");
-        assert_eq!(config.codex.approval_mode, "");
-        assert_eq!(config.codex.default_timeout_secs, 3600);
-        assert_eq!(config.codex.max_prompt_bytes, 100_000);
-        assert!(config.codex.allowed_extra_args.is_empty());
     }
 
     #[test]
@@ -883,8 +908,6 @@ mod tests {
             data_dir: PathBuf::from("./data"),
             token: Some("secret123".to_string()),
             max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         };
         assert!(config.is_auth_enabled());
@@ -900,8 +923,6 @@ mod tests {
             data_dir: PathBuf::from("./data"),
             token: None,
             max_text_size: 2 * 1024 * 1024,
-            max_file_size: 100 * 1024 * 1024,
-            codex: CodexConfig::default(),
             oauth2: crate::OAuth2Config::default(),
         };
         assert!(!config.is_auth_enabled());

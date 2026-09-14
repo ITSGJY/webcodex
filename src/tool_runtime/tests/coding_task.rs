@@ -1,12 +1,13 @@
 use super::support::*;
 use crate::auth::AuthContext;
-use crate::shell_protocol::{AgentPolicySummary, ShellClientCapabilities};
+use crate::runner_protocol::RunnerPolicySummary;
 use crate::tool_runtime::handoff::VALIDATION_IDENTITY_REUSE_ACTION;
 use crate::tool_runtime::metadata::lookup_tool_metadata;
 use crate::tool_runtime::sessions::SessionTransport;
 use crate::tool_runtime::validation_parser::VALIDATION_OUTPUT_METADATA_ABSENT_REASON;
 use crate::tool_runtime::{
-    is_known_tool_name, registered_tool_specs, SessionMode, ToolCall, ToolResult, ToolRuntime,
+    is_known_tool_name, registered_tool_specs, SessionMode, StartupDetail, ToolCall, ToolResult,
+    ToolRuntime,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -42,8 +43,22 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         "internal Runner path resolution must not become model-visible"
     );
     assert!(!is_known_tool_name("resolve_or_register_project"));
+    assert!(!is_known_tool_name("prepare_managed_worktree"));
+    assert!(
+        !names.contains(&"prepare_managed_worktree"),
+        "managed worktree preparation must remain ModelHidden"
+    );
 
-    for name in ["start_coding_task", "finish_coding_task"] {
+    assert!(
+        !is_known_tool_name("start_coding_task"),
+        "retired start_coding_task must not remain a current tool identity"
+    );
+    assert!(lookup_tool_metadata("start_coding_task").is_none());
+    assert!(
+        crate::tool_runtime::tool_definition::lookup_tool_definition("start_coding_task").is_none()
+    );
+
+    for name in ["work_on_project", "finish_coding_task"] {
         assert!(is_known_tool_name(name), "{name} missing from known names");
         let metadata = lookup_tool_metadata(name).expect("metadata");
         assert!(!metadata.destructive);
@@ -53,7 +68,7 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
             crate::tool_runtime::metadata::ToolAuthorityPolicy::Require("runtime:read")
         );
     }
-    let start_metadata = lookup_tool_metadata("start_coding_task").expect("start metadata");
+    let start_metadata = lookup_tool_metadata("work_on_project").expect("work metadata");
     assert_eq!(
         start_metadata.effect,
         crate::tool_runtime::metadata::ToolEffect::Mutate
@@ -80,15 +95,12 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         crate::tool_runtime::metadata::ToolIdempotency::PureRead
     );
     assert!(!names.contains(&"start_coding_task"));
+    assert!(names.contains(&"work_on_project"));
     assert!(names.contains(&"finish_coding_task"));
-    let start_definition =
-        crate::tool_runtime::tool_definition::lookup_tool_definition("start_coding_task").unwrap();
-    assert!(start_definition.visibility.is_model_hidden());
 
     let retired = ToolCall::from_tool_name("start_coding_task", json!({"project": "demo"}))
-        .expect_err("retired start_coding_task wire entry must fail closed");
-    assert!(retired.contains("no longer supported"));
-    assert!(retired.contains("work_on_project"));
+        .expect_err("retired start_coding_task must be an ordinary unknown tool");
+    assert!(retired.contains("unknown tool 'start_coding_task'"));
     let finish = specs
         .iter()
         .find(|spec| spec.name == "finish_coding_task")
@@ -103,7 +115,6 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     let work_props = work.input_schema["properties"].as_object().unwrap();
     for advanced in [
         "temporary_project_name",
-        "mode",
         "deny_write_tools",
         "deny_shell_tools",
         "execution_context",
@@ -117,7 +128,29 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
             "work_on_project must not grow advanced start knob {advanced}"
         );
     }
-    let start_output = crate::tool_runtime::registry::output_schema_for_tool("start_coding_task");
+    assert_eq!(work_props["mode"]["enum"], json!(["checkout", "worktree"]));
+    assert_eq!(work_props["mode"]["default"], "checkout");
+    assert!(work_props["base_ref"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("Runner resolves")));
+    for phrase in [
+        "mode=worktree",
+        "exact Git base",
+        "isolated worktree",
+        "Project authority",
+    ] {
+        assert!(
+            work.description.contains(phrase),
+            "work_on_project description should retain {phrase}: {}",
+            work.description
+        );
+    }
+    let work_output = crate::tool_runtime::registry::output_schema_for_tool("work_on_project");
+    assert!(work_output["properties"]["output"]["properties"]
+        .as_object()
+        .is_some_and(|properties| properties.contains_key("worktree")));
+    let start_output =
+        crate::tool_runtime::registry::coding_workflow_diagnostic_output_schema_for_test();
     let startup_variants = start_output["properties"]["output"]["oneOf"]
         .as_array()
         .expect("start output should expose detail-specific variants");
@@ -145,14 +178,14 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
             .as_object()
             .unwrap()
             .contains_key("startup_verdict"),
-        "start_coding_task output schema should include startup_verdict"
+        "coding workflow diagnostic schema should include startup_verdict"
     );
     assert!(
         standard["properties"]
             .as_object()
             .unwrap()
             .contains_key("project_resolution"),
-        "start_coding_task output schema should include project_resolution"
+        "coding workflow diagnostic schema should include project_resolution"
     );
     assert!(
         !standard["properties"]
@@ -207,6 +240,8 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         "project",
         "client_id",
         "path",
+        "mode",
+        "base_ref",
         "execution_context",
         "include_hygiene",
         "include_handoff",
@@ -222,7 +257,6 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     }
     for field in [
         "temporary_project_name",
-        "mode",
         "deny_write_tools",
         "deny_shell_tools",
         "detail",
@@ -255,24 +289,19 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         .values()
         .map(|methods| methods.as_object().unwrap().len())
         .sum();
-    assert_eq!(operation_count, 22, "no dedicated OpenAPI operations added");
-
-    let call =
-        internal_start_coding_task_call(json!({"project": "agent:test:demo", "detail": "full"}));
     assert_eq!(
-        call.session_log_arguments()["detail"],
-        "full",
-        "ToolCall audit serialization must preserve detail"
+        operation_count, 16,
+        "retired dedicated OpenAPI operations stay absent"
     );
 }
 
 #[tokio::test]
-async fn hidden_start_coding_task_keeps_internal_advanced_dispatch() {
+async fn coding_workflow_test_seam_keeps_internal_diagnostic_modes_without_tool_identity() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let client_id = "advanced-hidden-start";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let params = json!({
         "project": project,
@@ -282,18 +311,9 @@ async fn hidden_start_coding_task_keeps_internal_advanced_dispatch() {
     });
 
     let wire_error = ToolCall::from_tool_name("start_coding_task", params.clone())
-        .expect_err("retired wire entry must reject the internal advanced primitive");
-    assert!(wire_error.contains("work_on_project"));
-    let parsed = internal_start_coding_task_call(params.clone());
-    match parsed {
-        ToolCall::StartCodingTask { mode, detail, .. } => {
-            assert_eq!(mode, SessionMode::ReadOnly);
-            assert_eq!(detail, crate::tool_runtime::StartupDetail::Minimal);
-        }
-        other => panic!("expected StartCodingTask, got {}", other.tool_name()),
-    }
-
-    let result = start_coding_task_serviced(&runtime, client_id, params, &auth).await;
+        .expect_err("retired wire entry must remain unknown despite internal test-seam arguments");
+    assert!(wire_error.contains("unknown tool 'start_coding_task'"));
+    let result = coding_workflow_serviced(&runtime, client_id, params, &auth).await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["detail"], "minimal");
     let session_id = result.output["session"]["session_id"].as_str().unwrap();
@@ -304,186 +324,7 @@ async fn hidden_start_coding_task_keeps_internal_advanced_dispatch() {
 }
 
 #[tokio::test]
-async fn start_coding_task_creates_managed_temporary_project_then_restores_it_as_normal_project() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ledger = tmp.path().join("sessions.json");
-    let existing_root = tmp.path().join("existing-project");
-    let temporary_root = tmp.path().join("managed-temporary-project");
-    std::fs::create_dir(&existing_root).unwrap();
-    std::fs::create_dir(&temporary_root).unwrap();
-    init_git_repo(&existing_root);
-    init_git_repo(&temporary_root);
-    commit_file(
-        &temporary_root,
-        "README.md",
-        "temporary\n",
-        "initial temporary project",
-    );
-
-    let client_id = "temporary-runner";
-    let temporary_project_id = "temporary-7f01";
-    let temporary_runtime_id =
-        crate::tool_runtime::agent_project_runtime_id(client_id, temporary_project_id);
-    let temporary_path = temporary_root.to_string_lossy().to_string();
-    let auth = auth_context(None, true);
-    let runtime1 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    let existing_runtime_id =
-        register_agent_project_at_path(&runtime1, client_id, "existing", &existing_root).await;
-
-    let task = tokio::spawn({
-        let runtime = runtime1.clone();
-        let auth = auth.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::StartCodingTask {
-                        project: String::new(),
-                        client_id: Some(client_id.to_string()),
-                        path: None,
-                        temporary_project_name: Some("Scratch task".to_string()),
-                        title: Some("implement a temporary task".to_string()),
-                        mode: SessionMode::Normal,
-                        detail: crate::tool_runtime::StartupDetail::Full,
-                        deny_write_tools: false,
-                        deny_shell_tools: false,
-                        resume_session_id: None,
-                        execution_context: None,
-                    },
-                    Some(&auth),
-                )
-                .await
-        }
-    });
-
-    let mut create_seen = false;
-    let startup_deadline = Instant::now() + Duration::from_secs(10);
-    while !task.is_finished() {
-        assert!(
-            Instant::now() < startup_deadline,
-            "managed temporary startup did not finish within the 10-second test deadline"
-        );
-        let Some(request) = probe_patch_agent_request(&runtime1, client_id).await else {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            continue;
-        };
-        if request.kind == "create_project" {
-            create_seen = true;
-            let payload: Value = serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
-            assert_eq!(payload["managed_temporary_project"], true);
-            assert_eq!(payload["name"], "Scratch task");
-            assert!(payload.get("id").is_none());
-            assert!(payload.get("path").is_none());
-            complete_patch_agent_request(
-                &runtime1,
-                client_id,
-                &request.request_id,
-                0,
-                &json!({
-                    "id": temporary_runtime_id.clone(),
-                    "agent_project_id": temporary_project_id,
-                    "client_id": client_id,
-                    "name": "Scratch task",
-                    "path": temporary_path,
-                    "kind": "managed_temporary",
-                    "source": "managed_temporary",
-                    "allow_patch": true,
-                    "created_directory": true,
-                    "created_config": true,
-                    "overwritten": false,
-                    "operation": "create",
-                    "outcome": "created"
-                })
-                .to_string(),
-                "",
-            )
-            .await;
-        } else {
-            complete_agent_request_by_running_locally(&runtime1, client_id, request).await;
-        }
-    }
-    assert!(
-        task.is_finished(),
-        "managed temporary startup did not finish"
-    );
-    assert!(
-        create_seen,
-        "startup did not ask the Runner to create a project"
-    );
-
-    let result = task.await.unwrap();
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["project"], temporary_runtime_id);
-    assert_eq!(
-        result.output["resolved_project"]["id"],
-        temporary_runtime_id
-    );
-    let session_id = result.output["session"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(session_id.starts_with("wc_sess_"));
-
-    let projects = runtime1.list_projects(Some(&auth)).await;
-    assert!(projects.success);
-    let projects = projects.output["projects"].as_array().unwrap();
-    assert!(projects.iter().any(|project| {
-        project["id"] == temporary_runtime_id && project["source"] == "managed_temporary"
-    }));
-    assert!(projects.iter().any(|project| {
-        project["id"] == existing_runtime_id && project["source"] == "agent_registered"
-    }));
-    let resolved = runtime1
-        .resolve_project_input_for_auth(&temporary_runtime_id, Some(&auth))
-        .await
-        .unwrap();
-    assert_eq!(resolved.resolved_id, temporary_runtime_id);
-    assert_eq!(resolved.config.path, temporary_root.to_string_lossy());
-
-    runtime1.sessions.flush_persistence();
-    drop(runtime1);
-
-    // A restarted server only needs the Runner's normal persisted project
-    // registration to be reported again. The same normal resolver and Session
-    // ledger then recover the project/session pair without a temporary type.
-    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    let capabilities = ShellClientCapabilities {
-        shell: true,
-        git: true,
-        file_read: true,
-        file_write: true,
-        ..Default::default()
-    };
-    let mut temporary_summary = registered_project(
-        temporary_project_id,
-        temporary_root.to_string_lossy().as_ref(),
-    );
-    temporary_summary.name = Some("Scratch task".to_string());
-    temporary_summary.kind = Some("managed_temporary".to_string());
-    register_agent_projects(
-        &runtime2,
-        client_id,
-        None,
-        capabilities,
-        vec![temporary_summary],
-    )
-    .await;
-    let resolved_after_restart = runtime2
-        .resolve_project_input_for_auth(&temporary_runtime_id, Some(&auth))
-        .await
-        .unwrap();
-    assert_eq!(resolved_after_restart.resolved_id, temporary_runtime_id);
-    assert_eq!(
-        runtime2
-            .sessions
-            .summary(&session_id, None)
-            .unwrap()
-            .project,
-        Some(temporary_runtime_id)
-    );
-}
-
-#[tokio::test]
-async fn start_coding_task_full_brief_has_no_binding_projection() {
+async fn coding_workflow_full_diagnostic_has_no_binding_projection() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(
@@ -495,38 +336,20 @@ async fn start_coding_task_full_brief_has_no_binding_projection() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-start", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-start", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        let auth = auth.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::StartCodingTask {
-                        project,
-                        client_id: None,
-                        path: None,
-                        temporary_project_name: None,
-                        title: Some("implement deterministic aggregate".to_string()),
-                        mode: SessionMode::Normal,
-                        detail: crate::tool_runtime::StartupDetail::Full,
-                        deny_write_tools: false,
-                        deny_shell_tools: false,
-                        resume_session_id: None,
-                        execution_context: None,
-                    },
-                    Some(&auth),
-                )
-                .await
-        }
-    });
-
-    service_agent_task_until_finished(&runtime, "coding-start", &task, "start_coding_task").await;
-
-    let result = task.await.unwrap();
+    let result = coding_workflow_serviced(
+        &runtime,
+        "coding-start",
+        json!({
+            "project": project,
+            "title": "implement deterministic aggregate",
+            "detail": "full"
+        }),
+        &auth,
+    )
+    .await;
 
     assert!(result.success, "{:?}", result.error);
     let session_id = result.output["session"]["session_id"].as_str().unwrap();
@@ -552,7 +375,7 @@ async fn start_coding_task_full_brief_has_no_binding_projection() {
     ] {
         assert!(
             result.output.get(field).is_some(),
-            "start_coding_task output should include {field}"
+            "coding workflow diagnostic should include {field}"
         );
     }
     assert_eq!(result.output["authority"]["mode"], "trusted_agent");
@@ -561,9 +384,11 @@ async fn start_coding_task_full_brief_has_no_binding_projection() {
     let inspect = result.output["recommended_flow"]["inspect"]
         .as_array()
         .unwrap();
-    assert!(contains_string(inspect, "read_file"));
-    assert!(contains_string(inspect, "search_project_text"));
+    assert!(contains_string(inspect, "read_files"));
+    assert!(contains_string(inspect, "search_project_texts"));
     assert!(contains_string(inspect, "show_changes"));
+    assert!(!contains_string(inspect, "read_file"));
+    assert!(!contains_string(inspect, "search_project_text"));
     let edit = result.output["recommended_flow"]["edit"]
         .as_array()
         .unwrap();
@@ -624,32 +449,24 @@ async fn start_coding_task_full_brief_has_no_binding_projection() {
 }
 
 #[tokio::test]
-async fn start_coding_task_can_omit_compact_tool_manifest() {
+async fn coding_workflow_standard_omits_compact_tool_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-no-manifest", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-no-manifest", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::StartCodingTask {
-                project,
-                client_id: None,
-                path: None,
-                temporary_project_name: None,
-                title: Some("small startup payload".to_string()),
-                mode: SessionMode::Normal,
-                detail: Default::default(),
-                deny_write_tools: false,
-                deny_shell_tools: false,
-                resume_session_id: None,
-                execution_context: None,
-            },
-            Some(&auth),
-        )
-        .await;
+    let result = coding_workflow_serviced(
+        &runtime,
+        "coding-no-manifest",
+        json!({
+            "project": project,
+            "title": "small startup payload"
+        }),
+        &auth,
+    )
+    .await;
 
     assert!(result.success, "{:?}", result.error);
     assert!(
@@ -659,11 +476,11 @@ async fn start_coding_task_can_omit_compact_tool_manifest() {
 }
 
 #[tokio::test]
-async fn start_coding_task_minimal_brief_is_bounded_and_path_safe() {
+async fn coding_workflow_minimal_brief_is_bounded_and_path_safe() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
-    let policy = AgentPolicySummary {
+    let policy = RunnerPolicySummary {
         allowed_roots: vec![PathBuf::from("/tmp/startup-full-allowed-root")],
         ..Default::default()
     };
@@ -677,7 +494,7 @@ async fn start_coding_task_minimal_brief_is_bounded_and_path_safe() {
     let auth = auth_context(None, true);
     let project = "agent:coding-full-status:demo".to_string();
 
-    let result = start_coding_task_serviced(
+    let result = coding_workflow_serviced(
         &runtime,
         "coding-full-status",
         json!({
@@ -724,11 +541,11 @@ async fn start_coding_task_minimal_brief_is_bounded_and_path_safe() {
 }
 
 #[tokio::test]
-async fn start_coding_task_standard_returns_model_facing_brief_without_diagnostics() {
+async fn coding_workflow_standard_returns_model_facing_brief_without_diagnostics() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
-    let policy = AgentPolicySummary {
+    let policy = RunnerPolicySummary {
         allowed_roots: vec![PathBuf::from("/tmp/compact-allowed-root-never-emit")],
         ..Default::default()
     };
@@ -742,7 +559,7 @@ async fn start_coding_task_standard_returns_model_facing_brief_without_diagnosti
     let auth = auth_context(None, true);
     let project = "agent:coding-compact-status:demo".to_string();
 
-    let result = start_coding_task_serviced(
+    let result = coding_workflow_serviced(
         &runtime,
         "coding-compact-status",
         json!({ "project": project }),
@@ -790,34 +607,35 @@ async fn start_coding_task_standard_returns_model_facing_brief_without_diagnosti
     let serialized = serde_json::to_string(&result.output).unwrap();
     for forbidden in [
         "tools.names",
-        "policy",
         "allowed_roots",
         "compact-allowed-root-never-emit",
-        "stdout",
-        "stderr",
-        "command",
-        "env",
-        "token",
-        "secret",
     ] {
         assert!(
             !serialized.contains(forbidden),
-            "compact startup leaked {forbidden}: {serialized}"
+            "compact startup leaked sensitive value {forbidden}: {serialized}"
+        );
+    }
+    for forbidden in [
+        "policy", "stdout", "stderr", "command", "env", "token", "secret",
+    ] {
+        assert!(
+            !json_contains_key(&result.output, forbidden),
+            "compact startup leaked field {forbidden}: {serialized}"
         );
     }
 }
 
 #[tokio::test]
-async fn start_coding_task_compact_startup_verdict_accepts_clean_workspace() {
+async fn coding_workflow_full_startup_verdict_accepts_clean_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-start-verdict", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-start-verdict", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_serviced(
+    let result = coding_workflow_serviced(
         &runtime,
         "coding-start-verdict",
         json!({ "project": project, "detail": "full" }),
@@ -838,55 +656,112 @@ async fn start_coding_task_compact_startup_verdict_accepts_clean_workspace() {
     assert_compact_verdict_safe(verdict, "startup clean verdict");
 }
 
-/// Shared helper: start_coding_task with git inspection against a real temp repo.
-async fn start_coding_task_with_git_inspection(
+/// Shared helper: canonical coding-workflow diagnostics with Git inspection
+/// against a real temp repo.
+async fn coding_workflow_with_git_inspection(
     runtime: &ToolRuntime,
     client_id: &str,
     project: &str,
     auth: &AuthContext,
 ) -> ToolResult {
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.to_string();
-        let auth = auth.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    internal_start_coding_task_call(json!({
-                        "project": project,
-                    })),
-                    Some(&auth),
-                )
-                .await
-        }
-    });
-    service_agent_task_until_finished(runtime, client_id, &task, "start_coding_task").await;
-    task.await.unwrap()
+    coding_workflow_serviced(runtime, client_id, json!({"project": project}), auth).await
 }
 
-fn internal_start_coding_task_call(params: Value) -> ToolCall {
-    serde_json::from_value(json!({"tool": "start_coding_task", "params": params}))
-        .expect("internal StartCodingTask primitive")
+#[derive(serde::Deserialize)]
+struct CodingWorkflowTestParams {
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    mode: SessionMode,
+    #[serde(default)]
+    deny_write_tools: bool,
+    #[serde(default)]
+    deny_shell_tools: bool,
+    #[serde(default)]
+    detail: StartupDetail,
+    #[serde(default)]
+    resume_session_id: Option<String>,
+    #[serde(default)]
+    execution_context: Option<crate::tool_runtime::sessions::SessionExecutionContext>,
 }
 
-/// Shared helper: dispatch start_coding_task and service every startup agent
-/// request (rules read, git status, git log) locally until the call finishes.
-async fn start_coding_task_serviced(
+/// Shared test-only driver for the canonical coding workflow engine. It
+/// preserves the old diagnostic coverage without creating another ToolCall or
+/// model/API identity.
+async fn coding_workflow_serviced(
     runtime: &ToolRuntime,
     client_id: &str,
     params: Value,
     auth: &AuthContext,
 ) -> ToolResult {
+    let params: CodingWorkflowTestParams = serde_json::from_value(params).unwrap();
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let auth = auth.clone();
         async move {
             runtime
-                .dispatch_with_auth(internal_start_coding_task_call(params), Some(&auth))
+                .start_coding_workflow_for_test(
+                    params.project,
+                    params.client_id,
+                    params.path,
+                    params.title,
+                    params.mode,
+                    params.deny_write_tools,
+                    params.deny_shell_tools,
+                    params.detail,
+                    params.resume_session_id,
+                    params.execution_context,
+                    Some(&auth),
+                    None,
+                    None,
+                    SessionTransport::Api,
+                )
                 .await
         }
     });
-    service_agent_task_until_finished(runtime, client_id, &task, "start_coding_task").await;
+    service_agent_task_until_finished(runtime, client_id, &task, "coding workflow").await;
+    task.await.unwrap()
+}
+
+async fn work_on_project_serviced(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: &str,
+    instruction: &str,
+    auth: &AuthContext,
+) -> ToolResult {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.to_string();
+        let instruction = instruction.to_string();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::WorkOnProject {
+                        project,
+                        client_id: None,
+                        path: None,
+                        mode: None,
+                        base_ref: None,
+                        instruction,
+                        session_id: None,
+                        include_project_instructions: true,
+                        include_workflow_guidance: true,
+                        include_extension_catalog: false,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    service_agent_task_until_finished(runtime, client_id, &task, "work_on_project").await;
     task.await.unwrap()
 }
 
@@ -921,7 +796,7 @@ fn assert_startup_nonblocking_dirty(result: &ToolResult, workspace_reason: &str)
 }
 
 #[tokio::test]
-async fn start_coding_task_untracked_only_is_nonblocking_warning() {
+async fn coding_workflow_untracked_only_is_nonblocking_warning() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
@@ -930,10 +805,10 @@ async fn start_coding_task_untracked_only_is_nonblocking_warning() {
 
     let runtime = test_runtime();
     let client_id = "coding-start-untracked";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
+    let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["workspace"]["untracked"], 1);
@@ -941,12 +816,12 @@ async fn start_coding_task_untracked_only_is_nonblocking_warning() {
     assert_eq!(
         fs::read_to_string(tmp.path().join("report.md")).unwrap(),
         report_before,
-        "start_coding_task must not modify untracked report.md"
+        "coding workflow must not modify untracked report.md"
     );
 }
 
 #[tokio::test]
-async fn start_coding_task_tracked_modified_is_nonblocking_and_allows_continued_edit() {
+async fn coding_workflow_tracked_modified_is_nonblocking_and_allows_continued_edit() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -962,10 +837,10 @@ async fn start_coding_task_tracked_modified_is_nonblocking_and_allows_continued_
 
     let runtime = test_runtime();
     let client_id = "coding-start-modified";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
+    let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["workspace"]["modified"], 1);
@@ -1034,7 +909,7 @@ async fn start_coding_task_tracked_modified_is_nonblocking_and_allows_continued_
 }
 
 #[tokio::test]
-async fn start_coding_task_staged_changes_are_nonblocking() {
+async fn coding_workflow_staged_changes_are_nonblocking() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -1050,10 +925,10 @@ async fn start_coding_task_staged_changes_are_nonblocking() {
 
     let runtime = test_runtime();
     let client_id = "coding-start-staged";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
+    let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["workspace"]["staged"], 1);
@@ -1068,7 +943,7 @@ async fn start_coding_task_staged_changes_are_nonblocking() {
 }
 
 #[tokio::test]
-async fn start_coding_task_mixed_dirty_workspace_summarizes_counts_without_blocking() {
+async fn coding_workflow_mixed_dirty_workspace_summarizes_counts_without_blocking() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "tracked.rs", "tracked\n", "add tracked");
@@ -1082,10 +957,10 @@ async fn start_coding_task_mixed_dirty_workspace_summarizes_counts_without_block
 
     let runtime = test_runtime();
     let client_id = "coding-start-mixed";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_with_git_inspection(&runtime, client_id, &project, &auth).await;
+    let result = coding_workflow_with_git_inspection(&runtime, client_id, &project, &auth).await;
 
     assert_startup_nonblocking_dirty(&result, "workspace_dirty");
     assert_eq!(result.output["workspace"]["modified"], 2);
@@ -1094,7 +969,7 @@ async fn start_coding_task_mixed_dirty_workspace_summarizes_counts_without_block
 }
 
 #[tokio::test]
-async fn start_coding_task_conflict_state_is_a_hard_blocker_but_remains_inspectable() {
+async fn coding_workflow_conflict_state_is_a_hard_blocker_but_remains_inspectable() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "conflicted.rs", "base\n", "base");
@@ -1118,10 +993,10 @@ async fn start_coding_task_conflict_state_is_a_hard_blocker_but_remains_inspecta
 
     let runtime = test_runtime();
     let client_id = "coding-start-conflict";
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_serviced(
+    let result = coding_workflow_serviced(
         &runtime,
         client_id,
         json!({"project": project, "detail": "minimal"}),
@@ -1156,15 +1031,25 @@ async fn start_coding_task_conflict_state_is_a_hard_blocker_but_remains_inspecta
 }
 
 #[tokio::test]
-async fn start_coding_task_unknown_project_still_fails() {
+async fn coding_workflow_unknown_project_still_fails() {
     let runtime = test_runtime();
     let auth = auth_context(None, true);
     let result = runtime
-        .dispatch_with_auth(
-            internal_start_coding_task_call(json!({
-                "project": "agent:missing:does-not-exist"
-            })),
+        .start_coding_workflow_for_test(
+            "agent:missing:does-not-exist".to_string(),
+            None,
+            None,
+            None,
+            SessionMode::Normal,
+            false,
+            false,
+            StartupDetail::Standard,
+            None,
+            None,
             Some(&auth),
+            None,
+            None,
+            SessionTransport::Api,
         )
         .await;
     assert!(
@@ -1205,35 +1090,45 @@ async fn start_coding_task_unknown_project_still_fails() {
 }
 
 #[tokio::test]
-async fn start_coding_task_agent_offline_is_still_blocking() {
+async fn coding_workflow_runner_offline_is_still_blocking() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-start-offline", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-start-offline", "demo", tmp.path()).await;
     // Transport disconnect leaves the agent offline while project id may still resolve.
     runtime
-        .shell_clients
+        .runner_registry
         .reconcile_disconnect("coding-start-offline", "inst")
         .await;
 
     let auth = auth_context(None, true);
     let result = runtime
-        .dispatch_with_auth(
-            internal_start_coding_task_call(json!({
-                "project": project
-            })),
+        .start_coding_workflow_for_test(
+            project,
+            None,
+            None,
+            None,
+            SessionMode::Normal,
+            false,
+            false,
+            StartupDetail::Standard,
+            None,
+            None,
             Some(&auth),
+            None,
+            None,
+            SessionTransport::Api,
         )
         .await;
 
-    // Project resolution or agent health may fail closed — either is blocking.
+    // Project resolution or Runner health may fail closed — either is blocking.
     if result.success {
         let verdict = &result.output["startup_verdict"];
         assert_eq!(
             verdict["blocking"], true,
-            "agent offline / unreachable must remain blocking: {verdict}"
+            "Runner offline / unreachable must remain blocking: {verdict}"
         );
         assert_eq!(verdict["status"], "fail");
         assert!(result.output["blockers"]
@@ -1250,14 +1145,16 @@ async fn start_coding_task_agent_offline_is_still_blocking() {
 }
 
 #[test]
-fn start_coding_task_rejection_precedes_legacy_argument_validation() {
+fn start_coding_task_legacy_arguments_do_not_restore_live_identity() {
     let error = ToolCall::from_tool_name(
         "start_coding_task",
         json!({"project": "agent:demo:demo", "include_runtime_status": false}),
     )
-    .expect_err("retired entry must reject before legacy argument handling");
-    assert!(error.contains("no longer supported"), "{error}");
-    assert!(error.contains("work_on_project"), "{error}");
+    .expect_err("legacy arguments must not restore a retired tool identity");
+    assert!(
+        error.contains("unknown tool 'start_coding_task'"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1271,31 +1168,18 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
-    let start = runtime
-        .dispatch_with_auth(
-            ToolCall::StartCodingTask {
-                project: project.clone(),
-                client_id: None,
-                path: None,
-                temporary_project_name: None,
-                title: Some("finish contract".to_string()),
-                mode: SessionMode::Normal,
-                detail: Default::default(),
-                deny_write_tools: false,
-                deny_shell_tools: false,
-                resume_session_id: None,
-                execution_context: None,
-            },
-            Some(&auth),
-        )
-        .await;
+    let start = work_on_project_serviced(
+        &runtime,
+        "coding-finish",
+        &project,
+        "finish contract",
+        &auth,
+    )
+    .await;
     assert!(start.success, "{:?}", start.error);
-    let session_id = start.output["session"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
 
     fs::write(tmp.path().join("README.md"), "hello\nchanged\n").unwrap();
     let task = tokio::spawn({
@@ -1323,13 +1207,35 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
     });
     let req = wait_for_patch_agent_request(&runtime, "coding-finish").await;
     assert_internal_posix_script_contains(&req, "git status --porcelain=v1 -b");
-    let show_changes_stdout = "## main\n M README.md\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nstatus_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0\nfiles_total=1\nfiles_returned=1\nfiles_truncated=0\nfiles_limit=200\nmodified=1\nadded=0\ndeleted=0\nrenamed=0\ncopied=0\nuntracked=0\nconflicted=0\nstaged=0\nunstaged=1\nstatus_trunc_count=0\nstatus_trunc_bytes=0\nstatus_trunc_path=0\nstatus_bytes=20\n@@WEBCODEX_SHOW_CHANGES_SEP@@\ncommit=abc123\nshort=abc123\nsummary=add readme\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nhead_exit=0\nhead_truncated=0\nhead_bytes=45\n@@WEBCODEX_SHOW_CHANGES_SEP@@\n README.md | 1 +\n 1 file changed, 1 insertion(+)\n@@WEBCODEX_SHOW_CHANGES_SEP@@\ndiff_stat_exit=0\ndiff_stat_truncated=0\ndiff_stat_bytes=52\n";
+    let show_changes_stdout = format!(
+        "{}{}{}{}",
+        crate::tool_runtime::framed_show_changes_test_block(
+            'S',
+            "## main\n M README.md\n",
+            "status_exit=0\nrepository_probe=inside_worktree\nrepository_probe_exit=0\nfiles_total=1\nfiles_returned=1\nfiles_truncated=0\nfiles_limit=200\nmodified=1\nadded=0\ndeleted=0\nrenamed=0\ncopied=0\nuntracked=0\nconflicted=0\nstaged=0\nunstaged=1\nstatus_trunc_count=0\nstatus_trunc_bytes=0\nstatus_trunc_path=0\nstatus_bytes=20\n"
+        ),
+        crate::tool_runtime::framed_show_changes_test_block(
+            'H',
+            "commit=abc123\nshort=abc123\nsummary=add readme\n",
+            "head_exit=0\nhead_truncated=0\nhead_bytes=45\n"
+        ),
+        crate::tool_runtime::framed_show_changes_test_block(
+            'T',
+            " README.md | 1 +\n 1 file changed, 1 insertion(+)\n",
+            "diff_stat_exit=0\ndiff_stat_truncated=0\ndiff_stat_bytes=48\n"
+        ),
+        crate::tool_runtime::framed_show_changes_test_block(
+            'N',
+            "",
+            "numstat_exit=0\nnumstat_truncated=0\nnumstat_bytes=0\n"
+        )
+    );
     complete_patch_agent_request(
         &runtime,
         "coding-finish",
         &req.request_id,
         0,
-        show_changes_stdout,
+        &show_changes_stdout,
         "",
     )
     .await;
@@ -1404,7 +1310,8 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-compact", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish-compact", "demo", tmp.path())
+            .await;
     let auth = auth_context(None, true);
     let session = runtime
         .sessions
@@ -1537,7 +1444,7 @@ async fn finish_coding_task_summary_only_uses_review_evidence_without_projecting
     commit_file(tmp.path(), "docs.md", "hello\n", "add docs");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-docs", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish-docs", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let session = runtime
         .sessions
@@ -1559,8 +1466,8 @@ async fn finish_coding_task_summary_only_uses_review_evidence_without_projecting
     record_coding_task_tool_event(
         &runtime,
         &session_id,
-        "search_project_text",
-        json!({"project": project, "query": "docs"}),
+        "search_project_texts",
+        json!({"project": project, "queries": [{"pattern": "docs"}]}),
         true,
         json!({}),
     );
@@ -1633,7 +1540,7 @@ async fn finish_coding_task_summary_only_treats_dirty_workspace_as_advisory() {
     fs::write(tmp.path().join("README.md"), "changed\n").unwrap();
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-dirty", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-finish-dirty", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
     let session = runtime
         .sessions
@@ -1687,7 +1594,7 @@ async fn finish_coding_task_does_not_resolve_a_different_validation_identity() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-resolved", "demo", tmp.path())
+        register_runner_project_at_path(&runtime, "coding-finish-resolved", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
     let session = runtime.sessions.start_session(
@@ -1826,7 +1733,7 @@ async fn finish_coding_task_historical_unresolved_current_pass_does_not_request_
     assert_eq!(result.output["validation"]["stale_failure_count"], 1);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
-        result.output["tool_failures"]["historical_non_actionable_count"],
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
         1
     );
     assert_eq!(
@@ -1871,10 +1778,10 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
         record_coding_task_tool_event(
             &fixture.runtime,
             &fixture.session_id,
-            "read_file",
+            "read_files",
             json!({
                 "project": fixture.project.clone(),
-                "path": format!("src/display-padding-{index}.rs")
+                "items": [{"path": format!("src/display-padding-{index}.rs")}]
             }),
             true,
             json!({}),
@@ -1912,7 +1819,7 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     assert_eq!(result.output["hygiene_clean"], true);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
-        result.output["tool_failures"]["historical_non_actionable_count"],
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
         1
     );
     assert_eq!(
@@ -1966,7 +1873,7 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     for key in [
         "expected_count",
         "unexpected_count",
-        "historical_non_actionable_count",
+        "non_actionable_unexpected_count",
         "actionable_unexpected_count",
         "expectation_mismatch_count",
         "unexpected_success_count",
@@ -2028,10 +1935,10 @@ async fn handoff_display_limit_does_not_change_canonical_started_shell_failure_c
         record_coding_task_tool_event(
             &fixture.runtime,
             &fixture.session_id,
-            "read_file",
+            "read_files",
             json!({
                 "project": fixture.project.clone(),
-                "path": format!("src/benign-padding-{index}.rs")
+                "items": [{"path": format!("src/benign-padding-{index}.rs")}]
             }),
             true,
             json!({}),
@@ -2088,7 +1995,7 @@ async fn handoff_display_limit_does_not_change_canonical_started_shell_failure_c
         for key in [
             "expected_count",
             "unexpected_count",
-            "historical_non_actionable_count",
+            "non_actionable_unexpected_count",
             "actionable_unexpected_count",
             "expectation_mismatch_count",
             "unexpected_success_count",
@@ -2115,7 +2022,7 @@ async fn handoff_display_limit_does_not_change_canonical_started_shell_failure_c
 
     assert_eq!(finish.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
-        finish.output["tool_failures"]["historical_non_actionable_count"],
+        finish.output["tool_failures"]["non_actionable_unexpected_count"],
         0
     );
     assert_eq!(
@@ -2188,6 +2095,161 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_c
         &result.output["task_outcome"],
         "blocking_reasons",
         "unexpected_tool_failures",
+    );
+}
+
+#[tokio::test]
+async fn finish_coding_task_combined_early_fmt_and_test_failures_resolve_without_erasing_history() {
+    let fixture = finish_summary_fixture("coding-finish-combined-resolved-validation").await;
+
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_fmt",
+        json!({"project": fixture.project.clone(), "check": true}),
+        false,
+        json!({"exit_code": 1, "failure_kind": "validation_failed"}),
+    );
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "apply_text_edits",
+        json!({
+            "project": fixture.project.clone(),
+            "changes": [{"kind": "edit", "path": "src/lib.rs"}]
+        }),
+        true,
+        json!({"state_changed": true}),
+    );
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_fmt",
+        json!({"project": fixture.project.clone(), "check": true}),
+        true,
+        json!({"exit_code": 0}),
+    );
+
+    let test_target = json!({
+        "project": fixture.project.clone(),
+        "package": "webcodex",
+        "filter": "focused",
+    });
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_test",
+        test_target.clone(),
+        false,
+        json!({
+            "exit_code": 101,
+            "failure_kind": "validation_failed",
+            "stdout_tail": "running 1 test\ntest focused ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": 1,
+            "tests_passed": 0,
+            "tests_failed": 1,
+            "zero_tests_run": false
+        }),
+    );
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "apply_text_edits",
+        json!({
+            "project": fixture.project.clone(),
+            "changes": [{"kind": "edit", "path": "src/lib.rs"}]
+        }),
+        true,
+        json!({"state_changed": true}),
+    );
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_test",
+        test_target,
+        true,
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "running 1 test\ntest focused ... ok\ntest result: ok. 1 passed; 0 failed\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": 1,
+            "tests_passed": 1,
+            "tests_failed": 0,
+            "zero_tests_run": false
+        }),
+    );
+    record_coding_task_tool_event(
+        &fixture.runtime,
+        &fixture.session_id,
+        "cargo_check",
+        json!({"project": fixture.project.clone()}),
+        true,
+        json!({"exit_code": 0}),
+    );
+
+    let immutable = fixture
+        .runtime
+        .sessions
+        .summary(&fixture.session_id, Some(100))
+        .unwrap();
+    assert_eq!(
+        immutable
+            .events
+            .iter()
+            .filter(|event| event.kind == "tool_call_finished"
+                && event.status.as_deref() == Some("failed"))
+            .count(),
+        2
+    );
+
+    let result = finish_coding_task_summary_only_with_agent(
+        &fixture.runtime,
+        fixture.client_id,
+        fixture.project,
+        fixture.session_id,
+        fixture.auth,
+    )
+    .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["workspace_clean"], true);
+    assert_eq!(result.output["hygiene_clean"], true);
+    assert_eq!(result.output["jobs"]["blocking_active_count"], 0);
+    assert_eq!(result.output["tool_failures"]["unexpected_count"], 2);
+    assert_eq!(
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
+        2
+    );
+    assert_eq!(
+        result.output["tool_failures"]["actionable_unexpected_count"],
+        0
+    );
+    assert_eq!(result.output["validation"]["status"], "mixed");
+    assert_eq!(result.output["validation"]["resolved_failure_count"], 2);
+    assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
+    assert_eq!(result.output["validation"]["current_status"], "passed");
+    assert_eq!(
+        result.output["validation"]["current_unresolved_failure_count"],
+        0
+    );
+    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["blocking"], false);
+    assert_reason_list_not_contains(
+        &result.output["task_outcome"],
+        "blocking_reasons",
+        "unexpected_tool_failures",
+    );
+    assert_reason_list_not_contains(
+        &result.output["task_outcome"],
+        "blocking_reasons",
+        "validation_failed",
     );
 }
 
@@ -2327,8 +2389,8 @@ async fn failure_history_fail_closed_attempts_do_not_block_clean_finish() {
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "read_file",
-        json!({"project": fixture.project.clone(), "path": "missing.rs"}),
+        "read_files",
+        json!({"project": fixture.project.clone(), "items": [{"path": "missing.rs"}]}),
         false,
         json!({"error_kind": "invalid_arguments"}),
     );
@@ -2382,7 +2444,7 @@ async fn failure_history_fail_closed_attempts_do_not_block_clean_finish() {
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 3);
     assert_eq!(
-        result.output["tool_failures"]["historical_non_actionable_count"],
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
         3
     );
     assert_eq!(
@@ -2409,11 +2471,11 @@ async fn failure_history_fail_closed_attempts_do_not_block_clean_finish() {
         .iter()
         .any(|note| note.as_str()
             == Some(
-                "historical fail-closed tool failures are retained as non-actionable evidence"
+                "non-actionable failed tool calls are retained as historical/process evidence"
             )));
     for field in [
         "unexpected_count",
-        "historical_non_actionable_count",
+        "non_actionable_unexpected_count",
         "actionable_unexpected_count",
     ] {
         assert_eq!(
@@ -2480,7 +2542,7 @@ async fn failure_history_started_diagnostic_process_failure_remains_actionable()
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
-        result.output["tool_failures"]["historical_non_actionable_count"],
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
         0
     );
     assert_eq!(
@@ -2547,7 +2609,7 @@ async fn failure_history_started_shell_failure_remains_actionable() {
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
-        result.output["tool_failures"]["historical_non_actionable_count"],
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
         0
     );
     assert_eq!(
@@ -2655,7 +2717,7 @@ async fn failure_history_missing_effect_proof_remains_actionable() {
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
-        result.output["tool_failures"]["historical_non_actionable_count"],
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
         0
     );
     assert_eq!(
@@ -2691,7 +2753,18 @@ async fn finish_coding_task_summary_only_keeps_cargo_fmt_failure_blocking_when_o
         "cargo_test",
         json!({"project": fixture.project.clone()}),
         true,
-        json!({"exit_code": 0}),
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": 1,
+            "tests_passed": 1,
+            "tests_failed": 0,
+            "zero_tests_run": false
+        }),
     );
 
     let result = finish_coding_task_summary_only_with_agent(
@@ -2764,13 +2837,20 @@ async fn finish_coding_task_summary_only_warns_for_cargo_test_zero_tests_success
         result.output["tool_failures"]["expectation_mismatch_count"],
         0
     );
-    assert_eq!(result.output["validation"]["status"], "passed");
+    assert_eq!(result.output["validation"]["status"], "inconclusive");
+    assert_eq!(result.output["validation"]["successes"], 0);
+    assert_eq!(result.output["validation"]["latest_status"], "inconclusive");
     assert_eq!(
         result.output["validation"]["cargo_test_zero_tests_run"],
         true
     );
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
+    assert_reason_list_contains(
+        &result.output["task_outcome"],
+        "warning_reasons",
+        "validation_inconclusive",
+    );
     assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "warning");
     assert_reason_list_contains(
@@ -2838,8 +2918,9 @@ async fn finish_coding_task_summary_only_keeps_cargo_test_failure_blocking_after
 
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
-    assert_eq!(result.output["validation"]["status"], "mixed");
-    assert_eq!(result.output["validation"]["latest_status"], "passed");
+    assert_eq!(result.output["validation"]["status"], "failed");
+    assert_eq!(result.output["validation"]["successes"], 0);
+    assert_eq!(result.output["validation"]["latest_status"], "inconclusive");
     assert_eq!(
         result.output["validation"]["cargo_test_zero_tests_run"],
         true
@@ -2923,8 +3004,8 @@ async fn finish_coding_task_summary_only_treats_read_failure_as_historical_non_a
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "read_file",
-        json!({"project": fixture.project.clone(), "path": "README.md"}),
+        "read_files",
+        json!({"project": fixture.project.clone(), "items": [{"path": "README.md"}]}),
         false,
         json!({
             "error_kind": "permission_denied"
@@ -2936,7 +3017,18 @@ async fn finish_coding_task_summary_only_treats_read_failure_as_historical_non_a
         "cargo_test",
         json!({"project": fixture.project.clone()}),
         true,
-        json!({"exit_code": 0}),
+        json!({
+            "exit_code": 0,
+            "stdout_tail": "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": 1,
+            "tests_passed": 1,
+            "tests_failed": 0,
+            "zero_tests_run": false
+        }),
     );
 
     let result = finish_coding_task_summary_only_with_agent(
@@ -2953,7 +3045,7 @@ async fn finish_coding_task_summary_only_treats_read_failure_as_historical_non_a
     assert_eq!(result.output["hygiene_clean"], true);
     assert_eq!(result.output["tool_failures"]["unexpected_count"], 1);
     assert_eq!(
-        result.output["tool_failures"]["historical_non_actionable_count"],
+        result.output["tool_failures"]["non_actionable_unexpected_count"],
         1
     );
     assert_eq!(
@@ -2975,14 +3067,14 @@ async fn finish_coding_task_summary_only_treats_read_failure_as_historical_non_a
 #[tokio::test]
 async fn finish_coding_task_summary_only_keeps_active_blocking_job_decision_complete() {
     let fixture = finish_summary_fixture("coding-finish-compact-jobs").await;
-    seed_session_projection_job(
+    let _job_id = seed_session_projection_job(
         &fixture.runtime,
-        fixture._tmp.path(),
-        "22222222-3333-4444-5555-666666666671",
+        fixture.client_id,
         &fixture.project,
         &fixture.session_id,
         "running",
         "compact-secret-job-output\n",
+        &fixture.auth,
     )
     .await;
 
@@ -3129,15 +3221,14 @@ async fn finish_coding_task_summary_only_has_bounded_clear_size_reduction() {
 #[tokio::test]
 async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
     let fixture = finish_summary_fixture("coding-finish-jobs").await;
-    let job_id = "22222222-3333-4444-5555-666666666661";
-    seed_session_projection_job(
+    let job_id = seed_session_projection_job(
         &fixture.runtime,
-        fixture._tmp.path(),
-        job_id,
+        fixture.client_id,
         &fixture.project,
         &fixture.session_id,
         "running",
         "secret-job-output\n",
+        &fixture.auth,
     )
     .await;
 
@@ -3165,15 +3256,14 @@ async fn finish_coding_task_includes_active_jobs_warning_without_logs() {
 #[tokio::test]
 async fn finish_coding_task_treats_stop_requested_jobs_as_nonblocking() {
     let fixture = finish_summary_fixture("coding-finish-stop-pending").await;
-    let job_id = "22222222-3333-4444-5555-666666666662";
-    seed_session_projection_job(
+    let job_id = seed_session_projection_job(
         &fixture.runtime,
-        fixture._tmp.path(),
-        job_id,
+        fixture.client_id,
         &fixture.project,
         &fixture.session_id,
         "stop_requested",
         "stop-pending-secret-output\n",
+        &fixture.auth,
     )
     .await;
 
@@ -3330,12 +3420,9 @@ fn assert_review_evidence_tools_safe(review_evidence: &Value) {
         assert!(
             matches!(
                 tool,
-                "read_file"
+                "read_files"
                     | "list_project_files"
-                    | "search_project_text"
                     | "search_project_texts"
-                    | "git_diff"
-                    | "git_diff_summary"
                     | "git_diff_hunks"
                     | "git_review_summary"
                     | "show_changes"
@@ -3395,6 +3482,7 @@ fn record_coding_task_tool_event(
         SessionTransport::Api,
         tool_name,
         &arguments,
+        crate::tool_runtime::sessions::session_tool_contract(tool_name),
     );
     let error = (!success).then_some("tool failed");
     runtime
@@ -3416,7 +3504,10 @@ async fn finish_summary_fixture(client_id: &'static str) -> FinishSummaryFixture
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
-    let project = register_agent_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
+    let auth = auth_context(None, true);
+    let project =
+        register_runner_project_at_path_with_auth(&runtime, client_id, "demo", tmp.path(), &auth)
+            .await;
     let session = runtime
         .sessions
         .start_session(Some(project.clone()), Some(client_id.to_string()));
@@ -3425,7 +3516,7 @@ async fn finish_summary_fixture(client_id: &'static str) -> FinishSummaryFixture
         runtime,
         project,
         session_id: session.session_id,
-        auth: auth_context(None, true),
+        auth,
         client_id,
     }
 }
@@ -3456,12 +3547,14 @@ async fn finish_coding_task_jobs_projection(fixture: &FinishSummaryFixture) -> T
     });
     let request = wait_for_patch_agent_request(&fixture.runtime, fixture.client_id).await;
     assert_internal_posix_script_contains(&request, "git status --porcelain=v1 -b");
+    let show_changes_stdout =
+        crate::tool_runtime::framed_clean_show_changes_test_stdout("add readme", false);
     complete_patch_agent_request(
         &fixture.runtime,
         fixture.client_id,
         &request.request_id,
         0,
-        "## main\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nabc123\0abc123\0add readme\n@@WEBCODEX_SHOW_CHANGES_SEP@@\n",
+        &show_changes_stdout,
         "",
     )
     .await;
@@ -3564,15 +3657,15 @@ async fn session_handoff_summary_only_with_agent_limit(
 }
 
 #[tokio::test]
-async fn start_coding_task_top_level_recommended_flow_projects_to_visible_manifest_tools() {
+async fn coding_workflow_full_diagnostic_recommended_flow_projects_to_visible_manifest_tools() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-flow-proj", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-flow-proj", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let result = start_coding_task_serviced(
+    let result = coding_workflow_serviced(
         &runtime,
         "coding-flow-proj",
         json!({ "project": project, "detail": "full" }),
@@ -3618,33 +3711,24 @@ async fn start_coding_task_top_level_recommended_flow_projects_to_visible_manife
 }
 
 #[tokio::test]
-async fn start_coding_task_standard_omits_repeated_manifest_and_recommended_flow() {
+async fn coding_workflow_standard_omits_repeated_manifest_and_recommended_flow() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-flow-full", "demo", tmp.path()).await;
+        register_runner_project_at_path(&runtime, "coding-flow-full", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
 
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        let auth = auth.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    internal_start_coding_task_call(json!({
-                        "project": project,
-                        "detail": "standard"
-                    })),
-                    Some(&auth),
-                )
-                .await
-        }
-    });
-    let request = wait_for_patch_agent_request(&runtime, "coding-flow-full").await;
-    complete_agent_request_by_running_locally(&runtime, "coding-flow-full", request).await;
-    let result = task.await.unwrap();
+    let result = coding_workflow_serviced(
+        &runtime,
+        "coding-flow-full",
+        json!({
+            "project": project,
+            "detail": "standard"
+        }),
+        &auth,
+    )
+    .await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["detail"], "standard");
     assert!(result.output.get("tool_manifest").is_none());

@@ -11,7 +11,9 @@
 /data*
 /.env
 /webcodex.env
+/runner.toml
 /agent.toml
+/project-registry
 /projects.d
 
 /docs-local-archive

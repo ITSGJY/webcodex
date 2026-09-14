@@ -21,6 +21,7 @@ use crate::models::{
 use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use webcodex_core::authority::SCOPE_RUNNER_MANAGE;
 
 const DEFAULT_TTL_SECS: i64 = 600;
 const MIN_TTL_SECS: i64 = 60;
@@ -28,6 +29,7 @@ const MAX_TTL_SECS: i64 = 3600;
 
 const ENROLL_USER_SCOPES: &[&str] = &[
     SCOPE_RUNTIME_READ,
+    SCOPE_RUNNER_MANAGE,
     SCOPE_SESSION_COLLABORATE,
     SCOPE_PROJECT_READ,
     SCOPE_PROJECT_WRITE,
@@ -67,12 +69,6 @@ pub(crate) struct PairingEnrollRequest {
     pub display_name: Option<String>,
     #[serde(default)]
     pub transport: Option<String>,
-    #[serde(default)]
-    pub projects_dir: Option<String>,
-    #[serde(default)]
-    pub allowed_roots: Option<Vec<String>>,
-    #[serde(default)]
-    pub allow_cwd_anywhere: Option<bool>,
 }
 
 fn clean_display_name(value: Option<String>) -> Result<Option<String>, String> {
@@ -333,12 +329,6 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
             return;
         }
     };
-    let _ = (
-        body.projects_dir,
-        body.allowed_roots,
-        body.allow_cwd_anywhere,
-    );
-
     let Some(db) = crate::get_db(depot) else {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         res.render(json_error(
@@ -753,6 +743,7 @@ mod tests {
             body["user_token_scopes"],
             json!([
                 SCOPE_RUNTIME_READ,
+                SCOPE_RUNNER_MANAGE,
                 SCOPE_SESSION_COLLABORATE,
                 SCOPE_PROJECT_READ,
                 SCOPE_PROJECT_WRITE,

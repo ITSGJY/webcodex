@@ -30,6 +30,7 @@ EXPECTED_PLATFORMS = (
     "win32-x64",
     "win32-arm64",
 )
+EXPECTED_DESKTOP_PLATFORMS = ("darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
 REQUIRED_TOOLS = ("git", "gh", "npm", "node", "python3", "bash")
 
 
@@ -58,6 +59,10 @@ def _platform_contract(root: Path) -> str:
         raise DoctorError(
             f"collector platform contract drift: expected={EXPECTED_PLATFORMS} actual={tuple(collector.PLATFORMS)}"
         )
+    if tuple(collector.DESKTOP_PLATFORMS) != EXPECTED_DESKTOP_PLATFORMS:
+        raise DoctorError(
+            f"Desktop release platform contract drift: actual={tuple(collector.DESKTOP_PLATFORMS)}"
+        )
     manifest_path = root / "npm/webcodex/manifest.example.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -68,26 +73,81 @@ def _platform_contract(root: Path) -> str:
         raise DoctorError(
             f"npm manifest platform contract drift: expected={EXPECTED_PLATFORMS} actual={tuple(artifacts) if isinstance(artifacts, dict) else None}"
         )
-    return f"six-platform contract: {', '.join(EXPECTED_PLATFORMS)}"
+    return (
+        "six-platform npm runtime contract plus Desktop "
+        f"{', '.join(EXPECTED_DESKTOP_PLATFORMS)}: {', '.join(EXPECTED_PLATFORMS)}"
+    )
+
+
+def _version_contract(root: Path, version: str) -> str:
+    versions = publication._package_versions(root)
+    mismatches = {name: value for name, value in versions.items() if value != version}
+    if mismatches:
+        detail = " ".join(f"{name}={value}" for name, value in versions.items())
+        raise DoctorError(f"canonical release version mismatch: requested={version} {detail}")
+    return "Cargo, npm, Desktop package, Desktop Cargo, and Tauri app versions match"
 
 
 def _workflow_contract(root: Path) -> str:
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    extended = (root / ".github/workflows/extended-native.yml").read_text(encoding="utf-8")
     readiness_workflow = (root / ".github/workflows/release-readiness.yml").read_text(encoding="utf-8")
     build = (root / ".github/workflows/release-build.yml").read_text(encoding="utf-8")
     required = {
         "ci.yml": (
-            ("macos-15-intel", ci),
-            ("windows-11-arm", ci),
-            ("ubuntu-24.04-arm", ci),
+            ("apps/desktop/package-lock.json", ci),
+            ("test-windows-desktop:", ci),
+            ("DESKTOP_RESULT", ci),
+            ("prepare_desktop_bundle.ps1", ci),
+            ("desktop_install_windows_smoke.ps1", ci),
+            ("prepare_desktop_bundle_macos.py", ci),
+            ("desktop_install_macos_smoke.sh", ci),
+            ("darwin-arm64", ci),
+            ("test-docker-server:", ci),
+            ("needs_docker", ci),
+            ("linux/amd64", ci),
+        ),
+        "extended-native.yml": (
+            ("workflow_call:", extended),
+            ("workflow_dispatch:", extended),
+            ("ubuntu-24.04-arm", extended),
+            ("macos-15-intel", extended),
+            ("windows-11-arm", extended),
+            ("darwin-x64", extended),
+            ("win32-arm64", extended),
+            ("prepare_desktop_bundle.ps1", extended),
+            ("desktop_install_windows_smoke.ps1", extended),
+            ("prepare_desktop_bundle_macos.py", extended),
+            ("desktop_install_macos_smoke.sh", extended),
         ),
         "release-readiness.yml": (
             ("ci_run_id", readiness_workflow),
+            ("uses: ./.github/workflows/extended-native.yml", readiness_workflow),
             ("linux/amd64", readiness_workflow),
             ("linux/arm64", readiness_workflow),
         ),
         "release-build.yml": tuple((platform, build) for platform in EXPECTED_PLATFORMS)
-        + (("macos-15-intel", build), ("windows-11-arm", build), ("ubuntu-24.04-arm", build)),
+        + (
+            ("macos-15-intel", build),
+            ("windows-11-arm", build),
+            ("ubuntu-24.04-arm", build),
+            ("prepare_desktop_bundle.ps1", build),
+            ("desktop_install_windows_smoke.ps1", build),
+            ("prepare_desktop_bundle_macos.py", build),
+            ("desktop_install_macos_smoke.sh", build),
+            ("desktop_artifacts", build),
+            ("webcodex-desktop-v$env:VERSION-$env:WEBCODEX_RELEASE_PLATFORM-setup.exe", build),
+            ("webcodex-desktop-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.dmg", build),
+            ('desktop_dist="$GITHUB_WORKSPACE/dist"', build),
+            ('$installerPath = Join-Path $desktopDist $installerName', build),
+            ("DESKTOP_INSTALLER_PATH=$installerPath", build),
+            ('--dmg "${{ steps.desktop_dmg.outputs.path }}"', build),
+            ("-Installer $env:DESKTOP_INSTALLER_PATH", build),
+            ("dist/webcodex-desktop-*.dmg", build),
+            ("dist/webcodex-desktop-*-${{ matrix.platform }}-setup.exe", build),
+            ("signing_mode=adhoc", build),
+            ('export APPLE_SIGNING_IDENTITY="-"', build),
+        ),
     }
     missing = []
     for filename, tokens in required.items():
@@ -96,13 +156,23 @@ def _workflow_contract(root: Path) -> str:
                 missing.append(f"{filename}:{token}")
     if missing:
         raise DoctorError(f"release workflow contract is missing: {', '.join(missing)}")
+    forbidden_daily = ("macos-15-intel", "windows-11-arm", "ubuntu-24.04-arm", "test-windows-arm64:", "test-linux-arm64:")
+    leaked = [token for token in forbidden_daily if token in ci]
+    if leaked:
+        raise DoctorError(f"ordinary CI regained extended-native lanes: {', '.join(leaked)}")
     if "packages: write" in readiness_workflow or "actions/upload-artifact" in readiness_workflow:
         raise DoctorError("release-readiness gained publication/upload authority")
-    return "CI, readiness, and authoritative build workflow contracts are consistent"
+    if "prepare_desktop_bundle.ps1" in readiness_workflow or "tauri" in readiness_workflow.lower():
+        raise DoctorError("release-readiness gained Desktop candidate build responsibility")
+    if "secrets.APPLE_" in build:
+        raise DoctorError("release-build unexpectedly depends on paid Apple signing credentials")
+    return "daily CI, extended-native readiness, and authoritative build workflow contracts are consistent"
 
 
 def _compile_verifiers(root: Path) -> str:
     for relative in (
+        "scripts/collect_release_bundle.py",
+        "scripts/prepare_release_metadata.py",
         "scripts/verify_public_release.py",
         "scripts/prepare_server_deployment_assets.py",
         "scripts/release_publication.py",
@@ -110,7 +180,7 @@ def _compile_verifiers(root: Path) -> str:
     ):
         source = (root / relative).read_text(encoding="utf-8")
         compile(source, relative, "exec")
-    return "public verifier, deployment metadata, publication, and readiness Python parse cleanly"
+    return "collector, release metadata, public verifier, deployment metadata, publication, and readiness Python parse cleanly"
 
 
 def _actionlint(root: Path) -> str:
@@ -124,6 +194,7 @@ def _actionlint(root: Path) -> str:
         [
             executable,
             str(root / ".github/workflows/ci.yml"),
+            str(root / ".github/workflows/extended-native.yml"),
             str(root / ".github/workflows/release-readiness.yml"),
             str(root / ".github/workflows/release-build.yml"),
             str(root / ".github/workflows/release-image.yml"),
@@ -156,6 +227,7 @@ def run_doctor(
 
     _record(checks, "required-tools", _require_tools)
     _record(checks, "six-platform-contract", lambda: _platform_contract(source_root))
+    _record(checks, "version-contract", lambda: _version_contract(source_root, release_version))
     _record(checks, "workflow-contract", lambda: _workflow_contract(source_root))
     _record(checks, "python-verifiers", lambda: _compile_verifiers(source_root))
     _record(checks, "actionlint", lambda: _actionlint(source_root))

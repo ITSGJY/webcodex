@@ -5,7 +5,8 @@ use webcodex::SERVER_SYSTEMD_TIMEOUT_STOP_SECS;
 use webcodex_admin::ServerHttpOptions;
 
 use crate::{
-    ServerInitOptions, ServerInstallServiceOptions, ServiceActionKind, ServiceActionOptions,
+    ServerInitOptions, ServerInstallServiceOptions, ServerTunnelOptions, ServiceActionKind,
+    ServiceActionOptions,
 };
 
 use super::{
@@ -28,6 +29,64 @@ pub(crate) struct ServerStatusOptions {
     pub(crate) token_file: Option<PathBuf>,
     pub(crate) service_file: PathBuf,
     pub(crate) json: bool,
+}
+
+pub(crate) async fn run_server_tunnel(opts: ServerTunnelOptions) -> Result<(), String> {
+    let local_server_url = derive_regular_tunnel_server_url(&opts.env_file)?;
+    let bootstrap_token = derive_regular_tunnel_bootstrap_token(&opts.env_file)?;
+    let runtime_parent = opts
+        .env_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    webcodex::run_regular_server_tunnel(webcodex::RegularServerTunnelOptions {
+        local_server_url,
+        bootstrap_token,
+        runtime_parent,
+    })
+    .await
+}
+
+pub(crate) fn derive_regular_tunnel_bootstrap_token(env_file: &Path) -> Result<String, String> {
+    let value = match std::env::var("WEBCODEX_TOKEN") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => read_env_file_value(env_file, "WEBCODEX_TOKEN")?,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("WEBCODEX_TOKEN is not valid UTF-8".to_string())
+        }
+    };
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "regular Server Tunnel requires the effective local Server WEBCODEX_TOKEN".to_string()
+        })
+}
+
+pub(crate) fn derive_regular_tunnel_server_url(env_file: &Path) -> Result<String, String> {
+    if !env_file.is_file() {
+        return Err(format!("env file {} does not exist", env_file.display()));
+    }
+    let value = read_env_file_value(env_file, "WEBCODEX_ADDR")?
+        .ok_or_else(|| format!("{} does not define WEBCODEX_ADDR", env_file.display()))?;
+    let mut addr = value.trim().parse::<SocketAddr>().map_err(|error| {
+        format!(
+            "WEBCODEX_ADDR {:?} from {} is not a fixed IP socket address: {error}",
+            value.trim(),
+            env_file.display()
+        )
+    })?;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(if addr.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    if !addr.ip().is_loopback() {
+        return Err("server tunnel requires a loopback WEBCODEX_ADDR".to_string());
+    }
+    Ok(format!("http://{addr}"))
 }
 
 pub(crate) fn run_server_init(opts: ServerInitOptions) -> Result<String, String> {

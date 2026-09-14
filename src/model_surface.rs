@@ -5,7 +5,7 @@
 //! - A complete Connector configuration (`WEBCODEX_CONNECTOR_SURFACE=task-v1`)
 //!   selects the separate `project_connector` contract.
 //! - Without Connector configuration, an unset `WEBCODEX_MCP_MODEL_SURFACE`
-//!   selects `Runtime(LocalCoding)`. Explicit `local-coding-v1`,
+//!   selects `Runtime(AdaptiveRuntime)`. Explicit `local-coding-v1`,
 //!   `adaptive-runtime-v1`, and `full-operator-v1` values select the corresponding
 //!   runtime `ModelSurface`.
 //! - Setting Connector configuration and `WEBCODEX_MCP_MODEL_SURFACE` together,
@@ -56,6 +56,21 @@ impl RuntimeExposure {
     }
 }
 
+/// Resolve the MCP `tools/list` schema projection after startup exposure is known.
+///
+/// An explicit operator override always wins. Without one, Adaptive Runtime uses
+/// compact discovery to reduce model schema/context cost; compatibility surfaces
+/// and ProjectConnector preserve their historical full-schema projection.
+pub(crate) fn effective_mcp_compact_schemas(
+    exposure: RuntimeExposure,
+    configured_override: Option<bool>,
+) -> bool {
+    configured_override.unwrap_or(matches!(
+        exposure,
+        RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)
+    ))
+}
+
 /// The top-level exposure and Connector runtime slot are one coherent startup state.
 /// ProjectConnector requires Connector state; runtime ModelSurfaces forbid it.
 pub(crate) fn validate_connector_runtime_presence(
@@ -103,6 +118,28 @@ impl ModelSurface {
         self,
         tool_name: &str,
     ) -> (&'static str, Option<&'static str>) {
+        self.runtime_tool_invocation_route_with_operator_extension(tool_name, false)
+    }
+
+    /// Route one runtime tool when the protocol adapter has already admitted a
+    /// ModelHidden Stateless operator extension. `operator_extension_admitted`
+    /// is server-owned request context; callers cannot use this to make an
+    /// arbitrary hidden tool model-visible.
+    pub(crate) fn runtime_tool_invocation_route_with_operator_extension(
+        self,
+        tool_name: &str,
+        operator_extension_admitted: bool,
+    ) -> (&'static str, Option<&'static str>) {
+        if operator_extension_admitted {
+            return match self {
+                Self::LocalCoding => (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None),
+                Self::AdaptiveRuntime => (
+                    TOOL_SURFACE_AVAILABILITY_GATEWAY,
+                    Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
+                ),
+                Self::FullOperatorRuntime => (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+            };
+        }
         if !is_model_visible_tool_name(tool_name) {
             return (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None);
         }
@@ -148,7 +185,7 @@ pub(crate) fn resolve_runtime_exposure(
             "{MCP_MODEL_SURFACE_ENV}='{value}' cannot be combined with WEBCODEX_CONNECTOR_SURFACE; the Connector surface is authoritative"
         )),
         (Some(_), None) => Ok(RuntimeExposure::ProjectConnector),
-        (None, None) => Ok(RuntimeExposure::Runtime(ModelSurface::LocalCoding)),
+        (None, None) => Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)),
         (None, Some(MCP_MODEL_SURFACE_LOCAL_CODING_V1)) => {
             Ok(RuntimeExposure::Runtime(ModelSurface::LocalCoding))
         }
@@ -238,23 +275,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adaptive_runtime_routes_every_local_coding_compatibility_tool() {
+        for tool_name in LOCAL_CODING_TOOL_NAMES {
+            let (availability, via) =
+                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(tool_name);
+            assert_ne!(
+                availability, TOOL_SURFACE_AVAILABILITY_UNAVAILABLE,
+                "AdaptiveRuntime must preserve Local Coding capability {tool_name}"
+            );
+            if availability == TOOL_SURFACE_AVAILABILITY_DIRECT {
+                assert_eq!(via, None, "direct tool {tool_name} must not name a gateway");
+            } else {
+                assert_eq!(availability, TOOL_SURFACE_AVAILABILITY_GATEWAY);
+                assert_eq!(via, Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME));
+            }
+        }
+    }
+
+    #[test]
+    fn coding_intent_tools_are_all_adaptive_reachable_with_expected_routes() {
+        let expected_gateway = [
+            "project_overview",
+            "document_symbols",
+            "document_diagnostics",
+            "hover",
+            "workspace_symbols",
+            "goto_definition",
+            "find_references",
+            "call_hierarchy",
+            "apply_patch",
+            "run_script",
+            "cargo_fmt",
+            "go_test",
+        ];
+        for tool_name in crate::tool_runtime::tool_definition::CODING_INTENT_TOOL_NAMES {
+            let (availability, via) =
+                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(tool_name);
+            assert_ne!(
+                availability, TOOL_SURFACE_AVAILABILITY_UNAVAILABLE,
+                "coding intent tool {tool_name} must remain Adaptive reachable"
+            );
+            if expected_gateway.contains(tool_name) {
+                assert_eq!(
+                    (availability, via),
+                    (
+                        TOOL_SURFACE_AVAILABILITY_GATEWAY,
+                        Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
+                    ),
+                    "coding specialist {tool_name} must remain gateway-routed"
+                );
+            } else {
+                assert_eq!(
+                    (availability, via),
+                    (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+                    "ordinary coding tool {tool_name} should use the Adaptive direct path"
+                );
+            }
+        }
+    }
+
     const EXPECTED_ADAPTIVE_RUNTIME_DIRECT_TOOL_NAMES: &[&str] = &[
         "work_on_project",
+        "session_discussion_summary",
+        "session_handoff_summary",
+        "present_goal_plan",
+        "present_agent_continuation",
+        "rotate_agent_continuation_endpoint",
         "runtime_status",
+        "wait_for_agent_events",
+        "plugin_tool",
         "tool_manifest",
         "search_project_texts",
         "read_files",
-        "apply_patch",
+        "import_conversation_files_to_project",
+        "export_project_artifact",
         "apply_text_edits",
         "run_process",
+        "run_detached_process",
+        "run_shell",
         "observe_jobs",
+        "list_jobs",
         "cargo_check",
         "cargo_test",
-        "go_test",
         "git_review_summary",
+        "git_diff_hunks",
         "show_changes",
         "workspace_hygiene_check",
         "finish_coding_task",
+        "present_work_result",
     ];
 
     #[test]
@@ -272,16 +381,125 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_model_visible_tool_defaults_to_adaptive_gateway() {
-        assert!(is_model_visible_tool_name("run_script"));
-        assert!(!is_adaptive_runtime_direct_tool("run_script"));
+    fn adaptive_runtime_structured_action_targets_are_directly_actionable() {
+        for (source_tool, edge, target_tool) in [
+            (
+                "read_files",
+                "session_hint.suggested_next_tool",
+                "session_discussion_summary",
+            ),
+            ("observe_jobs", "items[].suggested_call.tool", "list_jobs"),
+            (
+                "run_process",
+                "session_continuity.suggested_call.tool",
+                "session_handoff_summary",
+            ),
+            (
+                "show_changes",
+                "diff_review_handoff.recovery.tool",
+                "git_diff_hunks",
+            ),
+            (
+                "finish_coding_task",
+                "changes.show_changes.diff_review_handoff.recovery.tool",
+                "git_diff_hunks",
+            ),
+        ] {
+            assert_eq!(
+                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(source_tool),
+                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+                "structured action source {source_tool}.{edge} must itself be Adaptive direct"
+            );
+            assert_eq!(
+                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(target_tool),
+                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+                "{source_tool}.{edge} points to non-direct Adaptive target {target_tool}"
+            );
+        }
+
         assert_eq!(
-            ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route("run_script"),
+            ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route("apply_patch"),
             (
                 TOOL_SURFACE_AVAILABILITY_GATEWAY,
                 Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
-            )
+            ),
+            "specialized patching should be discovered through the Adaptive gateway"
         );
+        assert_eq!(
+            ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route("read_files"),
+            (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+            "apply_patch recovery must still point to a directly actionable read_files target"
+        );
+    }
+
+    #[test]
+    fn adaptive_handoff_promotions_preserve_local_and_full_operator_routes() {
+        for tool_name in ["list_jobs", "git_diff_hunks"] {
+            assert_eq!(
+                ModelSurface::LocalCoding.runtime_tool_invocation_route(tool_name),
+                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+                "{tool_name} was already Local Coding direct"
+            );
+        }
+        for tool_name in ["list_jobs", "git_diff_hunks"] {
+            assert_eq!(
+                ModelSurface::FullOperatorRuntime.runtime_tool_invocation_route(tool_name),
+                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+                "Full Operator must remain direct for {tool_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_model_visible_tool_defaults_to_adaptive_gateway() {
+        for tool_name in ["run_script", "apply_patch"] {
+            assert!(is_model_visible_tool_name(tool_name));
+            assert!(!is_adaptive_runtime_direct_tool(tool_name));
+            assert_eq!(
+                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(tool_name),
+                (
+                    TOOL_SURFACE_AVAILABILITY_GATEWAY,
+                    Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_patch_remains_direct_on_compatibility_surfaces() {
+        assert!(LOCAL_CODING_TOOL_NAMES.contains(&"apply_patch"));
+        for surface in [ModelSurface::LocalCoding, ModelSurface::FullOperatorRuntime] {
+            assert_eq!(
+                surface.runtime_tool_invocation_route("apply_patch"),
+                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+                "apply_patch must remain directly callable on {surface:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ergonomics_promotions_do_not_expand_local_coding_or_project_connector() {
+        for tool_name in [
+            "import_conversation_files_to_project",
+            "export_project_artifact",
+        ] {
+            assert!(is_adaptive_runtime_direct_tool(tool_name), "{tool_name}");
+            assert!(
+                !LOCAL_CODING_TOOL_NAMES.contains(&tool_name),
+                "{tool_name} must not expand local_coding"
+            );
+            assert!(
+                !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&tool_name),
+                "{tool_name} must not expand project_connector"
+            );
+            assert_eq!(
+                ModelSurface::FullOperatorRuntime.runtime_tool_invocation_route(tool_name),
+                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+                "Full Operator must remain direct for {tool_name}"
+            );
+        }
+        assert!(is_adaptive_runtime_direct_tool("run_shell"));
+        assert!(!is_adaptive_runtime_direct_tool("run_script"));
     }
 
     #[test]
@@ -340,9 +558,37 @@ mod tests {
             executor_root: "/tmp/webcodex".to_string(),
             runs_root: "/tmp/webcodex-runs".to_string(),
             results_root: "/tmp/webcodex-results".to_string(),
-            projects_dir: "/tmp/webcodex-projects".to_string(),
+            project_registry_dir: "/tmp/webcodex-projects".to_string(),
             profile: "default".to_string(),
             project_grant_id: "wc_pgrant_1111111111111111".to_string(),
+        }
+    }
+
+    #[test]
+    fn compact_schema_policy_defaults_only_adaptive_runtime_to_compact() {
+        for exposure in [
+            RuntimeExposure::Runtime(ModelSurface::LocalCoding),
+            RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime),
+            RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime),
+            RuntimeExposure::ProjectConnector,
+        ] {
+            let expected_default = matches!(
+                exposure,
+                RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)
+            );
+            assert_eq!(
+                effective_mcp_compact_schemas(exposure, None),
+                expected_default,
+                "unset compact policy drifted for {exposure:?}"
+            );
+            assert!(
+                effective_mcp_compact_schemas(exposure, Some(true)),
+                "explicit true must win for {exposure:?}"
+            );
+            assert!(
+                !effective_mcp_compact_schemas(exposure, Some(false)),
+                "explicit false must win for {exposure:?}"
+            );
         }
     }
 
@@ -379,12 +625,12 @@ mod tests {
     }
 
     #[test]
-    fn default_surface_is_local_coding_without_connector_or_env() {
+    fn default_surface_is_adaptive_runtime_without_connector_or_env() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.remove(MCP_MODEL_SURFACE_ENV);
         assert_eq!(
             resolve_runtime_exposure(None),
-            Ok(RuntimeExposure::Runtime(ModelSurface::LocalCoding))
+            Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime))
         );
     }
 

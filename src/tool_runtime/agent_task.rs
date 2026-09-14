@@ -15,7 +15,7 @@ use serde_json::{json, to_value, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use webcodex_core::coding_agent::{
-    CodingAgentConfigValue, CodingAgentExecutionState, CodingAgentRunSnapshot, CodingAgentRunState,
+    CodingAgentConfigValue, CodingAgentRunSnapshot, CodingAgentRunState,
 };
 
 const DEFAULT_AGENT_TASK_LIST_LIMIT: usize = 50;
@@ -34,7 +34,7 @@ fn agent_task_store_unavailable() -> ToolResult {
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn agent_task_recovery_kind(
@@ -61,6 +61,7 @@ fn agent_task_recovery_kind(
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+    use webcodex_core::coding_agent::CodingAgentExecutionState;
 
     #[test]
     fn coding_run_observation_revision_overflow_fails_closed() {
@@ -100,7 +101,7 @@ fn agent_task_error(
             "state_changed": false,
         }),
     )
-    .with_recovery(recovery, None)
+    .with_recovery(recovery)
 }
 
 fn serialized_task_success<T: Serialize>(value: T) -> ToolResult {
@@ -113,28 +114,7 @@ fn serialized_task_success<T: Serialize>(value: T) -> ToolResult {
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
-    }
-}
-
-fn coding_run_state_name(state: &CodingAgentRunState) -> &'static str {
-    match state {
-        CodingAgentRunState::Starting => "starting",
-        CodingAgentRunState::Running => "running",
-        CodingAgentRunState::WaitingPermission => "waiting_permission",
-        CodingAgentRunState::Completed => "completed",
-        CodingAgentRunState::Failed => "failed",
-        CodingAgentRunState::Cancelled => "cancelled",
-        CodingAgentRunState::Lost => "lost",
-    }
-}
-
-fn coding_execution_state_name(state: CodingAgentExecutionState) -> &'static str {
-    match state {
-        CodingAgentExecutionState::NotStarted => "not_started",
-        CodingAgentExecutionState::Started => "started",
-        CodingAgentExecutionState::OutcomeUnknown => "outcome_unknown",
-        CodingAgentExecutionState::Completed => "completed",
+        .with_recovery(RecoveryKind::NoAction),
     }
 }
 
@@ -194,7 +174,7 @@ fn coding_run_observation(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::Reconcile, None)
+        .with_recovery(RecoveryKind::Reconcile)
     })?;
     Ok(AgentTaskCodingRunObservation {
         run_id: run.run_id.clone(),
@@ -203,8 +183,8 @@ fn coding_run_observation(
         provider_instance_id: run.provider_instance_id.clone(),
         authority_fingerprint: run.authority_fingerprint.clone(),
         coding_agent_intent_fingerprint: run.intent_fingerprint.clone(),
-        run_state: coding_run_state_name(&run.state).to_string(),
-        execution_state: coding_execution_state_name(run.execution_state).to_string(),
+        run_state: run.state.clone(),
+        execution_state: run.execution_state,
         observation_revision,
         terminal_stop_reason: bounded_optional_terminal(
             run.terminal
@@ -232,14 +212,16 @@ fn binding_execution_status(binding: &AgentTaskCodingRunBindingRecord) -> &'stat
         }
         AgentTaskCodingRunDispatchState::OutcomeUnknown => "outcome_unknown",
         AgentTaskCodingRunDispatchState::Terminal => "terminal",
-        AgentTaskCodingRunDispatchState::Bound => {
-            match binding.last_observed_run_state.as_deref() {
-                Some("waiting_permission") => "waiting_permission",
-                Some("lost") => "outcome_unknown",
-                Some("completed" | "failed" | "cancelled") => "terminal",
-                _ => "active",
-            }
-        }
+        AgentTaskCodingRunDispatchState::Bound => match binding.last_observed_run_state.as_ref() {
+            Some(CodingAgentRunState::WaitingPermission) => "waiting_permission",
+            Some(CodingAgentRunState::Lost) => "outcome_unknown",
+            Some(
+                CodingAgentRunState::Completed
+                | CodingAgentRunState::Failed
+                | CodingAgentRunState::Cancelled,
+            ) => "terminal",
+            _ => "active",
+        },
     }
 }
 
@@ -249,12 +231,15 @@ fn binding_recovery_kind(binding: &AgentTaskCodingRunBindingRecord) -> &'static 
         | AgentTaskCodingRunDispatchState::NotStarted
         | AgentTaskCodingRunDispatchState::Terminal => "none",
         AgentTaskCodingRunDispatchState::OutcomeUnknown => "reconcile",
-        AgentTaskCodingRunDispatchState::Bound => {
-            match binding.last_observed_run_state.as_deref() {
-                Some("lost" | "completed" | "failed" | "cancelled") => "reconcile",
-                _ => "observe",
-            }
-        }
+        AgentTaskCodingRunDispatchState::Bound => match binding.last_observed_run_state.as_ref() {
+            Some(
+                CodingAgentRunState::Lost
+                | CodingAgentRunState::Completed
+                | CodingAgentRunState::Failed
+                | CodingAgentRunState::Cancelled,
+            ) => "reconcile",
+            _ => "observe",
+        },
     }
 }
 
@@ -270,7 +255,7 @@ fn coding_run_binding_projection(
         "project": binding.runtime_project_id,
         "provider_id": binding.provider_id,
         "dispatch_state": binding.dispatch_state.as_str(),
-        "run_state": binding.last_observed_run_state,
+        "run_state": binding.last_observed_run_state.as_ref(),
         "execution_state": binding.last_observed_execution_state,
         "execution_status": binding_execution_status(binding),
         "execution_recovery": binding_recovery_kind(binding),
@@ -306,15 +291,11 @@ fn coding_run_failure_result(
             "state_changed": false,
         }),
     )
-    .with_recovery(failure.recovery, None)
+    .with_recovery(failure.recovery)
 }
 
 fn coding_run_terminal_result(run: &CodingAgentRunSnapshot) -> String {
-    let mut result = format!(
-        "CodingAgentRun {} {}",
-        run.run_id,
-        coding_run_state_name(&run.state)
-    );
+    let mut result = format!("CodingAgentRun {} {}", run.run_id, run.state.as_str());
     if let Some(terminal) = run.terminal.as_ref() {
         if let Some(message) = terminal.message.as_deref() {
             result.push_str(": ");
@@ -400,7 +381,7 @@ impl ToolRuntime {
         };
         let offset = offset.unwrap_or(0);
         let limit = limit.unwrap_or(DEFAULT_AGENT_TASK_LIST_LIMIT);
-        if limit == 0 || limit > MAX_AGENT_TASK_LIST_LIMIT {
+        if limit == 0 {
             return ToolResult::err_with_output(
                 format!("limit must be 1..={MAX_AGENT_TASK_LIST_LIMIT}"),
                 json!({
@@ -408,8 +389,9 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None);
+            .with_recovery(RecoveryKind::FixInput);
         }
+        let limit = limit.min(MAX_AGENT_TASK_LIST_LIMIT);
         match db.list_agent_tasks(&principal, assignee_agent_id.as_deref(), offset, limit) {
             Ok(result) => serialized_task_success(result),
             Err(error) => agent_task_error(error, RecoveryKind::Reobserve),
@@ -479,6 +461,41 @@ impl ToolRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_agent_task_endpoint_continuation(
+        &self,
+        auth: Option<&AuthContext>,
+        task_id: String,
+        attempt_id: String,
+        assignee_agent_id: String,
+        attempt_fence: String,
+        attempt_controller_generation: i64,
+    ) -> ToolResult {
+        let principal = match task_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return agent_task_store_unavailable();
+        };
+        match db.start_agent_task_endpoint_continuation(
+            &principal,
+            &task_id,
+            &attempt_id,
+            &assignee_agent_id,
+            &attempt_fence,
+            attempt_controller_generation,
+        ) {
+            Ok(result) => {
+                if let Some(controller) = self.agent_continuations.as_ref() {
+                    controller.schedule_agent(&assignee_agent_id);
+                }
+                serialized_task_success(result)
+            }
+            Err(error) => agent_task_error(error, RecoveryKind::RetrySame),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_agent_task_coding_run(
         &self,
         auth: Option<&AuthContext>,
@@ -537,7 +554,7 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None);
+            .with_recovery(RecoveryKind::FixInput);
         }
         let binding_intent_fingerprint =
             coding_run_binding_fingerprint(&task_id, &attempt_id, &prepared);
@@ -680,8 +697,12 @@ impl ToolRuntime {
         };
         if observed_binding.last_observation_revision != Some(observation.observation_revision)
             || !matches!(
-                observed_binding.last_observed_run_state.as_deref(),
-                Some("completed" | "failed" | "cancelled")
+                observed_binding.last_observed_run_state.as_ref(),
+                Some(
+                    CodingAgentRunState::Completed
+                        | CodingAgentRunState::Failed
+                        | CodingAgentRunState::Cancelled
+                )
             )
         {
             return ToolResult::ok(coding_run_binding_projection(
@@ -702,6 +723,18 @@ impl ToolRuntime {
             Some(&terminal_reason),
         ) {
             Ok(mutation) => {
+                if mutation.state_changed && mutation.attention_event_count > 0 {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        controller.schedule_agent(&mutation.attempt.assignee_agent_id);
+                    }
+                }
+                if mutation.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &mutation.wait_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
+                    }
+                }
                 let mut output =
                     coding_run_binding_projection(&mutation.binding, mutation.state_changed, false);
                 if let Some(object) = output.as_object_mut() {
@@ -729,7 +762,19 @@ impl ToolRuntime {
         assignee_agent_id: String,
         attempt_fence: String,
         attempt_controller_generation: i64,
+        active_turn_wake_id: Option<String>,
+        active_turn_consume_token: Option<String>,
     ) -> ToolResult {
+        if active_turn_wake_id.is_some() != active_turn_consume_token.is_some() {
+            return ToolResult::err_with_output(
+                "active_turn_wake_id and active_turn_consume_token must be provided together",
+                json!({
+                    "error_kind": "invalid_agent_task_active_turn_proof",
+                    "state_changed": false,
+                }),
+            )
+            .with_recovery(RecoveryKind::FixInput);
+        }
         let principal = match task_principal(auth) {
             Ok(principal) => principal,
             Err(result) => return result,
@@ -737,13 +782,15 @@ impl ToolRuntime {
         let Some(db) = self.communication_db.as_ref() else {
             return agent_task_store_unavailable();
         };
-        match db.heartbeat_agent_task_attempt(
+        match db.heartbeat_agent_task_attempt_with_active_turn_proof(
             &principal,
             &task_id,
             &attempt_id,
             &assignee_agent_id,
             &attempt_fence,
             attempt_controller_generation,
+            active_turn_wake_id.as_deref(),
+            active_turn_consume_token.as_deref(),
         ) {
             Ok(result) => serialized_task_success(result),
             Err(error) => agent_task_error(error, RecoveryKind::Reconcile),
@@ -779,7 +826,7 @@ impl ToolRuntime {
                         "state_changed": false,
                     }),
                 )
-                .with_recovery(RecoveryKind::FixInput, None)
+                .with_recovery(RecoveryKind::FixInput)
             }
         };
         let Some(db) = self.communication_db.as_ref() else {
@@ -797,7 +844,21 @@ impl ToolRuntime {
             terminal_reason.as_deref(),
             &completion_key,
         ) {
-            Ok(result) => serialized_task_success(result),
+            Ok(result) => {
+                if result.state_changed && result.attention_event_count > 0 {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        controller.schedule_agent(&assignee_agent_id);
+                    }
+                }
+                if result.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &result.wait_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
+                    }
+                }
+                serialized_task_success(result)
+            }
             Err(error) => agent_task_error(error, RecoveryKind::RetrySame),
         }
     }

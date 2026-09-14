@@ -1,9 +1,8 @@
 # OpenAPI / GPT Action Guidelines
 
 Product and integration detail for GPT Actions and OpenAPI exposure.
-**Hard invariants agents must obey are in [`AGENTS.md`](../../AGENTS.md)**
-(architecture section). This document holds the longer product rules so
-`AGENTS.md` stays an execution contract.
+Repository-wide rules are in [`AGENTS.md`](../../AGENTS.md). This document
+owns the API-specific invariants and product guidance linked from that guide.
 
 Related: [`GPT_ACTIONS.md`](../GPT_ACTIONS.md), [`MCP.md`](../MCP.md).
 
@@ -27,6 +26,27 @@ The **model-visible** registry, MCP `tools/list`, `tool_manifest`, and GPT Actio
 `ToolCallRequest` selector/flattened fields must separately stay synchronized with
 `registered_tool_specs()`. Internal or retired runtime names must not leak names
 or implementation-only fields into the model-facing Action schema.
+
+## Route/OpenAPI ownership
+
+- `RouteSpec` owns canonical HTTP method/path, scope/auth surface, audit class,
+  and whether a route projects as `Hidden`, a dedicated Public Action, or a
+  Connector capability binding. Handler mounting remains explicit in the owning
+  HTTP modules; OpenAPI metadata is never an authorization source.
+- A Public Action projection carries the static product operation policy used by
+  `/openapi.json`: operation id, summary/description, request/response component
+  identities, explicit consequential policy, and typed request-example identity.
+  The Public OpenAPI projector iterates canonical routes directly; do not add a
+  second handwritten path/operation registry or post-generation route filter.
+- Connector capability semantics remain owned by
+  `webcodex_connector_runtime::surface::capability_specs()` (description, input
+  and output schemas, and annotations such as `readOnlyHint`). `RouteSpec` owns
+  only the capability-to-HTTP-route binding; the Connector OpenAPI projector
+  combines those two canonical sources.
+- Component construction in `openapi::schemas()` remains a separate manual schema
+  projection. Route operation ownership does not require a schema-DSL rewrite.
+
+---
 
 ---
 
@@ -59,8 +79,10 @@ or implementation-only fields into the model-facing Action schema.
 - `listRuntimeTools` full detail discovery includes expanded schemas and may be
   too large for GPT Actions. Daily discovery should prefer
   `callRuntimeTool(tool="tool_manifest")`; once the exact target is known, pass
-  `tool_name=<exact-name>` to that manifest call to retrieve only its description,
-  input schema, and annotations. Full output schemas stay out of this exact view.
+  `tool_name=<exact-name>` to that manifest call to retrieve its description, input
+  schema, current invocation route, and decision-relevant effect/risk/authority
+  metadata. Full output schemas and duplicate inventory bookkeeping stay out of
+  this exact view.
   Focused `listRuntimeTools` calls should be reserved for schema/debug work and
   pass `summary_only=true` with `category`, `features`, or `limit`. Prefer
   `runtime_status` or the tool manifest for the current tool count; the
@@ -116,3 +138,11 @@ failures. `policy_rejected` means policy blocked the request before a write.
 - Add/update tests that fail when flattened Action fields are missing.
 - Do **not** loosen `additionalProperties` to `true` as a workaround — list the
   needed flattened fields explicitly.
+
+Closed schemas and low-friction normalization are complementary. Keep unknown
+fields rejected so typos cannot silently change intent, but make declared
+non-semantic bounds tolerant when the runtime can safely normalize them. For
+example, a presentation/result budget may accept an oversized value and clamp it
+inside the documented bound instead of forcing a second model turn; authority,
+identity/fence, destructive, and effect-selecting fields remain exact. See
+[`tool-contract-guidelines.md`](tool-contract-guidelines.md).

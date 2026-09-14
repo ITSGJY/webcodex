@@ -129,7 +129,7 @@ pub(crate) fn validate_client_id(value: &str) -> Result<String, String> {
 /// The suffix is what makes two machines with the same hostname distinct: it is
 /// generated once per machine, kept under `base`, and reused on every login, so
 /// an overwrite on the same machine mints the same `client_id` and the bound
-/// agent token stays usable.
+/// Runner transport token stays usable.
 ///
 /// `base` must already be a verified real directory tree (login resolves it
 /// through `resolve_connection_parent` before calling this). The file is
@@ -324,7 +324,7 @@ pub(crate) struct StatusOptions {
 pub(crate) struct EnrolledIdentity {
     pub(crate) username: String,
     pub(crate) user_token: String,
-    pub(crate) agent_token: String,
+    pub(crate) runner_token: String,
 }
 
 /// Where a finished login ended up.
@@ -396,7 +396,7 @@ fn remove_internal_dir(path: &Path) -> Result<(), String> {
 
 /// Delete an internal directory, reporting the path if anything is left.
 ///
-/// A leftover staging or backup directory still contains a usable agent token
+/// A leftover staging or backup directory still contains a usable Runner transport token
 /// and user token. `status` will not show it, which is exactly why silence here
 /// would be wrong: nothing else would ever mention it again.
 #[must_use = "leftover internal directories hold live credentials"]
@@ -534,20 +534,25 @@ pub(crate) fn write_descriptor(
 
 /// Build the whole connection inside `staging`.
 ///
-/// The agent token is written only into `agent.toml`; there is deliberately no
+/// The Runner token is written only into `runner.toml`; there is deliberately no
 /// second copy on disk for it to drift from.
 pub(crate) fn stage_connection(
     staging: &Path,
-    published_projects_dir: &Path,
+    published_project_registry_dir: &Path,
     opts: &LoginOptions,
+    allowed_roots: &[PathBuf],
     server_url: &str,
     identity: &EnrolledIdentity,
     device: &str,
     now: &str,
 ) -> Result<(), String> {
     let paths = ConnectionPaths::new(staging.to_path_buf());
-    std::fs::create_dir_all(&paths.projects_dir)
-        .map_err(|error| format!("failed to create {}: {error}", paths.projects_dir.display()))?;
+    std::fs::create_dir_all(&paths.project_registry_dir).map_err(|error| {
+        format!(
+            "failed to create {}: {error}",
+            paths.project_registry_dir.display()
+        )
+    })?;
 
     super::system::write_text_file(
         &paths.user_token,
@@ -558,7 +563,7 @@ pub(crate) fn stage_connection(
 
     crate::runner_config::run_runner_init(crate::runner_config::RunnerInitOptions {
         server_url: server_url.to_string(),
-        token: Some(identity.agent_token.clone()),
+        token: Some(identity.runner_token.clone()),
         token_file: None,
         client_id: device.to_string(),
         owner: identity.username.clone(),
@@ -566,21 +571,20 @@ pub(crate) fn stage_connection(
         transport: opts.transport.clone(),
         poll_interval_ms: crate::runner_config::DEFAULT_POLL_INTERVAL_MS,
         // The directory is created inside staging above so it is published
-        // atomically with the rest of the connection, but agent.toml must
+        // atomically with the rest of the connection, but runner.toml must
         // point at its final path after that staging directory is renamed.
-        projects_dir: published_projects_dir.to_path_buf(),
-        output: paths.agent_config.clone(),
-        allowed_roots: opts.allowed_roots.clone(),
+        project_registry_dir: published_project_registry_dir.to_path_buf(),
+        output: paths.runner_config.clone(),
+        allowed_roots: allowed_roots.to_vec(),
         allow_cwd_anywhere: false,
         overwrite: true,
     })?;
-    harden_secret_file(&paths.agent_config)?;
+    harden_secret_file(&paths.runner_config)?;
 
     write_descriptor(&paths, server_url, &identity.username, device, now)
 }
 
-const ROOT_RUNNER_INSTALL_REASON: &str = "login ran as root; no safe systemd installation argv can be generated without explicitly selecting a non-root Runner user and validating access to the agent config, working directory, projects directory, and allowed roots";
-const ROOT_FOREGROUND_REASON: &str = "login ran as root; no foreground Runner argv is emitted because it would execute project commands as root";
+const ROOT_RUNNER_WARNING: &str = "Warning: this Runner will execute project commands as root.";
 const WINDOWS_RUNNER_INSTALL_REASON: &str = "automatic Windows Runner service installation is not supported in this release; start the foreground Runner shown above instead";
 const NON_LINUX_RUNNER_INSTALL_REASON: &str = "managed Runner service installation is supported only on Linux; start the foreground Runner shown above instead";
 
@@ -595,44 +599,42 @@ pub(crate) fn render_login_result(
     json: bool,
     print_mcp_config: bool,
 ) -> Result<String, String> {
-    let foreground_argv = (!effective_root).then(|| {
-        vec![
-            "webcodex-runner".to_string(),
-            "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
-        ]
-    });
-    let runner_install_argv = (!effective_root && cfg!(target_os = "linux")).then(|| {
-        vec![
+    let foreground_argv = vec![
+        "webcodex-runner".to_string(),
+        "--config".to_string(),
+        paths.runner_config.to_string_lossy().into_owned(),
+    ];
+    let runner_install_argv = cfg!(target_os = "linux").then(|| {
+        let mut argv = vec![
             "webcodex".to_string(),
             "runner".to_string(),
             "install".to_string(),
             "--scope".to_string(),
-            "user".to_string(),
+            if effective_root { "system" } else { "user" }.to_string(),
             "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
-        ]
+            paths.runner_config.to_string_lossy().into_owned(),
+        ];
+        if effective_root {
+            argv.push("--allow-root-runner".to_string());
+        }
+        argv
     });
-    let runner_install_reason = if effective_root {
-        Some(ROOT_RUNNER_INSTALL_REASON)
-    } else if cfg!(windows) {
+    let runner_install_reason = if cfg!(windows) {
         Some(WINDOWS_RUNNER_INSTALL_REASON)
     } else if !cfg!(target_os = "linux") {
         Some(NON_LINUX_RUNNER_INSTALL_REASON)
     } else {
         None
     };
-    let foreground_command = foreground_argv.as_ref().map(|argv| shell_command(argv));
+    let foreground_command = shell_command(&foreground_argv);
     let runner_install_command = runner_install_argv.as_ref().map(|argv| shell_command(argv));
-    let human_foreground_command = (!effective_root).then(|| {
-        shell_command(&[
-            "webcodex".to_string(),
-            "runner".to_string(),
-            "run".to_string(),
-            "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
-        ])
-    });
+    let human_foreground_command = shell_command(&[
+        "webcodex".to_string(),
+        "runner".to_string(),
+        "run".to_string(),
+        "--config".to_string(),
+        paths.runner_config.to_string_lossy().into_owned(),
+    ]);
     let register_command = format!(
         "{} <existing-workspace>",
         shell_command(&[
@@ -640,7 +642,7 @@ pub(crate) fn render_login_result(
             "project".to_string(),
             "register".to_string(),
             "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
+            paths.runner_config.to_string_lossy().into_owned(),
         ])
     );
     let human_register_command = format!(
@@ -650,7 +652,7 @@ pub(crate) fn render_login_result(
             "project".to_string(),
             "register".to_string(),
             "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
+            paths.runner_config.to_string_lossy().into_owned(),
         ])
     );
 
@@ -662,9 +664,7 @@ pub(crate) fn render_login_result(
         if registration.is_none() {
             next_steps.push(register_command.clone());
         }
-        if let Some(command) = &foreground_command {
-            next_steps.push(command.clone());
-        }
+        next_steps.push(foreground_command.clone());
         if let Some(command) = &runner_install_command {
             next_steps.push(command.clone());
         }
@@ -686,8 +686,8 @@ pub(crate) fn render_login_result(
             "mcp_url": format!("{server_url}/mcp"),
             "dir": paths.dir.to_string_lossy(),
             "user_token_file": paths.user_token.to_string_lossy(),
-            "agent_config": paths.agent_config.to_string_lossy(),
-            "projects_registry": paths.projects_dir.to_string_lossy(),
+            "runner_config": paths.runner_config.to_string_lossy(),
+            "project_registry_dir": paths.project_registry_dir.to_string_lossy(),
             "allowed_roots": allowed_roots.iter().map(|root| root.to_string_lossy().to_string()).collect::<Vec<_>>(),
             "project_registration": {
                 "registered": registration.is_some(),
@@ -696,11 +696,12 @@ pub(crate) fn render_login_result(
             "registered_projects": registered_projects,
             "credential_usage": {
                 "webcodex-user-token": "GPT Actions, MCP, and REST/project APIs",
-                "agent_config_token": "Runner transport only",
+                "runner_config_token": "Runner transport only",
             },
-            "foreground_available": foreground_argv.is_some(),
+            "foreground_available": true,
             "foreground_argv": &foreground_argv,
-            "foreground_reason": effective_root.then_some(ROOT_FOREGROUND_REASON),
+            "foreground_reason": serde_json::Value::Null,
+            "runner_warning": effective_root.then_some(ROOT_RUNNER_WARNING),
             "runner_install_available": runner_install_argv.is_some(),
             "runner_install_argv": &runner_install_argv,
             "runner_install_reason": runner_install_reason,
@@ -729,6 +730,10 @@ pub(crate) fn render_login_result(
 
     let mut out = String::new();
     out.push_str("Login complete\n\n");
+    if effective_root {
+        out.push_str(ROOT_RUNNER_WARNING);
+        out.push_str("\n\n");
+    }
     if let Some(project) = registration {
         out.push_str("Project:\n");
         out.push_str(&format!("  {}\n", project.path.display()));
@@ -736,7 +741,7 @@ pub(crate) fn render_login_result(
         out.push_str("No project has been added yet.\n");
     }
     out.push_str("\nRunner configuration:\n");
-    out.push_str(&format!("  {}\n", paths.agent_config.display()));
+    out.push_str(&format!("  {}\n", paths.runner_config.display()));
     if !allowed_roots.is_empty() {
         out.push_str("\nProjects may be added under:\n");
         for root in allowed_roots {
@@ -746,16 +751,14 @@ pub(crate) fn render_login_result(
     out.push_str("\nNext:\n");
     if registration.is_none() {
         out.push_str(&format!("  {human_register_command}\n"));
-    } else if let Some(command) = &human_foreground_command {
-        out.push_str(&format!("  {command}\n"));
+    }
+    if registration.is_some() || effective_root {
+        out.push_str(&format!("  {human_foreground_command}\n"));
         out.push_str("\nKeep this terminal open. Ctrl-C stops this Runner.\n");
         if let Some(install) = &runner_install_command {
             out.push_str("\nFor daily background use on Linux instead:\n");
             out.push_str(&format!("  {install}\n"));
         }
-    } else {
-        out.push_str("  Use a fresh one-time login code as the ordinary local user who will run project commands.\n");
-        out.push_str("  No root Runner command is recommended by this login.\n");
     }
     out.push_str("\nDetails:\n");
     out.push_str(&format!("  Server: {server_url}\n"));
@@ -918,19 +921,11 @@ pub(crate) async fn redeem_pairing_code(
     opts: &LoginOptions,
     device: &str,
 ) -> Result<EnrolledIdentity, String> {
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
         "pairing_code": opts.code,
         "client_id": device,
         "transport": opts.transport,
-        "allow_cwd_anywhere": false,
     });
-    if !opts.allowed_roots.is_empty() {
-        body["allowed_roots"] = serde_json::json!(opts
-            .allowed_roots
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>());
-    }
 
     let value =
         super::http::post_json_unauthed(server_url, &opts.server_http, "/api/pairing/enroll", body)
@@ -946,7 +941,7 @@ pub(crate) async fn redeem_pairing_code(
     Ok(EnrolledIdentity {
         username: field("username")?,
         user_token: field("user_token")?,
-        agent_token: field("agent_token")?,
+        runner_token: field("agent_token")?,
     })
 }
 
@@ -969,8 +964,16 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", parent.display()))?;
     let device = resolve_device_name(base, &opts)?;
-    let mut output_allowed_roots =
-        webcodex_runner_config::effective_allowed_roots(&opts.allowed_roots, false)?;
+    // Explicit project selection can supply an exact root even without HOME.
+    // This only resolves defaults; the saved Runner policy remains restricted.
+    let mut output_allowed_roots = webcodex_runner_config::effective_allowed_roots(
+        &opts.allowed_roots,
+        opts.project.is_some(),
+    )?;
+    // Preserve the historical generated-config behavior unless explicit project
+    // selection adds exact project authority. In that case this becomes the persisted
+    // Runner policy, including any effective HOME root that existed beforehand.
+    let mut runner_allowed_roots = opts.allowed_roots.clone();
 
     // When --project is present, even the project record is fully validated and
     // staged before redemption. The staging directory contains no credentials at
@@ -979,15 +982,18 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
     let mut prestaged: Option<(PathBuf, ProjectRegistration)> = None;
     if let Some(project) = &opts.project {
         let staging = create_staging_dir(&parent)?;
-        let staged_projects_dir = staging.join("projects.d");
+        let staged_project_registry_dir = staging.join("project-registry");
         match register_existing_project(
-            &staged_projects_dir,
+            &staged_project_registry_dir,
             project,
             &output_allowed_roots,
             false,
             None,
         ) {
-            Ok((registration, roots)) => {
+            Ok((registration, roots, authority_changed)) => {
+                if authority_changed {
+                    runner_allowed_roots = roots.clone();
+                }
                 output_allowed_roots = roots;
                 prestaged = Some((staging, registration));
             }
@@ -1031,8 +1037,9 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(error) = stage_connection(
         &staging,
-        &paths.projects_dir,
+        &paths.project_registry_dir,
         &opts,
+        &runner_allowed_roots,
         &server_url,
         &identity,
         &device,
@@ -1045,7 +1052,9 @@ pub(crate) async fn run_login(opts: LoginOptions) -> Result<String, String> {
     match publish_connection(&staging, &paths.dir, opts.overwrite)? {
         PublishOutcome::Published => {
             if let Some(project) = registration.as_mut() {
-                project.record_path = paths.projects_dir.join(format!("{}.toml", project.id));
+                project.record_path = paths
+                    .project_registry_dir
+                    .join(format!("{}.toml", project.id));
             }
             render_login_result(
                 &paths,
@@ -1153,6 +1162,7 @@ pub(crate) fn run_status(opts: StatusOptions) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webcodex_cli::test_support::canonical_test_tempdir;
 
     thread_local! {
         /// Forces `remove_internal_dir` to fail, so the residue-reporting paths
@@ -1186,7 +1196,11 @@ mod tests {
             device_explicit: false,
             base_dir: base.to_path_buf(),
             transport: "websocket".to_string(),
-            allowed_roots: Vec::new(),
+            // Test fixtures should not depend on process-global HOME discovery:
+            // other tests intentionally remove HOME/USERPROFILE while exercising
+            // explicit project authority. Tests that need empty-root semantics
+            // can override this field explicitly.
+            allowed_roots: vec![base.to_path_buf()],
             overwrite,
             project: None,
             json: false,
@@ -1198,7 +1212,7 @@ mod tests {
         EnrolledIdentity {
             username: "alice".to_string(),
             user_token: USER_TOKEN.to_string(),
-            agent_token: AGENT_TOKEN.to_string(),
+            runner_token: AGENT_TOKEN.to_string(),
         }
     }
 
@@ -1216,8 +1230,9 @@ mod tests {
         let staging = create_staging_dir(&parent)?;
         if let Err(error) = stage_connection(
             &staging,
-            &paths.projects_dir,
+            &paths.project_registry_dir,
             &opts,
+            &opts.allowed_roots,
             &canonical.url,
             &identity,
             &opts.device,
@@ -1309,18 +1324,18 @@ mod tests {
 
     #[test]
     fn destination_is_server_then_user() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let paths = resolve_destination(temp.path(), "https://api.example.com", "alice").unwrap();
         assert_eq!(
             paths.dir,
             temp.path().join("https_api.example.com").join("alice")
         );
-        assert_eq!(paths.agent_config, paths.dir.join("agent.toml"));
+        assert_eq!(paths.runner_config, paths.dir.join("runner.toml"));
     }
 
     #[test]
     fn a_fresh_login_publishes_through_staging_and_leaves_nothing_behind() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         assert_eq!(
             publish_login(base, "https://api.example.com", false).unwrap(),
@@ -1333,27 +1348,32 @@ mod tests {
         assert_eq!(listed[0].server_url, "https://api.example.com");
 
         let paths = &listed[0].paths;
-        assert!(paths.agent_config.is_file());
+        assert!(paths.runner_config.is_file());
         assert!(paths.user_token.is_file());
-        assert!(paths.projects_dir.is_dir());
-        assert_eq!(std::fs::read_dir(&paths.projects_dir).unwrap().count(), 0);
-        // The agent token has exactly one home.
+        assert!(paths.project_registry_dir.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&paths.project_registry_dir)
+                .unwrap()
+                .count(),
+            0
+        );
+        // The Runner transport token has exactly one home.
         assert!(!paths.dir.join("webcodex-runner-token").exists());
-        let agent_config = std::fs::read_to_string(&paths.agent_config).unwrap();
-        assert!(agent_config.contains(AGENT_TOKEN));
-        let parsed: toml::Value = toml::from_str(&agent_config).unwrap();
-        let configured_projects_dir = PathBuf::from(
+        let runner_config = std::fs::read_to_string(&paths.runner_config).unwrap();
+        assert!(runner_config.contains(AGENT_TOKEN));
+        let parsed: toml::Value = toml::from_str(&runner_config).unwrap();
+        let configured_project_registry_dir = PathBuf::from(
             parsed
-                .get("projects_dir")
+                .get("project_registry_dir")
                 .and_then(toml::Value::as_str)
-                .expect("projects_dir must be present"),
+                .expect("project_registry_dir must be present"),
         );
         assert_eq!(
-            configured_projects_dir.canonicalize().unwrap(),
-            paths.projects_dir.canonicalize().unwrap(),
-            "published agent.toml must reference the published projects.d directory"
+            configured_project_registry_dir.canonicalize().unwrap(),
+            paths.project_registry_dir.canonicalize().unwrap(),
+            "published runner.toml must reference the published project-registry directory"
         );
-        // Canonical equality above proves this is the published projects.d,
+        // Canonical equality above proves this is the published project-registry,
         // not the differently named staging directory that existed before the
         // atomic rename.
 
@@ -1363,7 +1383,7 @@ mod tests {
 
     #[test]
     fn allowed_root_without_project_remains_policy_only() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         let allowed_root = temp.path().join("workspaces");
         std::fs::create_dir_all(&allowed_root).unwrap();
@@ -1376,8 +1396,9 @@ mod tests {
         let staging = create_staging_dir(&parent).unwrap();
         stage_connection(
             &staging,
-            &paths.projects_dir,
+            &paths.project_registry_dir,
             &opts,
+            &opts.allowed_roots,
             &canonical.url,
             &identity,
             &opts.device,
@@ -1388,17 +1409,22 @@ mod tests {
             publish_connection(&staging, &paths.dir, false).unwrap(),
             PublishOutcome::Published
         );
-        assert_eq!(std::fs::read_dir(&paths.projects_dir).unwrap().count(), 0);
-        let agent_config = std::fs::read_to_string(&paths.agent_config).unwrap();
-        let parsed: toml::Value = toml::from_str(&agent_config).unwrap();
         assert_eq!(
-            PathBuf::from(parsed["projects_dir"].as_str().unwrap())
+            std::fs::read_dir(&paths.project_registry_dir)
+                .unwrap()
+                .count(),
+            0
+        );
+        let runner_config = std::fs::read_to_string(&paths.runner_config).unwrap();
+        let parsed: toml::Value = toml::from_str(&runner_config).unwrap();
+        assert_eq!(
+            PathBuf::from(parsed["project_registry_dir"].as_str().unwrap())
                 .canonicalize()
                 .unwrap(),
-            paths.projects_dir.canonicalize().unwrap()
+            paths.project_registry_dir.canonicalize().unwrap()
         );
         assert_ne!(
-            paths.projects_dir.canonicalize().unwrap(),
+            paths.project_registry_dir.canonicalize().unwrap(),
             allowed_root.canonicalize().unwrap()
         );
         assert_eq!(
@@ -1407,14 +1433,52 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn staged_login_persists_exact_network_project_authority_override() {
+        let temp = canonical_test_tempdir();
+        let base = temp.path().join("config");
+        let opts = login_opts(&base, "https://api.example.com", false);
+        let canonical = canonical_server_url(&opts.server_url).unwrap();
+        let identity = identity();
+        let parent = resolve_connection_parent(&base, &canonical).unwrap();
+        let paths = ConnectionPaths::new(parent.join(user_slug(&identity.username).unwrap()));
+        let staging = create_staging_dir(&parent).unwrap();
+        let network_project = PathBuf::from(r"\\?\UNC\NAS\work\repo");
+        stage_connection(
+            &staging,
+            &paths.project_registry_dir,
+            &opts,
+            std::slice::from_ref(&network_project),
+            &canonical.url,
+            &identity,
+            &opts.device,
+            "t",
+        )
+        .unwrap();
+        let runner_config = std::fs::read_to_string(staging.join("runner.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&runner_config).unwrap();
+        let roots = parsed["policy"]["allowed_roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert!(webcodex_runner_config::paths::paths_equal(
+            Path::new(roots[0].as_str().unwrap()),
+            &network_project
+        ));
+        assert!(!webcodex_runner_config::paths::paths_equal(
+            Path::new(roots[0].as_str().unwrap()),
+            Path::new(r"\\nas\work")
+        ));
+        let _ = discard_internal_dir(&staging);
+    }
+
     #[cfg(unix)]
     #[test]
     fn published_secrets_are_not_world_readable() {
         use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         publish_login(temp.path(), "https://api.example.com", false).unwrap();
         let paths = all_connections(temp.path())[0].paths.clone();
-        for secret in [&paths.agent_config, &paths.user_token] {
+        for secret in [&paths.runner_config, &paths.user_token] {
             let mode = std::fs::metadata(secret).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{} has mode {mode:o}", secret.display());
         }
@@ -1424,7 +1488,7 @@ mod tests {
     #[test]
     fn a_staging_directory_is_private_while_it_exists() {
         use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let paths = resolve_destination(temp.path(), "https://api.example.com", "alice").unwrap();
         std::fs::create_dir_all(paths.dir.parent().unwrap()).unwrap();
         let staging = create_staging_dir(paths.dir.parent().unwrap()).unwrap();
@@ -1436,7 +1500,7 @@ mod tests {
 
     #[test]
     fn a_failure_while_staging_leaves_no_connection_and_no_residue() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let opts = login_opts(base, "https://api.example.com", false);
         let identity = identity();
@@ -1444,12 +1508,13 @@ mod tests {
         std::fs::create_dir_all(paths.dir.parent().unwrap()).unwrap();
         let staging = create_staging_dir(paths.dir.parent().unwrap()).unwrap();
 
-        // Make agent.toml impossible to create by putting a directory there.
-        std::fs::create_dir_all(staging.join("agent.toml")).unwrap();
+        // Make runner.toml impossible to create by putting a directory there.
+        std::fs::create_dir_all(staging.join("runner.toml")).unwrap();
         let result = stage_connection(
             &staging,
-            &paths.projects_dir,
+            &paths.project_registry_dir,
             &opts,
+            &opts.allowed_roots,
             "https://api.example.com",
             &identity,
             &opts.device,
@@ -1465,7 +1530,7 @@ mod tests {
 
     #[test]
     fn overwrite_replaces_the_connection_and_removes_the_backup() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         let paths = all_connections(base)[0].paths.clone();
@@ -1485,7 +1550,7 @@ mod tests {
 
     #[test]
     fn a_failed_overwrite_restores_the_previous_connection() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         let paths = all_connections(base)[0].paths.clone();
@@ -1506,7 +1571,7 @@ mod tests {
 
     #[test]
     fn without_overwrite_the_old_connection_stays_and_new_credentials_are_kept() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         let paths = all_connections(base)[0].paths.clone();
@@ -1523,8 +1588,8 @@ mod tests {
             "old"
         );
         // ...the redeemed credentials still exist...
-        assert!(path.join("agent.toml").is_file());
-        assert!(std::fs::read_to_string(path.join("agent.toml"))
+        assert!(path.join("runner.toml").is_file());
+        assert!(std::fs::read_to_string(path.join("runner.toml"))
             .unwrap()
             .contains(AGENT_TOKEN));
         // ...and `status` shows one connection, not two.
@@ -1538,7 +1603,7 @@ mod tests {
 
     #[test]
     fn status_ignores_staging_backup_and_recovery_directories() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         // A second login without --overwrite parks a full recovery directory.
@@ -1559,7 +1624,7 @@ mod tests {
 
     #[test]
     fn logout_with_multiple_users_requires_explicit_user_or_all() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         seed_connection(base, "https://api.example.com", "alice");
         seed_connection(base, "https://api.example.com", "bob");
@@ -1604,7 +1669,7 @@ mod tests {
 
     #[test]
     fn logout_json_multiple_user_ambiguity_is_structured_and_secret_free() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         seed_connection(base, "https://api.example.com", "alice");
         seed_connection(base, "https://api.example.com", "bob");
@@ -1630,7 +1695,7 @@ mod tests {
 
     #[test]
     fn logout_over_https_does_not_touch_the_http_connection() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         seed_connection(base, "http://api.example.com", "alice");
         seed_connection(base, "https://api.example.com", "alice");
@@ -1653,7 +1718,7 @@ mod tests {
 
     #[test]
     fn logout_on_one_port_does_not_touch_another() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         seed_connection(base, "https://api.example.com", "alice");
         seed_connection(base, "https://api.example.com:8443", "alice");
@@ -1676,7 +1741,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn logout_never_follows_a_symlinked_connection_directory() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         let outside = temp.path().join("precious");
         std::fs::create_dir_all(&outside).unwrap();
@@ -1707,7 +1772,7 @@ mod tests {
 
     #[test]
     fn removal_refuses_a_path_outside_the_base_directory() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         std::fs::create_dir_all(&base).unwrap();
         let outside = temp.path().join("elsewhere/https_api.example.com/alice");
@@ -1727,7 +1792,7 @@ mod tests {
 
     #[test]
     fn status_lists_every_connection_and_guides_when_empty() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let empty = render_status(&all_connections(base), false).unwrap();
         assert!(empty.contains("Not logged in"), "{empty}");
@@ -1749,7 +1814,7 @@ mod tests {
 
     #[test]
     fn one_device_can_hold_the_same_user_on_several_servers() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://s1.example.com", false).unwrap();
         publish_login(base, "https://s2.example.com", false).unwrap();
@@ -1770,7 +1835,7 @@ mod tests {
             let name = entry.unwrap().file_name().to_string_lossy().to_string();
             if matches!(
                 name.as_str(),
-                "server.toml" | "agent.toml" | "webcodex-user-token"
+                "server.toml" | "runner.toml" | "webcodex-user-token"
             ) || name.starts_with(INTERNAL_DIR_PREFIX)
             {
                 offenders.push(name);
@@ -1786,7 +1851,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_refuses_a_symlinked_base_directory() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let base = temp.path().join("config");
@@ -1801,7 +1866,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_refuses_a_symlinked_server_directory() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let base = temp.path().join("config");
@@ -1819,7 +1884,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dangling_server_symlink_is_rejected() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         std::fs::create_dir_all(&base).unwrap();
         let canonical = canonical_server_url("https://api.example.com").unwrap();
@@ -1837,7 +1902,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn login_does_not_create_staging_outside_base() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let base = temp.path().join("config");
@@ -1860,7 +1925,7 @@ mod tests {
         // safe/link -> outside, base = safe/link/config. `create_dir_all` walks
         // straight through `link` and the canonicalize afterwards then reports
         // the relocated path as if it were fine.
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let outside = temp.path().join("outside");
         let safe = temp.path().join("safe");
         std::fs::create_dir_all(&outside).unwrap();
@@ -1882,7 +1947,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn login_refuses_a_symlinked_base_ancestor_before_redeeming() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let outside = temp.path().join("outside");
         let safe = temp.path().join("safe");
         std::fs::create_dir_all(&outside).unwrap();
@@ -1906,7 +1971,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_refuses_a_dangling_symlinked_base_ancestor() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let safe = temp.path().join("safe");
         std::fs::create_dir_all(&safe).unwrap();
         let nowhere = temp.path().join("nowhere");
@@ -1925,7 +1990,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn login_refuses_a_file_in_the_base_path() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let safe = temp.path().join("safe");
         std::fs::create_dir_all(&safe).unwrap();
         std::fs::write(safe.join("blocker"), "not a directory").unwrap();
@@ -1944,7 +2009,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_base_components_are_created_without_following_symlinks() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         // A symlink that shares a name with a component that will be created
@@ -1967,7 +2032,7 @@ mod tests {
 
     #[test]
     fn base_paths_may_be_relative_and_contain_dot_components() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let anchor = temp.path().canonicalize().unwrap();
         let canonical = canonical_server_url("https://api.example.com").unwrap();
 
@@ -1988,7 +2053,7 @@ mod tests {
 
     #[test]
     fn resolve_connection_parent_creates_a_missing_base_and_server_directory() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("nested/config");
         let canonical = canonical_server_url("https://api.example.com").unwrap();
         let parent = resolve_connection_parent(&base, &canonical).unwrap();
@@ -2005,7 +2070,7 @@ mod tests {
 
     #[test]
     fn successful_overwrite_does_not_silently_leave_backup() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         let outcome = publish_login(base, "https://api.example.com", true).unwrap();
@@ -2019,7 +2084,7 @@ mod tests {
 
     #[test]
     fn backup_cleanup_failure_is_reported() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
 
@@ -2036,7 +2101,7 @@ mod tests {
 
     #[test]
     fn staging_cleanup_failure_is_reported() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let canonical = canonical_server_url("https://api.example.com").unwrap();
         let parent = resolve_connection_parent(base, &canonical).unwrap();
@@ -2054,7 +2119,7 @@ mod tests {
 
     #[test]
     fn cleanup_errors_do_not_contain_credentials() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let canonical = canonical_server_url("https://api.example.com").unwrap();
         let parent = resolve_connection_parent(base, &canonical).unwrap();
@@ -2075,8 +2140,9 @@ mod tests {
         let staging = create_staging_dir(&parent).unwrap();
         stage_connection(
             &staging,
-            &final_dir.join("projects.d"),
+            &final_dir.join("project-registry"),
             &opts,
+            &opts.allowed_roots,
             &canonical.url,
             &identity(),
             &opts.device,
@@ -2099,7 +2165,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_rejects_an_unusable_server_url_before_spending_the_code() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         for bad in [
             "https://api.example.com/path",
             "ftp://api.example.com",
@@ -2141,7 +2207,7 @@ mod tests {
 
     #[test]
     fn resolved_default_device_combines_hostname_and_persistent_suffix() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let opts = login_opts(base, "https://api.example.com", false);
         let first = resolve_device_name(base, &opts).unwrap();
@@ -2162,7 +2228,7 @@ mod tests {
         let second = resolve_device_name(base, &opts).unwrap();
         assert_eq!(first, second);
         // Two different bases get different suffixes.
-        let other = tempfile::TempDir::new().unwrap();
+        let other = canonical_test_tempdir();
         let third = resolve_device_name(other.path(), &opts).unwrap();
         assert_ne!(first, third);
     }
@@ -2196,7 +2262,7 @@ mod tests {
             .unwrap();
         });
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config root");
         let opts = LoginOptions {
             server_url: format!("http://{address}"),
@@ -2246,8 +2312,17 @@ mod tests {
             let body = request.split("\r\n\r\n").nth(1).unwrap();
             let value: serde_json::Value = serde_json::from_str(body).unwrap();
             assert_eq!(value["pairing_code"], CODE);
-            assert_eq!(value["allow_cwd_anywhere"], false);
-            assert_eq!(value["allowed_roots"].as_array().unwrap().len(), 1);
+            for absent in [
+                "project_registry_dir",
+                "projects_dir",
+                "allowed_roots",
+                "allow_cwd_anywhere",
+            ] {
+                assert!(
+                    value.get(absent).is_none(),
+                    "pairing request leaked {absent}: {value}"
+                );
+            }
             let body = serde_json::json!({
                 "username": "alice",
                 "user_token": USER_TOKEN,
@@ -2263,10 +2338,11 @@ mod tests {
             .unwrap();
         });
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         let allowed_root = temp.path().join("workspaces");
-        let project = allowed_root.join("my-repo");
+        let project = temp.path().join("selected/my-repo");
+        std::fs::create_dir_all(&allowed_root).unwrap();
         std::fs::create_dir_all(&project).unwrap();
         let opts = LoginOptions {
             server_url: format!("http://{address}"),
@@ -2303,34 +2379,45 @@ mod tests {
         assert_eq!(connections.len(), 1);
         let paths = &connections[0].paths;
         let records =
-            crate::webcodex_cli::connect::profile::read_project_files(&paths.projects_dir).unwrap();
+            crate::webcodex_cli::connect::profile::read_project_files(&paths.project_registry_dir)
+                .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].1.id, "my-repo");
         assert_eq!(
             PathBuf::from(&records[0].1.path).canonicalize().unwrap(),
             project.canonicalize().unwrap()
         );
-        assert!(records[0].0.starts_with(&paths.projects_dir));
+        assert!(records[0].0.starts_with(&paths.project_registry_dir));
         let reported_record =
             PathBuf::from(value["registered_projects"][0]["record"].as_str().unwrap());
         assert_eq!(
             reported_record.canonicalize().unwrap(),
             records[0].0.canonicalize().unwrap()
         );
-        let agent_config = std::fs::read_to_string(&paths.agent_config).unwrap();
-        let parsed: toml::Value = toml::from_str(&agent_config).unwrap();
+        let runner_config = std::fs::read_to_string(&paths.runner_config).unwrap();
+        let parsed: toml::Value = toml::from_str(&runner_config).unwrap();
         assert_eq!(
-            PathBuf::from(parsed["projects_dir"].as_str().unwrap())
+            PathBuf::from(parsed["project_registry_dir"].as_str().unwrap())
                 .canonicalize()
                 .unwrap(),
-            paths.projects_dir.canonicalize().unwrap()
+            paths.project_registry_dir.canonicalize().unwrap()
         );
+        let local_allowed_roots = parsed["policy"]["allowed_roots"].as_array().unwrap();
+        assert_eq!(local_allowed_roots.len(), 2);
+        assert!(webcodex_runner_config::paths::paths_equal(
+            Path::new(local_allowed_roots[1].as_str().unwrap()),
+            &project.canonicalize().unwrap()
+        ));
+        assert!(webcodex_runner_config::paths::paths_equal(
+            Path::new(local_allowed_roots[0].as_str().unwrap()),
+            &allowed_root
+        ));
         assert_no_internal_residue(paths.dir.parent().unwrap());
     }
 
     #[tokio::test]
-    async fn login_project_outside_allowed_roots_fails_before_redemption() {
-        let temp = tempfile::TempDir::new().unwrap();
+    async fn login_project_outside_allowed_roots_reaches_redemption() {
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         let allowed_root = temp.path().join("allowed");
         let outside = temp.path().join("outside");
@@ -2357,15 +2444,15 @@ mod tests {
             print_mcp_config: false,
         };
         let error = run_login(opts).await.unwrap_err();
-        assert!(error.contains("outside allowed_roots"), "{error}");
+        assert!(error.contains("request failed"), "{error}");
         let canonical = canonical_server_url(&format!("http://{address}")).unwrap();
         let parent = resolve_connection_parent(&base, &canonical).unwrap();
         assert_no_internal_residue(&parent);
     }
 
     #[tokio::test]
-    async fn login_project_rejects_unauthorized_dangerous_root_before_redemption() {
-        let temp = tempfile::TempDir::new().unwrap();
+    async fn login_project_explicit_system_root_reaches_redemption() {
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         let allowed_root = temp.path().join("allowed");
         std::fs::create_dir_all(&allowed_root).unwrap();
@@ -2375,7 +2462,7 @@ mod tests {
         #[cfg(windows)]
         let dangerous_project = PathBuf::from(r"C:\");
         #[cfg(not(windows))]
-        let dangerous_project = PathBuf::from("/etc");
+        let dangerous_project = PathBuf::from("/etc").canonicalize().unwrap();
         let opts = LoginOptions {
             server_url: format!("http://{address}"),
             server_http: ServerHttpOptions {
@@ -2394,11 +2481,7 @@ mod tests {
             print_mcp_config: false,
         };
         let error = run_login(opts).await.unwrap_err();
-        assert!(error.contains("outside allowed_roots"), "{error}");
-        assert!(
-            !error.contains("failed to send"),
-            "path policy must fail before the one-shot pairing request: {error}"
-        );
+        assert!(error.contains("request failed"), "{error}");
         let canonical = canonical_server_url(&format!("http://{address}")).unwrap();
         let parent = resolve_connection_parent(&base, &canonical).unwrap();
         assert_no_internal_residue(&parent);
@@ -2406,8 +2489,8 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn login_project_rejects_raw_unc_before_redemption_or_canonicalization() {
-        let temp = tempfile::TempDir::new().unwrap();
+    async fn login_project_allows_raw_unc_to_reach_canonicalization_before_redemption() {
+        let temp = canonical_test_tempdir();
         let base = temp.path().join("config");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2431,14 +2514,17 @@ mod tests {
             print_mcp_config: false,
         };
         let error = run_login(opts).await.unwrap_err();
-        assert!(error.contains("not on a local disk drive"), "{error}");
         assert!(
-            !error.contains("does not exist or cannot be resolved"),
-            "raw UNC ingress must fail before project canonicalization: {error}"
+            error.contains("does not exist or cannot be resolved"),
+            "raw UNC ingress must reach project canonicalization: {error}"
+        );
+        assert!(
+            !error.contains("unsupported Windows project namespace"),
+            "{error}"
         );
         assert!(
             !error.contains("failed to send"),
-            "raw UNC ingress must fail before the one-shot pairing request: {error}"
+            "filesystem resolution must still happen before the one-shot pairing request: {error}"
         );
         let canonical = canonical_server_url(&format!("http://{address}")).unwrap();
         let parent = resolve_connection_parent(&base, &canonical).unwrap();
@@ -2447,7 +2533,7 @@ mod tests {
 
     #[test]
     fn explicit_device_wins_verbatim_without_a_suffix() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let opts = explicit_device_opts(base, "https://api.example.com", "my-rig");
         assert_eq!(resolve_device_name(base, &opts).unwrap(), "my-rig");
@@ -2460,7 +2546,7 @@ mod tests {
     fn device_suffix_file_is_created_with_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         std::fs::create_dir_all(base).unwrap();
         let opts = login_opts(base, "https://api.example.com", false);
@@ -2476,7 +2562,7 @@ mod tests {
 
     #[test]
     fn device_suffix_is_not_listed_as_a_connection() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         std::fs::write(base.join(DEVICE_ID_FILE), "aabbccddeeff0011\n").unwrap();
@@ -2486,7 +2572,7 @@ mod tests {
 
     #[test]
     fn device_suffix_race_reuses_the_winner() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let path = base.join(DEVICE_ID_FILE);
         std::fs::create_dir_all(base).unwrap();
@@ -2499,7 +2585,7 @@ mod tests {
     fn device_suffix_waits_for_a_concurrent_creator_to_finish() {
         use std::io::Write;
 
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let path = temp.path().join(DEVICE_ID_FILE);
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -2533,7 +2619,7 @@ mod tests {
 
     #[test]
     fn device_suffix_rejects_malformed_or_planted_files_before_redeem() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         std::fs::create_dir_all(base).unwrap();
 
@@ -2560,7 +2646,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn device_suffix_rejects_a_symlink() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(base).unwrap();
@@ -2574,7 +2660,7 @@ mod tests {
     #[test]
     fn device_suffix_rejects_group_or_other_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         std::fs::create_dir_all(base).unwrap();
         let path = base.join(DEVICE_ID_FILE);
@@ -2586,7 +2672,7 @@ mod tests {
 
     #[test]
     fn a_hostname_near_the_cap_is_truncated_so_the_suffix_survives() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         // 80-char hostname plus suffix would exceed the server's 80 cap; the
         // head must be truncated to make room for `-` + 16 hex.
@@ -2605,7 +2691,7 @@ mod tests {
 
     #[test]
     fn render_login_result_includes_safe_metadata_and_no_tokens_by_default() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         let paths = all_connections(base)[0].paths.clone();
@@ -2625,7 +2711,7 @@ mod tests {
         assert!(text.contains("No project has been added yet."), "{text}");
         assert!(text.contains("Runner configuration:"), "{text}");
         assert!(
-            text.contains(&paths.agent_config.display().to_string()),
+            text.contains(&paths.runner_config.display().to_string()),
             "{text}"
         );
         assert!(
@@ -2634,7 +2720,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("device/client_id"), "{text}");
-        assert!(!text.contains("projects registry"), "{text}");
+        assert!(!text.contains("project registry"), "{text}");
         assert!(!text.contains("runtime_project"), "{text}");
         assert!(
             !text.contains(&paths.user_token.display().to_string()),
@@ -2664,13 +2750,27 @@ mod tests {
             Some("https://api.example.com/mcp")
         );
         assert!(json_value.get("credential_usage").is_some(), "{json}");
+        assert_eq!(
+            json_value["runner_config"],
+            paths.runner_config.to_string_lossy().as_ref()
+        );
+        assert!(json_value.get("agent_config").is_none());
+        assert_eq!(
+            json_value["credential_usage"]["runner_config_token"],
+            "Runner transport only"
+        );
+        assert!(json_value["credential_usage"]
+            .get("agent_config_token")
+            .is_none());
         assert_eq!(json_value["project_registration"]["registered"], false);
         assert_eq!(json_value["project_registration"]["count"], 0);
         assert_eq!(json_value["registered_projects"], serde_json::json!([]));
         assert_eq!(
-            json_value["projects_registry"],
-            paths.projects_dir.to_string_lossy().as_ref()
+            json_value["project_registry_dir"],
+            paths.project_registry_dir.to_string_lossy().as_ref()
         );
+        assert!(json_value.get("projects_registry").is_none());
+        assert!(json_value.get("projects_dir").is_none());
         assert_eq!(
             json_value
                 .get("user_token_file")
@@ -2699,7 +2799,7 @@ mod tests {
         let project = ProjectRegistration {
             id: "demo".to_string(),
             path: PathBuf::from("/tmp/demo"),
-            record_path: paths.projects_dir.join("demo.toml"),
+            record_path: paths.project_registry_dir.join("demo.toml"),
             already_registered: false,
         };
         let text = render_login_result(
@@ -2737,7 +2837,7 @@ mod tests {
         let foreground_argv = vec![
             "webcodex-runner".to_string(),
             "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
+            paths.runner_config.to_string_lossy().into_owned(),
         ];
         let install_argv = vec![
             "webcodex".to_string(),
@@ -2746,19 +2846,19 @@ mod tests {
             "--scope".to_string(),
             "user".to_string(),
             "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
+            paths.runner_config.to_string_lossy().into_owned(),
         ];
         let human_foreground_argv = vec![
             "webcodex".to_string(),
             "runner".to_string(),
             "run".to_string(),
             "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
+            paths.runner_config.to_string_lossy().into_owned(),
         ];
         let registration = ProjectRegistration {
             id: "demo".to_string(),
             path: PathBuf::from("/tmp/demo"),
-            record_path: paths.projects_dir.join("demo.toml"),
+            record_path: paths.project_registry_dir.join("demo.toml"),
             already_registered: false,
         };
 
@@ -2852,7 +2952,7 @@ mod tests {
         } else {
             install_argv.clone()
         };
-        let parser_env = tempfile::TempDir::new().unwrap();
+        let parser_env = canonical_test_tempdir();
         std::fs::write(parser_env.path().join("webcodex-runner"), "").unwrap();
         #[cfg(windows)]
         std::fs::write(parser_env.path().join("webcodex-runner.exe"), "").unwrap();
@@ -2870,17 +2970,17 @@ mod tests {
     }
 
     #[test]
-    fn render_login_result_omits_invalid_root_service_guidance() {
+    fn render_login_result_root_has_usable_commands_and_warning() {
         let paths = ConnectionPaths::new(PathBuf::from("/tmp/root-login"));
         let foreground_argv = vec![
             "webcodex-runner".to_string(),
             "--config".to_string(),
-            paths.agent_config.to_string_lossy().into_owned(),
+            paths.runner_config.to_string_lossy().into_owned(),
         ];
         let registration = ProjectRegistration {
             id: "demo".to_string(),
             path: PathBuf::from("/tmp/demo"),
-            record_path: paths.projects_dir.join("demo.toml"),
+            record_path: paths.project_registry_dir.join("demo.toml"),
             already_registered: false,
         };
 
@@ -2896,21 +2996,12 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(
-            !text.contains("webcodex runner install --scope user"),
-            "{text}"
-        );
-        assert!(!text.contains("--allow-root-runner"), "{text}");
-        assert!(
-            !text.contains("Start the Runner in the foreground"),
-            "{text}"
-        );
-        assert!(!text.contains(&shell_command(&foreground_argv)), "{text}");
-        assert!(text.contains("ordinary local user"), "{text}");
-        assert!(text.contains("fresh one-time login code"), "{text}");
-        assert!(
-            text.contains("No root Runner command is recommended"),
-            "{text}"
+        assert!(text.contains(ROOT_RUNNER_WARNING));
+        assert!(text.contains("webcodex runner run"));
+        assert!(!text.contains("fresh one-time login code"));
+        assert_eq!(
+            text.contains("--allow-root-runner"),
+            cfg!(target_os = "linux")
         );
         assert!(!text.contains(USER_TOKEN), "root text leaked a token");
         assert!(!text.contains(AGENT_TOKEN), "root text leaked a token");
@@ -2928,31 +3019,40 @@ mod tests {
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_text).unwrap();
-        assert_eq!(value["runner_install_available"], serde_json::json!(false));
-        assert!(value["runner_install_argv"].is_null());
-        let reason = value["runner_install_reason"].as_str().unwrap();
-        assert!(reason.contains("login ran as root"), "{reason}");
-        assert!(reason.contains("non-root Runner user"), "{reason}");
-        assert!(!reason.contains("--allow-root-runner"), "{reason}");
-        assert_eq!(value["foreground_available"], serde_json::json!(false));
-        assert!(value["foreground_argv"].is_null());
-        let foreground_reason = value["foreground_reason"].as_str().unwrap();
-        assert!(foreground_reason.contains("login ran as root"));
-        assert!(foreground_reason.contains("project commands as root"));
-        assert_eq!(value["next_steps"].as_array().unwrap().len(), 1);
-        assert!(value["next_steps"][0]
-            .as_str()
-            .unwrap()
-            .contains("webcodex project register"));
-        assert!(!json_text.contains("--allow-root-runner"));
-        assert!(!json_text.contains("webcodex runner install --scope user"));
+        assert_eq!(value["runner_install_available"], cfg!(target_os = "linux"));
+        if cfg!(target_os = "linux") {
+            let argv: Vec<String> =
+                serde_json::from_value(value["runner_install_argv"].clone()).unwrap();
+            assert!(argv.contains(&"--allow-root-runner".to_string()));
+            assert!(argv.contains(&"system".to_string()));
+
+            // The workspace-crates CI shard intentionally excludes the Runner
+            // package, so no sibling `webcodex-runner` binary is guaranteed to
+            // exist beside this test executable. Give the install parser one
+            // deterministic PATH candidate instead of depending on stale target
+            // artifacts from another shard/build.
+            let parser_env = canonical_test_tempdir();
+            std::fs::write(parser_env.path().join("webcodex-runner"), "").unwrap();
+            let _guard = crate::webcodex_cli::test_support::env_test_guard();
+            let _env = crate::webcodex_cli::test_support::EnvGuard::new()
+                .set_os("PATH", parser_env.path().as_os_str().to_owned());
+            let parsed = crate::parse_runner_install_service_with_identity(&argv[3..], true);
+            assert!(
+                parsed.is_ok(),
+                "root recommendation was rejected by the install parser: {parsed:?}"
+            );
+        }
+        assert_eq!(value["foreground_available"], true);
+        assert_eq!(value["foreground_argv"], serde_json::json!(foreground_argv));
+        assert!(value["foreground_reason"].is_null());
+        assert_eq!(value["runner_warning"], ROOT_RUNNER_WARNING);
         assert!(!json_text.contains(USER_TOKEN), "root json leaked a token");
         assert!(!json_text.contains(AGENT_TOKEN), "root json leaked a token");
     }
 
     #[test]
     fn print_mcp_config_emits_the_bearer_block_and_marks_it_sensitive() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         let paths = all_connections(base)[0].paths.clone();
@@ -2988,8 +3088,8 @@ mod tests {
     }
 
     #[test]
-    fn print_mcp_config_rejects_an_agent_token_in_the_user_token_file() {
-        let temp = tempfile::TempDir::new().unwrap();
+    fn print_mcp_config_rejects_a_runner_transport_token_in_the_user_token_file() {
+        let temp = canonical_test_tempdir();
         let paths = ConnectionPaths::new(temp.path().join("connection"));
         std::fs::create_dir_all(&paths.dir).unwrap();
         let secret = "wc_agent_do_not_echo_login_0123456789";
@@ -3006,14 +3106,14 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(error.contains("Agent transport token"), "{error}");
+        assert!(error.contains("Runner transport token"), "{error}");
         assert!(error.contains("webcodex-user-token"), "{error}");
         assert!(!error.contains(secret));
     }
 
     #[test]
     fn print_mcp_config_never_touches_the_recovery_path() {
-        let temp = tempfile::TempDir::new().unwrap();
+        let temp = canonical_test_tempdir();
         let base = temp.path();
         publish_login(base, "https://api.example.com", false).unwrap();
         let paths = all_connections(base)[0].paths.clone();
@@ -3033,8 +3133,9 @@ mod tests {
         let staging = create_staging_dir(&parent).unwrap();
         stage_connection(
             &staging,
-            &paths.projects_dir,
+            &paths.project_registry_dir,
             &opts,
+            &opts.allowed_roots,
             &canonical.url,
             &identity,
             &opts.device,

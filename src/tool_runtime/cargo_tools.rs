@@ -19,12 +19,14 @@ impl ToolRuntime {
                 cwd,
                 check,
                 timeout_secs,
+                sync_wait_secs,
             } => {
                 self.cargo_fmt_with_context(
                     project,
                     cwd,
                     check,
                     timeout_secs,
+                    sync_wait_secs,
                     session_id,
                     ssh_resource,
                     auth,
@@ -41,6 +43,7 @@ impl ToolRuntime {
                 features,
                 package,
                 timeout_secs,
+                sync_wait_secs,
             } => {
                 self.cargo_check_with_context(
                     project,
@@ -51,6 +54,7 @@ impl ToolRuntime {
                     features,
                     package,
                     timeout_secs,
+                    sync_wait_secs,
                     session_id,
                     ssh_resource,
                     auth,
@@ -62,6 +66,7 @@ impl ToolRuntime {
                 session_id,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -71,11 +76,13 @@ impl ToolRuntime {
                 require_tests,
                 min_tests,
                 timeout_secs,
+                sync_wait_secs,
             } => {
                 self.cargo_test_with_context(
                     project,
                     cwd,
                     filter,
+                    lib,
                     all_targets,
                     all_features,
                     no_default_features,
@@ -85,6 +92,7 @@ impl ToolRuntime {
                     require_tests,
                     min_tests,
                     timeout_secs,
+                    sync_wait_secs,
                     session_id,
                     ssh_resource,
                     auth,
@@ -97,12 +105,14 @@ impl ToolRuntime {
                 cwd,
                 packages,
                 timeout_secs,
+                sync_wait_secs,
             } => {
                 self.go_test_with_context(
                     project,
                     cwd,
                     packages,
                     timeout_secs,
+                    sync_wait_secs,
                     session_id,
                     ssh_resource,
                     auth,

@@ -1,8 +1,8 @@
 //! Bounded, transport-neutral protocol for the Runner-owned stdio MCP gateway.
 //!
 //! This is intentionally not a raw JSON-RPC tunnel. Provider inventory rides
-//! normal Runner registration; request traffic contains only `tools/list` and
-//! `tools/call`.
+//! normal Runner registration; request traffic contains only passive provider
+//! lifecycle status, `tools/list`, and `tools/call`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,18 +16,22 @@ pub const MCP_GATEWAY_MAX_TOOL_NAME_BYTES: usize = 128;
 pub const MCP_GATEWAY_MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const MCP_GATEWAY_MAX_SCHEMA_BYTES: usize = 64 * 1024;
 pub const MCP_GATEWAY_MAX_ARGUMENT_BYTES: usize = 64 * 1024;
-pub const MCP_GATEWAY_MAX_STRUCTURED_CONTENT_BYTES: usize = 128 * 1024;
-pub const MCP_GATEWAY_MAX_TEXT_CONTENT_BYTES: usize = 64 * 1024;
-pub const MCP_GATEWAY_MAX_RESULT_BYTES: usize = 256 * 1024;
+pub const MCP_GATEWAY_MAX_STRUCTURED_CONTENT_BYTES: usize = 512 * 1024;
+pub const MCP_GATEWAY_MAX_TEXT_CONTENT_BYTES: usize = 512 * 1024;
+pub const MCP_GATEWAY_MAX_RESULT_BYTES: usize = 512 * 1024;
 pub const MCP_GATEWAY_MAX_CONTENT_ITEMS: usize = 32;
 pub const MCP_GATEWAY_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const MCP_GATEWAY_MAX_JSON_DEPTH: usize = 16;
 pub const MCP_GATEWAY_MAX_JSON_NODES: usize = 4_096;
-pub const MCP_GATEWAY_MAX_JSON_STRING_BYTES: usize = 64 * 1024;
+pub const MCP_GATEWAY_MAX_JSON_STRING_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum McpGatewayRequest {
+    ProviderStatus {
+        provider_id: String,
+        provider_instance_id: String,
+    },
     ToolsList {
         provider_id: String,
         provider_instance_id: String,
@@ -44,15 +48,19 @@ pub enum McpGatewayRequest {
 impl McpGatewayRequest {
     pub fn provider_id(&self) -> &str {
         match self {
-            Self::ToolsList { provider_id, .. } | Self::ToolsCall { provider_id, .. } => {
-                provider_id
-            }
+            Self::ProviderStatus { provider_id, .. }
+            | Self::ToolsList { provider_id, .. }
+            | Self::ToolsCall { provider_id, .. } => provider_id,
         }
     }
 
     pub fn provider_instance_id(&self) -> &str {
         match self {
-            Self::ToolsList {
+            Self::ProviderStatus {
+                provider_instance_id,
+                ..
+            }
+            | Self::ToolsList {
                 provider_instance_id,
                 ..
             }
@@ -70,6 +78,15 @@ pub enum McpGatewayDispatchState {
     NotStarted,
     OutcomeUnknown,
     Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpGatewayProviderState {
+    NeverStarted,
+    Healthy,
+    ConnectionRetired,
+    Busy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +167,7 @@ pub struct McpGatewayToolResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum McpGatewayResponsePayload {
+    ProviderStatus { state: McpGatewayProviderState },
     Tools { tools: Vec<McpGatewayTool> },
     ToolResult { result: McpGatewayToolResult },
 }
@@ -263,7 +281,11 @@ pub fn validate_provider_name(value: &str) -> Result<(), String> {
 
 pub fn validate_request(request: &McpGatewayRequest) -> Result<(), String> {
     match request {
-        McpGatewayRequest::ToolsList {
+        McpGatewayRequest::ProviderStatus {
+            provider_id,
+            provider_instance_id,
+        }
+        | McpGatewayRequest::ToolsList {
             provider_id,
             provider_instance_id,
         } => {
@@ -310,6 +332,7 @@ pub fn validate_response(response: &McpGatewayResponse) -> Result<(), String> {
         _ => {}
     }
     match response.payload.as_ref() {
+        Some(McpGatewayResponsePayload::ProviderStatus { .. }) => Ok(()),
         Some(McpGatewayResponsePayload::Tools { tools }) => validate_tools(tools),
         Some(McpGatewayResponsePayload::ToolResult { result }) => validate_tool_result(result),
         None => Ok(()),
@@ -550,6 +573,92 @@ mod tests {
         assert!(
             validate_json_value(&arguments, MCP_GATEWAY_MAX_ARGUMENT_BYTES, "arguments").is_err()
         );
+    }
+
+    #[test]
+    fn tool_result_bounds_allow_512_kib_outputs_without_expanding_inputs_or_messages() {
+        assert_eq!(MCP_GATEWAY_MAX_ARGUMENT_BYTES, 64 * 1024);
+        assert_eq!(MCP_GATEWAY_MAX_SCHEMA_BYTES, 64 * 1024);
+        assert_eq!(MCP_GATEWAY_MAX_TEXT_CONTENT_BYTES, 512 * 1024);
+        assert_eq!(MCP_GATEWAY_MAX_STRUCTURED_CONTENT_BYTES, 512 * 1024);
+        assert_eq!(MCP_GATEWAY_MAX_RESULT_BYTES, 512 * 1024);
+        assert_eq!(MCP_GATEWAY_MAX_JSON_STRING_BYTES, 512 * 1024);
+        assert_eq!(MCP_GATEWAY_MAX_MESSAGE_BYTES, 1024 * 1024);
+
+        let large_text = McpGatewayToolResult {
+            content: vec![McpGatewayContent::Text {
+                text: "x".repeat(384 * 1024),
+            }],
+            structured_content: None,
+            is_error: false,
+        };
+        validate_tool_result(&large_text).unwrap();
+
+        let large_structured = McpGatewayToolResult {
+            content: vec![],
+            structured_content: Some(json!({"payload": "x".repeat(384 * 1024)})),
+            is_error: false,
+        };
+        validate_tool_result(&large_structured).unwrap();
+
+        let aggregate_oversized = McpGatewayToolResult {
+            content: vec![McpGatewayContent::Text {
+                text: "x".repeat(300 * 1024),
+            }],
+            structured_content: Some(json!({"payload": "y".repeat(300 * 1024)})),
+            is_error: false,
+        };
+        assert!(validate_tool_result(&aggregate_oversized).is_err());
+
+        let oversized_text = McpGatewayToolResult {
+            content: vec![McpGatewayContent::Text {
+                text: "x".repeat(MCP_GATEWAY_MAX_TEXT_CONTENT_BYTES + 1),
+            }],
+            structured_content: None,
+            is_error: false,
+        };
+        assert!(validate_tool_result(&oversized_text).is_err());
+
+        let oversized_structured = McpGatewayToolResult {
+            content: vec![],
+            structured_content: Some(json!({
+                "payload": "x".repeat(MCP_GATEWAY_MAX_STRUCTURED_CONTENT_BYTES + 1)
+            })),
+            is_error: false,
+        };
+        assert!(validate_tool_result(&oversized_structured).is_err());
+
+        let oversized_arguments = json!({"value": "x".repeat(MCP_GATEWAY_MAX_ARGUMENT_BYTES)});
+        assert!(validate_json_value(
+            &oversized_arguments,
+            MCP_GATEWAY_MAX_ARGUMENT_BYTES,
+            "arguments"
+        )
+        .is_err());
+        let oversized_schema = json!({"description": "x".repeat(MCP_GATEWAY_MAX_SCHEMA_BYTES)});
+        assert!(
+            validate_json_value(&oversized_schema, MCP_GATEWAY_MAX_SCHEMA_BYTES, "schema").is_err()
+        );
+    }
+
+    #[test]
+    fn provider_status_wire_is_bounded_and_contains_no_local_process_details() {
+        let request = McpGatewayRequest::ProviderStatus {
+            provider_id: "provider".to_string(),
+            provider_instance_id: "instance".to_string(),
+        };
+        validate_request(&request).unwrap();
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["operation"], "provider_status");
+        assert!(encoded.get("pid").is_none());
+        assert!(encoded.get("executable").is_none());
+
+        let response = McpGatewayResponse::success(McpGatewayResponsePayload::ProviderStatus {
+            state: McpGatewayProviderState::NeverStarted,
+        });
+        validate_response(&response).unwrap();
+        let encoded = serde_json::to_value(response).unwrap();
+        assert_eq!(encoded["payload"]["state"], "never_started");
     }
 
     #[test]

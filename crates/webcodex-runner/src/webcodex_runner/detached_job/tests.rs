@@ -93,7 +93,7 @@ fn test_request(executable: String, args: Vec<String>) -> DetachedStartRequest {
         job_id: format!("job_{}", Uuid::new_v4().simple()),
         request_id: format!("req_{}", Uuid::new_v4().simple()),
         client_id: "test-runner".to_string(),
-        agent_instance_id: "test-instance".to_string(),
+        runner_instance_id: "test-instance".to_string(),
         context: safe_context(),
         launch: DetachedLaunchSpec {
             process: ShellProcessArgv { executable, args },
@@ -421,6 +421,26 @@ fn output_tail_is_bounded_while_total_bytes_and_line_cursors_continue() {
 }
 
 #[test]
+fn detached_job_persistence_preserves_historical_agent_instance_key() {
+    let request = test_request("/bin/true".to_string(), Vec::new());
+    let request_value = serde_json::to_value(&request).unwrap();
+    assert_eq!(request_value["agent_instance_id"], "test-instance");
+    assert!(request_value.get("runner_instance_id").is_none());
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = DetachedJobStore::new(temp.path().join("state"));
+    let record = match store.prepare(&request).unwrap() {
+        PrepareOutcome::First(record) => record,
+        _ => panic!("first prepare must claim"),
+    };
+    let record_value = serde_json::to_value(&record).unwrap();
+    assert_eq!(record_value["agent_instance_id"], "test-instance");
+    assert!(record_value.get("runner_instance_id").is_none());
+    let decoded: DetachedJobRecord = serde_json::from_value(record_value).unwrap();
+    assert_eq!(decoded.runner_instance_id, "test-instance");
+}
+
+#[test]
 fn durable_record_bound_covers_worst_case_escaped_output_tails() {
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -497,14 +517,14 @@ fn stale_watchdog_invocation_fails_before_tree_lock_creation() {
     assert!(!job_dir.join(TREE_LOCK_FILE).exists());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 fn process_alive(pid: u32) -> bool {
     // SAFETY: kill(pid, 0) performs a liveness/permission probe only.
     let rc = unsafe { libc::kill(pid as i32, 0) };
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -516,7 +536,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     predicate()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn wait_for_terminal(store: &DetachedJobStore, job_id: &str) -> DetachedJobRecord {
     assert!(wait_until(Duration::from_secs(15), || {
         store
@@ -648,7 +668,7 @@ fn handoff_and_wait_running(
     wait_for_running_record(store, &request.job_id)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 fn run_accept_then_exit_owner(temp: &Path, state_root: &Path, request: &DetachedStartRequest) {
     let instruction = temp.join("accept-exit-owner.json");
     fs::write(
@@ -668,7 +688,10 @@ fn run_accept_then_exit_owner(temp: &Path, state_root: &Path, request: &Detached
     assert!(owner.spawn().unwrap().wait().unwrap().success());
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "runner-real-process-tests"
+))]
 fn tree_payload_request(temp: &Path) -> (DetachedStartRequest, PathBuf, PathBuf) {
     let parent_marker = temp.join("parent.pid");
     let child_marker = temp.join("child.pid");
@@ -688,9 +711,10 @@ fn tree_payload_request(temp: &Path) -> (DetachedStartRequest, PathBuf, PathBuf)
     (request, parent_marker, child_marker)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn accepted_handoff_keeps_payload_alive_after_owner_process_exits() {
+#[ignore = "runner real-process lane: detached supervisor outlives its owner process"]
+fn runner_real_process_accepted_handoff_keeps_payload_alive_after_owner_process_exits() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let state_root = temp.path().join("state");
@@ -740,9 +764,10 @@ fn owner_subprocess_entrypoint() {
     fs::write(result_path, format!("{outcome:?}")).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn accepted_handoff_survives_owner_exit_before_ack() {
+#[ignore = "runner real-process lane: detached handoff survives owner loss after accept"]
+fn runner_real_process_accepted_handoff_survives_owner_exit_before_ack() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let state_root = temp.path().join("state");
@@ -818,9 +843,10 @@ fn accept_then_exit_owner_subprocess_entrypoint() {
     std::process::exit(0);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn duplicate_handoff_never_spawns_a_second_payload() {
+#[ignore = "runner real-process lane: detached handoff owns a real payload process"]
+fn runner_real_process_duplicate_handoff_never_spawns_a_second_payload() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -847,27 +873,40 @@ fn duplicate_handoff_never_spawns_a_second_payload() {
     assert_eq!(runs.lines().count(), 1);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn durable_update_sequence_advances_and_duplicate_handoff_does_not() {
+#[ignore = "runner real-process lane: detached update sequencing observes a live payload"]
+fn runner_real_process_durable_update_sequence_advances_and_duplicate_handoff_does_not() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
-    let request = make_payload_request("count_once", Vec::new());
-    let _ = handoff_detached_job(&store, request.clone()).unwrap();
-    let running = store.read(&request.job_id).unwrap();
+    // Keep the payload alive until this test explicitly stops it. The previous
+    // count_once fixture could finish before handoff_detached_job returned on a
+    // loaded runner, making the first observation terminal and turning the
+    // sequence assertion into a scheduler-speed assumption.
+    let request = make_payload_request("linger", Vec::new());
+    let running = handoff_and_wait_running(&store, &request);
     assert!(running.update_seq >= 3);
     let sequence = running.update_seq;
     let replay = handoff_detached_job(&store, request.clone()).unwrap();
     assert!(matches!(replay, DetachedHandoffOutcome::Accepted { .. }));
     assert_eq!(store.read(&request.job_id).unwrap().update_seq, sequence);
+    let stopped = store
+        .request_stop(&request.job_id, &running.execution_id)
+        .unwrap();
+    assert_eq!(stopped.update_seq, sequence + 1);
     let terminal = wait_for_terminal(&store, &request.job_id);
-    assert!(terminal.update_seq > sequence);
+    assert_eq!(terminal.terminal.as_ref().unwrap().status, "stopped");
+    assert!(terminal.update_seq > stopped.update_seq);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "runner-real-process-tests"
+))]
 #[test]
-fn restart_scan_reconciles_live_detached_execution_without_respawn() {
+#[ignore = "runner real-process lane: restart reconciliation observes a live detached supervisor"]
+fn runner_real_process_restart_scan_reconciles_live_detached_execution_without_respawn() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let state_root = temp.path().join("state");
@@ -899,9 +938,13 @@ fn restart_scan_reconciles_live_detached_execution_without_respawn() {
     assert_eq!(fs::read_to_string(marker).unwrap().lines().count(), 1);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "runner-real-process-tests"
+))]
 #[test]
-fn durable_stop_request_terminates_exact_supervisor_owned_tree() {
+#[ignore = "runner real-process lane: durable stop terminates a detached process tree"]
+fn runner_real_process_durable_stop_request_terminates_exact_supervisor_owned_tree() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -934,12 +977,12 @@ fn durable_stop_request_terminates_exact_supervisor_owned_tree() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runner-real-process-tests"))]
 fn stale_native_start_identity() -> &'static str {
     "linux_start_0"
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "runner-real-process-tests"))]
 fn stale_native_start_identity() -> &'static str {
     "macos_start_0_0"
 }
@@ -954,9 +997,13 @@ fn macos_native_process_start_identity_is_stable() {
     assert_eq!(first, second);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "runner-real-process-tests"
+))]
 #[test]
-fn stale_native_supervisor_identity_reconciles_to_lost_without_respawn() {
+#[ignore = "runner real-process lane: stale supervisor identity is checked against a live process"]
+fn runner_real_process_stale_native_supervisor_identity_reconciles_to_lost_without_respawn() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -993,9 +1040,10 @@ fn stale_native_supervisor_identity_reconciles_to_lost_without_respawn() {
     )));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn supervisor_continuously_drains_and_bounds_both_output_streams() {
+#[ignore = "runner real-process lane: detached supervisor drains a real child process"]
+fn runner_real_process_supervisor_continuously_drains_and_bounds_both_output_streams() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -1012,9 +1060,10 @@ fn supervisor_continuously_drains_and_bounds_both_output_streams() {
     assert!(terminal.stderr.tail.contains("STDERR_END"));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn terminal_state_is_atomically_rereadable() {
+#[ignore = "runner real-process lane: terminal persistence races a real detached child"]
+fn runner_real_process_terminal_state_is_atomically_rereadable() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -1046,7 +1095,7 @@ fn terminal_state_is_atomically_rereadable() {
     assert_eq!(reread.phase, DetachedJobPhase::Terminal);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runner-real-process-tests"))]
 fn linux_child_pids(pid: u32) -> Vec<u32> {
     let mut children = Vec::new();
     let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
@@ -1067,9 +1116,10 @@ fn linux_child_pids(pid: u32) -> Vec<u32> {
     children
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runner-real-process-tests"))]
 #[test]
-fn pre_accept_owner_disconnect_is_terminal_and_replay_never_spawns() {
+#[ignore = "runner real-process lane: pre-accept disconnect controls a real supervisor process"]
+fn runner_real_process_pre_accept_owner_disconnect_is_terminal_and_replay_never_spawns() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -1135,9 +1185,10 @@ fn pre_accept_owner_disconnect_is_terminal_and_replay_never_spawns() {
     assert!(!marker.exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runner-real-process-tests"))]
 #[test]
-fn pre_accept_supervisor_death_leaves_no_internal_or_payload_orphan() {
+#[ignore = "runner real-process lane: pre-accept supervisor death exercises real process cleanup"]
+fn runner_real_process_pre_accept_supervisor_death_leaves_no_internal_or_payload_orphan() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -1189,9 +1240,13 @@ fn pre_accept_supervisor_death_leaves_no_internal_or_payload_orphan() {
     assert!(record.tree_leader.is_none());
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "runner-real-process-tests"
+))]
 #[test]
-fn supervisor_death_terminates_payload_process_tree() {
+#[ignore = "runner real-process lane: supervisor death terminates a real detached process tree"]
+fn runner_real_process_supervisor_death_terminates_payload_process_tree() {
     let _guard = test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let store = DetachedJobStore::new(temp.path().join("state"));
@@ -1248,4 +1303,21 @@ fn supervisor_death_terminates_payload_process_tree() {
         lifetime_lock_is_held(&job_dir.join(TREE_LOCK_FILE), &tree_identity.creation_id)
             == Ok(false)
     }));
+}
+
+#[cfg(all(windows, feature = "runner-real-process-tests"))]
+#[test]
+#[ignore = "runner real-process lane: detached batch shim with an empty supervisor environment"]
+fn runner_real_process_windows_detached_batch_works_without_inherited_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let batch = temp.path().join("package shim.cmd");
+    fs::write(&batch, "@echo off\r\necho batch-ok\r\nexit /b 0\r\n").unwrap();
+    let store = DetachedJobStore::new(temp.path().join("state"));
+    let mut request = test_request(batch.to_string_lossy().into_owned(), Vec::new());
+    request.launch.cwd = Some(temp.path().to_string_lossy().into_owned());
+    assert!(request.launch.env.is_empty());
+    handoff_detached_job(&store, request.clone()).unwrap();
+    let terminal = wait_for_terminal(&store, &request.job_id);
+    assert_eq!(terminal.terminal.as_ref().unwrap().exit_code, Some(0));
+    assert!(terminal.stdout.tail.contains("batch-ok"));
 }

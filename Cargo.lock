@@ -5107,12 +5107,11 @@ dependencies = [
 
 [[package]]
 name = "webcodex"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
  "chrono",
- "fs2",
  "futures-util",
  "libc",
  "quinn",
@@ -5136,9 +5135,16 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webcodex-admin",
+ "webcodex-connector-runtime",
  "webcodex-core",
  "webcodex-persistent-shell",
  "webcodex-runner-config",
+ "webcodex-runner-registry",
+ "webcodex-store",
+ "webcodex-tool-contracts",
+ "webcodex-tool-runtime-contracts",
+ "webcodex-validation",
+ "webcodex-workflow-session",
  "webcodex-workspace",
  "windows-sys 0.61.2",
  "zip",
@@ -5147,7 +5153,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-admin"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "reqwest 0.12.28",
  "serde_json",
@@ -5157,7 +5163,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-cli"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "fs2",
@@ -5171,6 +5177,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "url",
  "uuid",
  "webcodex",
@@ -5182,7 +5189,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-computer"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "base64",
  "block2",
@@ -5204,17 +5211,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "webcodex-connector-runtime"
+version = "0.4.1"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "webcodex-core",
+ "webcodex-runner-config",
+ "webcodex-runner-registry",
+ "webcodex-store",
+ "webcodex-tool-contracts",
+ "webcodex-validation",
+ "webcodex-workspace",
+]
+
+[[package]]
 name = "webcodex-core"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
 [[package]]
+name = "webcodex-lsp"
+version = "0.4.1"
+dependencies = [
+ "libc",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "url",
+ "webcodex-core",
+ "webcodex-process",
+ "webcodex-runner-config",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "webcodex-persistent-shell"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "base64",
  "libc",
@@ -5226,7 +5272,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-process"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "libc",
  "tempfile",
@@ -5235,7 +5281,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-runner"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "agent-client-protocol-schema",
  "base64",
@@ -5260,6 +5306,7 @@ dependencies = [
  "uuid",
  "webcodex-computer",
  "webcodex-core",
+ "webcodex-lsp",
  "webcodex-persistent-shell",
  "webcodex-process",
  "webcodex-runner-config",
@@ -5272,7 +5319,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-runner-config"
-version = "0.3.9"
+version = "0.4.1"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -5280,13 +5327,97 @@ dependencies = [
 ]
 
 [[package]]
-name = "webcodex-workspace"
-version = "0.3.9"
+name = "webcodex-runner-registry"
+version = "0.4.1"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+ "webcodex-core",
+]
+
+[[package]]
+name = "webcodex-store"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fs2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tracing",
+ "uuid",
+ "webcodex-core",
+]
+
+[[package]]
+name = "webcodex-tool-contracts"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "webcodex-core",
+]
+
+[[package]]
+name = "webcodex-tool-runtime-contracts"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "webcodex-core",
+ "webcodex-tool-contracts",
+ "webcodex-workflow-session",
+]
+
+[[package]]
+name = "webcodex-validation"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "toml 0.8.23",
+ "webcodex-core",
+ "webcodex-tool-contracts",
+ "webcodex-tool-runtime-contracts",
+ "webcodex-workflow-session",
+]
+
+[[package]]
+name = "webcodex-workflow-session"
+version = "0.4.1"
+dependencies = [
+ "base64",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "webcodex-core",
+ "webcodex-tool-contracts",
+]
+
+[[package]]
+name = "webcodex-workspace"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "webcodex-core",
 ]
 
 [[package]]

@@ -48,8 +48,8 @@ this concrete Agent/Conversation model. Standing rules are:
 - Conversation participation governs communication only. It never confers Project,
   Workflow Session, Job, Artifact, shell, Computer, CodingAgent, or filesystem
   authority;
-- Message, Delivery, Wake, and execution are separate durable facts. Message/read
-  state never proves model-context retention, and Wake never proves Agent Task completion;
+- Message, Delivery, Attention Event, Wake, and execution are separate durable facts. Message/read
+  state never proves model-context retention; Event records a bounded semantic fact; Wake is only a reasoning/processing opportunity and never proves Agent Task or Goal completion;
 - each concrete execution may still use an independent Workflow Session for tool
   calls, validation, Jobs, checkpoints, and review evidence; pure communication
   does not require an execution Session;
@@ -59,7 +59,14 @@ this concrete Agent/Conversation model. Standing rules are:
 - the planned asynchronous work object is an independent **Agent Task** with an
   exact fenced **Agent TaskAttempt**. It is not the existing Connector Task and is
   not inferred merely because a Conversation Message exists;
-- references among Conversation, Agent Task, Workflow Session, Job, CodingAgentRun,
+- **Goal** is an independent `wc_goal_*` high-level durable intent/control domain. It is not an Agent Task, Workflow Session, Job, Project selector, execution primitive, or scheduler; Goal identity/status/revision/correlation is never a bearer credential;
+- Goal selection is exact durable identity or explicit creation only. Never infer the current Goal from Project, ClientWindow, credential, MCP/OpenAI session data, Conversation membership, Workflow Session, or shared timing;
+- Goal lifecycle is currently closed to `active | completed | cancelled`. `finish_coding_task`, AgentTask/TaskAttempt completion, Job terminal state, or validation evidence do not automatically transition a Goal;
+- ClientWindow liveness may be projected only as soft observational evidence from an exact authorized Goal through explicit Workflow Session correlations and re-authorized Project visibility. `last_seen` and `last_meaningful_activity` are distinct; five minutes without visible meaningful WebCodex activity may request human attention but is not proof of model failure and never mutates Goal/Task/Attempt state or authority;
+- the first durable **Attention Event** kind is narrowly `agent_task_terminal`. Event is a semantic terminal fact, not a generic bus, scheduler, authority snapshot, or copied business payload. Exact TaskAttempt terminalization commits the required per-active-Goal Event/Wake facts atomically with Task/Attempt completion and keyed replay;
+- `attention_event` Wake is distinct from A4b `agent_task_attempt` Wake: the former targets the completed Task's explicit assignee for Goal re-evaluation and never requires the terminal Attempt to heartbeat/hold a live lease; the latter still means execute one exact active fenced Attempt;
+- the resumed attention turn must independently re-read exact Goal and AgentTask truth through ordinary authorization and explicitly decide Goal progression. Neither terminal Task outcome nor Event/Wake consumption auto-completes/reopens a Goal or auto-creates a successor Task;
+- references among Goal, Conversation, Agent Task, Workflow Session, Job, CodingAgentRun,
   commit, PR, or Artifact provide correlation only. Dereferencing always re-runs
   the referenced object's normal authorization;
 - automatic worker spawning, runnable-frontier scheduling, capacity management,
@@ -163,13 +170,14 @@ closed (see §6). Full contract: [`permission-model.md`](permission-model.md).
 
 ---
 
-## 2. Internal API evolution (background)
+## 2. Runtime/tool contract evolution (background)
 
 WebCodex is an **internal / self-use** project. There are no supported external
-API consumers, public SDKs, or third-party stable clients of the runtime tool
-surface today.
+API consumers, public SDKs, or third-party stable clients of the model-facing
+runtime tool surface today.
 
-Standing executable rules (also summarized in `AGENTS.md`):
+Standing executable rules (also summarized in `AGENTS.md` and expanded in
+[`tool-contract-guidelines.md`](tool-contract-guidelines.md)):
 
 1. Do not retain compatibility fields for hypothetical consumers.
 2. Do not emit both a canonical field and an alias field for the same concept.
@@ -178,10 +186,19 @@ Standing executable rules (also summarized in `AGENTS.md`):
 4. When duplicate representations are found, choose one canonical structured
    representation and delete the others from outputs, schemas, tests, and docs
    in the same change.
+5. Do not reject a recognized semantically inert parameter merely to enforce a
+   presentation/resource bound that can be safely normalized or clamped. Strict
+   rejection belongs to semantic ambiguity, authority, identity/fence, effect,
+   privacy, and retry-safety boundaries.
+6. Optimize for model-turn economy only after preserving truth: server-known
+   mechanical repair may continue in the same call; unknown intent, uncertain
+   effects, or missing authority must never be guessed to save a turn.
 
 Before keeping any compatibility layer, name a **specific consumer** or a
-**specific public contract**. A `version` (or parser version) field may identify
-protocol shape; it is not a reason to keep duplicate or alias fields.
+**specific public/durable contract**. A `version` (or parser version) field may
+identify protocol shape; it is not a reason to keep duplicate or alias fields.
+Historical persisted truth is a separate concern from current model-facing tool
+shape and must not be rewritten merely because the current tool contract changes.
 
 When external stable consumers genuinely exist later, revise this decision
 explicitly and define a bounded migration window for that concrete contract.
@@ -223,13 +240,21 @@ See also [`TESTING.md`](../TESTING.md).
   purpose, bounded command summary, project-relative cwd, shell/executor,
   execution state, exit code, detected summary, bounded output metadata,
   timestamps, and failure classification. Full unbounded logs are not ledger
-  evidence.
-- Retry resolution is exact by stable identity. A later success resolves only
-  failures for that identity; it never deletes or rewrites the historical
-  failure and cannot resolve a different assertion.
-- Closeout and review expose `historical_failures`, `resolved_failures`, and
-  `unresolved_failures`. Resolved history is advisory; unresolved command/test
-  failure is a hard blocker.
+  evidence. The projection distinguishes immutable raw ToolResult success from
+  validator/correctness success and request-scoped evidence gaps.
+- Structured validation target identity describes what was executed. Cargo test
+  count assertions such as `require_tests` / `min_tests` are invocation-scoped
+  evidence requirements, not part of that target identity and not durable task
+  obligations.
+- Retry resolution for real validation failures is exact by stable target
+  identity. A later successful validation can resolve only failures for that
+  identity; it never deletes or rewrites historical events. Request-scoped
+  evidence assertion failures remain visible as evidence gaps rather than
+  correctness failures.
+- Closeout and review expose `historical_failures`, `resolved_failures`,
+  `unresolved_failures`, and separate evidence-gap facts. Resolved or stale
+  history is advisory; only current actionable command/test failures are hard
+  blockers.
 - `validation_summary` is a read of existing ledger evidence; it does not
   re-run Cargo/shell or replace `finish_coding_task`. Handoff and finish reuse
   this projection instead of building independent validation truth.
@@ -303,10 +328,10 @@ it never infers readiness from configuration.
 | Layer envelope | Every layer carries `{status, observed_at, source, age_secs, stale_after_secs, reason_code}` plus layer facts |
 | No config-inferred readiness | `connector_endpoint` readiness comes only from readiness probes or successful connector requests; configuration presence never implies `ready`. `runner_process` never fakes "running"; a stale registration is never presented as callable |
 | Explicit Workflow targeting | Full-runtime Workflow Sessions have no process-local or durable window binding. `runtime_status` exposes no Workflow binding layer. Ordinary project tools without an explicit business Session or authorized wrapper recorder execute unlinked to Workflow Session state. This remains separate from Connector-owned window/project/task continuity |
-| Full-runtime start/continue | `work_on_project(session_id=<id>)` continues exactly that authorized Active same-project Session; omission creates a fresh Workflow Session. Stable window or credential identity never selects a Workflow Session. The internal `StartCodingTask` primitive is implementation plumbing, not a wire/API continuation entry |
-| Canonical model coding bootstrap | `work_on_project` is the external runtime coding bootstrap. `registered_tool_specs` defines the canonical model-visible runtime universe used by discovery and generic ToolCall admission. A startup-selected model surface may project that universe more narrowly: `local_coding` lists its focused typed set, `adaptive_runtime` lists a smaller typed core plus one long-tail gateway, and `full_operator_runtime` expands the runtime universe. Retired wire names such as `start_coding_task` fail closed before dispatch and never contribute selector names or flattened model fields |
-| Runtime exposure selection | The Server owns one top-level `RuntimeExposure`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects `ProjectConnector`, exposed publicly as `project_connector`; ProjectConnector is a project-bound ConnectorTask capability contract, not a `ModelSurface`. Without Connector configuration, exposure is `Runtime(ModelSurface)`: an unset `WEBCODEX_MCP_MODEL_SURFACE` selects `local_coding`, while `local-coding-v1`, `adaptive-runtime-v1`, and `full-operator-v1` select `local_coding`, `adaptive_runtime`, and `full_operator_runtime` explicitly. `adaptive_runtime` direct admission/order is statically declared by canonical `ToolDefinition`s; ordinary model-visible runtime tools default to the bounded long-tail gateway unless explicitly promoted to direct. Gateway calls keep the target tool's existing scope, authority, permission, argument, effect, and Session/ACK semantics. A Connector + `WEBCODEX_MCP_MODEL_SURFACE` conflict, an unsupported value, or partial Connector configuration fails startup. MCP GET/initialize/discovery, `runtime_status.runtime_exposure`, and the startup log report the same flattened exposure name |
-| Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_agents`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
+| Full-runtime start/continue | `work_on_project(session_id=<id>)` continues exactly that authorized Active same-project Session; omission creates a fresh Workflow Session. Stable window or credential identity never selects a Workflow Session. `work_on_project` calls the shared coding workflow engine directly; there is no second internal ToolCall identity |
+| Canonical model coding bootstrap | `work_on_project` is the external runtime coding bootstrap. `registered_tool_specs` defines the canonical model-visible runtime universe used by discovery and generic ToolCall admission. A startup-selected model surface may project that universe more narrowly: `local_coding` lists its focused typed set, `adaptive_runtime` lists a smaller typed core plus one generic gateway for long-tail targets and fallback dispatch of otherwise-admitted direct targets, and `full_operator_runtime` expands the runtime universe. Retired wire names such as `start_coding_task` fail closed before dispatch and never contribute selector names or flattened model fields |
+| Runtime exposure selection | The Server owns one top-level `RuntimeExposure`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects `ProjectConnector`, exposed publicly as `project_connector`; ProjectConnector is a project-bound ConnectorTask capability contract, not a `ModelSurface`. Without Connector configuration, exposure is `Runtime(ModelSurface)`: an unset `WEBCODEX_MCP_MODEL_SURFACE` selects `adaptive_runtime`, while `local-coding-v1`, `adaptive-runtime-v1`, and `full-operator-v1` select `local_coding`, `adaptive_runtime`, and `full_operator_runtime` explicitly. `local-coding-v1` remains an explicit fixed typed exposure preset for hosts that select it; that preset does not freeze individual tool schemas, legacy aliases, or retired names. Fresh/default model exposure uses Adaptive discovery. `adaptive_runtime` direct admission/order is statically declared by canonical `ToolDefinition`s; ordinary model-visible runtime tools default to the bounded long-tail gateway unless explicitly promoted to direct. Direct availability is preferred exposure rather than exclusive execution authority: an otherwise-admitted direct target may fall back through the same generic gateway. Gateway dispatch preserves the target tool's existing scope, authority, permission, argument, capability, effect, and Session/ACK semantics. MCP `tools/list` schema projection is exposure-aware: unset `WEBCODEX_MCP_COMPACT_SCHEMAS` defaults Adaptive Runtime to compact discovery (omitting only `outputSchema`), while Local Coding, Full Operator, and ProjectConnector retain full-schema projection defaults; explicit true/false always overrides that projection without changing ToolSpec ownership or invocation/result semantics. A Connector + `WEBCODEX_MCP_MODEL_SURFACE` conflict, an unsupported value, or partial Connector configuration fails startup. MCP GET/initialize/discovery, `runtime_status.runtime_exposure`, and the startup log report the same flattened exposure name |
+| Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_runners`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
 | Independence | Layers degrade independently; `not_observed` on one layer must not be collapsed into a global offline verdict |
 
 ---
@@ -315,18 +340,18 @@ it never infers readiness from configuration.
 
 `work_on_project` is the only external runtime coding bootstrap. The retired
 `start_coding_task` wire/API name and its advanced input schema are not accepted.
-The internal `StartCodingTask` primitive may still use
-`detail=minimal|standard|full` to build bounded startup projections for shared
-implementation paths; that control is not a public tool argument.
+The shared coding workflow engine owns startup behavior directly. Bounded
+`minimal|standard|full` diagnostic projections are retained only behind test
+seams; those controls are not a public tool argument or ToolCall identity.
 
 | Decision | Choice |
 |---|---|
-| Retired wire entry | `start_coding_task` and its direct/API compatibility schema fail closed; callers migrate to `work_on_project` |
+| Removed wire entry | `start_coding_task` has no current ToolDefinition or compatibility schema and follows ordinary unknown-tool rejection; `work_on_project` is canonical |
 | External projection | `work_on_project` returns one deterministic sparse startup projection and does not expose full runtime/connection/authority diagnostics |
 | Internal `standard` | Default bounded Coding brief used by shared startup plumbing: strict session/project/workspace, incremental repository instructions, bounded continuation evidence, semantic-navigation summary, blockers/warnings, and concrete next actions |
 | Internal `minimal` / `full` | Retained only as implementation-level projection modes for internal callers/tests; they are not generic HTTP/MCP tool inputs |
 | Rule snapshot lifecycle | Fresh sessions load bounded content; unchanged same-process continuations reuse the in-memory fingerprint snapshot without repeating content; source additions/deletions/content/truncation changes return new bounded content; explicit or restart-restored Sessions reload because durable storage never contains rule bodies |
-| Unknown/retired external fields | The retired tool name fails closed before legacy argument interpretation; `work_on_project` keeps its own strict schema |
+| Unknown/removed external fields | Unknown or removed tool names fail closed before legacy argument interpretation; `work_on_project` keeps its own strict schema |
 
 No alias or dual shape is kept for the removed flags (consistent with §2).
 
@@ -356,26 +381,34 @@ The standing direction for model-facing execution is defined in
 1. **Structured lifecycle is execution truth.** Retry safety must not depend on
    interpreting prose. `command_started`, completion state, failure
    classification, Job state, and guidance must not contradict one another.
-2. **Prefer direct argv/process execution for ordinary commands.** Shell command
-   strings remain an escape hatch for real shell semantics; long script content
-   belongs in a bounded payload channel rather than an ever-larger quoted string.
+2. **Prefer direct argv/process execution for one native executable.** Use shell
+   command strings when shell semantics or a short, tightly related command chain
+   is the point; keep independent effect or validation boundaries separate. Long
+   script content belongs in a bounded payload channel rather than an ever-larger
+   quoted string.
 3. **One execution may outlive one tool/model turn.** When work exceeds a short
    synchronous grace window, the same execution should continue as a durable Job;
    handoff must not be implemented as cancel-and-retry.
-4. **Job/observation is the continuation API.** Durable Job identity, lifecycle,
-   bounded logs, observation token, cancellation, ownership, and recovery/lost
-   semantics remain OS-, transport-, and presentation-neutral. Batch observation
-   should reuse this model rather than create a second scheduler or revision
-   system.
+4. **Job/observation is the execution continuation and observation API.** Durable
+   Job identity, lifecycle, bounded logs, observation token, cancellation,
+   ownership, and recovery/lost semantics remain OS-, transport-, and
+   presentation-neutral. This does not itself mean model/Host continuation; batch
+   observation should reuse this model rather than create a second scheduler or
+   revision system.
 5. **Optional host UI is an adapter, not an owner.** MCP Apps or another host may
    observe Jobs and later resume a model, but core execution cannot depend on
-   Apps, MCP Tasks, MRTR, elicitation, progress extensions, or iframe state. If
-   automatic model resume is provided, exactly one durable continuation domain
-   owns each logical resume event; independent Job Views, cards, or Host views do
-   not race to resume the model. For Agent-bound continuation, the Agent Wake /
-   Wake Delivery Attempt domain owns that logical continuation; Host/controller
-   state is adapter-local delivery state rather than a second WebCodex
-   continuation truth.
+   Apps, MCP Tasks, MRTR, elicitation, progress extensions, or iframe state. MCP
+   App presentation is a Server-level optional adapter: `WEBCODEX_MCP_APPS_ENABLED`
+   defaults on and may disable App capability advertisement, descriptor linkage,
+   presentation metadata, and static App resources without disabling canonical
+   MCP tools/results or non-App resource delivery. If automatic model resume is
+   provided, exactly one durable continuation domain owns each logical resume
+   event; independent Job Views, cards, or Host views do not race to resume the
+   model. A long build/watch reaching terminal state may be an explicit input to
+   Goal/AgentTask orchestration, but the card is never the trigger or continuation
+   owner. For Agent-bound continuation, the Agent Wake / Wake Delivery Attempt
+   domain owns that logical continuation; Host/controller state is adapter-local
+   delivery state rather than a second WebCodex continuation truth.
 6. **Transport fallback must preserve execution semantics.** Polling, WebSocket,
    and QUIC may differ in delivery behavior, but none may silently duplicate a
    command or turn a transport stall into a false pre-start rejection.
@@ -388,61 +421,97 @@ unless the user task explicitly requires that scope.
 
 ## 11. 0.4 compatibility floor
 
-`v0.4.0` is the new compatibility floor. The `0.3.x -> 0.4.0` boundary is an
-intentional pre-release cleanup boundary: release upgrade notes may require a
-coordinated change for the Runner generation cleanup, retired CLI aliases,
-pre-0.4 persisted-state cleanup, Tool/runtime surface cleanup, and authority or
-configuration cleanup. That pre-0.4 freedom does not continue through the
-`0.4.x` patch series.
+`v0.4.0` is the compatibility floor for **concrete compatibility domains** such
+as durable persisted state, mixed-version Server/Runner operation, shipped
+operator/install workflows, and named external/public contracts. The
+`0.3.x -> 0.4.0` boundary remains an intentional cleanup point for Runner
+generation, retired CLI aliases, pre-0.4 persisted state, authority, and
+configuration.
 
-Once `v0.4.0` is published, its users are concrete external consumers. The
-standing rule for `0.4.x` is compatibility-first:
+The floor does **not** freeze every model-facing ToolSpec argument, result field,
+projection, or historical spelling through the `0.4.x` patch series. There is no
+supported third-party stable runtime-tool SDK today. During active development,
+a model-facing tool shape may therefore be simplified or broken when that removes
+duplicate truth, misleading semantics, or avoidable turn friction and no named
+consumer requires the old shape.
 
-1. **CLI.** Canonical commands and flags published in `v0.4.0` are not deleted
-   or renamed in a `0.4.x` patch release. Additive options are allowed, and
-   human-oriented prose may improve. Documented machine-readable JSON or schema
-   shapes require an additive or explicit migration/version strategy rather
-   than an unannounced breaking reinterpretation.
-2. **Runner configuration.** A canonical `agent.toml` accepted by `v0.4.0`
-   remains parseable throughout `0.4.x`. New fields should be optional or have
-   safe defaults. Patch releases do not force a filename or field rename merely
-   to make Runner terminology more uniform.
-3. **Server/Runner protocol.** Protocol generation 2 is the `0.4` baseline.
-   `0.4.x` does not introduce another required generation or expand the
-   generation-2 baseline-required capability set. New requirements use additive
-   `RegistrationRequired` capabilities; when an otherwise-valid `0.4` Runner lacks
-   such a capability, that feature is unavailable/fails closed instead of
-   invalidating the entire Runner registration. First-party Server and Runner releases in
-   `0.4.x` should preserve rolling interoperability as far as security and
-   correctness allow.
-4. **Persisted state.** The durable DB, Workflow Session state, and other
-   relevant state accepted by `v0.4.0` form the migration floor for later
-   `0.4.x` releases. Shape evolution needs an explicit migration, default, or
-   version strategy. Migrations must be deterministic, idempotent, and
-   fail-closed; ambiguous old state must not be silently reinterpreted. This
-   decision does not require a generic migration framework before a concrete
-   state evolution needs one.
-5. **Model, HTTP, and MCP contracts.** Canonical model-visible tool names,
-   documented REST routes, MCP capability names, and documented serialized
-   field names released in `v0.4.0` evolve additively or migration-first during
-   `0.4.x`. A true removal or rename should normally wait for `v0.5.0`. The
-   `v0.4.0` MCP result-framing floor makes `structuredContent` the canonical
-   machine-readable `tools/call` result. `content.text` is a concise human
-   fallback, not a duplicate serialization of that result. This applies to all
-   MCP protocol eras WebCodex advertises; protocol-version support does not
-   preserve the pre-0.4 JSON-in-text duplication. `0.4.x` must keep this
-   structured-result ownership stable, including any transport-specific
-   post-framing output schema.
+Compatibility code is retained only when it has a concrete consumer: accepted
+persisted state, mixed-version Server/Runner operation, a current external
+workflow or installer, a published artifact contract, or a required fail-closed
+security/privacy migration boundary. An implementation plus tests that only
+assert that implementation exists is not by itself a consumer. Published-but-
+unused CLI/API aliases and duplicate machine-readable fields may therefore be
+removed after an exact consumer search.
 
-The product concept and public lifecycle namespace are **Runner**, but several
-older `agent_*` names are already compatibility vocabulary and are deliberately
-frozen rather than cosmetically duplicated. In particular, `agent.toml`,
-`WEBCODEX_AGENT_CONFIG`, `WEBCODEX_AGENT_TOKEN`, `wc_agent_*`,
-`agent_instance_id`, runtime project ids of the form
-`agent:<client_id>:<project_id>`, and established DB/wire `agent_*` fields keep
-their existing names. Do not introduce a `runner.toml || agent.toml` fallback or
-new `WEBCODEX_RUNNER_*` aliases solely for naming consistency; that would create
-a second representation instead of preserving one compatibility contract.
+Where a concrete consumer does exist, compatibility remains narrow and
+fail-closed. Protocol generation 2 remains the 0.4 Server/Runner rolling
+baseline; additive capabilities do not expand its required set, and absence is
+handled as unavailable rather than inferred authority. Durable DB, Workflow
+Session, and registry state is migrated or quarantined deterministically rather
+than silently reinterpreted. MCP `structuredContent` remains the canonical
+machine-readable `tools/call` result; `content.text` is only the concise human
+fallback.
+
+The product concept and public lifecycle namespace are **Runner**. Before the
+`v0.4.0` compatibility floor, the local primary config filename is normalized
+from `agent.toml` to `runner.toml`. The compatibility contract is intentionally
+narrow and deterministic: a config directory containing only legacy
+`agent.toml` continues to use that file; one containing only `runner.toml` uses
+the canonical file; a directory containing both fails closed rather than
+choosing a winner; a directory containing neither creates/targets
+`runner.toml`. Explicit `--config PATH` remains exact and does not inspect a
+sibling filename. Explicit `--profile` similarly selects its authoritative
+profile directory before environment defaults are considered.
+`WEBCODEX_RUNNER_CONFIG` is the canonical default-path env override, while
+`WEBCODEX_AGENT_CONFIG` remains a legacy alias; setting both is an error only
+when environment defaults are actually consulted.
+
+The same pre-`v0.4.0` normalization applies to the Runner-owned project
+registry: `project_registry_dir` and `project-registry/` are canonical for new
+state, while a sole legacy `projects_dir` field or `projects.d/` directory may
+continue to identify existing state in place. New and legacy fields together,
+or both default directory names together, fail closed; WebCodex does not merge,
+copy, rename, or choose between two registries implicitly. The registry remains
+a directory of Runner-owned project registration records, not a second workspace
+or project-root abstraction.
+
+Project registration provenance is also normalized before the `v0.4.0` floor.
+The generic project-record `kind` field remains open project metadata, while the
+optional `registration_source` field describes how the record entered the
+Runner registry (`explicit` or `auto_registered`). New path auto-registration
+persists `registration_source = "auto_registered"` and does not persist a fake
+`kind`. For old records only, absent `registration_source` plus the exact
+historical `kind = "auto_registered"` sentinel remains a compatibility fallback;
+a present new field is authoritative. This interpretation is kept separate from
+the raw record representation used for project revision/CAS hashing, so merely
+upgrading WebCodex does not change an unchanged legacy record's revision. During
+rolling upgrades a new Runner may still project the historical sentinel on its
+inventory and path-operation wire results for a newly auto-registered project
+with no genuine kind so an old Server can classify it, while new Servers use the
+explicit additive provenance field.
+Public `list_projects.source` remains `agent_registered` / `auto_registered`.
+
+The pre-0.4 managed-temporary-project lifecycle is retired rather than carried
+into the `v0.4.0` product contract. Current project creation uses explicit
+`create_project`; existing directories use `work_on_project(path)` or
+`register_project`. The retired `temporary_projects_root` key no longer has a
+typed Runner configuration meaning. Runner configuration intentionally ignores
+obsolete unknown top-level keys, so an old file containing this key remains
+loadable without preserving its former validation, warning, or runtime field.
+Existing project-registry records whose generic
+`kind = "managed_temporary"` value predates this cleanup remain readable as
+ordinary registrations; current Server projections do not treat that value as
+an active lifecycle. A legacy Server request containing the old
+`managed_temporary_project` create flag fails closed on a new Runner before any
+filesystem mutation. This retirement does not change protocol generation,
+baseline capabilities, `client_id`, `agent_project_id`, or runtime project ids.
+
+Other older `agent_*` names below have concrete token, persisted-state, or wire
+consumers and are therefore retained rather than cosmetically duplicated. In
+particular, `WEBCODEX_AGENT_TOKEN`, `wc_agent_*`, `agent_instance_id`, runtime
+project ids of the form `agent:<client_id>:<project_id>`, and established
+DB/wire `agent_*` fields keep their existing names. This local filename migration does not imply
+a Server/Runner protocol-generation or wire-identity rename.
 
 Compatibility never requires retaining a known authentication bypass, unsafe
 authority, ambiguous or stale identity, or weakened fail-closed validation. A

@@ -3,7 +3,7 @@
 use super::super::helpers::*;
 use super::super::*;
 use super::support::*;
-use crate::shell_protocol::{ShellAgentResultRequest, ShellClientCapabilities};
+use crate::runner_protocol::{RunnerCapabilities, RunnerResultRequest};
 use serde_json::json;
 
 #[test]
@@ -14,18 +14,24 @@ fn structured_validation_tools_are_known_and_parse() {
     assert!(matches!(
         ToolCall::from_tool_name(
             "cargo_fmt",
-            json!({"project":"agent:oe:webcodex","check":true,"cwd":"crates/app"})
+            json!({"project":"agent:oe:webcodex","check":true,"cwd":"crates/app","sync_wait_secs":60})
         )
         .unwrap(),
         ToolCall::CargoFmt {
             check: Some(true),
+            sync_wait_secs: Some(60),
             ..
         }
     ));
     assert!(matches!(
-        ToolCall::from_tool_name("cargo_check", json!({"project":"agent:oe:webcodex"})).unwrap(),
+        ToolCall::from_tool_name(
+            "cargo_check",
+            json!({"project":"agent:oe:webcodex","sync_wait_secs":1})
+        )
+        .unwrap(),
         ToolCall::CargoCheck {
             all_targets: None,
+            sync_wait_secs: Some(1),
             ..
         }
     ));
@@ -37,6 +43,7 @@ fn structured_validation_tools_are_known_and_parse() {
                 "filter":"tool_runtime",
                 "require_tests": true,
                 "min_tests": 6
+                ,"sync_wait_secs": 1
             })
         )
         .unwrap(),
@@ -44,16 +51,17 @@ fn structured_validation_tools_are_known_and_parse() {
             filter: Some(filter),
             require_tests: Some(true),
             min_tests: Some(6),
+            sync_wait_secs: Some(1),
             ..
         } if filter == "tool_runtime"
     ));
     assert!(matches!(
         ToolCall::from_tool_name(
             "go_test",
-            json!({"project":"agent:oe:webcodex","cwd":"internal/nodeapp"})
+            json!({"project":"agent:oe:webcodex","cwd":"internal/nodeapp","sync_wait_secs":1})
         )
         .unwrap(),
-        ToolCall::GoTest { cwd: Some(cwd), .. } if cwd == "internal/nodeapp"
+        ToolCall::GoTest { cwd: Some(cwd), sync_wait_secs: Some(1), .. } if cwd == "internal/nodeapp"
     ));
 }
 
@@ -131,7 +139,8 @@ async fn agent_run_shell_resolves_relative_cwd_from_registered_project_root() {
     let frontend = root.join("frontend");
     std::fs::create_dir_all(&frontend).unwrap();
     let runtime = runtime_with_agent_project("cwd-agent");
-    let project = register_agent_project_at_path(&runtime, "cwd-agent", "cwd-project", &root).await;
+    let project =
+        register_runner_project_at_path(&runtime, "cwd-agent", "cwd-project", &root).await;
 
     for (cwd, expected) in [
         (Some("frontend".to_string()), frontend.clone()),
@@ -180,7 +189,7 @@ async fn agent_run_shell_resolves_relative_cwd_from_registered_project_root() {
 #[tokio::test]
 async fn cargo_check_failure_includes_stderr_tail_or_guidance() {
     let runtime = runtime_with_agent_project("cargo-checker");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -223,7 +232,7 @@ async fn cargo_check_failure_includes_stderr_tail_or_guidance() {
 #[tokio::test]
 async fn cargo_test_failure_includes_stderr_tail_or_guidance() {
     let runtime = runtime_with_agent_project("cargo-tester");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -274,7 +283,7 @@ async fn cargo_test_failure_includes_stderr_tail_or_guidance() {
 #[tokio::test]
 async fn cargo_test_output_includes_bounded_failed_test_diagnostics() {
     let runtime = runtime_with_agent_project("cargo-diag");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -374,7 +383,7 @@ test result: FAILED. 7 passed; 3 failed; 1 ignored; 0 measured; 0 filtered out\n
 #[tokio::test]
 async fn cargo_test_passing_output_includes_empty_failed_test_details_diagnostics() {
     let runtime = runtime_with_agent_project("cargo-pass-diag");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -429,7 +438,7 @@ test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out\n",
 #[tokio::test]
 async fn cargo_test_multi_harness_counts_match_diagnostics_summary() {
     let runtime = runtime_with_agent_project("cargo-multi-harness");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -492,7 +501,7 @@ test result: ok. 0 passed; 0 failed; 2 ignored\n",
 #[tokio::test]
 async fn cargo_test_agent_timeout_is_not_validation_failed() {
     let runtime = runtime_with_agent_project("cargo-timeout");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -518,10 +527,10 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
     let req = wait_for_patch_agent_request(&runtime, "cargo-timeout").await;
     assert_eq!(req.command, "cargo test 'slow'");
     runtime
-        .shell_clients
-        .complete(ShellAgentResultRequest {
+        .runner_registry
+        .complete(RunnerResultRequest {
             client_id: "cargo-timeout".to_string(),
-            agent_instance_id: "inst".to_string(),
+            runner_instance_id: "inst".to_string(),
             request_id: req.request_id,
             exit_code: Some(-1),
             stdout: Some("partial cargo output\n".to_string()),
@@ -543,7 +552,7 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
 #[tokio::test]
 async fn cargo_fmt_failure_includes_stderr_tail_or_guidance() {
     let runtime = runtime_with_agent_project("cargo-formatter");
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };
@@ -584,6 +593,7 @@ fn cleanup_paths_match_sensitive_directories_by_complete_component() {
     assert!(validate_limited_cleanup_paths(&root, true).is_err());
 
     for path in [
+        "runner.toml",
         "agent.toml",
         ".env",
         ".git/config",
@@ -656,7 +666,7 @@ async fn register_project_crosses_historical_64_threshold_and_is_immediately_res
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         existing,
     )
     .await;
@@ -678,7 +688,7 @@ async fn register_project_crosses_historical_64_threshold_and_is_immediately_res
             .await
     });
     let request =
-        wait_for_agent_request_for_instance(&runtime, client_id, &format!("inst-{client_id}"))
+        wait_for_runner_request_for_instance(&runtime, client_id, &format!("inst-{client_id}"))
             .await;
     assert_eq!(request.kind, "register_project");
     let authoritative = json!({
@@ -708,8 +718,8 @@ async fn register_project_crosses_historical_64_threshold_and_is_immediately_res
         "authoritative projection should commit: {result:?}"
     );
     let projects = runtime
-        .shell_clients
-        .list_client_projects(client_id)
+        .runner_registry
+        .list_runner_projects(client_id)
         .await
         .unwrap();
     assert_eq!(projects.len(), 65);
@@ -738,7 +748,7 @@ async fn register_project_projection_failure_returns_reconcile_required_without_
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities::default(),
+        RunnerCapabilities::default(),
         Vec::new(),
     )
     .await;
@@ -760,7 +770,7 @@ async fn register_project_projection_failure_returns_reconcile_required_without_
             .await
     });
     let request =
-        wait_for_agent_request_for_instance(&runtime, client_id, &format!("inst-{client_id}"))
+        wait_for_runner_request_for_instance(&runtime, client_id, &format!("inst-{client_id}"))
             .await;
     assert_eq!(request.kind, "register_project");
     let authoritative = json!({
@@ -809,8 +819,8 @@ async fn register_project_projection_failure_returns_reconcile_required_without_
     );
     assert!(
         runtime
-            .shell_clients
-            .list_client_projects(client_id)
+            .runner_registry
+            .list_runner_projects(client_id)
             .await
             .unwrap()
             .is_empty(),
@@ -844,7 +854,7 @@ async fn dispatch_register_project_rejects_unknown_client_id() {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("unknown agent"),
+            .contains("unknown Runner"),
         "register_project should reject unknown client_id: {:?}",
         result.error
     );
@@ -884,14 +894,14 @@ async fn dispatch_unregister_project_removes_server_inventory_after_terminal_run
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             project_lifecycle: true,
             ..Default::default()
         },
         vec![summary],
     )
     .await;
-    let project = crate::tool_runtime::agent_project_runtime_id(client_id, "demo");
+    let project = crate::tool_runtime::runner_project_runtime_id(client_id, "demo");
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -906,7 +916,7 @@ async fn dispatch_unregister_project_removes_server_inventory_after_terminal_run
                 .await
         }
     });
-    let request = wait_for_agent_request_for_client(&runtime, client_id).await;
+    let request = wait_for_runner_request_for_client(&runtime, client_id).await;
     assert_eq!(request.kind, "project_lifecycle_unregister");
     let payload: serde_json::Value =
         serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
@@ -936,8 +946,8 @@ async fn dispatch_unregister_project_removes_server_inventory_after_terminal_run
     assert_eq!(result.output["outcome"], "unregistered");
     assert_eq!(result.output["changed"], true);
     let client = runtime
-        .shell_clients
-        .get_client_view(client_id)
+        .runner_registry
+        .get_runner_view(client_id)
         .await
         .expect("Runner should remain registered");
     assert!(
@@ -959,7 +969,7 @@ async fn dispatch_create_project_rejects_unknown_client_id() {
             allow_patch: true,
             template: None,
             git_init: false,
-            allow_existing_empty: false,
+            adopt_existing_empty: false,
             overwrite: false,
         })
         .await;
@@ -969,7 +979,7 @@ async fn dispatch_create_project_rejects_unknown_client_id() {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("unknown agent"),
+            .contains("unknown Runner"),
         "create_project should reject unknown client_id: {:?}",
         result.error
     );
@@ -1011,7 +1021,7 @@ async fn dispatch_create_project_rejects_relative_path() {
             allow_patch: true,
             template: None,
             git_init: false,
-            allow_existing_empty: false,
+            adopt_existing_empty: false,
             overwrite: false,
         })
         .await;
@@ -1058,7 +1068,7 @@ async fn mutating_dispatch_feeds_the_activity_recorder() {
     let recorder = std::sync::Arc::new(CapturingRecorder::default());
     let runtime =
         runtime_with_agent_project("activity-shell").with_activity_recorder(recorder.clone());
-    let caps = ShellClientCapabilities {
+    let caps = RunnerCapabilities {
         shell: true,
         ..Default::default()
     };

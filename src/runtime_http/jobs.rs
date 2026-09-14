@@ -5,24 +5,6 @@ use salvo::prelude::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-struct JobStatusRequest {
-    pub job_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct JobLogRequest {
-    pub job_id: String,
-    #[serde(default)]
-    pub offset: Option<usize>,
-    #[serde(default)]
-    pub tail_lines: Option<usize>,
-    #[serde(default)]
-    pub after_observation_token: Option<String>,
-    #[serde(default)]
-    pub wait_secs: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct JobStopRequest {
     pub job_id: String,
 }
@@ -41,11 +23,11 @@ struct RunShellRequest {
 
 /// `POST /api/projects/run_job` - thin REST wrapper over
 /// `ToolCall::RunJob`. Starts an async background shell job in an
-/// agent-registered project and returns a `job_id`. Execution with side
-/// effects; requires Bearer auth and the agent async shell job capability.
+/// Runner-registered project and returns a `job_id`. Execution with side
+/// effects; requires Bearer auth and the Runner async shell job capability.
 /// Dedicated GPT Action (`startProjectShellJob`); also reachable via
-/// callRuntimeTool / MCP tools/call. Poll with `getRuntimeJobStatus` and read
-/// output with `getRuntimeJobTail` / `getRuntimeJobLog`.
+/// callRuntimeTool / MCP tools/call. Observe lifecycle plus bounded log deltas
+/// with `observe_jobs`; `getRuntimeJobTail` remains the dedicated REST tail.
 #[derive(Debug, Deserialize)]
 struct StartProjectShellJobRequest {
     pub project: String,
@@ -81,58 +63,11 @@ struct JobTailRequest {
     pub wait_secs: Option<u64>,
 }
 
-#[handler]
-pub async fn job_status(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let audit = ActionAudit::start(req, depot, "/api/jobs/status", "jobStatus");
-    let Some(runtime) = require_runtime(depot, res) else {
-        return;
-    };
-    let Some(body) = parse_json_body::<JobStatusRequest>(req, res).await else {
-        return;
-    };
-    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: body.job_id,
-                include_command_preview: false,
-            },
-            auth.as_ref(),
-        )
-        .await;
-    render_result(res, &audit, "job_status", None, result);
-}
-
-#[handler]
-pub async fn job_log(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let audit = ActionAudit::start(req, depot, "/api/jobs/log", "jobLog");
-    let Some(runtime) = require_runtime(depot, res) else {
-        return;
-    };
-    let Some(body) = parse_json_body::<JobLogRequest>(req, res).await else {
-        return;
-    };
-    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
-    let result = runtime
-        .dispatch_with_auth(
-            ToolCall::JobLog {
-                job_id: body.job_id,
-                offset: body.offset,
-                tail_lines: body.tail_lines,
-                after_observation_token: body.after_observation_token,
-                wait_secs: body.wait_secs,
-            },
-            auth.as_ref(),
-        )
-        .await;
-    render_result(res, &audit, "job_log", None, result);
-}
-
-/// Stop a local runtime job by terminating its process group and marking it
-/// `stopped`. This is a thin wrapper over `ToolRuntime::stop_job`; it is
+/// Stop a runtime Job through its owning Runner. This is a thin wrapper over
+/// `ToolRuntime::stop_job`; it is
 /// intentionally NOT exposed as a GPT Action (absent from openapi.json) so
-/// remote ChatGPT callers cannot drive an explicit kill. Only jobs the
-/// runtime created and recorded can be stopped.
+/// remote ChatGPT callers cannot drive an explicit stop. Only Jobs the
+/// runtime registry owns can be stopped.
 #[handler]
 pub async fn job_stop(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let audit = ActionAudit::start(req, depot, "/api/jobs/stop", "jobStop");
@@ -142,7 +77,8 @@ pub async fn job_stop(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     let Some(body) = parse_json_body::<JobStopRequest>(req, res).await else {
         return;
     };
-    let result = runtime.stop_job(body.job_id).await;
+    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
+    let result = runtime.stop_job(body.job_id, auth.as_ref()).await;
     render_result(res, &audit, "job_stop", None, result);
 }
 

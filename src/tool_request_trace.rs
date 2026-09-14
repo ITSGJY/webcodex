@@ -22,6 +22,7 @@
 //! combine with reverse-proxy `status` / `body_bytes_sent` / `request_time` for
 //! that transport boundary.
 
+use crate::client_window::ClientWindow;
 use crate::config::ToolRequestTraceMode;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -59,6 +60,7 @@ struct TraceCorrelation {
     trace_id: String,
     request_id: String,
     job_id: Option<String>,
+    runner_kind: String,
     created_at: i64,
 }
 
@@ -186,7 +188,7 @@ where
     }
 }
 
-fn current_active_trace_id() -> Option<String> {
+pub(crate) fn current_active_trace_id() -> Option<String> {
     ACTIVE_TOOL_TRACE_ID.try_with(Clone::clone).ok()
 }
 
@@ -1336,11 +1338,14 @@ pub(crate) fn record_runner_request_enqueued<T: Serialize>(
     client_id: &str,
     kind: &str,
     job_id: Option<&str>,
-    agent_instance_id: Option<&str>,
+    runner_instance_id: Option<&str>,
     runner_transport: Option<&str>,
     runner_version: Option<&str>,
     runner_git_commit: Option<&str>,
 ) {
+    if !tool_request_trace_enabled() {
+        return;
+    }
     let Some(trace_id) = current_active_trace_id() else {
         return;
     };
@@ -1363,7 +1368,7 @@ pub(crate) fn record_runner_request_enqueued<T: Serialize>(
         runner_client_id = client_id,
         runner_request_kind = kind,
         runner_job_id = job_id.unwrap_or("-"),
-        runner_agent_instance_id = agent_instance_id.unwrap_or("-"),
+        runner_agent_instance_id = runner_instance_id.unwrap_or("-"),
         runner_transport = runner_transport.unwrap_or("-"),
         runner_version = runner_version.unwrap_or("-"),
         runner_git_commit = runner_git_commit.unwrap_or("-"),
@@ -1376,6 +1381,7 @@ pub(crate) fn record_runner_request_enqueued<T: Serialize>(
             trace_id: trace_id.clone(),
             request_id: request_id.to_string(),
             job_id: job_id.map(str::to_string),
+            runner_kind: kind.to_string(),
             created_at: now_ts(),
         };
         correlations
@@ -1395,7 +1401,7 @@ pub(crate) fn record_runner_request_enqueued<T: Serialize>(
                 "runner_client_id": client_id,
                 "runner_request_kind": kind,
                 "runner_job_id": job_id,
-                "runner_agent_instance_id": agent_instance_id,
+                "runner_agent_instance_id": runner_instance_id,
                 "runner_transport": runner_transport,
                 "runner_version": runner_version,
                 "runner_git_commit": runner_git_commit,
@@ -1447,7 +1453,10 @@ pub(crate) fn capture_runner_result<T: Serialize>(request_id: &str, payload: &T)
         return;
     };
     match serde_json::to_value(payload) {
-        Ok(value) => capture_payload_for_trace(&correlation.trace_id, "runner_result", &value),
+        Ok(value) => {
+            let value = runner_result_trace_payload(&correlation.runner_kind, &value);
+            capture_payload_for_trace(&correlation.trace_id, "runner_result", &value)
+        }
         Err(error) => tracing::warn!(
             event = "tool_trace_capture_failed",
             server_trace_id = %correlation.trace_id,
@@ -1456,6 +1465,33 @@ pub(crate) fn capture_runner_result<T: Serialize>(request_id: &str, payload: &T)
             "tool_trace_capture_failed"
         ),
     }
+}
+
+fn runner_result_trace_payload(kind: &str, payload: &Value) -> Value {
+    if kind != "ssh_resource" {
+        return payload.clone();
+    }
+    let result = payload.get("result");
+    json!({
+        "kind": "ssh_resource",
+        "exit_code": result
+            .and_then(|value| value.get("exit_code"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "stdout_present": result
+            .and_then(|value| value.get("stdout"))
+            .is_some_and(|value| !value.is_null()),
+        "stderr_present": result
+            .and_then(|value| value.get("stderr"))
+            .is_some_and(|value| !value.is_null()),
+        "error_present": result
+            .and_then(|value| value.get("error"))
+            .is_some_and(|value| !value.is_null()),
+        "command_execution_state": payload
+            .get("command_execution_state")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
 }
 
 /// Finalize a non-Job Runner result correlation only after authoritative result
@@ -1504,6 +1540,17 @@ pub(crate) fn finalize_runner_job_correlation(request_id: Option<&str>, job_id: 
     remove_correlation(&correlation);
 }
 
+/// Canonical HTTP-adapter completion timing for one request. The absolute
+/// handoff timestamp is anchored at the request-observed wall clock and
+/// advanced by monotonic elapsed time, preserving sub-second precision without
+/// allowing a wall-clock adjustment to create a negative request duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestCompletionTiming {
+    pub(crate) request_observed_at_ms: i64,
+    pub(crate) response_handed_at_ms: i64,
+    pub(crate) elapsed_ms: u64,
+}
+
 /// Lifecycle guard shared by MCP `/mcp` and API `/api/tools/call` handlers.
 pub struct ToolRequestLifecycle {
     prefix: &'static str,
@@ -1512,9 +1559,28 @@ pub struct ToolRequestLifecycle {
     jsonrpc_id: String,
     method: String,
     tool_name: Option<String>,
+    client_window: Option<ClientWindow>,
+    app_call_id: Option<String>,
     suppress_payload_capture: bool,
+    request_observed_at_ms: i64,
     started: Instant,
     completed: AtomicBool,
+}
+
+fn tool_suppresses_payload_capture(tool_name: Option<&str>) -> bool {
+    matches!(
+        tool_name,
+        Some(
+            "read_tool_trace"
+                | "agent_continuation_bind"
+                | "agent_continuation_recover_endpoint"
+                | "agent_continuation_state"
+                | "agent_continuation_wake_acquire"
+                | "agent_continuation_wake_prepare"
+                | "agent_continuation_wake_finish"
+                | "agent_continuation_unbind"
+        )
+    )
 }
 
 impl ToolRequestLifecycle {
@@ -1525,7 +1591,8 @@ impl ToolRequestLifecycle {
         method: impl Into<String>,
         tool_name: Option<String>,
     ) -> Self {
-        let suppress_payload_capture = tool_name.as_deref() == Some("read_tool_trace");
+        let suppress_payload_capture = tool_suppresses_payload_capture(tool_name.as_deref());
+        let request_observed_at_ms = chrono::Utc::now().timestamp_millis();
         Self {
             prefix,
             mode: crate::config::tool_request_trace_mode(),
@@ -1533,7 +1600,10 @@ impl ToolRequestLifecycle {
             jsonrpc_id: jsonrpc_id.into(),
             method: method.into(),
             tool_name,
+            client_window: None,
+            app_call_id: None,
             suppress_payload_capture,
+            request_observed_at_ms,
             started: Instant::now(),
             completed: AtomicBool::new(false),
         }
@@ -1551,6 +1621,13 @@ impl ToolRequestLifecycle {
         self.enabled().then(|| self.trace_id.clone())
     }
 
+    /// Stable safe request-correlation id even when full request tracing is
+    /// disabled. Window activity may use this UUID without enabling or
+    /// persisting trace payloads.
+    pub fn correlation_trace_id(&self) -> String {
+        self.trace_id.clone()
+    }
+
     pub fn capture_payload(&self, phase: &str, value: &Value) {
         if self.full_enabled() && !self.suppress_payload_capture {
             capture_payload_for_trace(&self.trace_id, phase, value);
@@ -1562,7 +1639,7 @@ impl ToolRequestLifecycle {
     }
 
     pub fn set_tool_name(&mut self, tool_name: Option<String>) {
-        self.suppress_payload_capture = tool_name.as_deref() == Some("read_tool_trace");
+        self.suppress_payload_capture = tool_suppresses_payload_capture(tool_name.as_deref());
         self.tool_name = tool_name;
     }
 
@@ -1570,8 +1647,36 @@ impl ToolRequestLifecycle {
         self.jsonrpc_id = jsonrpc_id.into();
     }
 
+    /// Attach an adapter-resolved client window for diagnostic correlation only.
+    /// The lifecycle deliberately accepts `ClientWindow` rather than a raw host
+    /// identifier so tracing cannot become another opaque-identity parser.
+    pub(crate) fn set_client_window(&mut self, window: Option<&ClientWindow>) {
+        self.client_window = window.cloned();
+    }
+
+    /// Attach one bounded App-generated correlation id for diagnostics only.
+    /// The MCP adapter validates and strips this field before ToolRuntime parsing;
+    /// it is never authority and never contains Agent, Endpoint, Wake, or binding ids.
+    pub(crate) fn set_app_call_id(&mut self, app_call_id: Option<String>) {
+        self.app_call_id = app_call_id;
+    }
+
     pub fn duration_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    pub(crate) fn request_observed_at_ms(&self) -> i64 {
+        self.request_observed_at_ms
+    }
+
+    fn completion_timing(&self) -> RequestCompletionTiming {
+        let elapsed_ms = self.duration_ms();
+        let elapsed_i64 = i64::try_from(elapsed_ms).unwrap_or(i64::MAX);
+        RequestCompletionTiming {
+            request_observed_at_ms: self.request_observed_at_ms,
+            response_handed_at_ms: self.request_observed_at_ms.saturating_add(elapsed_i64),
+            elapsed_ms,
+        }
     }
 
     pub fn mark_completed(&self) {
@@ -1591,6 +1696,27 @@ impl ToolRequestLifecycle {
         tool_success: Option<bool>,
         category: &str,
     ) {
+        self.log_with_duration(
+            suffix,
+            http_status,
+            estimated_json_bytes,
+            protocol_success,
+            tool_success,
+            category,
+            self.duration_ms(),
+        );
+    }
+
+    fn log_with_duration(
+        &self,
+        suffix: &str,
+        http_status: Option<u16>,
+        estimated_json_bytes: Option<usize>,
+        protocol_success: Option<bool>,
+        tool_success: Option<bool>,
+        category: &str,
+        duration_ms: u64,
+    ) {
         if !self.enabled() {
             return;
         }
@@ -1607,7 +1733,10 @@ impl ToolRequestLifecycle {
             jsonrpc_id = %self.jsonrpc_id,
             method = %self.method,
             tool_name = self.tool_name.as_deref().unwrap_or("-"),
-            duration_ms = self.duration_ms(),
+            client_window_key = self.client_window.as_ref().map(ClientWindow::key).unwrap_or("-"),
+            client_window_source = self.client_window.as_ref().map(ClientWindow::source).unwrap_or("-"),
+            app_call_id = self.app_call_id.as_deref().unwrap_or("-"),
+            duration_ms,
             estimated_json_bytes = estimated_json_bytes.map(|b| b as i64).unwrap_or(-1),
             http_status = http_status.map(|s| s as i32).unwrap_or(-1),
             protocol_success = protocol_success
@@ -1628,7 +1757,10 @@ impl ToolRequestLifecycle {
                     "jsonrpc_id": self.jsonrpc_id.as_str(),
                     "method": self.method.as_str(),
                     "tool_name": self.tool_name.as_deref(),
-                    "duration_ms": self.duration_ms(),
+                    "client_window_key": self.client_window.as_ref().map(ClientWindow::key),
+                    "client_window_source": self.client_window.as_ref().map(ClientWindow::source),
+                    "app_call_id": self.app_call_id.as_deref(),
+                    "duration_ms": duration_ms,
                     "estimated_json_bytes": estimated_json_bytes,
                     "http_status": http_status,
                     "protocol_success": protocol_success,
@@ -1705,16 +1837,19 @@ impl ToolRequestLifecycle {
         protocol_success: Option<bool>,
         tool_success: Option<bool>,
         category: &str,
-    ) {
-        self.log(
+    ) -> RequestCompletionTiming {
+        let timing = self.completion_timing();
+        self.log_with_duration(
             "tool_handler_returned",
             Some(http_status),
             estimated_json_bytes,
             protocol_success,
             tool_success,
             category,
+            timing.elapsed_ms,
         );
         self.mark_completed();
+        timing
     }
 }
 
@@ -1762,12 +1897,14 @@ mod tests {
             trace_id: "trace-a".to_string(),
             request_id: "request-a".to_string(),
             job_id: Some("job-a".to_string()),
+            runner_kind: "run_process".to_string(),
             created_at: 1,
         };
         let other_correlation = TraceCorrelation {
             trace_id: "trace-b".to_string(),
             request_id: "request-b".to_string(),
             job_id: Some("job-b".to_string()),
+            runner_kind: "run_process".to_string(),
             created_at: 1,
         };
         let mut correlations = TraceCorrelations::default();
@@ -1842,6 +1979,72 @@ mod tests {
         );
         guard.capture_payload("raw_arguments", &json!({"content": "private"}));
         assert!(!temp.path().join("trace-metadata").exists());
+    }
+
+    #[test]
+    fn full_mode_lifecycle_persists_only_hashed_client_window_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+        env.set(
+            "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+            temp.path().to_string_lossy().as_ref(),
+        );
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+        reset_trace_store_accounting();
+
+        let raw_window = "chatgpt-window-opaque-secret";
+        let params = json!({
+            "name": "runtime_status",
+            "arguments": {},
+            "_meta": {"openai/session": raw_window}
+        });
+        let resolved = crate::client_window::stateless_mcp_window(&params);
+        let window = resolved.identity.expect("valid OpenAI session window");
+        let expected_key = window.key().to_string();
+        let trace_ids = ["window-trace-a", "window-trace-b"];
+
+        for trace_id in trace_ids {
+            let mut guard = ToolRequestLifecycle::new(
+                "mcp",
+                trace_id.into(),
+                "none",
+                "tools/call",
+                Some("runtime_status".into()),
+            );
+            guard.set_client_window(Some(&window));
+            guard.parsed("ok");
+            guard.mark_completed();
+        }
+
+        let absent_trace_id = "window-trace-absent";
+        let absent = ToolRequestLifecycle::new(
+            "mcp",
+            absent_trace_id.into(),
+            "none",
+            "tools/call",
+            Some("runtime_status".into()),
+        );
+        absent.parsed("ok");
+        absent.mark_completed();
+        flush_full_trace_writer();
+
+        for trace_id in trace_ids {
+            let events =
+                fs::read_to_string(temp.path().join(trace_id).join("events.jsonl")).unwrap();
+            assert!(!events.contains(raw_window));
+            let event: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
+            assert_eq!(event["client_window_key"], expected_key);
+            assert_eq!(event["client_window_source"], "openai-session");
+            assert_eq!(event["server_trace_id"], trace_id);
+        }
+
+        let absent_events =
+            fs::read_to_string(temp.path().join(absent_trace_id).join("events.jsonl")).unwrap();
+        let absent_event: Value =
+            serde_json::from_str(absent_events.lines().next().unwrap()).unwrap();
+        assert!(absent_event["client_window_key"].is_null());
+        assert!(absent_event["client_window_source"].is_null());
     }
 
     #[test]
@@ -1983,6 +2186,62 @@ mod tests {
     }
 
     #[test]
+    fn agent_continuation_app_lifecycle_never_captures_host_binding_or_resume_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "full");
+        env.set(
+            "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+            temp.path().to_string_lossy().as_ref(),
+        );
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+        reset_trace_store_accounting();
+
+        for tool_name in [
+            "agent_continuation_bind",
+            "agent_continuation_recover_endpoint",
+            "agent_continuation_state",
+            "agent_continuation_wake_acquire",
+            "agent_continuation_wake_prepare",
+            "agent_continuation_wake_finish",
+            "agent_continuation_unbind",
+        ] {
+            let trace_id = Uuid::new_v4().to_string();
+            let mut guard = ToolRequestLifecycle::new(
+                "mcp",
+                trace_id.clone(),
+                "none",
+                "tools/call",
+                Some(tool_name.to_string()),
+            );
+            guard.set_app_call_id(Some("wc_app_call_0123456789abcdef_1".to_string()));
+            guard.parsed("ok");
+            guard.capture_payload(
+                "raw_request",
+                &json!({"binding_id": "wc_host_binding_PRIVATE", "consume_token": "PRIVATE"}),
+            );
+            guard.capture_payload(
+                "final_response",
+                &json!({"structuredContent": {"success": true, "output": {
+                    "app_protocol": {"automatic_message": "consume_token=wc_wake_consume_PRIVATE_RESUME_ENVELOPE"}
+                }}}),
+            );
+            drop(guard);
+            flush_full_trace_writer();
+            assert!(
+                payload_files(temp.path(), &trace_id).is_empty(),
+                "{tool_name} must suppress forensic payload capture"
+            );
+            let events = fs::read_to_string(temp.path().join(&trace_id).join("events.jsonl"))
+                .expect("continuation trace metadata");
+            assert!(events.contains("wc_app_call_0123456789abcdef_1"));
+            assert!(events.contains("mcp_tool_request_parsed"));
+            assert!(!events.contains("wc_host_binding_PRIVATE"));
+            assert!(!events.contains("PRIVATE_RESUME_ENVELOPE"));
+        }
+    }
+
+    #[test]
     fn full_mode_capture_does_not_wait_for_trace_io_lock() {
         let temp = tempfile::tempdir().unwrap();
         let mut env = crate::test_support::TestEnvGuard::new();
@@ -2003,7 +2262,7 @@ mod tests {
                 "trace-background-writer".into(),
                 "none",
                 "tools/call",
-                Some("read_file".into()),
+                Some("read_files".into()),
             );
             guard.capture_payload("raw_arguments", &json!({"path": "README.md"}));
             let _ = done_tx.send(());
@@ -2038,7 +2297,7 @@ mod tests {
             "trace-fail-open".into(),
             "-",
             "POST /api/tools/call",
-            Some("read_file".into()),
+            Some("read_files".into()),
         );
         guard.capture_payload("raw_arguments", &json!({"path": "README.md"}));
         drop(guard);
@@ -2423,6 +2682,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn window_correlation_without_tracing_does_not_retain_runner_requests() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.set("WEBCODEX_TOOL_REQUEST_TRACE", "off");
+        let guard = ToolRequestLifecycle::new(
+            "mcp",
+            new_trace_id(),
+            "none",
+            "tools/call",
+            Some("read_files".into()),
+        );
+        let runtime = crate::tool_runtime::ToolRuntime::new(
+            std::sync::Arc::new(crate::RunnerRegistry::default()),
+            std::sync::Arc::new(crate::tool_runtime::RuntimeInfo::default()),
+        );
+        let registry = runtime.window_activity_registry();
+        let window = crate::client_window::ClientWindow::for_test("trace-disabled-window");
+        let trace_id = guard.correlation_trace_id();
+        let _active = registry.start(&window, &trace_id, "tools/call", None);
+        assert!(guard.active_trace_id().is_none());
+        scope_active_trace(Some(trace_id), async {
+            let current = current_active_trace_id().unwrap();
+            registry.update(&current, Some("read_files"), Some("agent:r:p"));
+            assert!(current_full_trace_ref().is_none());
+            record_runner_request_enqueued(
+                &json!({}),
+                "window-without-tracing",
+                "r",
+                "read_files",
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        })
+        .await;
+        assert_eq!(
+            registry.list_for_window(window.key(), None)[0]
+                .project
+                .as_deref(),
+            Some("agent:r:p")
+        );
+        assert!(!correlations()
+            .lock()
+            .unwrap()
+            .requests
+            .contains_key("window-without-tracing"));
+    }
+
+    #[tokio::test]
     async fn runner_correlation_survives_original_dispatch_scope() {
         let temp = tempfile::tempdir().unwrap();
         let mut env = crate::test_support::TestEnvGuard::new();
@@ -2484,6 +2793,33 @@ mod tests {
     }
 
     #[test]
+    fn ssh_resource_runner_result_trace_never_persists_result_bodies() {
+        let target = "17724@w10";
+        let payload = json!({
+            "result": {
+                "exit_code": 0,
+                "stdout": format!("{{\"action\":\"register\",\"target\":\"{target}\"}}"),
+                "stderr": target,
+                "error": target
+            },
+            "command_execution_state": "completed"
+        });
+        let sanitized = runner_result_trace_payload("ssh_resource", &payload);
+        let serialized = serde_json::to_string(&sanitized).unwrap();
+        assert!(!serialized.contains(target));
+        assert_eq!(sanitized["kind"], "ssh_resource");
+        assert_eq!(sanitized["stdout_present"], true);
+        assert_eq!(sanitized["stderr_present"], true);
+        assert_eq!(sanitized["error_present"], true);
+        assert_eq!(sanitized["exit_code"], 0);
+
+        assert_eq!(
+            runner_result_trace_payload("run_process", &payload),
+            payload
+        );
+    }
+
+    #[test]
     fn incomplete_drop_is_safe_when_disabled() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.remove("WEBCODEX_TOOL_REQUEST_TRACE");
@@ -2508,5 +2844,34 @@ mod tests {
         guard.handler_returned(200, Some(12), Some(true), Some(true), "ok");
         drop(guard);
         env.remove("WEBCODEX_TOOL_REQUEST_TRACE");
+    }
+
+    #[test]
+    fn completion_timing_preserves_subsecond_monotonic_precision() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.remove("WEBCODEX_TOOL_REQUEST_TRACE");
+        let guard = ToolRequestLifecycle::new(
+            "mcp",
+            "trace-precise".into(),
+            "-",
+            "tools/call",
+            Some("read_files".into()),
+        );
+        let observed_at_ms = guard.request_observed_at_ms();
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        let timing = guard.handler_returned(200, None, Some(true), Some(true), "ok");
+        assert_eq!(timing.request_observed_at_ms, observed_at_ms);
+        assert!(
+            timing.elapsed_ms > 0,
+            "sub-second work must not quantize to zero"
+        );
+        assert!(
+            timing.elapsed_ms < 1_000,
+            "test request unexpectedly exceeded one second"
+        );
+        assert_eq!(
+            timing.response_handed_at_ms - timing.request_observed_at_ms,
+            i64::try_from(timing.elapsed_ms).unwrap()
+        );
     }
 }

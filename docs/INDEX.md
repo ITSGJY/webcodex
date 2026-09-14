@@ -7,7 +7,8 @@ Start with the goal that matches what you are trying to do.
 ## I want to use WebCodex normally
 
 - [README](../README.md) — what WebCodex does and the difference between full use and a temporary trial
-- [Full Setup](PERSONAL_SETUP.md) — **recommended entry**: regular Server + Runner + projects + ChatGPT
+- [Desktop installation](desktop-install.md) — **recommended Windows/macOS entry**: Desktop + official OpenAI Secure Tunnel
+- [Full Setup](PERSONAL_SETUP.md) — CLI, existing Server, Linux, and advanced regular Server + Runner setup
 - [AI-assisted setup](AI_ONBOARDING.md) — have an AI agent configure WebCodex using ordinary user language
 - [MCP](MCP.md) — ChatGPT, Claude, and other MCP clients
 
@@ -38,9 +39,14 @@ Start with the goal that matches what you are trying to do.
 
 - [Architecture](ARCHITECTURE.md) — how the major components fit together
 - [Coding Workflow](CODING_WORKFLOW.md) — task bootstrap, guidance, validation, and closeout
-- [Computer Use roadmap](COMPUTER_USE.md) — semantic-first desktop automation direction and dogfood priorities
+- [Native Tool Plugins](PLUGINS.md) — add Runner-local tools with any executable language and no MCP SDK
+- [Computer Use roadmap](COMPUTER_USE.md) — semantic-first desktop automation direction and validation priorities
 
 ## I want to contribute or release WebCodex
+
+The `docs/agent/` pages below are maintainer/internal contracts. They intentionally
+contain protocol fields, compatibility names, and implementation invariants that
+ordinary users should not need to learn.
 
 - [AGENTS.md](../AGENTS.md) — repository instructions for coding/AI agents
 - [Maintenance](MAINTENANCE.md) — maintenance queue, dependency cadence, PR/CI expectations, and bilingual-doc policy
@@ -49,6 +55,7 @@ Start with the goal that matches what you are trying to do.
 - [Architecture decisions](agent/architecture-decisions.md)
 - [Runtime host context](agent/runtime-host-context.md) — Runner-configured planning context and runtime diagnostics
 - [Job reliability and Runner concurrency](agent/job-reliability-and-concurrency.md) — restart recovery, observation semantics, shared Job capacity, and tool-description requirements
+- [Tool request tracing](agent/tool-request-tracing.md) — maintainer forensic payload/correlation contract
 - [Authority model](agent/permission-model.md)
 - [Session model](agent/session-model.md)
 - [Manual multi-window collaboration](agent/manual-window-collaboration.md)

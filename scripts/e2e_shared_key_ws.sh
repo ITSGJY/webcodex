@@ -146,8 +146,8 @@ TMP_ROOT="$(mktemp -d /tmp/webcodex-shared-key-e2e.XXXXXX)"
 DATA_DIR="$TMP_ROOT/data"
 SHARED_PROJECT="$TMP_ROOT/shared-project"
 MANAGED_PROJECT="$TMP_ROOT/managed-project"
-SHARED_PROJECTS_DIR="$TMP_ROOT/shared-projects.d"
-MANAGED_PROJECTS_DIR="$TMP_ROOT/managed-projects.d"
+SHARED_PROJECTS_DIR="$TMP_ROOT/shared-project-registry"
+MANAGED_PROJECTS_DIR="$TMP_ROOT/managed-project-registry"
 mkdir -p "$DATA_DIR" "$SHARED_PROJECT" "$MANAGED_PROJECT" \
     "$SHARED_PROJECTS_DIR" "$MANAGED_PROJECTS_DIR"
 
@@ -198,13 +198,13 @@ MANAGED_AGENT_TOKEN="$(printf '%s' "$MANAGED_AGENT_RESPONSE" | json_field token)
 [ -n "$MANAGED_AGENT_TOKEN" ] || die "failed to create managed Agent token"
 unset MANAGED_PAT_RESPONSE MANAGED_AGENT_RESPONSE
 
-cat >"$TMP_ROOT/shared-agent.toml" <<EOF
+cat >"$TMP_ROOT/shared-runner.toml" <<EOF
 server_url = "http://127.0.0.1:${PORT}"
 token = "$SHARED_KEY_A"
 client_id = "shared-runner"
 display_name = "Shared Runner"
 owner = "must-be-ignored"
-projects_dir = "$SHARED_PROJECTS_DIR"
+project_registry_dir = "$SHARED_PROJECTS_DIR"
 transport = "websocket"
 
 [policy]
@@ -212,13 +212,13 @@ allow_cwd_anywhere = false
 allowed_roots = ["$SHARED_PROJECT"]
 allow_raw_shell = true
 EOF
-cat >"$TMP_ROOT/managed-agent.toml" <<EOF
+cat >"$TMP_ROOT/managed-runner.toml" <<EOF
 server_url = "http://127.0.0.1:${PORT}"
 token = "$MANAGED_AGENT_TOKEN"
 client_id = "managed-runner"
 display_name = "Managed Runner"
 owner = "managed-e2e"
-projects_dir = "$MANAGED_PROJECTS_DIR"
+project_registry_dir = "$MANAGED_PROJECTS_DIR"
 transport = "websocket"
 
 [policy]
@@ -226,12 +226,12 @@ allow_cwd_anywhere = false
 allowed_roots = ["$MANAGED_PROJECT"]
 allow_raw_shell = true
 EOF
-chmod 600 "$TMP_ROOT/shared-agent.toml" "$TMP_ROOT/managed-agent.toml"
+chmod 600 "$TMP_ROOT/shared-runner.toml" "$TMP_ROOT/managed-runner.toml"
 
-"$REPO_DIR/target/debug/webcodex-runner" --config "$TMP_ROOT/shared-agent.toml" \
+"$REPO_DIR/target/debug/webcodex-runner" --config "$TMP_ROOT/shared-runner.toml" \
     >"$TMP_ROOT/shared-runner.log" 2>&1 &
 SHARED_PID=$!
-"$REPO_DIR/target/debug/webcodex-runner" --config "$TMP_ROOT/managed-agent.toml" \
+"$REPO_DIR/target/debug/webcodex-runner" --config "$TMP_ROOT/managed-runner.toml" \
     >"$TMP_ROOT/managed-runner.log" 2>&1 &
 MANAGED_PID=$!
 
@@ -241,15 +241,15 @@ wait_for_project "$MANAGED_PAT" "agent:managed-runner:project-m" \
     || die "managed project did not become visible"
 log "same-key and managed projects registered"
 
-READ_RESPONSE="$(post "$SHARED_KEY_A" /api/projects/read_file \
-    '{"project":"agent:shared-runner:project-a","path":"README.md"}')"
+READ_RESPONSE="$(post "$SHARED_KEY_A" /api/tools/call \
+    '{"tool":"read_files","params":{"project":"agent:shared-runner:project-a","items":[{"path":"README.md"}]}}')"
 [ "$(printf '%s' "$READ_RESPONSE" | json_field success)" = "True" ] \
-    || die "same-key read_file failed"
+    || die "same-key read_files failed"
 printf '%s' "$READ_RESPONSE" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
-raise SystemExit(0 if "transport smoke" in data.get("output", {}).get("text", "") else 1)
-' || die "same-key read_file returned unexpected content"
+raise SystemExit(0 if "transport smoke" in data.get("output", {}).get("items", [{}])[0].get("output", {}).get("text", "") else 1)
+' || die "same-key read_files returned unexpected content"
 
 KEY_B_PROJECTS="$(post "$SHARED_KEY_B" /api/projects/list '{}')"
 [ "$(printf '%s' "$KEY_B_PROJECTS" | json_field output.count)" = "0" ] \

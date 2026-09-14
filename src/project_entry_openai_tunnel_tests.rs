@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn runtime_command_inherits_only_tunnel_authority_not_server_bootstrap_or_openai_admin_keys() {
+    let prerequisites = OpenAiTunnelPrerequisites {
+        binary: PathBuf::from("tunnel-client"),
+        tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".to_string(),
+    };
+    let mut command = Command::new("tunnel-client");
+    configure_runtime_command(
+        &mut command,
+        &prerequisites,
+        "http://127.0.0.1:8080/mcp",
+        Path::new("authorization"),
+    );
+
+    let env = command.as_std().get_envs().collect::<Vec<_>>();
+    for key in ["WEBCODEX_TOKEN", "OPENAI_ADMIN_KEY", "OPENAI_API_KEY"] {
+        assert!(env
+            .iter()
+            .any(|(name, value)| { name.to_str() == Some(key) && value.is_none() }));
+    }
+    assert!(env.iter().any(|(name, value)| {
+        name.to_str() == Some("CONTROL_PLANE_TUNNEL_ID")
+            && value.and_then(|value| value.to_str()) == Some(prerequisites.tunnel_id.as_str())
+    }));
+}
+
+#[test]
 fn tunnel_ids_are_strict_and_runtime_key_never_part_of_the_id_contract() {
     assert!(valid_tunnel_id("tunnel_0123456789abcdef0123456789abcdef"));
     for invalid in [
@@ -76,32 +102,32 @@ fn official_release_assets_and_extracted_binaries_are_pinned_per_supported_platf
 
 #[test]
 fn managed_root_prefers_private_xdg_then_home() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let home = temp.path().join("home");
+    let local = temp.path().join("local");
     assert_eq!(
         managed_tunnel_client_root_from(
-            Some(OsStr::new("/state")),
-            Some(OsStr::new("/home/user")),
-            Some(OsStr::new("/local")),
+            Some(state.as_os_str()),
+            Some(home.as_os_str()),
+            Some(local.as_os_str()),
         )
         .unwrap(),
-        PathBuf::from("/state/webcodex/tools/tunnel-client")
+        state.join("webcodex/tools/tunnel-client")
     );
     assert_eq!(
-        managed_tunnel_client_root_from(
-            None,
-            Some(OsStr::new("/home/user")),
-            Some(OsStr::new("/local")),
-        )
-        .unwrap(),
-        PathBuf::from("/home/user/.local/state/webcodex/tools/tunnel-client")
+        managed_tunnel_client_root_from(None, Some(home.as_os_str()), Some(local.as_os_str()),)
+            .unwrap(),
+        home.join(".local/state/webcodex/tools/tunnel-client")
     );
     assert_eq!(
-        managed_tunnel_client_root_from(None, None, Some(OsStr::new("/local"))).unwrap(),
-        PathBuf::from("/local/WebCodex/tools/tunnel-client")
+        managed_tunnel_client_root_from(None, None, Some(local.as_os_str())).unwrap(),
+        local.join("WebCodex/tools/tunnel-client")
     );
     assert!(managed_tunnel_client_root_from(None, None, None).is_err());
     assert!(managed_tunnel_client_root_from(
         Some(OsStr::new("relative")),
-        Some(OsStr::new("/home/user")),
+        Some(home.as_os_str()),
         None,
     )
     .is_err());

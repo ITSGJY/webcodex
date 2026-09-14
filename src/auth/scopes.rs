@@ -8,102 +8,27 @@ use std::collections::HashSet;
 
 use super::context::AuthContext;
 use crate::tool_runtime::metadata::lookup_tool_metadata;
-pub(crate) use crate::tool_runtime::metadata::ToolAuthorityPolicy as OAuthToolScopePolicy;
+pub(crate) use webcodex_core::authority::ToolAuthorityPolicy as OAuthToolScopePolicy;
 
 // ---------------------------------------------------------------------------
 // Scope constants
 // ---------------------------------------------------------------------------
 
-/// The set of scopes a Phase 2 personal API token may carry. Bootstrap auth is
-/// treated as having the `admin` scope (full access). Stored space-separated in
-/// the database; parsed into a list on read.
-pub const SCOPE_RUNTIME_READ: &str = "runtime:read";
-pub const SCOPE_SESSION_COLLABORATE: &str = "session:collaborate";
-pub const SCOPE_PROJECT_READ: &str = "project:read";
-pub const SCOPE_PROJECT_WRITE: &str = "project:write";
-pub const SCOPE_MEMORY_READ: &str = "memory:read";
-pub const SCOPE_MEMORY_MANAGE: &str = "memory:manage";
-pub const SCOPE_COMMUNICATION_READ: &str = "communication:read";
-pub const SCOPE_COMMUNICATION_MANAGE: &str = "communication:manage";
-/// Canonical durable Agent and Conversation read authority. Communication
-/// identity remains independent from Project, Session, Runner, and filesystem authority.
-pub(crate) const COMMUNICATION_READ_SCOPES: &[&str] = &[SCOPE_COMMUNICATION_READ];
-/// Canonical durable Agent and Conversation mutation authority. Reading is
-/// required as an explicit companion scope so mutations can return durable state.
-pub(crate) const COMMUNICATION_MANAGE_SCOPES: &[&str] =
-    &[SCOPE_COMMUNICATION_READ, SCOPE_COMMUNICATION_MANAGE];
-/// Canonical project Memory read authority. Both dimensions are required;
-/// neither a project grant nor Memory authority alone is sufficient.
-pub(crate) const MEMORY_READ_SCOPES: &[&str] = &[SCOPE_PROJECT_READ, SCOPE_MEMORY_READ];
-/// Canonical project Memory mutation authority. PermissionEvaluator remains an
-/// independent consequential-effect gate after these credential scopes pass.
-pub(crate) const MEMORY_MANAGE_SCOPES: &[&str] = &[SCOPE_PROJECT_WRITE, SCOPE_MEMORY_MANAGE];
-pub const SCOPE_JOB_RUN: &str = "job:run";
-pub const SCOPE_JOB_DETACH: &str = "job:detach";
-pub const SCOPE_COMPUTER_READ: &str = "computer:read";
-pub const SCOPE_COMPUTER_CONTROL: &str = "computer:control";
-pub const SCOPE_COMPUTER_LAUNCH: &str = "computer:launch";
-pub const SCOPE_COMPUTER_DISPLAY_READ: &str = "computer:display_read";
-pub const SCOPE_COMPUTER_POINTER_CONTROL: &str = "computer:pointer_control";
-pub const SCOPE_COMPUTER_CLIPBOARD_READ: &str = "computer:clipboard_read";
-pub const SCOPE_COMPUTER_CLIPBOARD_WRITE: &str = "computer:clipboard_write";
-/// Explicit authority to discover and call Runner-owned local MCP providers
-/// through the built-in `/mcp` gateway. It is intentionally absent from legacy
-/// and lightweight default scope ceilings.
-pub const SCOPE_MCP_LOCAL: &str = "mcp:local";
-/// Explicit authority to start/observe/cancel delegated autonomous ACP coding
-/// agents. It is intentionally absent from all legacy/default shared-key scopes.
-pub const SCOPE_CODING_AGENT_RUN: &str = "coding_agent:run";
-pub const SCOPE_AGENT_REGISTER: &str = "agent:register";
-pub const SCOPE_ADMIN: &str = "admin";
+#[allow(unused_imports)]
+pub use webcodex_core::authority::{
+    AGENT_SCOPES, COMMUNICATION_MANAGE_SCOPES, COMMUNICATION_READ_SCOPES, KNOWN_SCOPES,
+    MEMORY_MANAGE_SCOPES, MEMORY_READ_SCOPES, SCOPE_ACCOUNT_MANAGE, SCOPE_ADMIN,
+    SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
+    SCOPE_CODING_AGENT_RUN, SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ,
+    SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL,
+    SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL,
+    SCOPE_COMPUTER_READ, SCOPE_JOB_DETACH, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL, SCOPE_MEMORY_MANAGE,
+    SCOPE_MEMORY_READ, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE,
+    SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNNER_MANAGE, SCOPE_RUNTIME_READ,
+    SCOPE_SESSION_COLLABORATE, SCOPE_SSH_LOCAL,
+};
 
-/// Phase 3 agent transport scopes. Agent tokens may only carry `agent:*`
-/// scopes and may only be used on agent transport endpoints. They are rejected
-/// by all normal runtime/project/admin/user-token-management endpoints.
-pub const SCOPE_AGENT_POLL: &str = "agent:poll";
-pub const SCOPE_AGENT_RESULT: &str = "agent:result";
-pub const SCOPE_AGENT_JOB_UPDATE: &str = "agent:job_update";
-pub const SCOPE_ACCOUNT_MANAGE: &str = "account:manage";
-
-/// The complete set of agent transport scopes, in canonical order.
-pub const AGENT_SCOPES: &[&str] = &[
-    SCOPE_AGENT_REGISTER,
-    SCOPE_AGENT_POLL,
-    SCOPE_AGENT_RESULT,
-    SCOPE_AGENT_JOB_UPDATE,
-];
-
-/// All scopes recognized by this phase. Unknown scopes are rejected at token
-/// creation time so the stored scope string stays clean.
-pub(crate) const KNOWN_SCOPES: &[&str] = &[
-    SCOPE_COMPUTER_POINTER_CONTROL,
-    SCOPE_COMPUTER_CLIPBOARD_READ,
-    SCOPE_COMPUTER_CLIPBOARD_WRITE,
-    SCOPE_RUNTIME_READ,
-    SCOPE_SESSION_COLLABORATE,
-    SCOPE_PROJECT_READ,
-    SCOPE_PROJECT_WRITE,
-    SCOPE_MEMORY_READ,
-    SCOPE_MEMORY_MANAGE,
-    SCOPE_COMMUNICATION_READ,
-    SCOPE_COMMUNICATION_MANAGE,
-    SCOPE_JOB_RUN,
-    SCOPE_JOB_DETACH,
-    SCOPE_COMPUTER_READ,
-    SCOPE_COMPUTER_CONTROL,
-    SCOPE_COMPUTER_LAUNCH,
-    SCOPE_COMPUTER_DISPLAY_READ,
-    SCOPE_MCP_LOCAL,
-    SCOPE_CODING_AGENT_RUN,
-    SCOPE_ACCOUNT_MANAGE,
-    SCOPE_AGENT_REGISTER,
-    SCOPE_AGENT_POLL,
-    SCOPE_AGENT_RESULT,
-    SCOPE_AGENT_JOB_UPDATE,
-    SCOPE_ADMIN,
-];
-
-/// True when `scope` is one of the agent transport scopes.
+/// True when `scope` is one of the Runner transport scopes.
 pub(crate) fn is_agent_scope(scope: &str) -> bool {
     AGENT_SCOPES.contains(&scope)
 }
@@ -112,7 +37,7 @@ pub(crate) fn is_agent_scope(scope: &str) -> bool {
 // Scope validation
 // ---------------------------------------------------------------------------
 
-/// Validate and normalize a list of agent transport scopes. Returns an error
+/// Validate and normalize a list of Runner transport scopes. Returns an error
 /// if any scope is not an `agent:*` scope. Rejects duplicates and unknown
 /// scopes.
 pub(crate) fn validate_agent_scopes(scopes: &[String]) -> Result<Vec<String>, String> {
@@ -174,25 +99,8 @@ pub(crate) fn scopes_to_string(scopes: &[String]) -> String {
 // with the existing policy registry. Enforcement is principal-neutral; OAuth
 // remains special only for delegated-scope issuance and wire error framing.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OAuthRouteScopePolicy {
-    Public,
-    FirstPartyOnly,
-    /// Explicit representation of the historical fail-closed behavior for an
-    /// authenticated route that only bootstrap could traverse because no
-    /// delegated route policy existed.
-    BootstrapOnly,
-    AgentSurface,
-    Require(&'static str),
-    BodyAware(OAuthBodyAwarePolicy),
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OAuthBodyAwarePolicy {
-    RuntimeToolCall,
-    McpToolCall,
-}
+#[allow(unused_imports)]
+pub(crate) use webcodex_core::authority::{OAuthBodyAwarePolicy, OAuthRouteScopePolicy};
 
 pub(crate) fn oauth_route_scope_policy_for_path_method(
     method: &str,
@@ -254,7 +162,7 @@ pub(crate) fn enforce_route_scope(
                 ))
             }
         }
-        // Agent transport identity and exact agent:* scopes are enforced by the
+        // Runner transport identity and exact agent:* scopes are enforced by the
         // dedicated surface gate and transport handlers. Do not reinterpret
         // those credentials as ordinary runtime principals here.
         OAuthRouteScopePolicy::AgentSurface => Ok(()),
@@ -360,6 +268,7 @@ mod tests {
         for (method, path) in [
             ("POST", "/api/pairing/enroll"),
             ("POST", "/api/shell/agent/register"),
+            ("POST", "/api/shell/agent/offline"),
             ("POST", "/api/shell/agent/poll"),
             ("POST", "/api/shell/agent/result"),
             ("POST", "/api/shell/agent/persistent_shell_result"),
@@ -415,7 +324,7 @@ mod tests {
             ("POST", "/api/connector/checks/run", SCOPE_JOB_RUN),
             ("POST", "/api/connector/task/cancel", SCOPE_JOB_RUN),
             ("POST", "/api/connector/task/finish", SCOPE_PROJECT_WRITE),
-            ("POST", "/api/projects/read_file", SCOPE_PROJECT_READ),
+            ("POST", "/api/projects/git_status", SCOPE_PROJECT_READ),
             ("POST", "/api/runtime-console/projects", SCOPE_PROJECT_READ),
             (
                 "POST",
@@ -490,7 +399,7 @@ mod tests {
         }
         for (label, auth) in [("pat", &pat), ("oauth", &oauth)] {
             assert_eq!(
-                enforce_route_scope(auth, "POST", "/api/projects/read_file"),
+                enforce_route_scope(auth, "POST", "/api/projects/git_status"),
                 Err((
                     Some(SCOPE_PROJECT_READ),
                     "missing required scope: project:read".to_string()
@@ -509,7 +418,7 @@ mod tests {
             );
         }
         assert!(
-            enforce_route_scope(&shared, "POST", "/api/projects/read_file").is_ok(),
+            enforce_route_scope(&shared, "POST", "/api/projects/git_status").is_ok(),
             "direct shared key should use its declared project:read scope"
         );
         assert!(
@@ -699,10 +608,6 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
             ),
             (
-                "read_file",
-                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
-            ),
-            (
                 "read_files",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
@@ -719,10 +624,12 @@ mod tests {
                 "workspace_symbols",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
+            #[cfg(feature = "workspace-checkpoints")]
             (
                 "workspace_checkpoint_create",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
+            #[cfg(feature = "workspace-checkpoints")]
             (
                 "workspace_checkpoint_restore",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
@@ -768,6 +675,13 @@ mod tests {
                 OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE]),
             ),
             (
+                "start_agent_task_endpoint_continuation",
+                OAuthToolScopePolicy::RequireAll(&[
+                    SCOPE_COMMUNICATION_READ,
+                    SCOPE_COMMUNICATION_MANAGE,
+                ]),
+            ),
+            (
                 "start_agent_task_coding_run",
                 OAuthToolScopePolicy::RequireAll(&[
                     SCOPE_COMMUNICATION_READ,
@@ -811,13 +725,14 @@ mod tests {
             "resolve_session_message",
             "complete_session_message",
             "session_discussion_summary",
+            #[cfg(feature = "workspace-checkpoints")]
             "workspace_checkpoint_create",
+            #[cfg(feature = "workspace-checkpoints")]
             "workspace_checkpoint_restore",
             "show_changes",
             "document_diagnostics",
             "hover",
             "workspace_symbols",
-            "read_file",
             "read_files",
             "write_project_file",
             "artifact_upload_begin",
@@ -852,6 +767,20 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn runner_manage_scope_is_not_inherited_by_project_anonymous_or_plugin_authority() {
+        assert!(
+            crate::auth::shared_key_context("runner-manage-check").has_scope(SCOPE_RUNNER_MANAGE)
+        );
+        assert!(!crate::auth::open_anonymous_context().has_scope(SCOPE_RUNNER_MANAGE));
+        assert!(
+            !crate::auth::shared_key::project_credential_context("wc_pgrant_runnermanage")
+                .has_scope(SCOPE_RUNNER_MANAGE)
+        );
+        assert_ne!(SCOPE_RUNNER_MANAGE, SCOPE_PLUGIN_MANAGE);
+        assert!(KNOWN_SCOPES.contains(&SCOPE_RUNNER_MANAGE));
     }
 
     #[test]

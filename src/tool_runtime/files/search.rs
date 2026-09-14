@@ -22,6 +22,7 @@ const SEARCH_PROJECT_TEXT_EXCLUDES: &[&str] = &[
     "--exclude-dir=tokens",
     "--exclude=.env",
     "--exclude=.env.*",
+    "--exclude=runner.toml",
     "--exclude=agent.toml",
     "--exclude=webcodex.env",
     "--exclude=*.pem",
@@ -58,6 +59,8 @@ const SEARCH_PROJECT_TEXT_RG_EXCLUDE_GLOBS: &[&str] = &[
     "!**/.env",
     "!.env.*",
     "!**/.env.*",
+    "!runner.toml",
+    "!**/runner.toml",
     "!agent.toml",
     "!**/agent.toml",
     "!webcodex.env",
@@ -262,16 +265,6 @@ pub(crate) fn search_agent_timeout_budget(effective_timeout_secs: u64) -> (u64, 
     (command_timeout, wait_timeout, outer_timeout)
 }
 
-impl SearchResultMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Matches => "matches",
-            Self::FilesWithMatches => "files_with_matches",
-            Self::Count => "count",
-        }
-    }
-}
-
 fn validate_search_globs(
     field: &'static str,
     globs: Vec<String>,
@@ -416,7 +409,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// Shell preamble that resolves `head_cmd` at runtime (agent/local sh).
+/// Shell preamble that resolves `head_cmd` at runtime on the Runner POSIX shell.
 /// Absolute fallbacks are embedded as literals for POSIX `sh`.
 pub(super) fn search_head_resolution_shell(absolute_candidates: &[&str]) -> String {
     let mut script = String::from(
@@ -565,14 +558,14 @@ exit "$status""#,
 }
 
 /// Formal cap on search output bytes, applied by a second `head -c` stage in
-/// the command (shared by local and agent paths) so no single over-long match
+/// the Runner command so no single over-long match
 /// line, context line, or path can push the output past the Runner transport
 /// cap (default 256 KiB) before the Rust layer ever sees it. The command emits
 /// at most one probe byte beyond this formal budget; the parser consumes that
 /// byte only as proof of truncation and never exposes it. A record cut mid-line
 /// is dropped and reports `truncation_reason = "output_bytes"`.
 ///
-/// Kept at 32 KiB, not larger: the local path executes the command through
+/// Kept at 32 KiB, not larger: unit tests execute the same command through
 /// [`run_command_sync`](crate::tool_runtime::helpers::run_command_sync), whose
 /// polling loop does not drain stdout while waiting. Output over the ~64 KiB
 /// Linux pipe buffer would block the producer until the hard timeout. 32 KiB
@@ -691,7 +684,7 @@ pub(crate) fn search_project_text_command_with_head_fallbacks(
 }
 
 fn search_request_dropped_tool_result(options: &SearchOptions) -> ToolResult {
-    let message = "search_project_text agent request was dropped";
+    let message = "search_project_text Runner request was dropped";
     search_failure_tool_result(
         options,
         "search_request_dropped",
@@ -796,6 +789,24 @@ struct SearchContextLine {
     text: String,
 }
 
+const SEARCH_READ_HINT_CONTEXT_BEFORE: u64 = 20;
+const SEARCH_READ_HINT_LIMIT: u64 = 80;
+
+#[derive(Debug, Serialize)]
+struct SearchReadHint {
+    path: String,
+    start_line: u64,
+    limit: u64,
+}
+
+fn search_read_hint(path: &str, line: u64) -> SearchReadHint {
+    SearchReadHint {
+        path: path.to_string(),
+        start_line: line.saturating_sub(SEARCH_READ_HINT_CONTEXT_BEFORE).max(1),
+        limit: SEARCH_READ_HINT_LIMIT,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SearchMatch {
     path: String,
@@ -803,6 +814,7 @@ struct SearchMatch {
     preview: String,
     context_before: Vec<SearchContextLine>,
     context_after: Vec<SearchContextLine>,
+    read_hint: SearchReadHint,
 }
 
 #[derive(Debug, Serialize)]
@@ -816,6 +828,36 @@ struct SearchFileCount {
     match_count: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct CountParseEvidence {
+    data_record_seen: bool,
+    parsed_record_count: usize,
+    safe_record_seen: bool,
+    filtered_record_seen: bool,
+    malformed_record_seen: bool,
+}
+
+impl CountParseEvidence {
+    fn parsed_record_seen(self) -> bool {
+        self.parsed_record_count > 0
+    }
+
+    fn projection_complete(self) -> bool {
+        !self.filtered_record_seen
+            && !self.malformed_record_seen
+            && (!self.parsed_record_seen() || self.safe_record_seen)
+    }
+}
+
+#[derive(Debug)]
+struct ParsedFileCounts {
+    files: Vec<SearchFileCount>,
+    returned_match_count: u64,
+    limit_truncated: bool,
+    bytes_truncated: bool,
+    evidence: CountParseEvidence,
+}
+
 #[derive(Debug)]
 enum SearchResultData {
     Matches(Vec<SearchMatch>),
@@ -824,6 +866,7 @@ enum SearchResultData {
         files: Vec<SearchFileCount>,
         returned_match_count: u64,
         count_complete: bool,
+        evidence: CountParseEvidence,
     },
 }
 
@@ -837,10 +880,11 @@ enum SearchTruncation {
     /// The `head -c` byte budget cut the stream, possibly mid-record; the
     /// parser drops the partial tail so only complete records are returned.
     OutputBytes,
-    /// stdout was transport-truncated (the Runner keeps a tail of the output).
-    /// Public identity validation rejects prefix loss before retained records
-    /// can be promoted; this remains parser-level truncation metadata only.
-    Transport,
+    /// stdout lost its prefix to Runner/Server result retention. Public
+    /// identity validation rejects that loss before retained records can be
+    /// promoted. The public reason string remains the legacy `transport`
+    /// spelling for compatibility; this is not a wire/body/frame ceiling.
+    ResultRetention,
     /// The search did not finish within the effective timeout; records
     /// collected before the timeout are still complete and trusted.
     Timeout,
@@ -851,7 +895,7 @@ impl SearchTruncation {
         match self {
             SearchTruncation::Limit => "limit",
             SearchTruncation::OutputBytes => "output_bytes",
-            SearchTruncation::Transport => "transport",
+            SearchTruncation::ResultRetention => "transport",
             SearchTruncation::Timeout => "timeout",
         }
     }
@@ -877,6 +921,7 @@ fn search_result_has_records(result: &SearchResult) -> bool {
 struct SearchBackendStatus {
     backend: String,
     feature_unavailable: bool,
+    path_not_found: bool,
     marker_present: bool,
     marker_invalid: bool,
     payload_start: usize,
@@ -886,6 +931,7 @@ fn missing_search_backend_status(marker_invalid: bool) -> SearchBackendStatus {
     SearchBackendStatus {
         backend: "grep".to_string(),
         feature_unavailable: false,
+        path_not_found: false,
         marker_present: false,
         marker_invalid,
         payload_start: 0,
@@ -932,12 +978,18 @@ fn parse_search_backend_status(stdout: &str) -> SearchBackendStatus {
     {
         return missing_search_backend_status(true);
     }
+    let path_not_found = match marker.get("path_status") {
+        None => false,
+        Some(value) if value.as_str() == Some("not_found") => true,
+        Some(_) => return missing_search_backend_status(true),
+    };
     SearchBackendStatus {
         backend: backend.to_string(),
         feature_unavailable: marker
             .get("feature_unavailable")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        path_not_found,
         marker_present: true,
         marker_invalid: false,
         payload_start,
@@ -1008,7 +1060,9 @@ fn is_trusted_search_record_path(path: &str) -> bool {
         return false;
     }
     let p = Path::new(path);
-    if p.is_absolute()
+    if p.has_root()
+        || p.components()
+            .any(|component| matches!(component, std::path::Component::Prefix(_)))
         || p.components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
@@ -1018,6 +1072,10 @@ fn is_trusted_search_record_path(path: &str) -> bool {
 }
 
 fn normalize_search_record_path(path: &str) -> Option<String> {
+    #[cfg(windows)]
+    let normalized = path.replace('\\', "/");
+    #[cfg(windows)]
+    let path = normalized.as_str();
     let path = path.strip_prefix("./").unwrap_or(path);
     if !is_trusted_search_record_path(path) {
         return None;
@@ -1109,7 +1167,7 @@ fn parse_search_line_records(stdout: &str) -> (Vec<SearchLineRecord>, bool) {
     (records, bytes_truncated)
 }
 
-fn strip_leading_transport_truncation_marker(stdout: &str) -> (&str, bool) {
+fn strip_leading_result_retention_truncation_marker(stdout: &str) -> (&str, bool) {
     for marker in ["[output truncated]\n", "[...]\n"] {
         if let Some(rest) = stdout.strip_prefix(marker) {
             return (rest, true);
@@ -1181,6 +1239,7 @@ fn search_matches_from_records(
             preview: record.text.clone(),
             context_before,
             context_after,
+            read_hint: search_read_hint(&record.path, record.line),
         });
     }
     (matches, truncated)
@@ -1211,13 +1270,15 @@ fn parse_file_paths(stdout: &str, limit: usize) -> (Vec<SearchFile>, bool, bool)
     )
 }
 
-fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, bool, bool) {
+fn parse_file_counts(stdout: &str, limit: usize) -> ParsedFileCounts {
     let (lines, bytes_truncated) = split_complete_search_lines(stdout);
     let mut counts = Vec::<(String, u64)>::new();
+    let mut evidence = CountParseEvidence::default();
     for line in lines {
         if serde_json::from_str::<Value>(line).is_ok() {
             continue;
         }
+        evidence.data_record_seen = true;
         let parsed = line
             .split_once('\0')
             .or_else(|| line.rsplit_once(':'))
@@ -1225,33 +1286,43 @@ fn parse_file_counts(stdout: &str, limit: usize) -> (Vec<SearchFileCount>, u64, 
                 Some((path, count.trim_end_matches('\r').parse::<u64>().ok()?))
             });
         let Some((path, count)) = parsed else {
+            evidence.malformed_record_seen = true;
             continue;
         };
+        evidence.parsed_record_count = evidence.parsed_record_count.saturating_add(1);
+        if count == 0 {
+            evidence.malformed_record_seen = true;
+            continue;
+        }
         let Some(path) = normalize_search_record_path(path) else {
+            evidence.filtered_record_seen = true;
             continue;
         };
+        evidence.safe_record_seen = true;
         if let Some((_, existing)) = counts.iter_mut().find(|(existing, _)| existing == &path) {
             *existing = existing.saturating_add(count);
         } else {
             counts.push((path, count));
         }
     }
-    let limit_truncated = counts.len() > limit;
+    let limit_truncated = evidence.parsed_record_count > limit;
     counts.truncate(limit);
     let returned_match_count = counts.iter().map(|(_, count)| *count).sum();
-    (
-        counts
+    ParsedFileCounts {
+        files: counts
             .into_iter()
             .map(|(path, match_count)| SearchFileCount { path, match_count })
             .collect(),
         returned_match_count,
         limit_truncated,
         bytes_truncated,
-    )
+        evidence,
+    }
 }
 
 fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -> SearchResult {
-    let (stdout, transport_truncated) = strip_leading_transport_truncation_marker(stdout);
+    let (stdout, result_retention_truncated) =
+        strip_leading_result_retention_truncation_marker(stdout);
     let (data, limit_truncated, bytes_truncated) = match options.result_mode {
         SearchResultMode::Matches => {
             let (records, bytes_truncated) = parse_search_line_records(stdout);
@@ -1271,21 +1342,25 @@ fn parse_search_result(stdout: &str, options: &SearchOptions, backend: String) -
             )
         }
         SearchResultMode::Count => {
-            let (files, returned_match_count, limit_truncated, bytes_truncated) =
-                parse_file_counts(stdout, options.limit);
+            let parsed = parse_file_counts(stdout, options.limit);
+            let count_complete = !parsed.limit_truncated
+                && !parsed.bytes_truncated
+                && !result_retention_truncated
+                && parsed.evidence.projection_complete();
             (
                 SearchResultData::Count {
-                    files,
-                    returned_match_count,
-                    count_complete: !limit_truncated && !bytes_truncated && !transport_truncated,
+                    files: parsed.files,
+                    returned_match_count: parsed.returned_match_count,
+                    count_complete,
+                    evidence: parsed.evidence,
                 },
-                limit_truncated,
-                bytes_truncated,
+                parsed.limit_truncated,
+                parsed.bytes_truncated,
             )
         }
     };
-    let truncation = if transport_truncated {
-        Some(SearchTruncation::Transport)
+    let truncation = if result_retention_truncated {
+        Some(SearchTruncation::ResultRetention)
     } else if limit_truncated {
         Some(SearchTruncation::Limit)
     } else if bytes_truncated {
@@ -1339,6 +1414,17 @@ pub(crate) fn search_project_text_output_with_agent_error(
             message,
             None,
             exit_code,
+        );
+    }
+    if backend_status.path_not_found {
+        return search_failure_tool_result(
+            options,
+            "search_path_not_found",
+            "path_resolution",
+            "not_found",
+            "search_project_text path was not found",
+            None,
+            None,
         );
     }
     if backend_status.feature_unavailable {
@@ -1398,16 +1484,20 @@ pub(crate) fn search_project_text_output_with_agent_error(
     }
 
     let result = parse_search_result(stdout, options, backend_status.backend.clone());
-    // Search status is part of the evidence contract: 0 means at least one
-    // match, 1 means a completed no-match scan, and 141 means bounded output
-    // stopped after at least one complete record. If parsed safe records
-    // disagree, output was malformed, transport-incomplete, or entirely
-    // rejected by the path/privacy filter. Returning an empty success in any
-    // of those cases would falsely claim proven absence.
+    // Search status is backend evidence, not a statement about the final safe
+    // projection. Count mode therefore distinguishes parseable backend count
+    // records from records later removed by path/privacy filtering. A malformed
+    // count stream still fails closed; a filtered-but-parseable stream remains
+    // an incomplete observation rather than a false no-match or protocol error.
     let has_records = search_result_has_records(&result);
-    let status_consistent = match exit_code {
-        Some(1) => !has_records,
-        Some(0 | 141) => has_records,
+    let status_consistent = match (&result.data, exit_code) {
+        (SearchResultData::Count { evidence, .. }, Some(1)) => !evidence.data_record_seen,
+        (SearchResultData::Count { evidence, .. }, Some(0 | 141)) => {
+            !evidence.malformed_record_seen
+                && (evidence.parsed_record_seen() || result.truncation_reason.is_some())
+        }
+        (_, Some(1)) => !has_records,
+        (_, Some(0 | 141)) => has_records,
         _ => true,
     };
     if !status_consistent {
@@ -1458,6 +1548,7 @@ fn search_result_json(
             files,
             returned_match_count,
             count_complete,
+            evidence: _,
         } => {
             output["returned_file_count"] = json!(files.len());
             output["returned_match_count"] = json!(returned_match_count);
@@ -1528,63 +1619,6 @@ fn empty_search_project_text_output(project: &str, options: &SearchOptions) -> T
 /// Maximum accepted size for `write_project_file` `content`.
 
 impl ToolRuntime {
-    /// `search_project_text`: bounded rg-first text search with grep fallback.
-    /// Excludes sensitive/build paths by default. Each match carries a
-    /// project-relative path, 1-based line number, preview line, and bounded
-    /// context arrays.
-    pub(crate) async fn search_project_text(
-        &self,
-        project: String,
-        pattern: String,
-        pattern_mode: Option<SearchPatternMode>,
-        path: Option<String>,
-        limit: Option<usize>,
-        context_before: Option<usize>,
-        context_after: Option<usize>,
-        include_globs: Option<Vec<String>>,
-        exclude_globs: Option<Vec<String>>,
-        result_mode: Option<SearchResultMode>,
-        timeout_secs: Option<i64>,
-    ) -> ToolResult {
-        let request = SearchRequest {
-            pattern,
-            path,
-            limit,
-            context_before,
-            context_after,
-            include_globs,
-            exclude_globs,
-            result_mode,
-            timeout_secs,
-        };
-        // Preserve the single-query validation-before-resolution ordering.
-        let options = match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
-            Ok(options) => options,
-            Err(error) => return error.into_tool_result(),
-        };
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
-        };
-        self.search_one_resolved_project_text(&proj, &project, options, None)
-            .await
-    }
-
-    pub(crate) async fn search_project_text_resolved(
-        &self,
-        resolved: &ResolvedProject,
-        output_project: &str,
-        request: SearchRequest,
-        pattern_mode: Option<SearchPatternMode>,
-    ) -> ToolResult {
-        let options = match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
-            Ok(options) => options,
-            Err(error) => return error.into_tool_result(),
-        };
-        self.search_one_resolved_project_text(&resolved.config, output_project, options, None)
-            .await
-    }
-
     pub(crate) async fn search_one_resolved_project_text(
         &self,
         proj: &ProjectConfig,
@@ -1611,183 +1645,135 @@ impl ToolRuntime {
         let effective_timeout_secs = options.timeout_secs;
         let (command_timeout, wait_timeout, outer_timeout) =
             search_agent_timeout_budget(effective_timeout_secs);
-        if proj.is_agent() {
-            let client_id = match proj.agent_client_id() {
-                Ok(id) => id.to_string(),
-                Err(_) => {
-                    return search_failure_tool_result(
-                        &options,
-                        "agent_unavailable",
-                        "agent_request",
-                        "agent_request_failed",
-                        "search_project_text could not resolve the Agent executor",
-                        None,
-                        None,
-                    )
-                }
-            };
-            // External search providers historically interpret `pattern` as regex and
-            // older Runners ignore unknown request fields. Encode literal semantics into
-            // that established pattern contract so mixed Server/Runner versions cannot
-            // silently reinterpret an exact-text request as a regex. The native command
-            // above still uses --fixed-strings/-F when the external provider falls back.
-            let external_pattern = match options.pattern_mode {
-                SearchPatternMode::Regex => options.pattern.clone(),
-                SearchPatternMode::Literal => escape_search_literal_for_regex(&options.pattern),
-            };
-            let payload = json!({
-                "pattern": external_pattern,
-                "path": options.path,
-                "limit": options.limit,
-                "context_before": options.context_before,
-                "context_after": options.context_after,
-                "include_globs": options.include_globs,
-                "exclude_globs": options.exclude_globs,
-                "result_mode": options.result_mode.as_str(),
-                "timeout_secs": command_timeout,
-            });
-            let (req_id, rx) = match self
-                .shell_clients
-                .enqueue_run(
-                    ShellRunRequest {
-                        client_id,
-                        cwd: Some(proj.path.clone()),
-                        command: format!("{EXTERNAL_SEARCH_REQUEST_PREFIX}\n{cmd}"),
-                        stdin: Some(payload.to_string()),
-                        timeout_secs: command_timeout,
-                        wait_timeout_secs: wait_timeout,
-                    },
-                    "tool_runtime".to_string(),
+        let client_id = proj.client_id.clone();
+        // External search providers historically interpret `pattern` as regex and
+        // older Runners ignore unknown request fields. Encode literal semantics into
+        // that established pattern contract so mixed Server/Runner versions cannot
+        // silently reinterpret an exact-text request as a regex. The native command
+        // above still uses --fixed-strings/-F when the external provider falls back.
+        let external_pattern = match options.pattern_mode {
+            SearchPatternMode::Regex => options.pattern.clone(),
+            SearchPatternMode::Literal => escape_search_literal_for_regex(&options.pattern),
+        };
+        let payload = json!({
+            "pattern": external_pattern,
+            "path": options.path,
+            "limit": options.limit,
+            "context_before": options.context_before,
+            "context_after": options.context_after,
+            "include_globs": options.include_globs,
+            "exclude_globs": options.exclude_globs,
+            "result_mode": options.result_mode.as_str(),
+            "timeout_secs": command_timeout,
+        });
+        let (req_id, rx) = match self
+            .runner_registry
+            .enqueue_run(
+                ShellRunRequest {
+                    client_id,
+                    cwd: Some(proj.path.clone()),
+                    command: format!("{EXTERNAL_SEARCH_REQUEST_PREFIX}\n{cmd}"),
+                    stdin: Some(payload.to_string()),
+                    timeout_secs: command_timeout,
+                    wait_timeout_secs: wait_timeout,
+                },
+                "tool_runtime".to_string(),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return search_failure_tool_result(
+                    &options,
+                    "agent_unavailable",
+                    "agent_request",
+                    "agent_request_failed",
+                    "search_project_text Runner request could not be started",
+                    None,
+                    None,
                 )
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    return search_failure_tool_result(
-                        &options,
-                        "agent_unavailable",
-                        "agent_request",
-                        "agent_request_failed",
-                        "search_project_text Agent request could not be started",
-                        None,
-                        None,
-                    )
+            }
+        };
+        let agent_wait_deadline = Instant::now() + Duration::from_secs(outer_timeout);
+        let batch_deadline_wins =
+            batch_deadline.is_some_and(|deadline| deadline <= agent_wait_deadline);
+        let wait_deadline = batch_deadline.map_or(agent_wait_deadline, |deadline| {
+            std::cmp::min(deadline, agent_wait_deadline)
+        });
+        match tokio::time::timeout_at(wait_deadline, rx).await {
+            Ok(Ok(resp)) => {
+                let raw_stdout = resp.stdout.unwrap_or_default();
+                if let Some(result) = external_provider_error_result(&raw_stdout, &options) {
+                    return result;
                 }
-            };
-            let agent_wait_deadline = Instant::now() + Duration::from_secs(outer_timeout);
-            let batch_deadline_wins =
-                batch_deadline.is_some_and(|deadline| deadline <= agent_wait_deadline);
-            let wait_deadline = batch_deadline.map_or(agent_wait_deadline, |deadline| {
-                std::cmp::min(deadline, agent_wait_deadline)
-            });
-            return match tokio::time::timeout_at(wait_deadline, rx).await {
-                Ok(Ok(resp)) => {
-                    let raw_stdout = resp.stdout.unwrap_or_default();
-                    if let Some(result) = external_provider_error_result(&raw_stdout, &options) {
-                        return result;
-                    }
-                    let stdout = raw_stdout;
-                    let stderr = resp.stderr.unwrap_or_default();
-                    let agent_error = resp.error.as_deref();
-                    if looks_like_search_timeout(
-                        resp.exit_code,
-                        &stderr,
-                        agent_error,
-                        options.timeout_secs,
-                    ) {
-                        let backend_status = parse_search_backend_status(&stdout);
-                        let backend = backend_status
-                            .marker_present
-                            .then_some(backend_status.backend);
-                        return search_timeout_tool_result_with_records(
-                            output_project,
-                            &options,
-                            &stdout,
-                            backend.as_deref(),
-                            resp.exit_code,
-                            if backend.is_some() {
-                                "backend_execution"
-                            } else {
-                                "agent_execution"
-                            },
-                        );
-                    }
-                    if agent_error.is_some() {
-                        let backend_status = parse_search_backend_status(&stdout);
-                        return search_failure_tool_result(
-                            &options,
-                            "search_execution_failed",
-                            "agent_execution",
-                            "agent_execution_failed",
-                            "search_project_text Agent execution failed",
-                            backend_status
-                                .marker_present
-                                .then_some(backend_status.backend.as_str()),
-                            resp.exit_code,
-                        );
-                    }
-                    search_project_text_output(
+                let stdout = raw_stdout;
+                let stderr = resp.stderr.unwrap_or_default();
+                let agent_error = resp.error.as_deref();
+                if looks_like_search_timeout(
+                    resp.exit_code,
+                    &stderr,
+                    agent_error,
+                    options.timeout_secs,
+                ) {
+                    let backend_status = parse_search_backend_status(&stdout);
+                    let backend = backend_status
+                        .marker_present
+                        .then_some(backend_status.backend);
+                    return search_timeout_tool_result_with_records(
                         output_project,
                         &options,
                         &stdout,
+                        backend.as_deref(),
                         resp.exit_code,
-                        &stderr,
-                    )
-                }
-                Ok(Err(_)) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    // Channel closed without a result: agent disconnect / waiter
-                    // drop — not a search timeout.
-                    search_request_dropped_tool_result(&options)
-                }
-                Err(_) => {
-                    self.shell_clients.cancel_request(&req_id).await;
-                    // Preserve whether the per-search transport bound or the
-                    // batch's shared absolute deadline ended the wait.
-                    search_timeout_tool_result(
-                        &options,
-                        None,
-                        if batch_deadline_wins {
-                            "batch_deadline"
+                        if backend.is_some() {
+                            "backend_execution"
                         } else {
-                            "agent_transport"
+                            "agent_execution"
                         },
-                    )
+                    );
                 }
-            };
-        }
-        let root = proj.root();
-        let local = run_command_sync_bounded(cmd, root, effective_timeout_secs);
-        let local = match batch_deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, local).await {
-                Ok(result) => result,
-                Err(_) => return search_timeout_tool_result(&options, None, "batch_deadline"),
-            },
-            None => local.await,
-        };
-        match local {
-            Ok((exit_code, stdout, stderr, _)) => search_project_text_output(
-                output_project,
-                &options,
-                &stdout,
-                Some(exit_code),
-                &stderr,
-            ),
-            // Outer hard bound (command timeout + grace) fired: treat as a
-            // search timeout so the MCP request still returns a structured error
-            // instead of parking forever on a wedged output drain.
-            Err(LocalRunFailure::HardTimeout { bound_secs: _ }) => {
-                search_timeout_tool_result(&options, None, "local_execution")
+                if agent_error.is_some() {
+                    let backend_status = parse_search_backend_status(&stdout);
+                    return search_failure_tool_result(
+                        &options,
+                        "search_execution_failed",
+                        "agent_execution",
+                        "agent_execution_failed",
+                        "search_project_text Runner execution failed",
+                        backend_status
+                            .marker_present
+                            .then_some(backend_status.backend.as_str()),
+                        resp.exit_code,
+                    );
+                }
+                search_project_text_output(
+                    output_project,
+                    &options,
+                    &stdout,
+                    resp.exit_code,
+                    &stderr,
+                )
             }
-            Err(LocalRunFailure::Join(_)) => search_failure_tool_result(
-                &options,
-                "search_execution_failed",
-                "local_execution",
-                "local_execution_failed",
-                "search_project_text local execution failed",
-                None,
-                None,
-            ),
+            Ok(Err(_)) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                // Channel closed without a result: agent disconnect / waiter
+                // drop — not a search timeout.
+                search_request_dropped_tool_result(&options)
+            }
+            Err(_) => {
+                self.runner_registry.cancel_request(&req_id).await;
+                // Preserve whether the per-search transport bound or the
+                // batch's shared absolute deadline ended the wait.
+                search_timeout_tool_result(
+                    &options,
+                    None,
+                    if batch_deadline_wins {
+                        "batch_deadline"
+                    } else {
+                        "agent_transport"
+                    },
+                )
+            }
         }
     }
 }
@@ -2273,7 +2259,7 @@ mod tests {
         assert_eq!(matches[0]["path"], "src/a.rs");
     }
 
-    fn transport_truncation_markers() -> [&'static str; 3] {
+    fn result_retention_truncation_markers() -> [&'static str; 3] {
         [
             "[output truncated to last 12000 bytes]\n",
             "[output truncated]\n",
@@ -2319,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_truncated_stdout_cannot_recover_backend_identity() {
+    fn search_result_retention_truncated_stdout_cannot_recover_backend_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2346,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_forms_cannot_recover_match_identity() {
+    fn search_result_retention_marker_forms_cannot_recover_match_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2360,7 +2346,7 @@ mod tests {
         })
         .unwrap();
 
-        for marker in transport_truncation_markers() {
+        for marker in result_retention_truncation_markers() {
             let stdout = format!(
                 "{marker}{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\nsrc/a.rs:1:needle one\nsrc/b.rs:2:needle two\n"
             );
@@ -2379,7 +2365,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_forms_cannot_recover_file_identity() {
+    fn search_result_retention_marker_forms_cannot_recover_file_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2393,7 +2379,7 @@ mod tests {
         })
         .unwrap();
 
-        for marker in transport_truncation_markers() {
+        for marker in result_retention_truncation_markers() {
             let stdout = format!(
                 "{marker}{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\nsrc/a.rs\nsrc/b.rs\n"
             );
@@ -2412,7 +2398,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_forms_cannot_recover_count_identity() {
+    fn search_result_retention_marker_forms_cannot_recover_count_identity() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2426,7 +2412,7 @@ mod tests {
         })
         .unwrap();
 
-        for marker in transport_truncation_markers() {
+        for marker in result_retention_truncation_markers() {
             let stdout = format!(
                 "{marker}{{\"webcodex_search\":{{\"backend\":\"rg\"}}}}\nsrc/a.rs:2\nsrc/b.rs:3\n"
             );
@@ -2445,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn search_transport_marker_text_in_middle_is_not_transport_truncation() {
+    fn search_result_retention_marker_text_in_middle_is_not_prefix_loss() {
         let options = SearchOptions::normalize(SearchRequest {
             pattern: "needle".to_string(),
             path: None,
@@ -2473,7 +2459,7 @@ mod tests {
 
     #[test]
     fn search_local_and_agent_parse_same_stdout_identically() {
-        // The agent path parses the runner's stdout with the same function as
+        // The Runner path parses the Runner's stdout with the same function as
         // the local path, so the exact same stdout string must yield identical
         // field semantics in both. This pins that parity for the record fields
         // the task lists: backend, result_mode, matches, count, truncated,

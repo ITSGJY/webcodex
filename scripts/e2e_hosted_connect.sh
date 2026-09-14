@@ -204,13 +204,13 @@ RUNTIME_PROJECT="$(awk '$0 ~ /^Runtime project:/ {sub(/^Runtime project:[[:space
 
 PROFILE_DIR="$TMP_ROOT/config/webcodex/clients/$PROFILE"
 STATE_DIR="$TMP_ROOT/state/webcodex/clients/$PROFILE"
-[ "$(stat -c '%a' "$PROFILE_DIR/agent.toml")" = "600" ] \
-    || die "agent.toml is not mode 0600"
+[ "$(stat -c '%a' "$PROFILE_DIR/runner.toml")" = "600" ] \
+    || die "runner.toml is not mode 0600"
 [ "$(stat -c '%a' "$STATE_DIR/runner.toml")" = "600" ] \
     || die "runner state is not mode 0600"
 [ "$(stat -c '%a' "$STATE_DIR/runner.log")" = "600" ] \
     || die "runner log is not mode 0600"
-[ -f "$PROFILE_DIR/projects.d/project.toml" ] \
+[ -f "$PROFILE_DIR/project-registry/project.toml" ] \
     || die "connect did not register the project locally"
 [ -f "$STATE_DIR/runner.toml" ] && [ -f "$STATE_DIR/runner.log" ] \
     || die "connect did not persist Runner state and logs"
@@ -225,8 +225,8 @@ process_active "$LOG_WRITER_PID" \
 PROJECTS_A="$(post "$SHARED_KEY_A" /api/projects/list '{}')"
 [ "$(printf '%s' "$PROJECTS_A" | json_field output.projects.0.id)" = "$RUNTIME_PROJECT" ] \
     || die "same-key project visibility failed"
-READ_RESPONSE="$(post "$SHARED_KEY_A" /api/projects/read_file \
-    "{\"project\":\"${RUNTIME_PROJECT}\",\"path\":\"README.md\"}")"
+READ_RESPONSE="$(post "$SHARED_KEY_A" /api/tools/call \
+    "{\"tool\":\"read_files\",\"params\":{\"project\":\"${RUNTIME_PROJECT}\",\"items\":[{\"path\":\"README.md\"}]}}")"
 if [ "$(printf '%s' "$READ_RESPONSE" | json_field success)" != "True" ]; then
     READ_ERROR="$(printf '%s' "$READ_RESPONSE" | python3 -c '
 import json,sys
@@ -237,10 +237,10 @@ print(json.dumps({
     "output": value.get("output"),
 }, separators=(",",":")))
 ')"
-    die "same-key read_file failed (${READ_ERROR})"
+    die "same-key read_files failed (${READ_ERROR})"
 fi
 printf '%s' "$READ_RESPONSE" | grep -q 'hosted connect smoke' \
-    || die "same-key read_file returned unexpected content"
+    || die "same-key read_files returned unexpected content"
 
 PROJECTS_B="$(post "$SHARED_KEY_B" /api/projects/list '{}')"
 [ "$(printf '%s' "$PROJECTS_B" | json_field output.count)" = "0" ] \

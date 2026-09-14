@@ -21,7 +21,22 @@ const requiredAssets = [
   "console.html",
   "app.js",
   "workflow_session_state.js",
+  "runtime_collaboration_state.js",
+  "runtime_communication_state.js",
+  "runtime_context_state.js",
   "runtime_console_state.js",
+  "runtime_i18n.js",
+  "runtime_rich_text.js",
+  "runtime_api.js",
+  "runtime_window.js",
+  "runtime_communication.js",
+  "runtime_activity.js",
+  "runtime_storage.js",
+  "runtime_overview.js",
+  "runtime_icons.js",
+  "runtime_operations.js",
+  "runtime_navigation.js",
+  "runtime_collaboration.js",
   "runtime.html",
   "runtime.js",
   "runtime.css",
@@ -176,7 +191,7 @@ async function assertRequiredAssets(outputDirectory) {
   assert.match(styles, /workflow-session-summary-runtime/);
   const runtimeStyles = await readFile(resolve(outputDirectory, "runtime.css"), "utf8");
   assert.match(runtimeStyles, /max-width:\s*900px/);
-  assert.match(runtimeStyles, /min-width:\s*1600px/);
+  assert.match(runtimeStyles, /min-width:\s*1280px/);
   assert.match(runtimeStyles, /safe-area-inset-bottom/);
   assert.match(runtimeStyles, /safe-area-inset-top/);
   assert.match(runtimeStyles, /prefers-reduced-motion/);
@@ -190,10 +205,10 @@ async function assertRequiredAssets(outputDirectory) {
   assert.match(runtimeStyles, /workspace-main\{[^}]*background:var\(--page-surface\)/);
   assert.match(runtimeStyles, /--layout-major:61\.8%/);
   assert.match(runtimeStyles, /--layout-minor:38\.2%/);
-  assert.match(runtimeStyles, /--sidebar-width:clamp\(300px,21vw,356px\)/);
-  assert.match(runtimeStyles, /--content-width:1120px/);
-  assert.match(runtimeStyles, /--context-rail-width:clamp\(320px,18vw,360px\)/);
-  assert.match(runtimeStyles, /runtime-shell\.context-docked\{--content-width:1160px;grid-template-columns:var\(--sidebar-width\) minmax\(0,1fr\) var\(--context-rail-width\)/);
+  assert.match(runtimeStyles, /--sidebar-width:clamp\(280px,21vw,320px\)/);
+  assert.match(runtimeStyles, /--content-width:760px/);
+  assert.match(runtimeStyles, /--context-rail-width:clamp\(320px,26vw,420px\)/);
+  assert.match(runtimeStyles, /runtime-shell\.context-docked\{--content-width:760px;grid-template-columns:var\(--sidebar-width\) minmax\(0,1fr\) var\(--context-rail-width\)/);
   assert.match(runtimeStyles, /message-card\.message-incoming\{[^}]*width:fit-content[^}]*max-width:min\(82%,880px\)/);
   assert.match(runtimeStyles, /message-card\.message-outgoing\{[^}]*max-width:min\(68%,680px\)[^}]*align-self:flex-end/);
   assert.match(runtimeStyles, /--message-bubble-radius:22px/);
@@ -224,7 +239,7 @@ async function assertRequiredAssets(outputDirectory) {
   assert.match(runtimeStyles, /send-btn\.is-ready/);
   assert.match(runtimeStyles, /session-state-chips \.chip:not\(:last-child\)\{display:none/);
   assert.match(runtimeStyles, /message-card\.message-group-continuation \.message-author\{display:none/);
-  assert.match(runtimeStyles, /session-evidence/);
+  assert.match(runtimeStyles, /context-navigation/);
   await exec(process.execPath, ["--check", resolve(outputDirectory, "app.js")]);
   const admin = await readFile(resolve(outputDirectory, "admin.js"), "utf8");
   await exec(process.execPath, ["--check", resolve(outputDirectory, "admin.js")]);
@@ -242,7 +257,22 @@ async function copySources(sourceDirectory) {
     "styles.css",
     "console.html",
     "runtime.ts",
+    "runtime_collaboration_state.ts",
+    "runtime_communication_state.ts",
+    "runtime_context_state.ts",
     "runtime_console_state.ts",
+    "runtime_i18n.ts",
+    "runtime_rich_text.ts",
+    "runtime_api.ts",
+    "runtime_window.ts",
+    "runtime_communication.ts",
+    "runtime_activity.ts",
+    "runtime_storage.ts",
+    "runtime_overview.ts",
+    "runtime_icons.ts",
+    "runtime_operations.ts",
+    "runtime_navigation.ts",
+    "runtime_collaboration.ts",
     "runtime.css",
     "runtime.html",
     "admin.ts",

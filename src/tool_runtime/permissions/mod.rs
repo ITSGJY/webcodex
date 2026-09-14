@@ -108,7 +108,7 @@ pub(crate) fn permission_execution_denied_result(decision: &PermissionDecision) 
             "permission_status": decision.status,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 /// Deserialize a permission decision previously attached to tool output.

@@ -61,6 +61,20 @@ fn application(id: &str, name: &str) -> Value {
 const APPLICATION_ID: &str = "application_0123456789abcdef0123456789abcdef";
 const APPLICATION_ID_2: &str = "application_fedcba9876543210fedcba9876543210";
 
+fn assert_computer_suggested_call(result: &ToolResult, tool: &str, arguments: Value) {
+    let suggested = &result.output["suggested_call"];
+    assert_eq!(suggested["tool"], tool);
+    assert_eq!(suggested["arguments"], arguments);
+    assert!(suggested.get("authority").is_none());
+    assert!(result.output.get("recovery_tool").is_none());
+    assert!(result.output.get("reconcile_with").is_none());
+    ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("Computer suggested_call must parse through the canonical ToolCall parser");
+}
+
 #[test]
 fn computer_application_id_and_public_argument_shape_are_closed() {
     assert!(valid_application_id(APPLICATION_ID));
@@ -199,13 +213,17 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
     assert!(!invalid.success);
     let unknown = computer_application_effect_outcome_unknown(
         "Runner returned inconsistent successful launch metadata",
+        "msi",
         APPLICATION_ID,
     );
     assert_eq!(unknown.output["error_kind"], "outcome_unknown");
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(unknown.output["reconcile_with"], "computer_list_windows");
     assert_eq!(unknown.output["recovery_kind"], "reobserve");
-    assert_eq!(unknown.output["recovery_tool"], "computer_list_windows");
+    assert_computer_suggested_call(
+        &unknown,
+        "computer_list_windows",
+        json!({"client_id": "msi"}),
+    );
     assert!(unknown.output.get("state_changed").is_none());
     assert!(!serde_json::to_string(&unknown.output)
         .unwrap()
@@ -219,13 +237,19 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
         let result = computer_application_effect_delivery_failure(
             "launch transport lost",
             dispatched,
+            "msi",
             APPLICATION_ID,
         );
         assert_eq!(result.output["error_kind"], expected);
         if expected == "not_started" {
             assert_eq!(result.output["state_changed"], false);
         } else {
-            assert_eq!(result.output["reconcile_with"], "computer_list_windows");
+            assert_eq!(result.output["execution_state"], "outcome_unknown");
+            assert_computer_suggested_call(
+                &result,
+                "computer_list_windows",
+                json!({"client_id": "msi"}),
+            );
         }
     }
 
@@ -233,13 +257,18 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
         "stale_application: PRIVATE_NATIVE_ID",
         "application_failed: PRIVATE_NATIVE_ID",
     ] {
-        let result = computer_application_launch_runner_error(error, Some(true), APPLICATION_ID);
+        let result =
+            computer_application_launch_runner_error(error, Some(true), "msi", APPLICATION_ID);
         assert_eq!(result.output["execution_state"], "not_started");
         assert_eq!(result.output["state_changed"], false);
         let serialized = serde_json::to_string(&result.output).unwrap();
         if error.starts_with("stale_application") {
             assert_eq!(result.output["recovery_kind"], "reobserve");
-            assert_eq!(result.output["recovery_tool"], "computer_list_applications");
+            assert_computer_suggested_call(
+                &result,
+                "computer_list_applications",
+                json!({"client_id": "msi"}),
+            );
         } else {
             assert!(result.output.get("recovery_kind").is_none());
         }
@@ -253,6 +282,7 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
     let malformed = computer_application_effect_not_started(
         "invalid_application",
         "application_id is invalid",
+        "msi",
         &"x".repeat(512),
     );
     assert!(malformed.output["application_id"].is_null());
@@ -264,6 +294,7 @@ const DISPLAY_ID: &str = "display_0123456789abcdef0123456789abcdef";
 #[test]
 fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
     let context = PointerRequestContext {
+        client_id: "msi".to_string(),
         display_id: DISPLAY_ID.to_string(),
         snapshot_generation: 7,
         x: 123,
@@ -329,9 +360,10 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
     assert!(!spent_not_started.success);
     assert_eq!(spent_not_started.output["execution_state"], "not_started");
     assert_eq!(spent_not_started.output["state_changed"], false);
-    assert_eq!(
-        spent_not_started.output["reconcile_with"],
-        "computer_snapshot_display"
+    assert_computer_suggested_call(
+        &spent_not_started,
+        "computer_snapshot_display",
+        json!({"client_id": "msi", "display_id": DISPLAY_ID}),
     );
     assert!(spent_not_started
         .error
@@ -345,18 +377,20 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
     );
     assert!(!runner_unknown.success);
     assert_eq!(runner_unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(
-        runner_unknown.output["reconcile_with"],
-        "computer_snapshot_display"
+    assert_computer_suggested_call(
+        &runner_unknown,
+        "computer_snapshot_display",
+        json!({"client_id": "msi", "display_id": DISPLAY_ID}),
     );
 
     let unknown =
         computer_pointer_effect_delivery_failure("maybe dispatched", Some(true), &context);
     assert!(!unknown.success);
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(
-        unknown.output["reconcile_with"],
-        "computer_snapshot_display"
+    assert_computer_suggested_call(
+        &unknown,
+        "computer_snapshot_display",
+        json!({"client_id": "msi", "display_id": DISPLAY_ID}),
     );
     assert!(unknown
         .error
@@ -477,6 +511,24 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
 }
 
 #[test]
+fn computer_snapshot_dimension_budgets_clamp_only_oversized_positive_values() {
+    assert_eq!(effective_snapshot_dimension_bound(None), Ok(None));
+    assert_eq!(
+        effective_snapshot_dimension_bound(Some(1024)),
+        Ok(Some(1024))
+    );
+    assert_eq!(
+        effective_snapshot_dimension_bound(Some(10_000)),
+        Ok(Some(MAX_IMAGE_DIMENSION as u32))
+    );
+    assert_eq!(
+        effective_snapshot_dimension_bound(Some(u32::MAX)),
+        Ok(Some(MAX_IMAGE_DIMENSION as u32))
+    );
+    assert_eq!(effective_snapshot_dimension_bound(Some(0)), Err(()));
+}
+
+#[test]
 fn computer_display_public_shape_and_read_only_semantics_are_closed() {
     assert!(valid_display_id(DISPLAY_ID));
     assert!(!computer_request_is_effect("computer_list_displays"));
@@ -577,6 +629,44 @@ fn computer_display_snapshot_validator_enforces_identity_geometry_and_privacy() 
     let valid = validate_display_snapshot(output.clone(), DISPLAY_ID, "msi", Some(960), None);
     assert!(valid.success, "{:?}", valid.output);
     assert_eq!(valid.output["client_id"], "msi");
+
+    // The model-facing request may be larger, but response correlation is against
+    // the single effective bound sent to the Runner. 5000x4000 stays under the
+    // raw-capture byte ceiling and downscales to 4096x3276 at the hard limit.
+    let effective = effective_snapshot_dimension_bound(Some(10_000)).unwrap();
+    assert_eq!(effective, Some(MAX_IMAGE_DIMENSION as u32));
+    let bounded_source = json!({
+        "display_id": DISPLAY_ID,
+        "snapshot_generation": 8,
+        "source_width": 5000,
+        "source_height": 4000,
+        "width": 4096,
+        "height": 3276,
+        "mime_type": "image/jpeg",
+        "file_bytes": image.len(),
+        "sha256": sha256_hex(&image),
+        "captured_at_unix_ms": 1_700_000_000_001u64,
+        "content_base64": general_purpose::STANDARD.encode(image)
+    });
+    let bounded = validate_display_snapshot(
+        bounded_source.clone(),
+        DISPLAY_ID,
+        "msi",
+        effective.map(u64::from),
+        None,
+    );
+    assert!(bounded.success, "{:?}", bounded.output);
+    let mut over_effective = bounded_source;
+    over_effective["width"] = json!(4097);
+    let rejected = validate_display_snapshot(
+        over_effective,
+        DISPLAY_ID,
+        "msi",
+        effective.map(u64::from),
+        None,
+    );
+    assert!(!rejected.success);
+    assert_eq!(rejected.output["error_kind"], "invalid_runner_response");
 
     for (field, value) in [
         ("native_identity", json!("PRIVATE")),
@@ -1147,7 +1237,7 @@ fn computer_input_text_runner_errors_never_echo_text() {
             "outcome_unknown",
         ),
     ] {
-        let result = computer_text_input_runner_error(&error, dispatched);
+        let result = computer_text_input_runner_error(&error, dispatched, "msi");
         let serialized = serde_json::to_string(&result.output).unwrap();
         assert_eq!(result.output["error_kind"], expected_kind);
         assert!(!serialized.contains(secret));
@@ -1257,7 +1347,7 @@ fn computer_control_runner_errors_preserve_structured_error_kinds() {
 
 #[test]
 fn stale_computer_identities_expose_bounded_reobserve_targets() {
-    for (error_kind, recovery_tool) in [
+    for (error_kind, reconcile_with) in [
         ("stale_element", "computer_find_elements"),
         ("stale_surface", "computer_list_windows"),
         ("stale_application", "computer_list_applications"),
@@ -1267,17 +1357,28 @@ fn stale_computer_identities_expose_bounded_reobserve_targets() {
         assert!(!result.success);
         assert_eq!(result.output["error_kind"], error_kind);
         assert_eq!(result.output["recovery_kind"], "reobserve");
-        assert_eq!(result.output["recovery_tool"], recovery_tool);
-        assert!(matches!(
-            result.output["recovery_tool"].as_str().unwrap(),
-            "computer_find_elements"
-                | "computer_list_windows"
-                | "computer_list_applications"
-                | "computer_list_displays"
-        ));
+        assert_eq!(result.output["reconcile_with"], reconcile_with);
+        assert!(result.output.get("suggested_call").is_none());
+        assert!(result.output.get("recovery_tool").is_none());
+    }
+
+    let stale_element =
+        computer_error_with_client("stale_element", "stale observed identity", Some("msi"));
+    assert_eq!(
+        stale_element.output["reconcile_with"],
+        "computer_find_elements"
+    );
+    assert!(stale_element.output.get("suggested_call").is_none());
+
+    for (error_kind, tool) in [
+        ("stale_surface", "computer_list_windows"),
+        ("stale_application", "computer_list_applications"),
+        ("stale_display", "computer_list_displays"),
+    ] {
+        let result = computer_error_with_client(error_kind, "stale observed identity", Some("msi"));
+        assert_computer_suggested_call(&result, tool, json!({"client_id": "msi"}));
     }
 }
-
 #[test]
 fn computer_window_list_validator_rejects_more_than_requested_limit() {
     let result = validate_window_list(
@@ -1531,14 +1632,11 @@ fn computer_save_snapshot_lifecycle_distinguishes_not_started_from_unknown() {
     assert!(!unknown.success);
     assert_eq!(unknown.output["error_kind"], "outcome_unknown");
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(
-        unknown.output["reconcile_with"],
-        "read_project_artifact_metadata"
-    );
     assert_eq!(unknown.output["recovery_kind"], "reconcile");
-    assert_eq!(
-        unknown.output["recovery_tool"],
-        "read_project_artifact_metadata"
+    assert_computer_suggested_call(
+        &unknown,
+        "read_project_artifact_metadata",
+        json!({"project": "agent:target:demo", "path": "artifacts/ui.jpg"}),
     );
     assert_eq!(unknown.output["project"], "agent:target:demo");
     assert_eq!(unknown.output["path"], "artifacts/ui.jpg");

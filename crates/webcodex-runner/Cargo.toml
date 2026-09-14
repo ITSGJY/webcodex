@@ -4,11 +4,17 @@ version.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+workspace-checkpoints = ["webcodex-workspace/workspace-checkpoints"]
+runner-real-process-tests = ["webcodex-lsp/real-process-tests"]
+
 [dependencies]
 agent-client-protocol-schema = { version = "1.7.0", default-features = false }
 webcodex-computer = { path = "../webcodex-computer" }
 webcodex-runner-config = { path = "../webcodex-runner-config" }
 webcodex-core = { path = "../webcodex-core" }
+webcodex-lsp = { path = "../webcodex-lsp" }
 webcodex-persistent-shell = { path = "../webcodex-persistent-shell" }
 webcodex-process = { path = "../webcodex-process" }
 webcodex-workspace = { path = "../webcodex-workspace" }

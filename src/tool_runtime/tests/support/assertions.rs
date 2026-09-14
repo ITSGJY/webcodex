@@ -79,3 +79,24 @@ pub(in crate::tool_runtime::tests) fn assert_safe_patch_command(command: &str, m
         command
     );
 }
+
+pub(in crate::tool_runtime::tests) fn assert_observe_job_continuation(output: &Value) {
+    use crate::tool_runtime::{ObserveJobsWakeOn, ToolCall};
+    let hint = &output["continuation"];
+    assert_eq!(hint["tool"], "observe_jobs");
+    assert_eq!(hint["arguments"]["items"][0]["job_id"], output["job_id"]);
+    assert_eq!(
+        hint["arguments"]["items"][0]["after_observation_token"],
+        output["observation_token"]
+    );
+    let call = ToolCall::from_tool_name(hint["tool"].as_str().unwrap(), hint["arguments"].clone())
+        .expect("Job continuation must be parser-ready");
+    assert!(matches!(
+        call,
+        ToolCall::ObserveJobs {
+            wait_secs: Some(60),
+            wake_on: ObserveJobsWakeOn::Terminal,
+            ..
+        }
+    ));
+}

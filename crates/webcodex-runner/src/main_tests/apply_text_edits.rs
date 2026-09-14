@@ -4,7 +4,7 @@ fn apply_text_edits_request(
     cwd: &Path,
     path: &str,
     mut payload: serde_json::Value,
-) -> ShellAgentShellRequest {
+) -> RunnerRequest {
     if payload.get("changes").is_none() {
         let expected_sha256 = payload
             .get("expected_file_sha256")
@@ -23,7 +23,7 @@ fn apply_text_edits_request(
             }]
         });
     }
-    ShellAgentShellRequest {
+    RunnerRequest {
         request_id: "req-apply-text-edits".to_string(),
         client_id: "agent-1".to_string(),
         kind: "file_apply_text_edits".to_string(),
@@ -48,6 +48,7 @@ fn apply_text_edits_request(
         lsp: None,
         job_context: None,
         mcp_gateway: None,
+        plugin_gateway: None,
         coding_agent: None,
         persistent_shell: None,
     }
@@ -221,6 +222,59 @@ fn file_apply_text_edits_replace_exact_writes_atomically() {
     assert_eq!(out["would_change"], true);
     assert_eq!(out["changed_paths"][0], "target.txt");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+}
+
+#[test]
+fn file_apply_text_edits_ignores_empty_insert_noop_and_applies_remaining_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let file = tmp.path().join("target.txt");
+    std::fs::write(&file, "old\n").unwrap();
+
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({
+                "edits": [
+                    {"kind": "insert_before", "anchor_text": "missing", "new_text": ""},
+                    {"kind": "replace_exact", "old_text": "old", "new_text": "new"}
+                ]
+            }),
+        ),
+    ));
+    assert_eq!(out["changed"], true);
+    assert_eq!(out["ignored_noop_count"], 1);
+    assert_eq!(out["files"][0]["edits"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+}
+
+#[test]
+fn file_apply_text_edits_empty_insert_noop_still_validates_anchor_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let file = tmp.path().join("target.txt");
+    std::fs::write(&file, "old\n").unwrap();
+
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({
+                "edits": [
+                    {"kind": "insert_before", "anchor_text": "bad\u{0}anchor", "new_text": ""},
+                    {"kind": "replace_exact", "old_text": "old", "new_text": "new"}
+                ]
+            }),
+        ),
+    ));
+    let msg = out["error"].as_str().unwrap();
+    assert!(msg.contains("NUL"), "{msg}");
+    assert!(msg.contains("No files were modified"), "{msg}");
+    assert_eq!(out["changed"], false);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
 }
 
 #[test]

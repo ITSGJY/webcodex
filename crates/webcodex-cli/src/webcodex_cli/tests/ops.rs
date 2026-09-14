@@ -1,6 +1,6 @@
 use super::support::*;
 use crate::webcodex_cli::ops::{
-    ops_agents_report, ops_exit_code, ops_projects_report, ops_runner_report,
+    ops_exit_code, ops_projects_report, ops_runner_report, ops_runners_report,
     ops_smoke_preflight_report, ops_status_report, render_ops_runner, render_ops_status,
 };
 use crate::webcodex_cli::run_ops_command;
@@ -14,8 +14,9 @@ fn ops_help_entrypoints_print_usage() {
             &[
                 "Usage: webcodex ops <COMMAND>",
                 "status",
-                "agents",
+                "runners",
                 "projects",
+                "windows",
                 "smoke-preflight",
                 "--server-url URL",
                 "--token TOKEN",
@@ -34,9 +35,9 @@ fn ops_help_entrypoints_print_usage() {
             ],
         ),
         (
-            &["ops", "agents", "--help"],
+            &["ops", "runners", "--help"],
             &[
-                "Usage: webcodex ops agents",
+                "Usage: webcodex ops runners",
                 "--server-url URL",
                 "--env-file PATH",
                 "--token-file PATH",
@@ -70,6 +71,18 @@ fn ops_help_entrypoints_print_usage() {
             ],
         ),
         (
+            &["ops", "windows", "--help"],
+            &[
+                "Usage: webcodex ops windows",
+                "--project PROJECT_ID",
+                "--limit COUNT",
+                "--server-url URL",
+                "--token-file PATH",
+                "--json",
+                "--strict",
+            ],
+        ),
+        (
             &["ops", "smoke-preflight", "--help"],
             &[
                 "Usage: webcodex ops smoke-preflight",
@@ -93,6 +106,24 @@ fn ops_help_entrypoints_print_usage() {
                 "help for {args:?} did not contain {needle:?}\n{out}"
             );
         }
+    }
+}
+
+#[test]
+fn ops_runners_is_canonical_and_agents_is_rejected() {
+    match cli_action(["ops", "runners", "--json"]) {
+        CliAction::Ops(OpsCommand::Runners(opts)) => assert!(opts.json),
+        other => panic!("canonical ops runners path did not parse: {other:?}"),
+    }
+    match cli_action(["ops", "agents", "--json"]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(
+                stderr.contains("unknown ops subcommand: agents"),
+                "{stderr}"
+            );
+        }
+        other => panic!("legacy ops agents alias must be rejected: {other:?}"),
     }
 }
 
@@ -166,6 +197,47 @@ fn ops_rejects_removed_server_url_alias() {
 }
 
 #[test]
+fn ops_windows_requires_project_and_bounds_limit() {
+    match cli_action(["ops", "windows", "--json"]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(stderr.contains("--project is required"), "{stderr}");
+        }
+        other => panic!("missing ops windows project should fail: {other:?}"),
+    }
+    match cli_action([
+        "ops",
+        "windows",
+        "--project",
+        "agent:msi:site",
+        "--limit",
+        "65",
+    ]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(stderr.contains("--limit must be within 1..=64"), "{stderr}");
+        }
+        other => panic!("oversized ops windows limit should fail: {other:?}"),
+    }
+    match cli_action([
+        "ops",
+        "windows",
+        "--project",
+        "agent:msi:site",
+        "--limit",
+        "7",
+        "--json",
+    ]) {
+        CliAction::Ops(OpsCommand::Windows(opts)) => {
+            assert_eq!(opts.project, "agent:msi:site");
+            assert_eq!(opts.limit, 7);
+            assert!(opts.common.json);
+        }
+        other => panic!("ops windows did not parse: {other:?}"),
+    }
+}
+
+#[test]
 fn ops_smoke_preflight_requires_project() {
     match cli_action(["ops", "smoke-preflight", "--json"]) {
         CliAction::Exit { code, stderr, .. } => {
@@ -234,7 +306,7 @@ async fn ops_rejects_agent_token_from_env_file_without_leaking_it() {
     opts.env_file = Some(env_file);
 
     let error = run_ops_command(OpsCommand::Status(opts)).await.unwrap_err();
-    assert!(error.contains("Agent transport token"), "{error}");
+    assert!(error.contains("Runner transport token"), "{error}");
     assert!(error.contains("webcodex-user-token"), "{error}");
     assert!(!error.contains(secret));
 }
@@ -250,7 +322,7 @@ async fn ops_rejects_agent_token_from_process_env_without_leaking_it() {
     let _env = EnvGuard::new().set("WEBCODEX_TOKEN", secret);
     let opts = ops_common_opts("http://127.0.0.1:1".to_string());
     let error = run_ops_command(OpsCommand::Status(opts)).await.unwrap_err();
-    assert!(error.contains("Agent transport token"), "{error}");
+    assert!(error.contains("Runner transport token"), "{error}");
     assert!(error.contains("webcodex-user-token"), "{error}");
     assert!(!error.contains(secret));
 }
@@ -594,19 +666,27 @@ fn spawn_ops_route_server(
     (format!("http://{}", addr), stop_tx, handle)
 }
 
+// Route fixtures may intentionally exercise the unauthenticated 401 contract.
+// Serialize them with process-env credential tests and remove both ambient
+// user/API credential aliases while preserving explicit per-command tokens.
+#[allow(clippy::await_holding_lock)]
 async fn run_ops_with_routes(
     command: OpsCommand,
     routes: Vec<(&'static str, OpsHttpResponse)>,
 ) -> String {
+    let _env_guard = env_test_guard();
+    let _env = EnvGuard::new()
+        .remove("WEBCODEX_TOKEN")
+        .remove("WEBCODEX_PAT");
     let (server_url, stop_tx, handle) = spawn_ops_route_server(routes);
     let command = match command {
         OpsCommand::Status(mut opts) => {
             opts.server_url = server_url;
             OpsCommand::Status(opts)
         }
-        OpsCommand::Agents(mut opts) => {
+        OpsCommand::Runners(mut opts) => {
             opts.server_url = server_url;
-            OpsCommand::Agents(opts)
+            OpsCommand::Runners(opts)
         }
         OpsCommand::Runner(mut opts) => {
             opts.common.server_url = server_url;
@@ -615,6 +695,10 @@ async fn run_ops_with_routes(
         OpsCommand::Projects(mut opts) => {
             opts.server_url = server_url;
             OpsCommand::Projects(opts)
+        }
+        OpsCommand::Windows(mut opts) => {
+            opts.common.server_url = server_url;
+            OpsCommand::Windows(opts)
         }
         OpsCommand::SmokePreflight(mut opts) => {
             opts.common.server_url = server_url;
@@ -625,6 +709,48 @@ async fn run_ops_with_routes(
     stop_tx.send(()).unwrap();
     handle.join().unwrap();
     output
+}
+
+#[tokio::test]
+async fn ops_windows_reports_project_scoped_chatgpt_observation() {
+    let output = run_ops_with_routes(
+        OpsCommand::Windows(OpsWindowsOptions {
+            common: ops_common_opts(String::new()),
+            project: "agent:msi:site".to_string(),
+            limit: 8,
+        }),
+        vec![(
+            "/api/runtime-console/windows",
+            json_http_response(
+                200,
+                json!({
+                    "success": true,
+                    "output": {
+                        "returned": 1,
+                        "total": 1,
+                        "truncated": false,
+                        "windows": [{
+                            "client_window_key": "a".repeat(64),
+                            "source": "openai-session",
+                            "last_seen_at_ms": 1234,
+                            "last_tool_call_at_ms": 1234,
+                            "last_meaningful_activity_at_ms": 1234,
+                            "active_count": 0,
+                            "linked_session_count": 1,
+                            "recorder_gap_count": 0
+                        }]
+                    }
+                }),
+            ),
+        )],
+    )
+    .await;
+    assert!(output.contains("Overall: PASS"), "{output}");
+    assert!(output.contains("returned: 1"), "{output}");
+    assert!(
+        output.contains("last_meaningful_activity_at_ms=1234"),
+        "{output}"
+    );
 }
 
 fn smoke_preflight_opts(server_url: String, project: &str) -> OpsSmokePreflightOptions {
@@ -755,6 +881,51 @@ fn ops_status_runtime_ok_passes() {
 }
 
 #[test]
+fn ops_status_tool_inventory_accepts_different_release_sizes() {
+    for count in [1_u64, 47, 66, 135, 200] {
+        let mut runtime = runtime_status_fixture();
+        runtime["tools"] = json!({"count": count});
+        let report = ops_status_report("https://ops.example.test", &Some(runtime.clone()));
+        assert_eq!(report.verdict.status, "pass", "compact count {count}");
+        runtime["tools"]["names"] =
+            json!((0..count).map(|i| format!("tool_{i}")).collect::<Vec<_>>());
+        let report = ops_status_report("https://ops.example.test", &Some(runtime));
+        assert_eq!(report.verdict.status, "pass", "full count {count}");
+        assert!(report.verdict.warning_reasons.is_empty());
+    }
+}
+
+#[test]
+fn ops_status_tool_inventory_rejects_missing_empty_or_inconsistent_data() {
+    for tools in [
+        Value::Null,
+        json!({}),
+        json!({"count": 0}),
+        json!({"count": -1}),
+        json!({"count": "135"}),
+        json!({"count": 1.5}),
+        json!({"count": 2, "names": ["one"]}),
+        json!({"count": 2, "names": ["one", "one"]}),
+        json!({"count": 1, "names": [""]}),
+        json!({"count": 1, "names": [" "]}),
+        json!({"count": 1, "names": [42]}),
+        json!({"count": 1, "names": null}),
+        json!({"count": 1, "names": "one"}),
+    ] {
+        let mut runtime = runtime_status_fixture();
+        runtime["tools"] = tools;
+        let report = ops_status_report("https://ops.example.test", &Some(runtime));
+        assert_eq!(report.verdict.status, "fail");
+        assert!(report.verdict.blocking);
+        assert!(report
+            .verdict
+            .blocking_reasons
+            .contains(&"malformed_tool_inventory".to_string()));
+        assert_eq!(ops_exit_code(true, report.verdict.status), 2);
+    }
+}
+
+#[test]
 fn ops_status_no_online_agents_fails() {
     let mut runtime = runtime_status_fixture();
     runtime["agents"]["online_count"] = json!(0);
@@ -783,7 +954,7 @@ fn ops_status_active_jobs_warns() {
 }
 
 #[test]
-fn ops_agents_maps_online_stale_and_jobs() {
+fn ops_runners_maps_online_stale_and_jobs() {
     let mut runtime = runtime_status_fixture();
     runtime["agents"]["online_count"] = json!(1);
     runtime["agents"]["stale_count"] = json!(1);
@@ -809,7 +980,7 @@ fn ops_agents_maps_online_stale_and_jobs() {
             "last_seen_age_secs": 120
         }
     ]);
-    let report = ops_agents_report("https://ops.example.test", &Some(runtime));
+    let report = ops_runners_report("https://ops.example.test", &Some(runtime));
     assert_eq!(report.verdict.status, "warn");
     assert_eq!(report.summary["online_count"], 1);
     assert_eq!(report.summary["stale_count"], 1);

@@ -36,7 +36,7 @@ pub(super) const MAX_MCP_ARTIFACT_EXPORTS: usize = 128;
 pub(super) const MAX_MCP_ARTIFACT_EXPORTS_PER_CALLER: usize = 16;
 pub(super) const MCP_ARTIFACT_EXPORT_BUSY_CODE: i64 = -32029;
 pub(super) const MCP_UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
-pub(super) const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v11";
+pub(super) const MCP_COMPUTER_UI_RESOURCE_URI: &str = "ui://webcodex/computer/v12";
 pub(super) const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v1",
     "ui://webcodex/computer/v2",
@@ -48,13 +48,29 @@ pub(super) const MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
     "ui://webcodex/computer/v8",
     "ui://webcodex/computer/v9",
     "ui://webcodex/computer/v10",
+    "ui://webcodex/computer/v11",
 ];
 // Temporary gray-card diagnostic: force the host to re-read the canonical App
 // resource for every card so resource reuse/cache is not an unobserved variable.
 pub(super) const MCP_COMPUTER_UI_RESOURCE_TTL_MS: u64 = 0;
-pub(super) const MCP_COMPUTER_UI_DOMAIN: &str = "https://sg4.yyjeqhc.cn";
+pub(super) const MCP_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/changes/v2";
+pub(super) const MCP_RESULT_UI_RESOURCE_LEGACY_URIS: &[&str] = &[
+    "ui://webcodex/changes/v1",
+    "ui://webcodex/result/v1",
+    "ui://webcodex/result/v2",
+    "ui://webcodex/result/v3",
+];
+pub(super) const MCP_WORK_RESULT_UI_RESOURCE_URI: &str = "ui://webcodex/work-result/v1";
+pub(super) const MCP_GOAL_PLAN_UI_RESOURCE_URI: &str = "ui://webcodex/goal-plan/v2";
+pub(super) const MCP_AGENT_CONTINUATION_UI_RESOURCE_URI: &str =
+    "ui://webcodex/agent-continuation/v17";
 pub(super) const MCP_UI_RESOURCE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(super) const MCP_COMPUTER_APP_HTML: &str = include_str!("../mcp_computer_app.html");
+pub(super) const MCP_RESULT_APP_HTML: &str = include_str!("../mcp_result_app.html");
+pub(super) const MCP_WORK_RESULT_APP_HTML: &str = include_str!("../mcp_work_result_app.html");
+pub(super) const MCP_GOAL_PLAN_APP_HTML: &str = include_str!("../mcp_goal_plan_app.html");
+pub(super) const MCP_AGENT_CONTINUATION_APP_HTML: &str =
+    include_str!("../mcp_agent_continuation_app.html");
 
 pub(super) fn request_supports_mcp_apps(params: &Value) -> bool {
     let Some(extension) = request_client_capabilities(params)
@@ -72,40 +88,88 @@ pub(super) fn request_supports_mcp_apps(params: &Value) -> bool {
     }
 }
 
-pub(super) fn model_surface_supports_computer_app(model_surface: ModelSurface) -> bool {
+pub(super) fn model_surface_supports_mcp_apps(model_surface: ModelSurface) -> bool {
     model_surface.supports_operator_extensions()
 }
 
-pub(super) fn mcp_computer_app_resource_meta() -> Value {
-    json!({
-        "ui": {
-            "prefersBorder": true,
-            "domain": MCP_COMPUTER_UI_DOMAIN,
-            "csp": {
-                "connectDomains": [],
-                "resourceDomains": []
-            }
-        }
-    })
+pub(super) fn model_surface_supports_computer_app(model_surface: ModelSurface) -> bool {
+    model_surface_supports_mcp_apps(model_surface)
 }
 
-pub(super) fn mcp_computer_app_resources_list() -> Value {
+fn mcp_app_resource_meta(domain: Option<&str>) -> Value {
+    let mut ui = json!({
+        "prefersBorder": true,
+        "csp": {
+            "connectDomains": [],
+            "resourceDomains": []
+        }
+    });
+    if let Some(domain) = domain {
+        ui["domain"] = Value::String(domain.to_string());
+    }
+    json!({ "ui": ui })
+}
+
+pub(super) fn mcp_computer_app_resource_meta(domain: Option<&str>) -> Value {
+    mcp_app_resource_meta(domain)
+}
+
+pub(super) fn mcp_computer_app_resources_list(domain: Option<&str>) -> Value {
     json!({
         "resources": [{
             "uri": MCP_COMPUTER_UI_RESOURCE_URI,
             "name": "WebCodex Computer",
             "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders the native computer_snapshot image.",
             "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
-            "_meta": mcp_computer_app_resource_meta()
+            "_meta": mcp_computer_app_resource_meta(domain)
         }]
     })
+}
+
+pub(super) fn mcp_result_app_resource_meta(domain: Option<&str>) -> Value {
+    mcp_app_resource_meta(domain)
+}
+
+pub(super) fn mcp_app_resources_list(domain: Option<&str>) -> Value {
+    let mut result = mcp_computer_app_resources_list(domain);
+    result["resources"]
+        .as_array_mut()
+        .expect("computer App resource list must be an array")
+        .push(json!({
+            "uri": MCP_WORK_RESULT_UI_RESOURCE_URI,
+            "name": "WebCodex Work",
+            "description": "Persistent read-only coding Work Result for one explicitly presented project-scoped Workflow Session. The initial present_work_result ToolResult is the authoritative snapshot; the mounted App stays static until the user explicitly refreshes, then performs one exact bounded state read. Ordinary work tools keep native Host presentation. Legacy Changes resources remain hidden readable compatibility aliases.",
+            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+            "_meta": mcp_app_resource_meta(domain)
+        }));
+    result["resources"]
+        .as_array_mut()
+        .expect("App resource list must be an array")
+        .push(json!({
+            "uri": MCP_GOAL_PLAN_UI_RESOURCE_URI,
+            "name": "WebCodex Goal Plan",
+            "description": "Sparse read-only durable Goal presentation. One explicit present_goal_plan call creates the card; the View converges by app-only exact polling of authoritative Goal state and never owns execution or lifecycle state.",
+            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+            "_meta": mcp_app_resource_meta(domain)
+        }));
+    result["resources"]
+        .as_array_mut()
+        .expect("App resource list must be an array")
+        .push(json!({
+            "uri": MCP_AGENT_CONTINUATION_UI_RESOURCE_URI,
+            "name": "WebCodex Agent Continuation",
+            "description": "Sparse Host controller for one explicit Durable Agent Endpoint generation. The View is a process-local carrier only: SQLite Wake/Wake Delivery Attempt remains authoritative, and Host dispatch is considered actually resumed only after exact consume_agent_wake.",
+            "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+            "_meta": mcp_app_resource_meta(domain)
+        }));
+    result
 }
 
 pub(super) fn is_mcp_computer_app_resource_uri(uri: &str) -> bool {
     uri == MCP_COMPUTER_UI_RESOURCE_URI || MCP_COMPUTER_UI_RESOURCE_LEGACY_URIS.contains(&uri)
 }
 
-pub(super) fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
+pub(super) fn mcp_computer_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
     // ChatGPT can retain an older tool descriptor across connector refreshes.
     // Keep prior computer App URIs as hidden read aliases so an already-bound
     // card can fetch the current safe template. resources/list and tools/list
@@ -117,10 +181,110 @@ pub(super) fn mcp_computer_app_resource_read(uri: &str) -> Option<Value> {
                 "uri": uri,
                 "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
                 "text": MCP_COMPUTER_APP_HTML,
-                "_meta": mcp_computer_app_resource_meta()
+                "_meta": mcp_computer_app_resource_meta(domain)
             }]
         })
     })
+}
+
+pub(super) fn is_mcp_result_app_resource_uri(uri: &str) -> bool {
+    uri == MCP_RESULT_UI_RESOURCE_URI || MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&uri)
+}
+
+pub(super) fn mcp_result_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    is_mcp_result_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_RESULT_APP_HTML,
+                "_meta": mcp_result_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+pub(super) fn is_mcp_work_result_app_resource_uri(uri: &str) -> bool {
+    uri == MCP_WORK_RESULT_UI_RESOURCE_URI
+}
+
+pub(super) fn mcp_work_result_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    is_mcp_work_result_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_WORK_RESULT_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+pub(super) fn is_mcp_goal_plan_app_resource_uri(uri: &str) -> bool {
+    // Hidden read alias for existing cards; discovery advertises only v2.
+    uri == MCP_GOAL_PLAN_UI_RESOURCE_URI || uri == "ui://webcodex/goal-plan/v1"
+}
+
+pub(super) fn mcp_goal_plan_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    is_mcp_goal_plan_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_GOAL_PLAN_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+pub(super) fn is_mcp_agent_continuation_app_resource_uri(uri: &str) -> bool {
+    // Thin hidden read aliases for existing cards; discovery advertises only v17.
+    uri == MCP_AGENT_CONTINUATION_UI_RESOURCE_URI
+        || matches!(
+            uri,
+            "ui://webcodex/agent-continuation/v1"
+                | "ui://webcodex/agent-continuation/v2"
+                | "ui://webcodex/agent-continuation/v3"
+                | "ui://webcodex/agent-continuation/v4"
+                | "ui://webcodex/agent-continuation/v5"
+                | "ui://webcodex/agent-continuation/v6"
+                | "ui://webcodex/agent-continuation/v7"
+                | "ui://webcodex/agent-continuation/v8"
+                | "ui://webcodex/agent-continuation/v9"
+                | "ui://webcodex/agent-continuation/v10"
+                | "ui://webcodex/agent-continuation/v11"
+                | "ui://webcodex/agent-continuation/v12"
+                | "ui://webcodex/agent-continuation/v13"
+                | "ui://webcodex/agent-continuation/v14"
+                | "ui://webcodex/agent-continuation/v15"
+                | "ui://webcodex/agent-continuation/v16"
+        )
+}
+
+pub(super) fn mcp_agent_continuation_app_resource_read(
+    uri: &str,
+    domain: Option<&str>,
+) -> Option<Value> {
+    is_mcp_agent_continuation_app_resource_uri(uri).then(|| {
+        json!({
+            "contents": [{
+                "uri": uri,
+                "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
+                "text": MCP_AGENT_CONTINUATION_APP_HTML,
+                "_meta": mcp_app_resource_meta(domain)
+            }]
+        })
+    })
+}
+
+fn mcp_static_app_resource_read(uri: &str, domain: Option<&str>) -> Option<Value> {
+    mcp_computer_app_resource_read(uri, domain)
+        .or_else(|| mcp_work_result_app_resource_read(uri, domain))
+        .or_else(|| mcp_result_app_resource_read(uri, domain))
+        .or_else(|| mcp_goal_plan_app_resource_read(uri, domain))
+        .or_else(|| mcp_agent_continuation_app_resource_read(uri, domain))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -887,7 +1051,10 @@ where
     match outcome {
         Ok(result) => result,
         Err(_) => {
-            runtime.shell_clients.cancel_abandoned_sync_requests().await;
+            runtime
+                .runner_registry
+                .cancel_abandoned_sync_requests()
+                .await;
             Err(McpArtifactExportReadError::Timeout)
         }
     }
@@ -1300,25 +1467,30 @@ pub(super) fn mcp_artifact_export_read_error_outcome(
     }
 }
 
-pub(super) fn server_capabilities() -> Value {
-    json!({
+pub(super) fn server_capabilities(apps_enabled: bool) -> Value {
+    let mut capabilities = json!({
         "tools": { "listChanged": false },
-        "resources": { "listChanged": false, "subscribe": false },
-        "extensions": {
+        "resources": { "listChanged": false, "subscribe": false }
+    });
+    if apps_enabled {
+        capabilities["extensions"] = json!({
             MCP_UI_EXTENSION: {
                 "mimeTypes": [MCP_UI_RESOURCE_MIME_TYPE]
             }
-        }
-    })
+        });
+    }
+    capabilities
 }
 
 pub(super) fn mcp_app_enabled(
+    server_apps_enabled: bool,
     stateless_2026: bool,
     model_surface: ModelSurface,
     params: &Value,
 ) -> bool {
-    stateless_2026
-        && model_surface_supports_computer_app(model_surface)
+    server_apps_enabled
+        && stateless_2026
+        && model_surface_supports_mcp_apps(model_surface)
         && request_supports_mcp_apps(params)
 }
 
@@ -1337,9 +1509,13 @@ pub(super) fn resource_read_bypasses_runtime_read(params: &Value) -> bool {
         .is_some_and(|uri| is_artifact_export_resource_uri(uri) || is_snapshot_resource_uri(uri))
 }
 
-pub(super) fn handle_list(id: Option<Value>, app_enabled: bool) -> McpOutcome {
+pub(super) fn handle_list(
+    runtime: &ToolRuntime,
+    id: Option<Value>,
+    app_enabled: bool,
+) -> McpOutcome {
     let result = if app_enabled {
-        mcp_computer_app_resources_list()
+        mcp_app_resources_list(runtime.runtime_info.configured_public_url.as_deref())
     } else {
         json!({ "resources": [] })
     };
@@ -1352,6 +1528,7 @@ pub(super) async fn handle_read(
     id: Option<Value>,
     auth: Option<&AuthContext>,
     model_surface: ModelSurface,
+    apps_enabled: bool,
 ) -> McpOutcome {
     let Some(uri) = params.get("uri").and_then(Value::as_str) else {
         return McpOutcome::BadRequest(rpc_error(id, -32602, "Invalid params: uri is required"));
@@ -1416,16 +1593,28 @@ pub(super) async fn handle_read(
         return McpOutcome::Ok(rpc_result(id, mcp_stateless_result(result, true)));
     }
 
+    // Artifact/snapshot resources above remain available independently. The
+    // global switch controls only optional static MCP App presentation.
+    if !apps_enabled {
+        return McpOutcome::BadRequest(rpc_error(
+            id,
+            -32602,
+            "MCP App resources are disabled by Server configuration",
+        ));
+    }
+
     // Tool descriptors advertise the App resource independently of whether a
     // later resource fetch repeats UI client-capability metadata.
-    if !model_surface_supports_computer_app(model_surface) {
+    if !model_surface_supports_mcp_apps(model_surface) {
         return McpOutcome::BadRequest(rpc_error(
             id,
             -32602,
             "MCP App resource is unavailable on this model surface",
         ));
     }
-    let Some(result) = mcp_computer_app_resource_read(uri) else {
+    let Some(result) =
+        mcp_static_app_resource_read(uri, runtime.runtime_info.configured_public_url.as_deref())
+    else {
         return McpOutcome::BadRequest(rpc_error(id, -32602, format!("Resource not found: {uri}")));
     };
     let mut result = mcp_stateless_result(result, true);
@@ -1549,7 +1738,10 @@ pub(super) fn start_artifact_export_stream(
                     .await;
             }
             Err(_) => {
-                runtime.shell_clients.cancel_abandoned_sync_requests().await;
+                runtime
+                    .runner_registry
+                    .cancel_abandoned_sync_requests()
+                    .await;
                 let _ = error_sender
                     .send(Err(std::io::Error::other(
                         "artifact export stream exceeded bounded transfer timeout",

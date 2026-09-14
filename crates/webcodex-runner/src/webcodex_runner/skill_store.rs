@@ -1,8 +1,6 @@
 use super::artifacts::validate_artifact_runner_path;
 use super::config::RunnerPolicy;
-use super::output::CommandResult;
 use super::shell::cwd_allowed;
-use crate::shell_protocol::ShellAgentShellRequest;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,22 +10,23 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
+use webcodex_core::runner_skill::{
+    RunnerSkillDescriptor, RunnerSkillReadResponse, RUNNER_SKILL_RESPONSE_FORMAT,
+};
 use webcodex_core::skill_metadata::{
     parse_skill_metadata, SkillMetadata, MAX_SKILL_DEFINITION_BYTES,
 };
 use webcodex_core::skill_store::{
     valid_lower_sha256, valid_package_revision, valid_skill_key, valid_state_revision,
-    RunnerSkillDescriptor, RunnerSkillVersion, SkillStoreActivateResponse,
-    SkillStoreInstallResponse, SkillStoreListActiveResponse, SkillStoreReadResponse,
-    SkillStoreRemoveResponse, SkillStoreRequest, SkillStoreVersionsResponse,
-    MAX_OPERATOR_REVISIONS_PER_SKILL, MAX_OPERATOR_SKILLS, MAX_SKILL_STORE_ARCHIVE_BYTES,
-    MAX_SKILL_STORE_FILE_BYTES, MAX_SKILL_STORE_FILE_COUNT, MAX_SKILL_STORE_IDEMPOTENCY_KEY_CHARS,
-    MAX_SKILL_STORE_PATH_CHARS, MAX_SKILL_STORE_PATH_DEPTH, MAX_SKILL_STORE_READ_LINES,
-    MAX_SKILL_STORE_READ_TEXT_BYTES, MAX_SKILL_STORE_REPLAY_RECORDS,
-    MAX_SKILL_STORE_REPLAY_RECORD_BYTES, MAX_SKILL_STORE_REPLAY_SCAN_ENTRIES,
-    MAX_SKILL_STORE_TOTAL_BYTES, MAX_SKILL_STORE_VERSIONS_LIMIT,
-    SKILL_STORE_REPLAY_CLAIMED_RETENTION_SECS, SKILL_STORE_REPLAY_EFFECT_RETENTION_SECS,
-    SKILL_STORE_RESPONSE_FORMAT,
+    RunnerSkillVersion, SkillStoreActivateResponse, SkillStoreInstallResponse,
+    SkillStoreRemoveResponse, SkillStoreVersionsResponse, MAX_OPERATOR_REVISIONS_PER_SKILL,
+    MAX_OPERATOR_SKILLS, MAX_SKILL_STORE_ARCHIVE_BYTES, MAX_SKILL_STORE_FILE_BYTES,
+    MAX_SKILL_STORE_FILE_COUNT, MAX_SKILL_STORE_IDEMPOTENCY_KEY_CHARS, MAX_SKILL_STORE_PATH_CHARS,
+    MAX_SKILL_STORE_PATH_DEPTH, MAX_SKILL_STORE_READ_LINES, MAX_SKILL_STORE_READ_TEXT_BYTES,
+    MAX_SKILL_STORE_REPLAY_RECORDS, MAX_SKILL_STORE_REPLAY_RECORD_BYTES,
+    MAX_SKILL_STORE_REPLAY_SCAN_ENTRIES, MAX_SKILL_STORE_TOTAL_BYTES,
+    MAX_SKILL_STORE_VERSIONS_LIMIT, SKILL_STORE_REPLAY_CLAIMED_RETENTION_SECS,
+    SKILL_STORE_REPLAY_EFFECT_RETENTION_SECS, SKILL_STORE_RESPONSE_FORMAT,
 };
 use webcodex_workspace::file_read_range;
 use zip::ZipArchive;
@@ -46,6 +45,12 @@ const REPLAY_DIR: &str = "replay";
 const PACKAGE_DIR: &str = "package";
 const VERSION_METADATA_FILE: &str = "metadata.json";
 const DEFAULT_RESOURCE_MAX_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone)]
+pub(super) struct ManagedSkillCatalogSnapshot {
+    pub(super) namespace_revision: String,
+    pub(super) skills: Vec<RunnerSkillDescriptor>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoreIdentity {
@@ -137,7 +142,7 @@ impl Drop for StoreLock {
     }
 }
 
-struct SkillStore {
+pub(super) struct SkillStore {
     root: PathBuf,
     namespace: String,
     #[cfg(test)]
@@ -147,7 +152,7 @@ struct SkillStore {
 }
 
 impl SkillStore {
-    fn for_runner(client_id: &str, server_url: &str) -> Result<Self, String> {
+    pub(super) fn for_runner(client_id: &str, server_url: &str) -> Result<Self, String> {
         let server_url = server_url.trim().trim_end_matches('/');
         if client_id.trim().is_empty() || server_url.is_empty() {
             return Err("skill_store_unavailable".to_string());
@@ -177,7 +182,7 @@ impl SkillStore {
     }
 
     #[cfg(test)]
-    fn for_test(root: PathBuf, namespace: &str) -> Self {
+    pub(super) fn for_test(root: PathBuf, namespace: &str) -> Self {
         Self {
             root,
             namespace: namespace.to_string(),
@@ -335,6 +340,50 @@ impl SkillStore {
         Ok(keys)
     }
 
+    fn resolve_skill_key(&self, skill_id: &str) -> Result<Option<String>, String> {
+        let resolution_started = Instant::now();
+        let skill_keys = match self.list_skill_keys() {
+            Ok(skill_keys) => skill_keys,
+            Err(error) => {
+                tracing::info!(
+                    event = "skill_store_exact_read_resolution_scan",
+                    source = "runner_managed",
+                    operation = "skill_id_resolution",
+                    outcome_class = "error",
+                    skill_keys_listed = 0_u64,
+                    skill_keys_examined = 0_u64,
+                    hit = false,
+                    elapsed_ms = resolution_started.elapsed().as_millis() as u64,
+                    "skill_store_exact_read_resolution_scan"
+                );
+                return Err(error);
+            }
+        };
+        let skill_keys_listed = skill_keys.len();
+        let mut skill_keys_examined = 0usize;
+        let mut resolved_skill_key = None;
+        for key in skill_keys {
+            skill_keys_examined = skill_keys_examined.saturating_add(1);
+            if self.skill_id(&key) == skill_id {
+                resolved_skill_key = Some(key);
+                break;
+            }
+        }
+        let hit = resolved_skill_key.is_some();
+        tracing::info!(
+            event = "skill_store_exact_read_resolution_scan",
+            source = "runner_managed",
+            operation = "skill_id_resolution",
+            outcome_class = if hit { "success" } else { "not_found" },
+            skill_keys_listed = skill_keys_listed as u64,
+            skill_keys_examined = skill_keys_examined as u64,
+            hit,
+            elapsed_ms = resolution_started.elapsed().as_millis() as u64,
+            "skill_store_exact_read_resolution_scan"
+        );
+        Ok(resolved_skill_key)
+    }
+
     fn list_version_metadata(
         &self,
         skill_key: &str,
@@ -457,12 +506,16 @@ impl SkillStore {
         hasher.update(self.namespace.as_bytes());
         for descriptor in descriptors {
             for value in [
-                descriptor.skill_id.as_str(),
-                descriptor.skill_key.as_str(),
-                descriptor.name.as_str(),
-                descriptor.description.as_str(),
-                descriptor.package_revision.as_str(),
-                descriptor.definition_revision.as_str(),
+                descriptor.skill_id(),
+                descriptor
+                    .skill_key()
+                    .expect("managed descriptor has skill key"),
+                descriptor.name(),
+                descriptor.description(),
+                descriptor
+                    .package_revision()
+                    .expect("managed descriptor has package revision"),
+                descriptor.definition_revision(),
             ] {
                 hasher.update((value.len() as u64).to_be_bytes());
                 hasher.update(value.as_bytes());
@@ -471,7 +524,7 @@ impl SkillStore {
         format!("wc_skillstore_{:x}", hasher.finalize())
     }
 
-    fn list_active(&self) -> Result<SkillStoreListActiveResponse, String> {
+    pub(super) fn list_active(&self) -> Result<ManagedSkillCatalogSnapshot, String> {
         let _lock = self.lock()?;
         let mut skills = Vec::new();
         for skill_key in self.list_skill_keys()? {
@@ -481,7 +534,7 @@ impl SkillStore {
             };
             let metadata = self.read_revision_metadata(&skill_key, active)?;
             self.verify_definition_immutable(&skill_key, &metadata)?;
-            skills.push(RunnerSkillDescriptor {
+            skills.push(RunnerSkillDescriptor::Managed {
                 skill_id: self.skill_id(&skill_key),
                 skill_key,
                 name: metadata.name,
@@ -490,16 +543,42 @@ impl SkillStore {
                 definition_revision: metadata.definition_revision,
             });
         }
-        skills.sort_by(|left, right| left.skill_key.cmp(&right.skill_key));
+        skills.sort_by(|left, right| left.skill_key().cmp(&right.skill_key()));
         let namespace_revision = self.namespace_revision(&skills);
-        Ok(SkillStoreListActiveResponse {
-            format: SKILL_STORE_RESPONSE_FORMAT.to_string(),
+        Ok(ManagedSkillCatalogSnapshot {
             namespace_revision,
             skills,
         })
     }
 
-    fn versions(
+    pub(super) fn resolve_active(
+        &self,
+        skill_id: &str,
+    ) -> Result<Option<RunnerSkillDescriptor>, String> {
+        if !valid_runtime_skill_id(skill_id) {
+            return Err("skill_store_invalid_request".to_string());
+        }
+        let _lock = self.lock()?;
+        let Some(skill_key) = self.resolve_skill_key(skill_id)? else {
+            return Ok(None);
+        };
+        let state = self.read_state(&skill_key)?;
+        let Some(active) = state.active_package_revision.as_deref() else {
+            return Ok(None);
+        };
+        let metadata = self.read_revision_metadata(&skill_key, active)?;
+        self.verify_definition_immutable(&skill_key, &metadata)?;
+        Ok(Some(RunnerSkillDescriptor::Managed {
+            skill_id: skill_id.to_string(),
+            skill_key,
+            name: metadata.name,
+            description: metadata.description,
+            package_revision: metadata.package_revision,
+            definition_revision: metadata.definition_revision,
+        }))
+    }
+
+    pub(super) fn versions(
         &self,
         skill_key: &str,
         offset: usize,
@@ -532,7 +611,7 @@ impl SkillStore {
         })
     }
 
-    fn read_resource(
+    pub(super) fn read_resource(
         &self,
         skill_id: &str,
         path: &str,
@@ -540,7 +619,7 @@ impl SkillStore {
         limit: usize,
         expected_package_revision: Option<&str>,
         expected_definition_revision: Option<&str>,
-    ) -> Result<SkillStoreReadResponse, String> {
+    ) -> Result<RunnerSkillReadResponse, String> {
         if !valid_runtime_skill_id(skill_id)
             || !(1..=MAX_SKILL_STORE_READ_LINES).contains(&limit)
             || start_line == 0
@@ -550,9 +629,7 @@ impl SkillStore {
         let path = validate_resource_path(path)?;
         let _lock = self.lock()?;
         let skill_key = self
-            .list_skill_keys()?
-            .into_iter()
-            .find(|key| self.skill_id(key) == skill_id)
+            .resolve_skill_key(skill_id)?
             .ok_or_else(|| "skill_not_found".to_string())?;
         let before = self.read_state(&skill_key)?;
         let active = before
@@ -623,14 +700,16 @@ impl SkillStore {
         if after.active_package_revision.as_deref() != Some(active.as_str()) {
             return Err("skill_package_changed".to_string());
         }
-        Ok(SkillStoreReadResponse {
-            format: SKILL_STORE_RESPONSE_FORMAT.to_string(),
-            skill_id: skill_id.to_string(),
-            skill_key,
-            name: metadata.name,
-            description: metadata.description,
-            package_revision: active,
-            definition_revision: metadata.definition_revision,
+        Ok(RunnerSkillReadResponse {
+            format: RUNNER_SKILL_RESPONSE_FORMAT.to_string(),
+            skill: RunnerSkillDescriptor::Managed {
+                skill_id: skill_id.to_string(),
+                skill_key,
+                name: metadata.name,
+                description: metadata.description,
+                package_revision: active,
+                definition_revision: metadata.definition_revision,
+            },
             path,
             sha256: read.sha256,
             text: read.content,
@@ -642,7 +721,7 @@ impl SkillStore {
         })
     }
 
-    fn install(
+    pub(super) fn install(
         &self,
         policy: &RunnerPolicy,
         skill_key: &str,
@@ -839,7 +918,7 @@ impl SkillStore {
         Ok(response)
     }
 
-    fn activate(
+    pub(super) fn activate(
         &self,
         skill_key: &str,
         package_revision: &str,
@@ -914,7 +993,7 @@ impl SkillStore {
         Ok(response)
     }
 
-    fn remove_revision(
+    pub(super) fn remove_revision(
         &self,
         skill_key: &str,
         package_revision: &str,
@@ -1527,128 +1606,6 @@ fn advance_replay_timestamp(record: &mut ReplayRecord, now_unix_ms: i64) {
     } else {
         now_unix_ms.max(created)
     });
-}
-
-pub(crate) fn handle_skill_store_request(
-    client_id: &str,
-    server_url: &str,
-    policy: &RunnerPolicy,
-    request: &ShellAgentShellRequest,
-) -> CommandResult {
-    let start = Instant::now();
-    let parsed = match request
-        .content
-        .as_deref()
-        .and_then(|content| serde_json::from_str::<SkillStoreRequest>(content).ok())
-    {
-        Some(request) => request,
-        None => return error_result(start, "skill_store_invalid_request"),
-    };
-    let store = match SkillStore::for_runner(client_id, server_url) {
-        Ok(store) => store,
-        Err(_) => return error_result(start, "skill_store_unavailable"),
-    };
-    let result = match parsed {
-        SkillStoreRequest::ListActive => store
-            .list_active()
-            .and_then(|value| serialize_response(value)),
-        SkillStoreRequest::Versions {
-            skill_key,
-            offset,
-            limit,
-        } => store
-            .versions(&skill_key, offset, limit)
-            .and_then(|value| serialize_response(value)),
-        SkillStoreRequest::Read {
-            skill_id,
-            path,
-            start_line,
-            limit,
-            expected_package_revision,
-            expected_definition_revision,
-        } => store
-            .read_resource(
-                &skill_id,
-                &path,
-                start_line,
-                limit,
-                expected_package_revision.as_deref(),
-                expected_definition_revision.as_deref(),
-            )
-            .and_then(|value| serialize_response(value)),
-        SkillStoreRequest::Install {
-            skill_key,
-            source_project_id,
-            source_project_root,
-            artifact_path,
-            expected_artifact_sha256,
-            idempotency_key,
-            activate,
-            expected_state_revision,
-        } => store
-            .install(
-                policy,
-                &skill_key,
-                &source_project_id,
-                &source_project_root,
-                &artifact_path,
-                &expected_artifact_sha256,
-                &idempotency_key,
-                activate,
-                expected_state_revision.as_deref(),
-            )
-            .and_then(|value| serialize_response(value)),
-        SkillStoreRequest::Activate {
-            skill_key,
-            package_revision,
-            expected_state_revision,
-            idempotency_key,
-        } => store
-            .activate(
-                &skill_key,
-                &package_revision,
-                &expected_state_revision,
-                &idempotency_key,
-            )
-            .and_then(|value| serialize_response(value)),
-        SkillStoreRequest::RemoveRevision {
-            skill_key,
-            package_revision,
-            expected_state_revision,
-            idempotency_key,
-        } => store
-            .remove_revision(
-                &skill_key,
-                &package_revision,
-                &expected_state_revision,
-                &idempotency_key,
-            )
-            .and_then(|value| serialize_response(value)),
-    };
-    match result {
-        Ok(stdout) => CommandResult {
-            exit_code: Some(0),
-            stdout: Some(stdout),
-            stderr: Some(String::new()),
-            duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: None,
-        },
-        Err(code) => error_result(start, &code),
-    }
-}
-
-fn serialize_response<T: Serialize>(value: T) -> Result<String, String> {
-    serde_json::to_string(&value).map_err(|_| "skill_store_response_invalid".to_string())
-}
-
-fn error_result(start: Instant, code: &str) -> CommandResult {
-    CommandResult {
-        exit_code: None,
-        stdout: None,
-        stderr: None,
-        duration_ms: Some(start.elapsed().as_millis() as u64),
-        error: Some(code.to_string()),
-    }
 }
 
 fn prepare_archive(
@@ -3233,8 +3190,8 @@ mod tests {
             "skill_store_state_write_failed"
         );
         assert_eq!(
-            store.list_active().unwrap().skills[0].package_revision,
-            first.package_revision
+            store.list_active().unwrap().skills[0].package_revision(),
+            Some(first.package_revision.as_str())
         );
         let activated_b = store
             .activate(
@@ -3246,9 +3203,12 @@ mod tests {
             .unwrap();
         assert!(activated_b.changed && activated_b.replayed);
         let active_b = store.list_active().unwrap();
-        assert_eq!(active_b.skills[0].package_revision, second.package_revision);
+        assert_eq!(
+            active_b.skills[0].package_revision(),
+            Some(second.package_revision.as_str())
+        );
         assert_ne!(active_b.namespace_revision, namespace_a);
-        assert_eq!(active_b.skills[0].skill_id, stable_skill_id);
+        assert_eq!(active_b.skills[0].skill_id(), stable_skill_id);
         assert_eq!(
             store
                 .read_resource(

@@ -6,6 +6,8 @@ pub(crate) mod login;
 pub(crate) mod ops;
 pub(crate) mod output;
 pub(crate) mod pairing;
+pub(crate) mod plugin;
+pub(crate) mod plugin_init;
 pub(crate) mod profiles;
 pub(crate) mod project;
 pub(crate) mod runner_service;
@@ -63,13 +65,17 @@ pub(crate) use env::{
 pub(crate) use http::format_error_body;
 #[cfg(test)]
 pub(crate) use http::post_json_unauthed;
-pub(crate) use http::{fetch_runtime_status, http_post_json_status, post_json_authed, ApiCall};
+pub(crate) use http::{
+    call_runtime_tool_status, fetch_runtime_status, http_post_json_status, post_json_authed,
+    ApiCall,
+};
 pub(crate) use login::{
     base_dir_or_default, default_device_name, run_login, run_logout, run_status, LoginOptions,
     LogoutOptions, StatusOptions,
 };
 pub(crate) use ops::{
     run_ops_command, OpsCommand, OpsCommonOptions, OpsRunnerOptions, OpsSmokePreflightOptions,
+    OpsWindowsOptions,
 };
 #[cfg(test)]
 pub(crate) use output::RevisionComparison;
@@ -78,17 +84,20 @@ pub(crate) use output::{
     runtime_build_metadata, server_status_revision_check,
 };
 pub(crate) use pairing::run_pairing_create;
-pub(crate) use profiles::{
-    agent_config_for_scope, client_profile_agent_config, client_profile_agent_token_file,
-    client_profile_agent_token_file_for_scope, client_profile_projects_dir,
-    client_profile_state_dir, client_profile_user_token_file,
-    client_profile_user_token_file_for_scope, current_user_home, runner_service_file_for_scope,
-    validate_client_profile, validate_service_file_scope,
-};
+pub(crate) use plugin::{parse_plugin_command, run_plugin_command, PluginCommand};
+pub(crate) use plugin_init::{parse_plugin_init, run_plugin_init, PluginInitOptions};
 #[cfg(test)]
 pub(crate) use profiles::{client_output_dir_for_profile, CLIENT_PROFILE_ERROR};
+pub(crate) use profiles::{
+    client_profile_project_registry_dir, client_profile_runner_config,
+    client_profile_runner_token_file, client_profile_runner_token_file_for_scope,
+    client_profile_state_dir, client_profile_user_token_file,
+    client_profile_user_token_file_for_scope, current_user_home, runner_config_for_scope,
+    runner_service_file_for_scope, validate_client_profile, validate_service_file_scope,
+};
 pub(crate) use project::{
-    register_existing_project, run_project_register, ProjectRegisterOptions, ProjectRegistration,
+    register_existing_project, run_project_activate, run_project_register, ProjectActivateOptions,
+    ProjectRegisterOptions, ProjectRegistration,
 };
 #[cfg(all(test, unix))]
 pub(crate) use runner_service::render_runner_systemd_unit;
@@ -97,7 +106,7 @@ pub(crate) use runner_service::{
 };
 pub(crate) use server::{
     run_server_init, run_server_install_service, run_server_service, run_server_status,
-    ServerStatusOptions,
+    run_server_tunnel, ServerStatusOptions,
 };
 pub(crate) use service::{
     control_server_unit_pair, control_service_for_scope, encode_exec_argument,
@@ -111,22 +120,25 @@ pub(crate) use service::{
 };
 pub(crate) use system::{
     discover_internal_binary, read_optional_token, read_optional_user_api_token,
-    system_group_exists, system_user_exists, system_user_home, system_user_is_root,
-    validate_user_api_token,
+    resolve_user_api_token, system_group_exists, system_user_exists, system_user_home,
+    system_user_is_root, validate_user_api_token,
 };
 #[cfg(test)]
 pub(crate) use token_commands::resolve_account_credential;
-pub(crate) use token_commands::{run_agent_token_create_local, run_token_create_local};
+pub(crate) use token_commands::{run_runner_token_create_local, run_token_create_local};
 pub(crate) use tokens::{
-    generate_bootstrap_token, generate_local_agent_token, generate_local_api_token,
+    generate_bootstrap_token, generate_local_api_token, generate_local_runner_token,
     hash_local_token, local_token_prefix, render_token_generate, token_prefix,
 };
 pub(crate) use usage::{
-    connect_usage, disconnect_usage, login_usage, logout_usage, ops_agents_usage,
-    ops_projects_usage, ops_runner_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
-    pairing_create_usage, pairing_usage, project_register_usage, runner_init_usage,
+    connect_usage, disconnect_usage, login_usage, logout_usage, ops_projects_usage,
+    ops_runner_usage, ops_runners_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage,
+    ops_windows_usage, pairing_create_usage, pairing_usage, plugin_check_usage,
+    plugin_describe_usage, plugin_init_usage, plugin_list_usage, plugin_reload_usage, plugin_usage,
+    project_activate_usage, project_register_usage, runner_init_usage,
     runner_install_service_usage, runner_status_usage, runner_usage, server_init_usage,
-    server_install_service_usage, server_status_usage, server_usage, status_usage, usage,
+    server_install_service_usage, server_status_usage, server_tunnel_usage, server_usage,
+    status_usage, usage,
 };
 
 #[cfg(test)]
@@ -136,7 +148,7 @@ mod shell_command_tests {
     #[test]
     fn shell_quote_arg_handles_shell_metacharacters() {
         assert_eq!(shell_quote_arg("webcodex-runner"), "webcodex-runner");
-        assert_eq!(shell_quote_arg("/tmp/agent.toml"), "/tmp/agent.toml");
+        assert_eq!(shell_quote_arg("/tmp/runner.toml"), "/tmp/runner.toml");
         assert_eq!(shell_quote_arg(""), "''");
         assert_eq!(shell_quote_arg("path with spaces"), "'path with spaces'");
         assert_eq!(shell_quote_arg("it's"), "'it'\\''s'");

@@ -1,9 +1,11 @@
 use super::RouteAuth::AuthMiddleware;
 use super::{
-    route, AuditClass::*, OpenApiVisibility::*, RouteId::*, RouteMethod::*, RouteSpec,
+    route, AuditClass::*, RouteId::*, RouteMethod::*, RouteOpenApiProjection::*, RouteSpec,
     RouteSurface::*,
 };
-use crate::auth::scopes::{OAuthBodyAwarePolicy, OAuthRouteScopePolicy::*, SCOPE_RUNTIME_READ};
+use webcodex_core::authority::{
+    OAuthBodyAwarePolicy, OAuthRouteScopePolicy::*, SCOPE_RUNTIME_READ,
+};
 
 pub(super) const ROUTES: &[RouteSpec] = &[
     route(

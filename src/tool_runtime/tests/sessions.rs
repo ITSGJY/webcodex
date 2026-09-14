@@ -4,7 +4,7 @@ use super::super::sessions::{SessionMessageKind, SessionMessagePriority};
 use super::super::*;
 use super::super::{ToolCall, ToolResult, ToolRuntime};
 use super::support::*;
-use crate::shell_protocol::ShellClientCapabilities;
+use crate::runner_protocol::RunnerCapabilities;
 use serde_json::Value;
 
 async fn post_session_message(
@@ -41,20 +41,23 @@ async fn read_agent_file_for_session(
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
-                        session_id,
-                        start_line: None,
-                        limit: None,
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
+                        session_id: session_id,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(runtime, client_id, "inst").await;
+    let req = wait_for_runner_request_for_instance(runtime, client_id, "inst").await;
     complete_patch_agent_request(
         runtime,
         client_id,
@@ -68,13 +71,13 @@ async fn read_agent_file_for_session(
 }
 
 #[tokio::test]
-async fn read_file_with_session_id_records_event_without_content() {
+async fn read_files_with_session_id_records_event_without_content() {
     let runtime = runtime_with_agent_project("telemetry-read");
     register_agent(
         &runtime,
         "telemetry-read",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -92,20 +95,23 @@ async fn read_file_with_session_id_records_event_without_content() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: Some(true),
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(&runtime, "telemetry-read", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "telemetry-read", "inst").await;
     assert_eq!(req.kind, "file_read");
     complete_patch_agent_request(
         &runtime,
@@ -119,9 +125,9 @@ async fn read_file_with_session_id_records_event_without_content() {
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["session_recorded"], true);
-    assert_eq!(result.output["session_id"], session.session_id);
-    assert!(result.output["session_event_id"].as_str().is_some());
+    assert!(result.output.get("session_recorded").is_none());
+    assert!(result.output.get("session_event_id").is_none());
+    assert!(result.output.get("session_id").is_none());
     assert!(result.output.get("session_hint").is_none());
     let summary = runtime
         .sessions
@@ -130,25 +136,25 @@ async fn read_file_with_session_id_records_event_without_content() {
     assert_eq!(summary.counts.tool_calls, 1);
     assert_eq!(summary.counts.succeeded, 1);
     assert_eq!(summary.counts.read_like, 1);
-    let event = finished_event(&summary, "read_file");
+    let event = finished_event(&summary, "read_files");
     assert_eq!(event.status.as_deref(), Some("succeeded"));
     assert!(event.read_like);
     assert!(!event.write_like);
     let serialized = serde_json::to_string(&summary.events).unwrap();
     assert!(
         !serialized.contains("secret line"),
-        "session event leaked read_file content: {serialized}"
+        "session event leaked read_files content: {serialized}"
     );
 }
 
 #[tokio::test]
-async fn read_file_without_session_id_omits_session_telemetry() {
+async fn read_files_without_session_id_omits_session_telemetry() {
     let runtime = runtime_with_agent_project("telemetry-nosession");
     register_agent(
         &runtime,
         "telemetry-nosession",
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -161,20 +167,23 @@ async fn read_file_without_session_id_omits_session_telemetry() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
-                        project,
-                        path: "README.md".to_string(),
+                    ToolCall::ReadFiles {
+                        project: project,
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                        }],
                         session_id: None,
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
                 .await
         }
     });
-    let req = wait_for_agent_request_for_instance(&runtime, "telemetry-nosession", "inst").await;
+    let req = wait_for_runner_request_for_instance(&runtime, "telemetry-nosession", "inst").await;
     complete_patch_agent_request(
         &runtime,
         "telemetry-nosession",
@@ -187,8 +196,8 @@ async fn read_file_without_session_id_omits_session_telemetry() {
     let result = task.await.unwrap();
 
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "hello");
-    assert!(result.output.get("format").is_none());
+    assert_eq!(result.output["items"][0]["output"]["text"], "hello");
+    assert!(result.output["items"][0]["output"].get("format").is_none());
     assert!(result.output.get("session_recorded").is_none());
     assert!(result.output.get("session_hint").is_none());
 }
@@ -201,7 +210,7 @@ async fn session_inbox_hint_reports_open_guidance_without_text() {
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -256,7 +265,7 @@ async fn high_ack_guidance_hint_is_actionable_and_inner_recorder_projects_attent
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -346,20 +355,10 @@ fn outer_session_telemetry_hint_clears_stale_inner_recorder_hint() {
         .unwrap();
 
     let mut result = ToolResult::ok(serde_json::json!({}));
-    super::super::add_session_telemetry_hint(
-        &mut result,
-        &runtime.sessions,
-        &inner.session_id,
-        Some("evt_inner".to_string()),
-    );
+    super::super::add_session_hint(&mut result, &runtime.sessions, &inner.session_id);
     assert_eq!(result.output["session_hint"]["attention_required"], true);
 
-    super::super::add_session_telemetry_hint(
-        &mut result,
-        &runtime.sessions,
-        &outer.session_id,
-        Some("evt_outer".to_string()),
-    );
+    super::super::add_session_hint(&mut result, &runtime.sessions, &outer.session_id);
     assert!(result.output.get("session_hint").is_none());
 }
 
@@ -371,7 +370,7 @@ async fn session_inbox_hint_counts_question_todo_and_risk() {
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -444,7 +443,7 @@ async fn session_inbox_hint_disappears_after_message_resolved() {
         &runtime,
         client_id,
         None,
-        ShellClientCapabilities {
+        RunnerCapabilities {
             file_read: true,
             ..Default::default()
         },
@@ -764,7 +763,7 @@ async fn finish_coding_task_does_not_auto_close_session() {
     commit_file(tmp.path(), "README.md", "hello\n", "add readme");
     let runtime = test_runtime();
     let project =
-        register_agent_project_at_path(&runtime, "coding-finish-no-close", "demo", tmp.path())
+        register_runner_project_at_path(&runtime, "coding-finish-no-close", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
     let session = runtime
@@ -802,12 +801,14 @@ async fn finish_coding_task_does_not_auto_close_session() {
         }
     });
     let req = wait_for_patch_agent_request(&runtime, "coding-finish-no-close").await;
+    let show_changes_stdout =
+        crate::tool_runtime::framed_clean_show_changes_test_stdout("add readme", false);
     complete_patch_agent_request(
         &runtime,
         "coding-finish-no-close",
         &req.request_id,
         0,
-        "## main\n@@WEBCODEX_SHOW_CHANGES_SEP@@\nabc123\0abc123\0add readme\n@@WEBCODEX_SHOW_CHANGES_SEP@@\n",
+        &show_changes_stdout,
         "",
     )
     .await;

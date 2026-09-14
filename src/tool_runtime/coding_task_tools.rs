@@ -1,6 +1,6 @@
 //! Runtime dispatch adapters for coding-task workflow tool calls.
 
-use super::{sessions, ToolCall, ToolResult, ToolRuntime};
+use super::{sessions, window_activity::ToolCallCorrelation, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 
 impl ToolRuntime {
@@ -11,61 +11,37 @@ impl ToolRuntime {
         transport: sessions::SessionTransport,
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
+        correlation: &mut ToolCallCorrelation,
     ) -> ToolResult {
         match call {
-            ToolCall::StartCodingTask {
-                project,
-                client_id,
-                path,
-                temporary_project_name,
-                title,
-                mode,
-                deny_write_tools,
-                deny_shell_tools,
-                detail,
-                resume_session_id,
-                execution_context,
-            } => {
-                self.start_coding_task(
-                    project,
-                    client_id,
-                    path,
-                    temporary_project_name,
-                    title,
-                    mode,
-                    deny_write_tools,
-                    deny_shell_tools,
-                    detail,
-                    resume_session_id,
-                    execution_context,
-                    auth,
-                    trusted_recording_session_id,
-                    trusted_recording_session_project,
-                    transport,
-                )
-                .await
-            }
             ToolCall::WorkOnProject {
                 project,
                 client_id,
                 path,
+                mode,
+                base_ref,
                 instruction,
                 include_project_instructions,
                 include_workflow_guidance,
+                include_extension_catalog,
                 session_id,
             } => {
                 self.work_on_project(
                     project,
                     client_id,
                     path,
+                    mode,
+                    base_ref,
                     instruction,
                     session_id,
                     include_project_instructions,
                     include_workflow_guidance,
+                    include_extension_catalog,
                     auth,
                     trusted_recording_session_id,
                     trusted_recording_session_project,
                     transport,
+                    correlation,
                 )
                 .await
             }

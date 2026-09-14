@@ -8,7 +8,7 @@ which governs development of WebCodex itself.
 
 Treat the default user goal as: **"let ChatGPT use my development environment normally."** Unless the user explicitly asks only for a temporary trial, prefer the full regular Server + Runner coding experience instead of treating `share` as WebCodex itself.
 
-Before the first successful setup, keep the user-facing vocabulary to: **WebCodex service, Runner (the machine that runs code), Project, one-time login code, and ChatGPT connection**. Do not front-load `client_id`, runtime project ids, `projects_dir`, PATs, Runner tokens, scope ceilings, or Connector surfaces.
+Before the first successful setup, keep the user-facing vocabulary to: **WebCodex service, Runner (the machine that runs code), Project, one-time login code, and ChatGPT connection**. Do not front-load `client_id`, runtime project ids, `project_registry_dir`, PATs, Runner tokens, scope ceilings, or Connector surfaces.
 
 ## First choose the experience
 
@@ -85,10 +85,10 @@ webcodex login https://webcodex.example --code <wc_pair_...> \
   --allowed-root "$HOME/git" \
   --project "$HOME/git/my-repo"
 webcodex runner install --scope user \
-  --config <login-reported-agent-config>
+  --config <login-reported-runner-config>
 ```
 
-For ordinary users, explain only that `--project` is the actual project and `--allowed-root` is a parent directory from which more projects may be added later. Do not require manual edits to `agent.toml` or `projects.d`; reserve registry/authority internals for troubleshooting and reference material. If login intentionally omitted `--project`, add it later with `webcodex project register --config <login-reported-agent-config> /path/to/repo`.
+For ordinary users, explain only that `--project` is the actual project and `--allowed-root` is a parent directory from which more projects may be added later. Do not require manual edits to `runner.toml` or `project-registry`; reserve registry/authority internals for troubleshooting and reference material. If login intentionally omitted `--project`, add it later with `webcodex project register --config <login-reported-runner-config> /path/to/repo`.
 
 Use `share --auth oauth` or `connect --auth oauth` only when the client requires
 OAuth and the exact callback URL is known. Do not collapse OAuth client secrets,
@@ -122,7 +122,7 @@ Do **not** read back, print, log, commit, or echo into chat:
 - shared keys, PATs, Runner tokens, account credentials, bootstrap tokens;
 - Project Credentials;
 - OAuth client secrets;
-- full `agent.toml` contents or Server env files;
+- full `runner.toml` contents or Server env files;
 - `Authorization` headers.
 
 When a credential must be entered into ChatGPT/Claude, identify the source precisely and ask the **human** to copy it. Prefer connection details explicitly produced by the current flow, such as `login --print-mcp-config` for full setup or the successful disclosure from a temporary `share` / existing-Server `connect`. If a stored value must be recovered, point the user to the exact protected file/field without echoing it yourself. Status/log commands intentionally do not reveal secrets.

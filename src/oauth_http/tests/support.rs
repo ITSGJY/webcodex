@@ -6,8 +6,6 @@ pub(super) fn test_config(oauth2: OAuth2Config) -> Arc<crate::Config> {
         data_dir: PathBuf::from("./data"),
         token: Some("bootstrap-token".to_string()),
         max_text_size: 2 * 1024 * 1024,
-        max_file_size: 100 * 1024 * 1024,
-        codex: crate::CodexConfig::default(),
         oauth2,
     })
 }
@@ -727,7 +725,7 @@ pub(super) fn build_router(config: Arc<crate::Config>, db: Arc<crate::Database>)
         config,
         db,
         session_store,
-        Arc::new(crate::ShellClientRegistry::default()),
+        Arc::new(crate::RunnerRegistry::default()),
     )
 }
 
@@ -735,7 +733,7 @@ pub(super) fn build_router_with_session_and_registry(
     config: Arc<crate::Config>,
     db: Arc<crate::Database>,
     session_store: Arc<AuthorizeSessionStore>,
-    registry: Arc<crate::ShellClientRegistry>,
+    registry: Arc<crate::RunnerRegistry>,
 ) -> Router {
     Router::new()
         .hoop(salvo::prelude::affix_state::inject(config))

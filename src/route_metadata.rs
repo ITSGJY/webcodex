@@ -5,15 +5,17 @@
 //! auth, OpenAPI, console, audit, and test-only route tables.
 
 mod account;
-mod agent_transport;
 mod connector;
 mod consoles;
 mod mcp;
 mod oauth;
+mod openapi;
 mod operations;
+mod runner_transport;
 mod runtime;
 
-use crate::auth::scopes::OAuthRouteScopePolicy;
+pub(crate) use openapi::{OpenApiExampleSet, OpenApiOperationSpec};
+use webcodex_core::authority::OAuthRouteScopePolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RouteMethod {
@@ -26,6 +28,13 @@ impl RouteMethod {
         match self {
             Self::Get => method.trim().eq_ignore_ascii_case("GET"),
             Self::Post => method.trim().eq_ignore_ascii_case("POST"),
+        }
+    }
+
+    pub(crate) const fn openapi_key(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Post => "post",
         }
     }
 }
@@ -55,19 +64,20 @@ pub(crate) enum RouteSurface {
     AccountManagement,
     AccountControl,
     Pairing,
-    AgentTransport,
+    RunnerTransport,
     /// Public browser/document delivery only. This surface carries no bearer
     /// authentication or token-admission semantics.
     PublicWeb,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum OpenApiVisibility {
-    /// The normal server `/openapi.json` GPT Actions surface.
-    PublicActions,
-    /// The project-hosted Connector OpenAPI surface.
-    ConnectorActions,
+pub(crate) enum RouteOpenApiProjection {
     Hidden,
+    /// Dedicated operation on the normal server `/openapi.json` GPT Actions surface.
+    PublicAction(OpenApiOperationSpec),
+    /// Project Connector capability identity; semantic ToolSpec data stays in the
+    /// canonical Connector capability registry.
+    ConnectorCapability(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,6 +138,8 @@ pub(crate) enum RouteId {
     HostConsoleConnect,
     RuntimeConsoleOverview,
     RuntimeConsoleRunner,
+    RuntimeConsoleWindows,
+    RuntimeConsoleWindow,
     RuntimeConsoleProjects,
     RuntimeConsoleWorkflowSessions,
     RuntimeConsoleWorkflowSession,
@@ -157,21 +169,18 @@ pub(crate) enum RouteId {
     ToolsList,
     ToolsCall,
     ArtifactsImport,
-    JobsStatus,
-    JobsLog,
     JobsStop,
     JobsList,
     JobsTail,
+    RunnerConfigCheck,
+    RunnerConfigReload,
     ProjectsList,
     ProjectsRegister,
     ProjectsCreate,
     ProjectsUnregister,
-    ProjectsReadFile,
+    ProjectsResolveOrRegister,
     ProjectsGitStatus,
-    ProjectsGitDiff,
-    ProjectsGitDiffSummary,
     ProjectsListFiles,
-    ProjectsSearchText,
     ProjectsApplyUnifiedDiff,
     ProjectsRunShell,
     ProjectsGitRestorePaths,
@@ -202,12 +211,13 @@ pub(crate) enum RouteId {
     ShellJobsLog,
     ShellJobsStop,
     ShellJobsList,
-    ShellAgentRegister,
-    ShellAgentPoll,
-    ShellAgentResult,
-    ShellAgentPersistentShellResult,
-    ShellAgentJobUpdate,
-    AgentsWs,
+    RunnerRegister,
+    RunnerOffline,
+    RunnerPoll,
+    RunnerResult,
+    RunnerPersistentShellResult,
+    RunnerJobUpdate,
+    RunnerWs,
     AuditSessions,
     AuditSession,
     AuditStats,
@@ -230,7 +240,7 @@ pub(crate) struct RouteSpec {
     pub(crate) path: &'static str,
     pub(crate) scope_policy: OAuthRouteScopePolicy,
     pub(crate) surface: RouteSurface,
-    pub(crate) openapi_visibility: OpenApiVisibility,
+    pub(crate) openapi_projection: RouteOpenApiProjection,
     pub(crate) audit_class: AuditClass,
     pub(crate) auth: RouteAuth,
 }
@@ -241,7 +251,7 @@ const fn route(
     path: &'static str,
     scope_policy: OAuthRouteScopePolicy,
     surface: RouteSurface,
-    openapi_visibility: OpenApiVisibility,
+    openapi_projection: RouteOpenApiProjection,
     audit_class: AuditClass,
     auth: RouteAuth,
 ) -> RouteSpec {
@@ -251,7 +261,7 @@ const fn route(
         path,
         scope_policy,
         surface,
-        openapi_visibility,
+        openapi_projection,
         audit_class,
         auth,
     }
@@ -264,9 +274,9 @@ use AuditClass::*;
 #[cfg(test)]
 use OAuthRouteScopePolicy::*;
 #[cfg(test)]
-use OpenApiVisibility::*;
-#[cfg(test)]
 use RouteId::*;
+#[cfg(test)]
+use RouteOpenApiProjection::*;
 #[cfg(test)]
 use RouteSurface::*;
 
@@ -281,7 +291,7 @@ const ROUTE_GROUPS: &[&[RouteSpec]] = &[
     oauth::MANAGEMENT_ROUTES,
     account::ROUTES,
     runtime::SHELL_ROUTES,
-    agent_transport::ROUTES,
+    runner_transport::ROUTES,
     operations::AUDIT_ROUTES,
     operations::PUBLIC_WEB_ROUTES,
     consoles::PUBLIC_WEB_ROUTES,
@@ -297,6 +307,7 @@ pub(crate) fn spec(id: RouteId) -> &'static RouteSpec {
         .unwrap_or_else(|| panic!("RouteId {id:?} has no canonical RouteSpec"))
 }
 
+#[cfg(test)]
 pub(crate) fn path(id: RouteId) -> &'static str {
     spec(id).path
 }
@@ -448,6 +459,96 @@ mod tests {
     }
 
     #[test]
+    fn desktop_project_activation_operator_routes_stay_hidden_and_narrowly_scoped() {
+        let check = spec(RouteId::RunnerConfigCheck);
+        assert_eq!(
+            check.scope_policy,
+            webcodex_core::authority::OAuthRouteScopePolicy::Require(
+                webcodex_core::authority::SCOPE_RUNTIME_READ,
+            )
+        );
+        assert_eq!(check.openapi_projection, RouteOpenApiProjection::Hidden);
+
+        let reload = spec(RouteId::RunnerConfigReload);
+        assert_eq!(
+            reload.scope_policy,
+            webcodex_core::authority::OAuthRouteScopePolicy::Require(
+                webcodex_core::authority::SCOPE_RUNNER_MANAGE,
+            )
+        );
+        assert_eq!(reload.openapi_projection, RouteOpenApiProjection::Hidden);
+
+        let activate = spec(RouteId::ProjectsResolveOrRegister);
+        assert_eq!(
+            activate.scope_policy,
+            webcodex_core::authority::OAuthRouteScopePolicy::Require(
+                webcodex_core::authority::SCOPE_PROJECT_WRITE,
+            )
+        );
+        assert_eq!(activate.openapi_projection, RouteOpenApiProjection::Hidden);
+    }
+
+    #[test]
+    fn openapi_projection_is_closed_unique_and_connector_bijective() {
+        let mut public_operation_ids = BTreeSet::new();
+        let mut connector_capabilities = BTreeSet::new();
+
+        for route_spec in iter_routes() {
+            match route_spec.openapi_projection {
+                Hidden => {}
+                PublicAction(operation) => {
+                    assert_eq!(route_spec.method, RouteMethod::Post, "{:?}", route_spec.id);
+                    assert_eq!(route_spec.surface, RuntimeApi, "{:?}", route_spec.id);
+                    assert_eq!(
+                        route_spec.auth,
+                        RouteAuth::AuthMiddleware,
+                        "{:?} Public Action OpenAPI declares bearer security and must stay behind AuthMiddleware",
+                        route_spec.id
+                    );
+                    assert!(!operation.operation_id.is_empty(), "{:?}", route_spec.id);
+                    assert!(!operation.request_schema.is_empty(), "{:?}", route_spec.id);
+                    assert!(!operation.response_schema.is_empty(), "{:?}", route_spec.id);
+                    assert!(
+                        public_operation_ids.insert(operation.operation_id),
+                        "duplicate public OpenAPI operationId: {}",
+                        operation.operation_id
+                    );
+                }
+                ConnectorCapability(name) => {
+                    assert_eq!(route_spec.method, RouteMethod::Post, "{:?}", route_spec.id);
+                    assert_eq!(route_spec.surface, Connector, "{:?}", route_spec.id);
+                    assert_eq!(
+                        route_spec.auth,
+                        RouteAuth::AuthMiddleware,
+                        "{:?} Connector OpenAPI declares bearer security and must stay behind AuthMiddleware",
+                        route_spec.id
+                    );
+                    assert!(!name.is_empty(), "{:?}", route_spec.id);
+                    assert!(
+                        connector_capabilities.insert(name),
+                        "duplicate Connector capability route binding: {name}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            public_operation_ids.len() < 30,
+            "GPT Actions operation budget exceeded: {}",
+            public_operation_ids.len()
+        );
+        let canonical_connector_capabilities =
+            webcodex_connector_runtime::surface::CAPABILITY_NAMES
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+        assert_eq!(
+            connector_capabilities, canonical_connector_capabilities,
+            "RouteSpec Connector bindings must be a bijection with the canonical capability registry"
+        );
+    }
+
+    #[test]
     fn canonical_lookup_normalizes_only_benign_request_path_variants() {
         assert_eq!(
             lookup(" post ", "api/runtime/status/?ignored=1")
@@ -463,8 +564,8 @@ mod tests {
         // allowlists and must not inherit the scope lookup's normalization.
         assert!(lookup_path("/api/runtime/status").is_some());
         assert!(lookup_path("/api/runtime/status/").is_none());
-        assert!(path_has_surface("/api/agents/ws", AgentTransport));
-        assert!(!path_has_surface("/api/agents/ws/", AgentTransport));
+        assert!(path_has_surface("/api/agents/ws", RunnerTransport));
+        assert!(!path_has_surface("/api/agents/ws/", RunnerTransport));
     }
 
     #[test]
@@ -520,7 +621,7 @@ mod tests {
                 route.id
             );
             assert_eq!(route.auth, RouteAuth::Public, "{:?}", route.id);
-            assert_eq!(route.openapi_visibility, Hidden, "{:?}", route.id);
+            assert_eq!(route.openapi_projection, Hidden, "{:?}", route.id);
             assert_eq!(route.audit_class, Other, "{:?}", route.id);
         }
         assert_eq!(direct_child_path(ConsoleWebRoot, ConsoleWebAppJs), "app.js");
@@ -549,7 +650,7 @@ mod tests {
             );
         }
         for spec in iter_routes().filter(|spec| spec.surface == RuntimeConsole) {
-            assert_eq!(spec.openapi_visibility, Hidden, "{:?}", spec.id);
+            assert_eq!(spec.openapi_projection, Hidden, "{:?}", spec.id);
         }
     }
 
@@ -613,12 +714,11 @@ mod tests {
     fn audit_class_preserves_existing_http_stats_semantics() {
         for (path, class) in [
             ("/api/projects/apply_unified_diff", Edit),
-            ("/api/projects/read_file", Context),
             ("/api/projects/run_job", Job),
             ("/api/tools/call", Command),
             ("/api/runtime/status", Report),
             ("/api/artifacts/import", Artifact),
-            ("/api/projects/git_diff", Git),
+            ("/api/projects/git_status", Git),
             ("/api/projects/run_shell", Shell),
         ] {
             assert_eq!(audit_class_for_path(path), Some(class), "{path}");
