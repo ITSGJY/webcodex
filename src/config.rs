@@ -325,6 +325,15 @@ pub(crate) fn mcp_compact_schemas_override() -> Option<bool> {
     env_flag("WEBCODEX_MCP_COMPACT_SCHEMAS")
 }
 
+/// Opt-in compatibility projection for MCP hosts that expose only text content.
+///
+/// `structuredContent` remains canonical. When enabled, ordinary Runtime and
+/// Connector tool results also serialize that same structured value into
+/// `content[0].text`. The default stays compact to avoid duplicating model context.
+pub(crate) fn mcp_text_json_compat_enabled() -> bool {
+    env_flag("WEBCODEX_MCP_TEXT_JSON_COMPAT").unwrap_or(false)
+}
+
 /// Global Server switch for optional MCP App presentation resources and metadata.
 ///
 /// Apps are enabled by default. Setting `WEBCODEX_MCP_APPS_ENABLED=false` keeps
