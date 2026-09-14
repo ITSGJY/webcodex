@@ -330,8 +330,12 @@ pub(crate) fn mcp_compact_schemas_override() -> Option<bool> {
 /// `structuredContent` remains canonical. When enabled, ordinary Runtime and
 /// Connector tool results also serialize that same structured value into
 /// `content[0].text`. The default stays compact to avoid duplicating model context.
+fn mcp_text_json_compat_enabled_from_flag(flag: Option<bool>) -> bool {
+    flag.unwrap_or(false)
+}
+
 pub(crate) fn mcp_text_json_compat_enabled() -> bool {
-    env_flag("WEBCODEX_MCP_TEXT_JSON_COMPAT").unwrap_or(false)
+    mcp_text_json_compat_enabled_from_flag(env_flag("WEBCODEX_MCP_TEXT_JSON_COMPAT"))
 }
 
 /// Global Server switch for optional MCP App presentation resources and metadata.
@@ -798,6 +802,13 @@ mod tests {
         // RuntimeExposure-specific default.
         assert_eq!(mcp_compact_schemas_override(), None);
         env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    }
+
+    #[test]
+    fn mcp_text_json_compat_defaults_off_and_requires_explicit_enablement() {
+        assert!(!mcp_text_json_compat_enabled_from_flag(None));
+        assert!(!mcp_text_json_compat_enabled_from_flag(Some(false)));
+        assert!(mcp_text_json_compat_enabled_from_flag(Some(true)));
     }
 
     #[test]
