@@ -1,10 +1,6 @@
 use serde_json::{json, Value};
 
 use super::common::object_schema;
-use crate::tool_spec::ToolSpec;
-use webcodex_core::workflow_session_contract::{
-    is_tool_call_expectation_metadata_field, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-};
 
 pub fn list_tools_input_schema() -> Value {
     json!({
@@ -193,79 +189,4 @@ pub fn read_tool_trace_input_schema() -> Value {
 
 pub fn empty_input_schema() -> Value {
     object_schema(vec![])
-}
-
-pub const ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER: &[&str] = &[
-    "project",
-    "client_id",
-    "client_ids",
-    "query",
-    "path",
-    "title",
-    "instruction",
-    "session_id",
-    "execution_context",
-    "compact",
-    "purpose",
-    "shell",
-    "include_diff",
-    "include_hygiene",
-    "include_handoff",
-    "include_validation_summary",
-    "include_validation",
-    "include_workspace",
-    "include_checkpoints",
-    "category",
-    "intent",
-    "features",
-    "summary_only",
-    "include_projects",
-    "limit",
-    "allow_missing",
-    "upload_id",
-    "offset",
-    "content_base64",
-    "expected_bytes",
-    "expected_sha256",
-    "mime_type",
-    "overwrite",
-];
-
-pub fn accepted_flattened_args_for_spec(spec: &ToolSpec) -> Vec<String> {
-    let Some(properties) = spec.input_schema["properties"].as_object() else {
-        return vec![TOOL_CALL_RECORDING_SESSION_ID_FIELD.to_string()];
-    };
-    let mut names = Vec::new();
-    for field in ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER {
-        if properties.contains_key(*field) {
-            names.push((*field).to_string());
-        }
-    }
-    let mut remaining: Vec<&str> = properties
-        .keys()
-        .map(String::as_str)
-        .filter(|field| !ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER.contains(field))
-        .collect();
-    remaining.sort_unstable();
-    names.extend(remaining.into_iter().map(str::to_string));
-    // These names belong to the generic callRuntimeTool envelope. Concrete
-    // tools may legitimately use the same words inside canonical `params`
-    // (plugin_tool uses provider-local `tool` and `arguments`), but they cannot
-    // be represented unambiguously as top-level flattened fields.
-    names.retain(|field| !matches!(field.as_str(), "tool" | "params" | "arguments"));
-    push_unique_flattened_arg(&mut names, TOOL_CALL_RECORDING_SESSION_ID_FIELD);
-    names
-}
-
-pub fn generic_tool_call_flattened_args_for_spec(spec: &ToolSpec) -> Vec<String> {
-    accepted_flattened_args_for_spec(spec)
-        .into_iter()
-        .filter(|field| !is_tool_call_expectation_metadata_field(field))
-        .collect()
-}
-
-fn push_unique_flattened_arg(names: &mut Vec<String>, field: &str) {
-    if !names.iter().any(|name| name == field) {
-        names.push(field.to_string());
-    }
 }

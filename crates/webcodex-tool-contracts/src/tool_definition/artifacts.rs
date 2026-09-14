@@ -71,7 +71,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 ),
                 "Import 1..10 current ChatGPT/host attachments into a Runner project using openaiFileIdRefs from the host file-reference mechanism. This is the preferred host-native attachment-to-project transfer path: do not base64-transfer files, construct download URLs, or use local /mnt/data paths; Control downloads and saves them as project artifacts. Existing trusted MCP host/OAuth client and host rewrite checks still apply.",
                 import_conversation_files_to_project_input_schema,
-            ),
+            ).with_gpt_action_description("Import current ChatGPT attachments into a Runner project through host-populated openaiFileIdRefs. Do not invent file ids/URLs or base64-transfer attachments. Host provenance is adapter-derived; runtime authority remains canonical."),
             PERMISSION_RISK_ARTIFACT_WRITE,
         ),
         55,
@@ -100,7 +100,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Create one short-lived authenticated MCP ResourceLink for a bounded project artifact so the host/user can fetch the complete binary with resources/read without routing base64 through model output. This is the preferred project-to-host/user transfer path and remains limited to supported Stateless/operator-capable MCP surfaces with caller binding and resource revalidation.",
             export_project_artifact_input_schema,
-        ),
+        )
+        .with_gpt_action_unsupported(),
         56,
     ),
     model_spec(

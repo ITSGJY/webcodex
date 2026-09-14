@@ -275,6 +275,19 @@ pub type ToolInputSchemaFactory = fn() -> serde_json::Value;
 pub struct ToolModelSpecDeclaration {
     pub description: &'static str,
     pub input_schema: ToolInputSchemaFactory,
+    /// Optional GPT Actions presentation copy. Canonical/MCP descriptions stay
+    /// unchanged; this exists only when the Action importer's 300-character
+    /// operation-description ceiling needs a deliberately shorter rendering.
+    pub gpt_action_description: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolGptActionExposure {
+    /// Follow the canonical Adaptive Runtime surface automatically.
+    Inherit,
+    /// This tool depends on MCP-only protocol semantics and must not be exposed
+    /// directly or through the GPT Actions gateway.
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,11 +296,15 @@ pub struct ToolModelSurfaceDeclaration {
     /// surface. `None` is the default and means a model-visible runtime tool
     /// belongs to the adaptive long tail behind `call_runtime_tool`.
     pub adaptive_runtime_direct_rank: Option<u16>,
+    /// GPT Actions inherits Adaptive Runtime unless a concrete protocol
+    /// incompatibility is declared on the canonical ToolDefinition.
+    pub gpt_action_exposure: ToolGptActionExposure,
 }
 
 impl ToolModelSurfaceDeclaration {
     const DEFAULT: Self = Self {
         adaptive_runtime_direct_rank: None,
+        gpt_action_exposure: ToolGptActionExposure::Inherit,
     };
 }
 
@@ -931,6 +948,23 @@ impl ToolDefinition {
         self
     }
 
+    /// Override only GPT Actions presentation text. This never changes the
+    /// canonical ToolSpec schema, semantic contract, authority, or MCP copy.
+    pub const fn with_gpt_action_description(mut self, description: &'static str) -> Self {
+        if let Some(mut model_spec) = self.model_spec {
+            model_spec.gpt_action_description = Some(description);
+            self.model_spec = Some(model_spec);
+        }
+        self
+    }
+
+    /// Mark a canonical model-visible tool as incompatible with GPT Actions
+    /// transport while leaving every other model/runtime surface unchanged.
+    pub const fn with_gpt_action_unsupported(mut self) -> Self {
+        self.model_surface.gpt_action_exposure = ToolGptActionExposure::Unsupported;
+        self
+    }
+
     pub const fn with_activity(
         mut self,
         presentation: ToolActivityPresentation,
@@ -1118,6 +1152,7 @@ const fn model_spec(
         model_spec: Some(ToolModelSpecDeclaration {
             description,
             input_schema,
+            gpt_action_description: None,
         }),
         ..definition
     }
@@ -1127,6 +1162,7 @@ const fn adaptive_runtime_direct(definition: ToolDefinition, rank: u16) -> ToolD
     ToolDefinition {
         model_surface: ToolModelSurfaceDeclaration {
             adaptive_runtime_direct_rank: Some(rank),
+            ..definition.model_surface
         },
         ..definition
     }

@@ -53,6 +53,8 @@ import {
   selectRuntimeProject,
   refreshRuntimeSessionList,
   isCurrentRuntimeSessionListRequest,
+  refreshRuntimeProjectWindows,
+  isCurrentRuntimeProjectWindowsRequest,
   selectRuntimeWorkflowSession,
   selectRuntimeSessionLocation,
   refreshRuntimeWorkflowSession,
@@ -71,6 +73,7 @@ import {
   formatProjectStatusText,
   formatRunnerCountText,
   formatRecentSessionStatusText,
+  formatProjectWindowStatusText,
   renderProjectSelectorTree,
   renderRunnerFleetRows,
   renderRecentSessionRows,
@@ -120,6 +123,7 @@ import {
   renderSessionWindowCorrelationLinks,
   formatWindowDetailFields,
   renderWindowCards,
+  renderProjectWindowCards,
 } from "./runtime_window.js";
 import {
   parseAgentIds,
@@ -223,6 +227,14 @@ let windowTimer = 0;
 let windowRows: any[] = [];
 let selectedWindowKey = "";
 let selectedWindowDetail: any | null = null;
+const PROJECT_WINDOW_LIMIT = 10;
+let projectWindowsAbort: AbortController | null = null;
+let projectWindowRows: any[] = [];
+let projectWindowAvailability: "idle" | "available" | "stale" | "unavailable" = "idle";
+let projectWindowTruncated = false;
+let projectWindowTotal = 0;
+let projectWindowProjectId = "";
+let renderedProjectWindowSignature = "";
 let projectRows: any[] = [];
 let homeProjectRows: any[] = [];
 let runnerRows: any[] = [];
@@ -334,7 +346,10 @@ function renderLanguageSensitiveUi(): void {
   }
   renderRunnerFleet(runnerRows);
   renderRecentSessions(recentSessionRows, recentSessionMetaSnapshot);
-  if (state.selectedProject) renderSessionList(sessionRows, sessionListMetaSnapshot);
+  if (state.selectedProject) {
+    renderSessionList(sessionRows, sessionListMetaSnapshot);
+    renderProjectWindows();
+  }
   const snapshot = state.workflow?.snapshot;
   if (snapshot) renderDetail(snapshot, false);
   else if (!state.workflow?.selectedSessionId) hideDetail();
@@ -739,8 +754,10 @@ function abortProjectWork(): void {
   abort(sessionsAbort);
   abort(detailAbort);
   abortCollaboration();
+  abort(projectWindowsAbort);
   sessionsAbort = null;
   detailAbort = null;
+  projectWindowsAbort = null;
 }
 
 function stopProjectSearchTimer(): void {
@@ -895,6 +912,13 @@ async function refreshWindows(refreshSelected = true): Promise<void> {
   }
 }
 
+function openWindowInspector(key: string): void {
+  selectedWindowKey = key;
+  applyWorkspaceView("windows");
+  renderWindowList();
+  void refreshWindowDetail();
+}
+
 function renderSessionWindowCorrelation(detail: any): void {
   const available = detail?.window_activity_available === true;
   show("runtime-linked-windows-unavailable", !available);
@@ -903,18 +927,117 @@ function renderSessionWindowCorrelation(detail: any): void {
   const links = available && Array.isArray(detail?.linked_windows) ? detail.linked_windows : [];
   setText("runtime-linked-windows-status", available ? runtimeCountLabel(links.length, "Window") : "runtime:read unavailable");
   if (available) {
-    renderSessionWindowCorrelationLinks(linkedNode, links, (key) => {
-      selectedWindowKey = key;
-      applyWorkspaceView("windows");
-      renderWindowList();
-      void refreshWindowDetail();
-    });
+    renderSessionWindowCorrelationLinks(linkedNode, links, (key) => openWindowInspector(key));
   }
   const gaps = available && Array.isArray(detail?.window_activity_after_last_session_record)
     ? detail.window_activity_after_last_session_record
     : [];
   show("runtime-recorder-gap-panel", gaps.length > 0);
   renderWindowActivities(el("runtime-recorder-gap-activity"), gaps, true);
+}
+
+function projectWindowActiveCount(): number {
+  if (projectWindowAvailability !== "available") return 0;
+  return projectWindowRows.reduce((sum, w) => sum + Math.max(0, Number(w?.active_count || 0)), 0);
+}
+
+function clearProjectWindows(): void {
+  projectWindowRows = [];
+  projectWindowAvailability = "idle";
+  projectWindowTruncated = false;
+  projectWindowTotal = 0;
+  projectWindowProjectId = "";
+  renderedProjectWindowSignature = "";
+  renderProjectWindows();
+}
+
+function renderProjectWindows(): void {
+  const list = el("runtime-project-windows-list");
+  if (!list) return;
+
+  if (projectWindowAvailability === "unavailable") {
+    clearNode(list);
+    show("runtime-project-windows-empty", false);
+    show("runtime-project-windows-unavailable", true);
+    setText("runtime-project-windows-count", "—");
+    setText("runtime-project-windows-status", tr("runtime:read required"));
+    return;
+  }
+
+  show("runtime-project-windows-unavailable", false);
+  const count = projectWindowRows.length;
+  setText("runtime-project-windows-count", String(count));
+  setText(
+    "runtime-project-windows-status",
+    projectWindowAvailability === "stale"
+      ? tr(count > 0 ? "Refresh failed · showing previous data" : "refresh unavailable")
+      : formatProjectWindowStatusText(count, projectWindowTotal, projectWindowTruncated, runtimeLanguage)
+  );
+  show("runtime-project-windows-empty", count === 0 && projectWindowAvailability === "available");
+
+  const signature = renderFingerprint([
+    runtimeLanguage,
+    projectWindowProjectId,
+    projectWindowRows,
+    projectWindowTruncated,
+    projectWindowTotal,
+    projectWindowAvailability,
+  ]);
+  if (signature === renderedProjectWindowSignature) return;
+  renderedProjectWindowSignature = signature;
+
+  renderProjectWindowCards(
+    list,
+    projectWindowRows,
+    (key) => openWindowInspector(key),
+    Date.now(),
+    runtimeLanguage,
+  );
+}
+
+async function fetchProjectWindows(request: any): Promise<boolean> {
+  abort(projectWindowsAbort);
+  const controller = new AbortController();
+  projectWindowsAbort = controller;
+  const response = await api("windows", { project: request.project, limit: PROJECT_WINDOW_LIMIT }, controller.signal);
+  if (projectWindowsAbort === controller) projectWindowsAbort = null;
+  if (!isCurrentRuntimeProjectWindowsRequest(state, request)) return false;
+  if (!response) {
+    projectWindowAvailability = "stale";
+    projectWindowProjectId = request.project;
+    renderProjectWindows();
+    renderProjectSelectors(projectRows, projectRowsTruncated);
+    return false;
+  }
+  if (response.status === 401) {
+    lock("Credential rejected.");
+    return false;
+  }
+  if (response.status === 403) {
+    projectWindowRows = [];
+    projectWindowAvailability = "unavailable";
+    projectWindowProjectId = request.project;
+    projectWindowTruncated = false;
+    projectWindowTotal = 0;
+    renderProjectWindows();
+    renderProjectSelectors(projectRows, projectRowsTruncated);
+    return false;
+  }
+  if (!response.ok || !response.data) {
+    projectWindowAvailability = "stale";
+    projectWindowProjectId = request.project;
+    renderProjectWindows();
+    renderProjectSelectors(projectRows, projectRowsTruncated);
+    return false;
+  }
+  projectWindowRows = Array.isArray(response.data.windows) ? response.data.windows : [];
+  projectWindowAvailability = "available";
+  projectWindowProjectId = request.project;
+  projectWindowTruncated = !!response.data.truncated;
+  projectWindowTotal = typeof response.data.total === "number" ? response.data.total : projectWindowRows.length;
+  renderProjectWindows();
+  renderProjectSelectors(projectRows, projectRowsTruncated);
+  return true;
 }
 
 function hideDetail(): void {
@@ -952,6 +1075,7 @@ function clearSessionSurface(): void {
   abortCollaboration();
   hideDetail();
   resetCollaborationComposerUi();
+  clearProjectWindows();
 }
 
 function lock(message = "", clearRemembered = true): void {
@@ -990,13 +1114,19 @@ function lock(message = "", clearRemembered = true): void {
   renderWindowDetail(null);
   resetCommunicationSurface();
   const projectList = el("runtime-project-list");
+  const windowPanel = el("runtime-project-window-activity-panel");
   const sessionsPanel = el("runtime-workflow-sessions-panel");
   renderedProjectSelectorsSignature = "";
   renderedRunnerFleetSignature = "";
   renderedRecentSessionsSignature = "";
+  windowPanel?.remove();
   sessionsPanel?.remove();
   clearNode(projectList);
   if (projectList && sessionsPanel) {
+    if (windowPanel) {
+      windowPanel.hidden = true;
+      projectList.appendChild(windowPanel);
+    }
     sessionsPanel.hidden = true;
     projectList.appendChild(sessionsPanel);
   }
@@ -1189,6 +1319,8 @@ async function fetchProjects(request: any, unlocking = false): Promise<boolean> 
     renderProjectSelectors(projectRows, projectRowsTruncated);
     const listRequest = refreshRuntimeSessionList(state);
     if (listRequest) void fetchSessions(listRequest);
+    const windowRequest = refreshRuntimeProjectWindows(state);
+    if (windowRequest) void fetchProjectWindows(windowRequest);
   }
   return true;
 }
@@ -1246,6 +1378,7 @@ function renderProjectSelectors(projects: any[], truncated: boolean): void {
   const projectList = el("runtime-project-list");
   if (!deviceSelect || !projectList) return;
   const effective = effectiveProjects(projects);
+  const activeWindowCount = projectWindowActiveCount();
   const signature = renderFingerprint({
     language: runtimeLanguage,
     selectedDevice: state.selectedDevice,
@@ -1257,10 +1390,13 @@ function renderProjectSelectors(projects: any[], truncated: boolean): void {
     knownProjectDevices,
     projects: effective,
     runners: runnerRows.map((runner) => [runner?.client_id, runner?.connected, runner?.status]),
+    activeWindowCount,
   });
   if (signature === renderedProjectSelectorsSignature) return;
   renderedProjectSelectorsSignature = signature;
+  const windowPanel = el("runtime-project-window-activity-panel");
   const sessionsPanel = el("runtime-workflow-sessions-panel");
+  windowPanel?.remove();
   sessionsPanel?.remove();
   const devices = projectSelectorDevices(projects);
   renderProjectSelectorTree(
@@ -1278,6 +1414,8 @@ function renderProjectSelectors(projects: any[], truncated: boolean): void {
       storedDeviceDisclosure: readDeviceDisclosure,
       onPersistDeviceDisclosure: writeDeviceDisclosure,
       onSelectProject: (clientId, projectId) => switchProject(clientId, projectId),
+      windowPanel,
+      selectedProjectWindowActiveCount: activeWindowCount,
     },
   );
   const returnedProjects = runtimeProjectsForDevice(effective, projectDeviceFilter).length;
@@ -1296,11 +1434,13 @@ function switchProject(device: string, project: string): void {
   clearSessionSurface();
   if (device) revealRunner(device);
   const request = selectRuntimeProject(state, device, project);
+  const windowRequest = refreshRuntimeProjectWindows(state);
   renderProjectSelectors(projectRows, projectRowsTruncated);
   renderRunnerFleet(runnerRows);
   renderRecentSessions(recentSessionRows, null);
   renderSelectedProjectIdentity();
   if (request) void fetchSessions(request);
+  if (windowRequest) void fetchProjectWindows(windowRequest);
   if (token) void fetchProjects(refreshRuntimeProjects(state, projectSearch, projectDeviceFilter));
 }
 
@@ -1385,6 +1525,8 @@ function selectRecentSession(session: any): void {
   renderSelectedProjectIdentity();
   revealWorkflowSessionDetail();
   if (location.sessionListRequest) void fetchSessions(location.sessionListRequest);
+  const windowRequest = refreshRuntimeProjectWindows(state);
+  if (windowRequest) void fetchProjectWindows(windowRequest);
   if (location.detailRequest) void fetchSessionDetail(location.detailRequest);
   const collaborationRequest = runtimeCollaborationRequest(state);
   if (collaborationRequest) void startCollaboration(collaborationRequest);
@@ -2852,11 +2994,13 @@ async function refreshAll(): Promise<void> {
   const recoverCollaboration = runtimeCollaborationNeedsRefreshRecovery(state);
   const overviewRequest = refreshRuntimeOverview(state);
   const projectsRequest = refreshRuntimeProjects(state, projectSearch, projectDeviceFilter);
+  const windowRequest = refreshRuntimeProjectWindows(state);
   try {
     const [overviewOk, projectsOk, communicationOk] = await Promise.all([
       fetchOverview(overviewRequest),
       fetchProjects(projectsRequest),
       refreshCommunication(),
+      windowRequest ? fetchProjectWindows(windowRequest) : Promise.resolve(true),
     ]);
     if (!token) return;
     if (overviewOk && projectsOk && communicationOk) {
@@ -2882,6 +3026,8 @@ function refreshAutoSurfaces(): void {
   void fetchOverview(refreshRuntimeOverview(state));
   const request = refreshRuntimeSessionList(state);
   if (request) void fetchSessions(request);
+  const windowRequest = refreshRuntimeProjectWindows(state);
+  if (windowRequest) void fetchProjectWindows(windowRequest);
   void refreshCommunication(workspaceView === "operations");
 }
 

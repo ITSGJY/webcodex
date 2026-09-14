@@ -25,9 +25,8 @@ struct RunShellRequest {
 /// `ToolCall::RunJob`. Starts an async background shell job in an
 /// Runner-registered project and returns a `job_id`. Execution with side
 /// effects; requires Bearer auth and the Runner async shell job capability.
-/// Dedicated GPT Action (`startProjectShellJob`); also reachable via
-/// callRuntimeTool / MCP tools/call. Observe lifecycle plus bounded log deltas
-/// with `observe_jobs`; `getRuntimeJobTail` remains the dedicated REST tail.
+/// Kept as a legacy REST compatibility endpoint. Canonical model-facing job
+/// operations use runtime tool names; observe lifecycle with `observe_jobs`.
 #[derive(Debug, Deserialize)]
 struct StartProjectShellJobRequest {
     pub project: String,

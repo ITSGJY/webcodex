@@ -4,6 +4,7 @@
 //! value. The projection is deterministic, bounded, path-safe, and contains
 //! only the facts a coding model needs to start or continue work.
 
+use crate::json_measurement::serialized_json_len;
 use serde::Serialize;
 use serde_json::{json, Value};
 #[cfg(test)]
@@ -199,8 +200,8 @@ impl<Entry: Serialize> StartupCatalog<Entry> {
             projection.update_completeness(upstream_truncated, discovery_hint);
             // Measure the full wire envelope: optional hints and JSON escaping
             // participate in the budget. Preserve the original greedy prefix.
-            if !serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= max_bytes)
+            if !serialized_json_len(&projection)
+                .map(|bytes| bytes <= max_bytes)
                 .unwrap_or(false)
             {
                 projection.entries.pop();
@@ -268,9 +269,7 @@ pub(crate) struct StartupExtensions {
 
 impl StartupExtensions {
     pub(crate) fn serialized_len(&self) -> usize {
-        serde_json::to_vec(self)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX)
+        serialized_json_len(self).unwrap_or(usize::MAX)
     }
 }
 
@@ -1574,9 +1573,7 @@ fn enforce_hard_size_limit(brief: &mut Value) {
 }
 
 fn serialized_len(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(value).unwrap_or(usize::MAX)
 }
 
 #[cfg(test)]

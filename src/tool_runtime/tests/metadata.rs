@@ -14,10 +14,6 @@ use crate::tool_runtime::kernel::{
 use crate::tool_runtime::project_resolution::{
     ProjectKnowledgeSourceResolution, ProjectKnowledgeUnavailableReason,
 };
-use crate::tool_runtime::sessions::{
-    TOOL_CALL_EXPECTATION_METADATA_FIELDS, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-};
-use crate::tool_runtime::TOOL_CALL_WRAPPER_FIELDS;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -1952,13 +1948,16 @@ fn runtime_status_input_schema_exposes_compact_flags() {
     );
 
     let openapi = crate::openapi::build_openapi_spec();
-    let tool_call_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
+    let action = &openapi["paths"]["/api/actions/runtime_status"]["post"];
+    assert_eq!(action["operationId"], "runtime_status");
+    let action_properties = action["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]
         .as_object()
-        .expect("ToolCallRequest properties");
+        .unwrap();
     for field in ["compact", "summary_only"] {
         assert!(
-            tool_call_properties.contains_key(field),
-            "ToolCallRequest.properties should expose flattened runtime_status {field}"
+            action_properties.contains_key(field),
+            "runtime_status Action missing {field}"
         );
     }
 }
@@ -1980,7 +1979,7 @@ fn session_handoff_validation_exposure_keeps_read_only_metadata() {
 }
 
 #[test]
-fn project_overview_metadata_schema_and_flattened_args_are_read_only() {
+fn project_overview_metadata_schema_is_read_only() {
     let metadata = crate::tool_runtime::metadata::lookup_tool_metadata("project_overview")
         .expect("project_overview metadata");
     assert_eq!(metadata.provider_id, "agent");
@@ -2009,28 +2008,10 @@ fn project_overview_metadata_schema_and_flattened_args_are_read_only() {
         );
     }
     assert_eq!(spec.input_schema["additionalProperties"], false);
-    let accepted = accepted_flattened_args_for_spec(&spec);
-    for field in ["project", "path", "max_depth", "limit", "session_id"] {
-        assert!(
-            accepted.contains(&field.to_string()),
-            "missing {field}: {accepted:?}"
-        );
-    }
     assert_eq!(spec.annotations["readOnlyHint"], true);
     assert_eq!(spec.annotations["destructiveHint"], false);
     assert_eq!(spec.annotations["idempotentHint"], true);
     assert_eq!(spec.annotations["openWorldHint"], false);
-
-    let openapi = crate::openapi::build_openapi_spec();
-    let action_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        .as_object()
-        .unwrap();
-    for field in ["max_depth", "limit", "path", "project"] {
-        assert!(
-            action_properties.contains_key(field),
-            "missing flattened {field}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -2059,41 +2040,8 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
             tool.get("inputSchema").is_none() && tool.get("outputSchema").is_none(),
             "tool_manifest must stay compact: {tool:?}"
         );
-        assert!(
-            tool["accepted_flattened_args"].is_array(),
-            "tool_manifest entry must expose accepted_flattened_args: {tool:?}"
-        );
         assert_eq!(tool["deprecated_or_unsupported_args"], json!([]));
-        let accepted = tool["accepted_flattened_args"].as_array().unwrap();
-        let tool_name = tool["name"].as_str().unwrap_or("unknown");
-        for &field in TOOL_CALL_EXPECTATION_METADATA_FIELDS {
-            let advertised = accepted.iter().any(|value| value.as_str() == Some(field));
-            let expected = match field {
-                "assertion_name" => {
-                    matches!(
-                        tool_name,
-                        "run_process" | "run_script" | "run_shell" | "run_job"
-                    )
-                }
-                "result_expectation" => matches!(
-                    tool_name,
-                    "run_process"
-                        | "run_script"
-                        | "run_shell"
-                        | "session_shell_exec"
-                        | "cargo_fmt"
-                        | "cargo_check"
-                        | "cargo_test"
-                        | "go_test"
-                ),
-                "accepted_exit_codes" => tool_name == "run_process",
-                _ => false,
-            };
-            assert_eq!(
-                advertised, expected,
-                "{tool_name} manifest expectation-field exposure mismatch for {field}"
-            );
-        }
+        assert!(tool.get("accepted_flattened_args").is_none());
     }
 
     let exact = runtime
@@ -2109,201 +2057,6 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
     assert_eq!(exact.output["contract"]["name"], "run_script");
     assert_eq!(exact.output["contract"]["input_schema"]["type"], "object");
     assert!(exact.output["contract"].get("output_schema").is_none());
-
-    let accepted = |name: &str| -> Vec<String> {
-        tools
-            .iter()
-            .find(|tool| tool["name"] == name)
-            .unwrap_or_else(|| panic!("missing manifest tool {name}"))["accepted_flattened_args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap().to_string())
-            .collect()
-    };
-
-    for field in [
-        "category",
-        "intent",
-        "include_recommended_flows",
-        "include_risk_summary",
-        TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-    ] {
-        assert!(accepted("tool_manifest").contains(&field.to_string()));
-    }
-    for field in ["summary_only", "category", "features", "limit"] {
-        assert!(accepted("list_tools").contains(&field.to_string()));
-    }
-    for field in ["compact", "summary_only"] {
-        assert!(accepted("runtime_status").contains(&field.to_string()));
-    }
-    for field in [
-        "project",
-        "client_id",
-        "path",
-        "instruction",
-        "include_project_instructions",
-        "include_workflow_guidance",
-        "session_id",
-        TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-    ] {
-        assert!(accepted("work_on_project").contains(&field.to_string()));
-    }
-    for field in [
-        "session_id",
-        "include_validation",
-        "include_workspace",
-        "include_checkpoints",
-        "summary_only",
-        "limit",
-    ] {
-        assert!(accepted("session_handoff_summary").contains(&field.to_string()));
-    }
-    for field in [
-        "project",
-        "session_id",
-        "include_diff",
-        "include_hygiene",
-        "include_handoff",
-        "include_workspace",
-        "include_validation_summary",
-        "summary_only",
-    ] {
-        assert!(accepted("finish_coding_task").contains(&field.to_string()));
-    }
-    for field in ["project", "path", "allow_missing", "session_id"] {
-        assert!(accepted("read_project_artifact_metadata").contains(&field.to_string()));
-    }
-    assert!(!accepted("read_project_artifact_metadata")
-        .contains(&"allow_cross_project_session".to_string()));
-    for (tool, fields) in [
-        (
-            "artifact_upload_begin",
-            vec![
-                "project",
-                "path",
-                "expected_bytes",
-                "expected_sha256",
-                "mime_type",
-                "overwrite",
-                "session_id",
-            ],
-        ),
-        (
-            "artifact_upload_chunk",
-            vec![
-                "project",
-                "path",
-                "upload_id",
-                "offset",
-                "content_base64",
-                "session_id",
-            ],
-        ),
-        (
-            "artifact_upload_finish",
-            vec!["project", "path", "upload_id", "session_id"],
-        ),
-        (
-            "artifact_upload_abort",
-            vec!["project", "path", "upload_id", "session_id"],
-        ),
-    ] {
-        let accepted = accepted(tool);
-        for field in fields {
-            assert!(
-                accepted.contains(&field.to_string()),
-                "{tool} missing accepted flattened arg {field}: {accepted:?}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn tool_manifest_model_fields_and_hidden_start_compatibility_stay_separate() {
-    let runtime = test_runtime();
-    let result = runtime
-        .dispatch(ToolCall::ToolManifest {
-            tool_name: None,
-            category: None,
-            intent: None,
-            include_recommended_flows: false,
-            include_risk_summary: false,
-        })
-        .await;
-    assert!(result.success, "{:?}", result.error);
-
-    let openapi = crate::openapi::build_openapi_spec();
-    let properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        .as_object()
-        .expect("ToolCallRequest properties");
-    let tools = result.output["tools"]
-        .as_array()
-        .expect("tool_manifest tools");
-    let mut accepted_fields = BTreeSet::new();
-
-    for tool in tools {
-        let tool_name = tool["name"].as_str().expect("tool name");
-        let accepted = tool["accepted_flattened_args"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{tool_name} accepted_flattened_args"));
-        for field in accepted {
-            let field = field
-                .as_str()
-                .unwrap_or_else(|| panic!("{tool_name} accepted field"));
-            accepted_fields.insert(field.to_string());
-            if TOOL_CALL_EXPECTATION_METADATA_FIELDS.contains(&field) {
-                assert!(
-                    !properties.contains_key(field),
-                    "{tool_name} recorder metadata arg {field} must stay out of generic ToolCallRequest.properties"
-                );
-                continue;
-            }
-            assert!(
-                properties.contains_key(field),
-                "{tool_name} advertises flattened arg {field}, but ToolCallRequest.properties does not declare it"
-            );
-        }
-    }
-
-    for field in [
-        "temporary_project_name",
-        "deny_write_tools",
-        "deny_shell_tools",
-        "detail",
-        "resume_session_id",
-        "bind_current",
-        "new_session",
-    ] {
-        assert!(
-            !accepted_fields.contains(field),
-            "retired start-only field {field} must not be owned by the model-visible manifest"
-        );
-        assert!(
-            !properties.contains_key(field),
-            "retired start-only flattened arg {field} must not remain in ToolCallRequest"
-        );
-    }
-    for field in ["mode", "base_ref", "execution_context"] {
-        assert!(
-            accepted_fields.contains(field),
-            "current model-visible flattened field {field} must be owned by the manifest"
-        );
-        assert!(
-            properties.contains_key(field),
-            "current model-visible flattened field {field} must be declared by ToolCallRequest"
-        );
-    }
-
-    for field in properties.keys() {
-        if TOOL_CALL_WRAPPER_FIELDS.contains(&field.as_str()) {
-            continue;
-        }
-        assert!(
-            accepted_fields.contains(field),
-            "ToolCallRequest.properties declares flattened field {field}, but no model-visible manifest entry accepts it"
-        );
-    }
 }
 
 #[tokio::test]
@@ -3206,6 +2959,13 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
+    let openapi_before = crate::openapi::build_openapi_spec();
+    let operation_ids_before = openapi_before["paths"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|path| path["post"]["operationId"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
     // Snapshot a model-visible tool's schema as the baseline that external
     // provider discovery must not perturb.
     let write_schema_before = before
@@ -3267,14 +3027,18 @@ async fn external_provider_discovery_cannot_change_public_tool_or_openapi_surfac
             .input_schema,
         write_schema_before
     );
-    let openapi = crate::openapi::build_openapi_spec();
-    let operation_count: usize = openapi["paths"]
+    let openapi_after = crate::openapi::build_openapi_spec();
+    let operation_ids_after = openapi_after["paths"]
         .as_object()
         .unwrap()
         .values()
-        .map(|path| path.as_object().unwrap().len())
-        .sum();
-    assert_eq!(operation_count, 16);
+        .map(|path| path["post"]["operationId"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(operation_ids_after, operation_ids_before);
+    let serialized = serde_json::to_string(&openapi_after).unwrap();
+    for internal in ["Edit", "Read", "Bash", "Write", "FutureTool"] {
+        assert!(!serialized.contains(&format!("\"{internal}\"")));
+    }
 }
 
 #[tokio::test]

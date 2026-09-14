@@ -1002,8 +1002,8 @@ fn from_tool_name_unknown_tool_lists_available_tools_and_hint() {
     let err = ToolCall::from_tool_name("definitely_not_a_tool", Value::Null).unwrap_err();
     assert!(err.contains("definitely_not_a_tool"));
     assert!(
-        err.contains("listRuntimeTools") || err.contains("list_tools"),
-        "unknown-tool error should hint at discovery: {}",
+        err.contains("tool_manifest") && err.contains("tool_name"),
+        "unknown-tool error should hint at canonical discovery: {}",
         err
     );
     // Should list at least a couple of known tool names.

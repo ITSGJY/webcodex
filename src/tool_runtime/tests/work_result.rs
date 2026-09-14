@@ -1,7 +1,10 @@
-use super::super::work_result::{build_work_result_projection, MAX_WORK_RESULT_FILES};
+use super::super::work_result::{
+    build_work_result_projection, work_result_state_version, MAX_WORK_RESULT_FILES,
+};
 use super::super::*;
 use super::support::*;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 fn counts(conflicted: u64) -> Value {
     json!({
@@ -102,6 +105,42 @@ fn work_result_projection_is_sparse_bounded_and_honest() {
     for private in ["stdout", "stderr", "job_id", "continuation", "message_body"] {
         assert!(!serialized.contains(private));
     }
+}
+
+#[test]
+fn work_result_state_version_matches_buffered_projection_hash() {
+    let projection = build_work_result_projection(
+        "agent:special:项目-🦀",
+        &format!("wc_sess_{}", "9".repeat(32)),
+        true,
+        &json!({
+            "git_available": true,
+            "clean": false,
+            "branch": "feature/escaped-\\-\"-分支",
+            "counts": counts(0),
+            "files_total": 2,
+            "files": [
+                {"path": "src/日本語.rs", "status": "modified", "kind": "tracked", "additions": 2, "deletions": 1},
+                {"path": "src/quoted_\\\".rs", "status": "added", "kind": "tracked", "additions": 3, "deletions": 0}
+            ]
+        }),
+        &json!({
+            "status": "mixed",
+            "latest_status": "failed",
+            "successes": 7,
+            "failures": 2,
+            "history": [{"kind": "test", "name": "unicode::你好"}]
+        }),
+        &json!({"status": "failed", "unresolved_failure_count": 1, "evidence_gap_event_count": 2}),
+        &json!({"available": true, "total": 2, "tools": ["show_changes", "git_review_summary"]}),
+        true,
+    );
+    let expected = format!(
+        "wr1_{:x}",
+        Sha256::digest(serde_json::to_vec(&projection).unwrap())
+    );
+    assert_eq!(work_result_state_version(&projection), expected);
+    assert!(projection.get("state_version").is_none());
 }
 
 #[test]

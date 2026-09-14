@@ -84,14 +84,17 @@ Server-global WebCodex tool namespace，也不会被追加到外层 MCP `tools/l
 MCP 与 OpenAPI/GPT Actions 使用的 generic Tool Runtime 都复用同一个 canonical
 `plugin_tool` parser 和 action-aware gateway executor；不存在 MCP Plugin 实现和 GPT
 Plugin 实现两套逻辑。任何声明暴露 `plugin_tool` 的 canonical model surface 都可以实际
-调用它。对 generic `callRuntimeTool`，完整 Plugin contract 使用 canonical nested
-`params`：外层 `tool` 已经用于选择 `plugin_tool`，provider-local `tool` 必须留在 Plugin
-业务参数里：
+调用它。当前 generic GPT Actions surface 上，`plugin_tool` 是 canonical direct
+operation，因此直接传它自己的 business arguments：
 
 ```json
-{"tool":"plugin_tool","params":{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}}
-{"tool":"plugin_tool","params":{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}}
+{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}
+{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}
 ```
+
+独立的 `call_runtime_tool` operation 只用于 manifest route 为 `gateway` 的 Adaptive
+long-tail tools；`plugin_tool` 这类 direct tool 不得再通过 gateway 调用。generic
+gateway envelope 是 canonical `{tool, arguments}`。
 
 静态 ToolDefinition 只表达 worst-case discovery contract。真正执行 policy 会在校验后的
 `action` 上先分类，再进入 Session/permission governance：list/describe 只要求

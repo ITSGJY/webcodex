@@ -10,6 +10,7 @@ import {
   formatProjectStatusText,
   formatRunnerCountText,
   formatRecentSessionStatusText,
+  renderProjectSelectorTree,
 } from "../dist/runtime_navigation.js";
 
 test("operation navigation shows one destination and moves focus without replacing its form", async () => {
@@ -293,3 +294,206 @@ test("formatRecentSessionStatusText formats session count with optional truncati
     "4 个会话 · 前 4 · 扫描不完整",
   );
 });
+
+function createMockElement(tag = "div") {
+  const listeners = new Map();
+  let directText = "";
+  let classNameStr = "";
+  const classList = {
+    classes: new Set(),
+    add(cls) {
+      cls.split(/\s+/).filter(Boolean).forEach((c) => this.classes.add(c));
+    },
+    remove(cls) {
+      cls.split(/\s+/).filter(Boolean).forEach((c) => this.classes.delete(c));
+    },
+    contains(cls) {
+      return this.classes.has(cls);
+    },
+  };
+  const el = {
+    tagName: tag.toUpperCase(),
+    get className() {
+      return classNameStr;
+    },
+    set className(val) {
+      classNameStr = String(val);
+      classList.classes.clear();
+      classNameStr.split(/\s+/).filter(Boolean).forEach((c) => classList.classes.add(c));
+    },
+    title: "",
+    hidden: false,
+    value: "",
+    dataset: {},
+    children: [],
+    childNodes: [],
+    attributes: {},
+    get textContent() {
+      if (this.childNodes.length === 0) return directText;
+      return this.childNodes.map((c) => (typeof c === "string" ? c : c.textContent || "")).join("");
+    },
+    set textContent(val) {
+      directText = String(val);
+      this.childNodes = [];
+      this.children = [];
+    },
+    classList,
+    appendChild(child) {
+      if (child && child.className) {
+        child.classList.add(child.className);
+      }
+      this.children.push(child);
+      this.childNodes.push(child);
+      return child;
+    },
+    removeChild(child) {
+      const idx = this.childNodes.indexOf(child);
+      if (idx >= 0) this.childNodes.splice(idx, 1);
+      const cidx = this.children.indexOf(child);
+      if (cidx >= 0) this.children.splice(cidx, 1);
+      return child;
+    },
+    setAttribute(key, value) {
+      this.attributes[key] = String(value);
+      if (key === "class") this.classList.add(String(value));
+    },
+    getAttribute(key) {
+      return this.attributes[key] ?? null;
+    },
+    addEventListener(event, handler) {
+      if (!listeners.has(event)) listeners.set(event, []);
+      listeners.get(event).push(handler);
+    },
+    querySelector(selector) {
+      const results = this.querySelectorAll(selector);
+      return results[0] || null;
+    },
+    querySelectorAll(selector) {
+      const found = [];
+      const match = (elem) => {
+        if (!elem) return;
+        if (selector.startsWith(".")) {
+          const classes = selector.split(".").filter(Boolean);
+          if (classes.every((cls) => elem.classList?.contains(cls) || (elem.className && elem.className.includes(cls)))) {
+            found.push(elem);
+          }
+        } else if (selector.toLowerCase() === elem.tagName?.toLowerCase()) {
+          found.push(elem);
+        }
+        if (elem.children) {
+          for (const c of elem.children) match(c);
+        }
+      };
+      for (const child of this.children) match(child);
+      return found;
+    },
+  };
+  return el;
+}
+
+function withMockDom(fn) {
+  const originalDoc = globalThis.document;
+  const originalWin = globalThis.window;
+  globalThis.document = {
+    createElement(tag) { return createMockElement(tag); },
+    createElementNS(_ns, tag) { return createMockElement(tag); },
+  };
+  globalThis.window = {
+    localStorage: { getItem: () => null, setItem: () => {} },
+  };
+  try {
+    return fn();
+  } finally {
+    globalThis.document = originalDoc;
+    globalThis.window = originalWin;
+  }
+}
+
+test("renderProjectSelectorTree mounts windowPanel before sessionsPanel and adds WINDOW ACTIVE signal", () => {
+  withMockDom(() => {
+    const deviceSelect = createMockElement("select");
+    const projectList = createMockElement("div");
+    const sessionsPanel = createMockElement("section");
+    sessionsPanel.setAttribute("id", "runtime-workflow-sessions-panel");
+    const windowPanel = createMockElement("section");
+    windowPanel.setAttribute("id", "runtime-project-window-activity-panel");
+
+    const effectiveProjects = [
+      {
+        id: "proj-active",
+        name: "Active Project",
+        client_id: "node-1",
+        connected: true,
+        sessions: { running_sessions: 0, retained_sessions: 0 },
+      },
+      {
+        id: "proj-idle",
+        name: "Idle Project",
+        client_id: "node-1",
+        connected: true,
+        sessions: { running_sessions: 0, retained_sessions: 0 },
+      },
+    ];
+
+    // 1. With active window requests > 0
+    renderProjectSelectorTree(deviceSelect, projectList, sessionsPanel, {
+      effectiveProjects,
+      devices: ["node-1"],
+      runnerRows: [{ client_id: "node-1", status: "online" }],
+      selectedDevice: "node-1",
+      selectedProject: "proj-active",
+      projectDeviceFilter: "",
+      language: "en",
+      storedDeviceDisclosure: () => true,
+      onPersistDeviceDisclosure: () => {},
+      onSelectProject: () => {},
+      windowPanel,
+      selectedProjectWindowActiveCount: 2,
+    });
+
+    const activeRow = projectList.querySelector(".project-row.selected");
+    assert.ok(activeRow, "active project row must be selected");
+    const signals = activeRow.querySelectorAll(".project-row-state");
+    const signalTexts = signals.map((s) => s.textContent);
+    assert.ok(signalTexts.includes("WINDOW ACTIVE"), "must include WINDOW ACTIVE signal when active count > 0");
+
+    // Check DOM hierarchy inside the workspace details element
+    const workspace = projectList.querySelector(".workspace-group");
+    assert.ok(workspace, "workspace element must exist");
+    const windowIdx = workspace.children.indexOf(windowPanel);
+    const sessionsIdx = workspace.children.indexOf(sessionsPanel);
+    assert.ok(windowIdx >= 0, "windowPanel must be attached inside workspace");
+    assert.ok(sessionsIdx >= 0, "sessionsPanel must be attached inside workspace");
+    assert.ok(windowIdx < sessionsIdx, "windowPanel must precede sessionsPanel in workspace DOM");
+    assert.equal(windowPanel.hidden, false);
+    assert.equal(sessionsPanel.hidden, false);
+
+    // 2. With active window requests === 0
+    const deviceSelect2 = createMockElement("select");
+    const projectList2 = createMockElement("div");
+    const sessionsPanel2 = createMockElement("section");
+    const windowPanel2 = createMockElement("section");
+
+    renderProjectSelectorTree(deviceSelect2, projectList2, sessionsPanel2, {
+      effectiveProjects,
+      devices: ["node-1"],
+      runnerRows: [{ client_id: "node-1", status: "online" }],
+      selectedDevice: "node-1",
+      selectedProject: "proj-idle",
+      projectDeviceFilter: "",
+      language: "en",
+      storedDeviceDisclosure: () => true,
+      onPersistDeviceDisclosure: () => {},
+      onSelectProject: () => {},
+      windowPanel: windowPanel2,
+      selectedProjectWindowActiveCount: 0,
+    });
+
+    const idleRow = projectList2.querySelector(".project-row.selected");
+    assert.ok(idleRow, "idle project row must be selected");
+    const idleSignals = idleRow.querySelectorAll(".project-row-state");
+    const idleSignalTexts = idleSignals.map((s) => s.textContent);
+    assert.equal(idleSignalTexts.includes("WINDOW ACTIVE"), false, "must NOT include WINDOW ACTIVE when count is 0");
+  });
+});
+

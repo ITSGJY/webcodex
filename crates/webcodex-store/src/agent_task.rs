@@ -5,10 +5,11 @@ use super::agent_wake::{
     WAKE_TRIGGER_AGENT_TASK_ATTEMPT,
 };
 use super::communication::{
-    authorize_conversation_access, digest_text, lookup_idempotent_resource, new_id, now_unix_ms,
-    record_idempotent_resource, store_error, validate_communication_principal, validate_id,
-    validate_idempotency_key, CommunicationPrincipal, CommunicationStoreError, ConversationAccess,
-    CONVERSATION_ID_PREFIX, CONVERSATION_MESSAGE_ID_PREFIX, DURABLE_AGENT_ID_PREFIX,
+    authorize_conversation_access, digest_json, digest_text, lookup_idempotent_resource, new_id,
+    now_unix_ms, record_idempotent_resource, store_error, validate_communication_principal,
+    validate_id, validate_idempotency_key, CommunicationPrincipal, CommunicationStoreError,
+    ConversationAccess, CONVERSATION_ID_PREFIX, CONVERSATION_MESSAGE_ID_PREFIX,
+    DURABLE_AGENT_ID_PREFIX,
 };
 use super::Database;
 use rusqlite::{
@@ -1284,7 +1285,7 @@ impl Database {
             attempt_fence,
             attempt_controller_generation,
         )?;
-        let start_identity_fingerprint = digest_text(
+        let start_identity_fingerprint = digest_json(
             "webcodex.agent-task.endpoint-continuation.start.v1",
             &json!({
                 "task_id": task_id,
@@ -1292,9 +1293,9 @@ impl Database {
                 "assignee_agent_id": assignee_agent_id,
                 "attempt_fence": attempt_fence,
                 "attempt_controller_generation": attempt_controller_generation,
-            })
-            .to_string(),
-        );
+            }),
+        )
+        .expect("AgentTask endpoint continuation identity serializes");
         let mut conn = self.lock_connection(crate::StoreDomain::AgentTask);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2889,10 +2890,7 @@ fn merge_agent_task_coding_run_observation(
 }
 
 fn task_request_hash(value: &serde_json::Value) -> String {
-    digest_text(
-        "webcodex.agent-task.request.v1",
-        &serde_json::to_string(value).expect("AgentTask request serializes"),
-    )
+    digest_json("webcodex.agent-task.request.v1", value).expect("AgentTask request serializes")
 }
 
 fn validate_title(value: &str) -> Result<String, CommunicationStoreError> {

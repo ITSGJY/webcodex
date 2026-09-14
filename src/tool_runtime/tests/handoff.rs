@@ -3529,52 +3529,34 @@ fn session_handoff_summary_metadata_mcp_openapi_consistency() {
         crate::tool_runtime::metadata::ToolAuthorityPolicy::Require("runtime:read")
     );
 
-    // OpenAPI operation set stays bounded after retiring dedicated compatibility actions.
-    let spec = crate::openapi::build_openapi_spec();
-    let tool_desc = &spec["components"]["schemas"]["ToolCallRequest"]["properties"]["tool"]
-        ["description"]
-        .as_str()
-        .unwrap();
-    assert!(
-        tool_desc.contains("session_handoff_summary"),
-        "OpenAPI ToolCallRequest.tool should list session_handoff_summary"
-    );
-    let tool_props = spec["components"]["schemas"]["ToolCallRequest"]["properties"]
+    let openapi = crate::openapi::build_openapi_spec();
+    let action = &openapi["paths"]["/api/actions/session_handoff_summary"]["post"];
+    assert_eq!(action["operationId"], "session_handoff_summary");
+    let properties = action["requestBody"]["content"]["application/json"]["schema"]["properties"]
         .as_object()
-        .expect("ToolCallRequest properties");
-    assert!(
-        tool_props.contains_key("include_validation"),
-        "OpenAPI ToolCallRequest should expose flattened include_validation"
-    );
-    assert!(
-        tool_props.contains_key("include_workspace"),
-        "OpenAPI ToolCallRequest should expose flattened include_workspace"
-    );
-    assert!(
-        tool_props.contains_key("include_checkpoints"),
-        "OpenAPI ToolCallRequest should expose flattened include_checkpoints"
-    );
-    assert!(
-        tool_props.contains_key("summary_only"),
-        "OpenAPI ToolCallRequest should expose flattened summary_only"
-    );
+        .unwrap();
+    for field in [
+        "session_id",
+        "include_validation",
+        "include_workspace",
+        "include_checkpoints",
+        "summary_only",
+    ] {
+        assert!(
+            properties.contains_key(field),
+            "session_handoff_summary missing {field}"
+        );
+    }
     for field in [
         "expected_failure",
         "expected_failure_kind",
         "assertion_name",
     ] {
         assert!(
-            !tool_props.contains_key(field),
-            "OpenAPI ToolCallRequest must not publish recorder metadata field {field}"
+            !properties.contains_key(field),
+            "unexpected Action field {field}"
         );
     }
-    let count: usize = spec["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|m| m.as_object().unwrap().len())
-        .sum();
-    assert_eq!(count, 16, "OpenAPI operation count must remain 16");
 }
 
 // =========================================================================

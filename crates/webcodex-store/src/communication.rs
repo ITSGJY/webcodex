@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 use uuid::Uuid;
 
 pub(crate) const DURABLE_AGENT_ID_PREFIX: &str = "wc_dagent_";
@@ -657,7 +658,7 @@ impl Database {
         let description = validate_description(&input.description)?;
         let specialty_labels = canonicalize_specialty_labels(input.specialty_labels)?;
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "handle": handle,
             "display_name": display_name,
             "description": description,
@@ -949,7 +950,7 @@ impl Database {
             "client_attachment_id",
         )?;
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "agent_id": input.agent_id,
             "host": host,
             "client_attachment_id": client_attachment_id,
@@ -1131,7 +1132,7 @@ impl Database {
             ));
         }
         validate_mcp_app_client_window_key(client_window_key)?;
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "agent_id": agent_id,
             "endpoint_id": endpoint_id,
             "expected_controller_generation": expected_controller_generation,
@@ -1806,7 +1807,8 @@ impl Database {
         )?;
         let agent_ids = canonicalize_agent_ids(input.agent_ids, true)?;
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = digest_json(&json!({"title": title, "agent_ids": agent_ids}));
+        let request_hash =
+            communication_request_hash(&json!({"title": title, "agent_ids": agent_ids}));
         let now = now_unix_ms();
         let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
@@ -2136,7 +2138,7 @@ impl Database {
             .is_none()
             .then_some(input.expected_controller_generation)
             .flatten();
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "conversation_id": &input.conversation_id,
             "author_agent_id": input.author_agent_id.as_deref(),
             "endpoint_id": replay_endpoint_id,
@@ -3436,11 +3438,34 @@ pub(super) fn new_id(prefix: &str) -> String {
     format!("{prefix}{}", Uuid::new_v4().simple())
 }
 
-fn digest_json(value: &Value) -> String {
-    digest_text(
-        "webcodex.communication.request.v1",
-        &serde_json::to_string(value).expect("communication request serializes"),
-    )
+struct Sha256Writer<'a>(&'a mut Sha256);
+
+impl Write for Sha256Writer<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(super) fn digest_json<T: Serialize + ?Sized>(
+    domain: &str,
+    value: &T,
+) -> Result<String, serde_json::Error> {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    let mut writer = Sha256Writer(&mut hasher);
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn communication_request_hash(value: &Value) -> String {
+    digest_json("webcodex.communication.request.v1", value)
+        .expect("communication request serializes")
 }
 
 pub(super) fn digest_text(domain: &str, value: &str) -> String {
@@ -3458,6 +3483,21 @@ pub(super) fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod lifecycle_contract_tests {
     use super::*;
+
+    #[test]
+    fn streaming_json_digest_matches_buffered_text_digest() {
+        let domain = "webcodex.compatibility.test.v1";
+        let value = json!({
+            "escaped": "line\n\"quoted\"\\slash",
+            "unicode": "你好 🦀 日本語",
+            "nested": [null, true, 42, {"key": "value"}]
+        });
+        let buffered = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            digest_json(domain, &value).unwrap(),
+            digest_text(domain, &buffered)
+        );
+    }
 
     #[test]
     fn durable_communication_lifecycle_encodings_are_closed_and_serde_stable() {

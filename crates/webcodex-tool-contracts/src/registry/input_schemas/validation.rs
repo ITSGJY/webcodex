@@ -68,7 +68,7 @@ pub fn cargo_fmt_input_schema() -> Value {
         (
             "sync_wait_secs",
             "integer",
-            "Optional synchronous grace in seconds. With check=true it controls same-execution Job handoff and never extends timeout_secs. With check=false it is accepted for caller-shape compatibility but ignored; ensure-format remains synchronous and timeout_secs remains the full precheck-plus-mutation budget.",
+            "Optional synchronous grace in seconds. With check=true it controls same-execution Job handoff; positive values above 60 or above the effective timeout_secs are accepted and clamped to the smaller bound, and it never extends timeout_secs. With check=false it is accepted for caller-shape compatibility but ignored; ensure-format remains synchronous and timeout_secs remains the full precheck-plus-mutation budget.",
             false,
         ),
     ]));

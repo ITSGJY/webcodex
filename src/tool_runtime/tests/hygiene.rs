@@ -137,31 +137,23 @@ fn workspace_hygiene_check_is_known_and_in_specs() {
         .as_str()
         .is_some_and(|description| description.contains("Sparse non-zero")));
 
-    // OpenAPI ToolCallRequest.tool description includes the name.
     let openapi_spec = crate::openapi::build_openapi_spec();
-    let tool_desc = &openapi_spec["components"]["schemas"]["ToolCallRequest"]["properties"]["tool"]
-        ["description"]
-        .as_str()
-        .unwrap();
-    assert!(
-        tool_desc.contains("workspace_hygiene_check"),
-        "ToolCallRequest.tool description should list workspace_hygiene_check"
-    );
+    let action = &openapi_spec["paths"]["/api/actions/workspace_hygiene_check"]["post"];
+    assert_eq!(action["operationId"], "workspace_hygiene_check");
 
     // tool_manifest category: cleanup.
     assert_eq!(tool_manifest_category("workspace_hygiene_check"), "cleanup");
 }
 
 #[test]
-fn workspace_hygiene_check_openapi_operation_count_unchanged() {
-    let spec = crate::openapi::build_openapi_spec();
-    let count: usize = spec["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|m| m.as_object().unwrap().len())
-        .sum();
-    assert_eq!(count, 16, "operation count must stay 16");
+fn workspace_hygiene_check_is_direct_on_the_derived_action_surface() {
+    assert!(
+        webcodex_tool_contracts::runtime_tool_adaptive_direct_rank("workspace_hygiene_check")
+            .is_some()
+    );
+    assert!(webcodex_tool_contracts::gpt_action_tool_supported(
+        "workspace_hygiene_check"
+    ));
 }
 
 // =========================================================================

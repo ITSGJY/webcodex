@@ -1,9 +1,10 @@
 use super::agent_task::{AgentTaskState, AGENT_TASK_ID_PREFIX};
 use super::agent_wake::{AgentWakeState, AGENT_WAKE_ID_PREFIX};
 use super::communication::{
-    digest_text, lookup_idempotent_resource, new_id, now_unix_ms, record_idempotent_resource,
-    require_agent_owner, require_current_endpoint, store_error, validate_communication_principal,
-    validate_id, validate_idempotency_key, CommunicationPrincipal, CommunicationStoreError,
+    digest_json, digest_text, lookup_idempotent_resource, new_id, now_unix_ms,
+    record_idempotent_resource, require_agent_owner, require_current_endpoint, store_error,
+    validate_communication_principal, validate_id, validate_idempotency_key,
+    CommunicationPrincipal, CommunicationStoreError,
 };
 use super::Database;
 use rusqlite::{
@@ -238,21 +239,21 @@ impl Database {
             }
         }
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = digest_text(
+        let request_hash = digest_json(
             "webcodex.agent-wait.request.v1",
-            &serde_json::to_string(&json!({
+            &json!({
                 "agent_id": input.target_agent_id,
                 "endpoint_id": input.endpoint_id,
                 "expected_controller_generation": input.expected_controller_generation,
                 "events": input.events,
-            }))
-            .map_err(|_| {
-                CommunicationStoreError::new(
-                    "agent_wait_request_invalid",
-                    "Agent Wait request could not be canonicalized",
-                )
-            })?,
-        );
+            }),
+        )
+        .map_err(|_| {
+            CommunicationStoreError::new(
+                "agent_wait_request_invalid",
+                "Agent Wait request could not be canonicalized",
+            )
+        })?;
 
         let mut conn = self.lock_connection(crate::StoreDomain::AgentWait);
         let transaction = conn

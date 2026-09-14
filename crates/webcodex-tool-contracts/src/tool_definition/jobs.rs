@@ -52,7 +52,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Run one one-shot executable with structured argv. This is the preferred route for one native executable with literal argv; Windows batch shims use the bounded Runner-owned quoting contract on executable. Use run_shell only when shell semantics or a short tightly related command chain is required. Do not open a persistent shell merely to run several commands: local persistence is only for same-process cwd/env/exports/functions/umask state; repeated commands on one named SSH resource preserve remote state. New persistent SSH targets use ssh_resource onboarding; one-shot/no-persistence SSH remains valid. Long work continues as the same execution and stays Runner-owned. If the native child must outlive the Runner because this Runner will restart, upgrade, stop, or be replaced, use run_detached_process from the start; duration alone is not a reason to detach.",
             run_process_input_schema,
-        )
+        ).with_gpt_action_description("Run one native executable with literal argv; prefer this over shell when shell syntax is unnecessary. Long work continues as the same Job. Use run_detached_process only when the child must survive Runner restart/upgrade.")
         .with_execution(super::ToolExecutionContract::new(
             super::ToolExecutionForm::NativeArgv,
             super::ToolExecutionLifetime::Runner,
@@ -94,7 +94,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
                 ),
                 "Start a supervisor-owned detached native process as a durable Job when accepted work must outlive the initiating Runner process. Use it from the start when the workflow will restart, upgrade, stop, or replace this Runner and a native child must remain alive across Runner exit or replacement. Duration alone is not a reason to detach: ordinary long work stays Runner-owned. Ownership is handed off before payload start; after restart or upgrade, a replacement Runner can recover the same logical Job only when the supervisor/native identity and lifetime fence reconcile. A bounded replay key prevents duplicate dispatch while retained; expired keys are not retry tokens. Observe or stop with Job tools. No shell, script, SSH-resource, or retry fallback.",
                 run_detached_process_input_schema,
-            )
+            ).with_gpt_action_description("Start a supervisor-owned native process that must survive Runner restart/upgrade as a durable Job. Requires an idempotency_key; observe/stop with Job tools. Duration alone is not a reason to detach.")
             .with_execution(super::ToolExecutionContract::new(
                 super::ToolExecutionForm::NativeArgv,
                 super::ToolExecutionLifetime::Supervisor,
@@ -171,7 +171,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Run one bounded shell command or short tightly related shell command chain. Use it for shell semantics such as &&, pipes, redirects, globbing, substitution, or one tightly related observation goal to reduce model/tool round trips. Keep run_process preferred for one native executable with literal argv. Do not chain independent effects or failure/permission boundaries such as validation, commit, push, deploy, or restart. Use run_script for program-like loops/conditionals/functions/traps/multi-stage logic. Persistent shell is only for same-process cwd/env/export/function/umask state or repeated commands on one named SSH resource. Longer shell work stays Runner-owned. If a native child must outlive the current Runner process across restart/upgrade/stop/replacement, use run_detached_process from the start; shell duration alone is not a reason to detach.",
             run_shell_input_schema,
-        )
+        ).with_gpt_action_description("Run one bounded shell command or tightly related shell chain when shell syntax is required. Prefer run_process for literal argv. Longer work may hand off as the same Job; do not use for independent effects.")
         .with_execution(super::ToolExecutionContract::new(
             super::ToolExecutionForm::ShellCommand,
             super::ToolExecutionLifetime::Runner,
@@ -384,7 +384,7 @@ pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Primary continuation path for an already-known Job: use job_id directly; do not call list_jobs first. Pass observation_token unchanged as after_observation_token; use each newer token next time. Observe 1-8 Jobs with bounded baseline/delta logs and isolated item errors. No token gives an immediate baseline; no wait_secs gives an immediate observation. With tokens, one shared bounded wait_secs (clamped to 60) uses wake_on=change (default) for any update, or wake_on=terminal to coalesce logs/progress until any Job is terminal, an item errors, or the deadline expires. Normal continuation: wait_secs=60, wake_on=terminal; terminal wakes immediately. Updates never extend the deadline; timeout can include changed=true and deltas from original tokens. reset is bounded recovery. Use list_jobs for lost identity/inventory; unknown_job points there. Never launches, retries, stops, or subscribes.",
             observe_jobs_input_schema,
-        ),
+        ).with_gpt_action_description("Continue already-known Jobs by job_id, optionally with opaque observation tokens. Normal continuation uses wait_secs=60 and wake_on=terminal. Tokens are observation cursors only, never retry or execution authority."),
         80,
     ),
 ];
@@ -420,7 +420,7 @@ pub(super) const LISTING_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Recovery and inventory primitive for caller-visible Jobs, not the normal continuation step. Do not call list_jobs when the initiating tool or current context already provides an exact job_id; continue that Job with observe_jobs instead. Use list_jobs when exact Job identity was lost, unknown_job explicitly requests inventory recovery, the user asks to enumerate background work, or multiple historical/parallel Jobs must be inspected. Exact project/session_id filters are preferred when known and combine with status using AND semantics. stdout/stderr bodies are never included; exact Job logs and continuation belong to observe_jobs.",
             list_jobs_input_schema,
-        )),
+        ).with_gpt_action_description("Inventory caller-visible Jobs when exact identity is lost or enumeration is requested. Prefer exact project/session/status filters. If job_id is already known, continue with observe_jobs instead.")),
         85,
     ),
     def(

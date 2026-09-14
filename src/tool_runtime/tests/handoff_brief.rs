@@ -211,17 +211,6 @@ fn handoff_brief_schema_is_shared_strict_and_absent_from_startup() {
         .to_string()
         .find("\"handoff_brief\"")
         .is_none());
-    let openapi = crate::openapi::build_openapi_spec();
-    assert_eq!(
-        &openapi["components"]["schemas"]["HandoffBrief"], handoff_schema,
-        "REST/OpenAPI and GPT Actions must reuse the MCP/runtime handoff schema"
-    );
-    assert_eq!(
-        openapi["components"]["schemas"]["ToolResult"]["properties"]["output"]["oneOf"][0]
-            ["properties"]["handoff_brief"]["$ref"],
-        "#/components/schemas/HandoffBrief"
-    );
-
     let store = store_with_limit(200);
     let session_id = start_session(&store, "schema");
     let workspace = clean_workspace();

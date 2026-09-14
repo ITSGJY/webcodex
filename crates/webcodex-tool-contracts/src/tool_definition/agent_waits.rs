@@ -49,7 +49,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     ),
                     "Create one caller-owned durable one-shot AgentWait over 1..8 exact agent_task_terminal selectors with fixed ANY semantics. Re-authorizes the exact Agent, current Endpoint generation, and every source Task before atomically registering sources and already-terminal snapshots. The Endpoint is presentation only, not durable Wait ownership. First match creates one existing-carrier Wake; further matches coalesce only while that Wake is pending/claimed. Exact keyed replay returns the same Wait.",
                     wait_for_agent_events_input_schema,
-                ),
+                ).with_gpt_action_description("Create one durable one-shot AgentWait over exact AgentTask terminal selectors. ANY semantics; first match creates/coalesces the existing-carrier Wake. Exact idempotency replay returns the same Wait."),
                 PERMISSION_RISK_WRITE,
             ),
             21,

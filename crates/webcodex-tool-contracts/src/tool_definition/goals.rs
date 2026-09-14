@@ -130,7 +130,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 ),
                 "Present one exact caller-owned durable Goal as a sparse read-only Goal Plan MCP App card. Requires explicit goal_id and never infers Goal identity from Project, Workflow Session, Conversation, credential, ClientWindow, or recent activity. Presentation creates no work, grants no execution authority, and does not modify Goal lifecycle.",
                 present_goal_plan_input_schema,
-            ),
+            )
+            .with_gpt_action_unsupported(),
             17,
         ),
         COMMUNICATION_READ_SCOPES,

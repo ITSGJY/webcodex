@@ -228,31 +228,16 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     }
 
     let openapi = crate::openapi::build_openapi_spec();
-    let tool_call = &openapi["components"]["schemas"]["ToolCallRequest"];
-    let tool_desc = tool_call["properties"]["tool"]["description"]
-        .as_str()
+    let work = &openapi["paths"]["/api/actions/work_on_project"]["post"];
+    assert_eq!(work["operationId"], "work_on_project");
+    let work_properties = work["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]
+        .as_object()
         .unwrap();
-    assert!(!tool_desc.contains("start_coding_task"));
-    assert!(tool_desc.contains("work_on_project"));
-    assert!(tool_desc.contains("finish_coding_task"));
-    let properties = tool_call["properties"].as_object().unwrap();
-    for field in [
-        "project",
-        "client_id",
-        "path",
-        "mode",
-        "base_ref",
-        "execution_context",
-        "include_hygiene",
-        "include_handoff",
-        "include_workspace",
-        "include_validation_summary",
-        "include_validation",
-        "summary_only",
-    ] {
+    for field in ["project", "client_id", "path", "mode", "base_ref"] {
         assert!(
-            properties.contains_key(field),
-            "ToolCallRequest missing model-visible flattened field {field}"
+            work_properties.contains_key(field),
+            "work_on_project missing {field}"
         );
     }
     for field in [
@@ -265,34 +250,34 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         "new_session",
     ] {
         assert!(
-            !properties.contains_key(field),
-            "ToolCallRequest must not expose hidden start-only flattened field {field}"
+            !work_properties.contains_key(field),
+            "retired work_on_project field {field}"
         );
     }
-    assert!(!tool_call["description"]
-        .as_str()
-        .unwrap()
-        .contains("start_coding_task"));
+
+    let finish = &openapi["paths"]["/api/actions/finish_coding_task"]["post"];
+    assert_eq!(finish["operationId"], "finish_coding_task");
+    let finish_properties = finish["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]
+        .as_object()
+        .unwrap();
     for field in [
-        "expected_failure",
-        "expected_failure_kind",
-        "assertion_name",
+        "project",
+        "session_id",
+        "include_hygiene",
+        "include_handoff",
+        "include_workspace",
+        "include_validation_summary",
+        "summary_only",
     ] {
         assert!(
-            !properties.contains_key(field),
-            "ToolCallRequest must not publish recorder metadata field {field}"
+            finish_properties.contains_key(field),
+            "finish_coding_task missing {field}"
         );
     }
-    let operation_count: usize = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|methods| methods.as_object().unwrap().len())
-        .sum();
-    assert_eq!(
-        operation_count, 16,
-        "retired dedicated OpenAPI operations stay absent"
-    );
+    assert!(openapi["paths"]
+        .get("/api/actions/start_coding_task")
+        .is_none());
 }
 
 #[tokio::test]
@@ -417,28 +402,7 @@ async fn coding_workflow_full_diagnostic_has_no_binding_projection() {
         .iter()
         .find(|tool| tool["name"] == "work_on_project")
         .expect("canonical work_on_project manifest entry");
-    for field in ["project", "client_id", "path", "instruction", "session_id"] {
-        assert!(
-            work_tool["accepted_flattened_args"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|accepted| accepted == field),
-            "work_on_project manifest entry missing {field}"
-        );
-    }
-    for advanced in [
-        "detail",
-        "temporary_project_name",
-        "bind_current",
-        "new_session",
-    ] {
-        assert!(!work_tool["accepted_flattened_args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field == advanced));
-    }
+    assert!(work_tool.get("accepted_flattened_args").is_none());
     assert!(work_tool.get("inputSchema").is_none());
     assert!(work_tool.get("outputSchema").is_none());
     assert_eq!(result.output["git"]["clean"], true);

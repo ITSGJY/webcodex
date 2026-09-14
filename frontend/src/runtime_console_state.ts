@@ -121,6 +121,7 @@ export function initialRuntimeConsoleState(): any {
     selectedProject: "",
     projectGeneration: 0,
     sessionListGeneration: 0,
+    projectWindowsGeneration: 0,
     workflow: initialWorkflowSessionState(),
     collaboration: emptyCollaborationState(),
   };
@@ -135,6 +136,7 @@ export function invalidateRuntimeCredential(state: any): void {
   state.selectedProject = "";
   state.projectGeneration += 1;
   state.sessionListGeneration += 1;
+  state.projectWindowsGeneration += 1;
   clearWorkflowSessionSelection(state.workflow);
   resetCollaborationState(state.collaboration);
 }
@@ -192,6 +194,7 @@ export function selectRuntimeProject(state: any, device: string, project: string
   state.selectedProject = project;
   state.projectGeneration += 1;
   state.sessionListGeneration += 1;
+  state.projectWindowsGeneration += 1;
   clearWorkflowSessionSelection(state.workflow);
   resetCollaborationState(state.collaboration);
   return refreshRuntimeSessionList(state);
@@ -212,6 +215,23 @@ export function isCurrentRuntimeSessionListRequest(state: any, request: any): bo
   return !!request && request.credentialGeneration === state.credentialGeneration &&
     request.project === state.selectedProject && request.projectGeneration === state.projectGeneration &&
     request.generation === state.sessionListGeneration;
+}
+
+export function refreshRuntimeProjectWindows(state: any): any {
+  if (!state.selectedProject) return null;
+  state.projectWindowsGeneration += 1;
+  return {
+    credentialGeneration: state.credentialGeneration,
+    project: state.selectedProject,
+    projectGeneration: state.projectGeneration,
+    generation: state.projectWindowsGeneration,
+  };
+}
+
+export function isCurrentRuntimeProjectWindowsRequest(state: any, request: any): boolean {
+  return !!request && request.credentialGeneration === state.credentialGeneration &&
+    request.project === state.selectedProject && request.projectGeneration === state.projectGeneration &&
+    request.generation === state.projectWindowsGeneration;
 }
 
 function wrapWorkflowRequest(state: any, request: any): any {

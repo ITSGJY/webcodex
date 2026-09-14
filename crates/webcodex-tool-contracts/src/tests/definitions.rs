@@ -382,6 +382,63 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         );
     }
 
+    let gpt_action_direct = gpt_action_direct_tool_definitions();
+    let expected_gpt_action_direct = derived
+        .iter()
+        .copied()
+        .filter(|definition| definition.supports_gpt_actions())
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gpt_action_direct
+            .iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>(),
+        expected_gpt_action_direct,
+        "GPT Actions direct exposure must inherit Adaptive Direct ordering minus explicit protocol exceptions"
+    );
+    assert!(gpt_action_tool_supported("apply_patch"));
+    assert!(
+        !gpt_action_direct
+            .iter()
+            .any(|definition| definition.name == "apply_patch"),
+        "apply_patch stays GPT-Action-supported long-tail behind call_runtime_tool"
+    );
+    for name in [
+        "present_goal_plan",
+        "present_agent_continuation",
+        "present_work_result",
+        "export_project_artifact",
+        "rotate_agent_continuation_endpoint",
+    ] {
+        assert!(
+            !gpt_action_tool_supported(name),
+            "{name} depends on MCP-only presentation/resource semantics"
+        );
+    }
+
+    for definition in &gpt_action_direct {
+        let model_spec = definition
+            .model_spec
+            .expect("model-visible direct tool spec");
+        let action_description = definition
+            .gpt_action_description()
+            .expect("GPT Action description projection");
+        assert!(
+            action_description.chars().count() <= GPT_ACTION_DESCRIPTION_MAX_CHARS,
+            "{} GPT Action description exceeds {} characters",
+            definition.name,
+            GPT_ACTION_DESCRIPTION_MAX_CHARS
+        );
+        if model_spec.description.chars().count() > GPT_ACTION_DESCRIPTION_MAX_CHARS {
+            assert!(
+                model_spec.gpt_action_description.is_some(),
+                "{} needs an explicit short GPT Action presentation description",
+                definition.name
+            );
+        }
+    }
+
     let observe_jobs = registered_tool_specs()
         .into_iter()
         .find(|spec| spec.name == "observe_jobs")

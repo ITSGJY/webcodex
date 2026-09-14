@@ -103,6 +103,7 @@ export function initialRuntimeConsoleState() {
         selectedProject: "",
         projectGeneration: 0,
         sessionListGeneration: 0,
+        projectWindowsGeneration: 0,
         workflow: initialWorkflowSessionState(),
         collaboration: emptyCollaborationState(),
     };
@@ -116,6 +117,7 @@ export function invalidateRuntimeCredential(state) {
     state.selectedProject = "";
     state.projectGeneration += 1;
     state.sessionListGeneration += 1;
+    state.projectWindowsGeneration += 1;
     clearWorkflowSessionSelection(state.workflow);
     resetCollaborationState(state.collaboration);
 }
@@ -166,6 +168,7 @@ export function selectRuntimeProject(state, device, project) {
     state.selectedProject = project;
     state.projectGeneration += 1;
     state.sessionListGeneration += 1;
+    state.projectWindowsGeneration += 1;
     clearWorkflowSessionSelection(state.workflow);
     resetCollaborationState(state.collaboration);
     return refreshRuntimeSessionList(state);
@@ -185,6 +188,22 @@ export function isCurrentRuntimeSessionListRequest(state, request) {
     return !!request && request.credentialGeneration === state.credentialGeneration &&
         request.project === state.selectedProject && request.projectGeneration === state.projectGeneration &&
         request.generation === state.sessionListGeneration;
+}
+export function refreshRuntimeProjectWindows(state) {
+    if (!state.selectedProject)
+        return null;
+    state.projectWindowsGeneration += 1;
+    return {
+        credentialGeneration: state.credentialGeneration,
+        project: state.selectedProject,
+        projectGeneration: state.projectGeneration,
+        generation: state.projectWindowsGeneration,
+    };
+}
+export function isCurrentRuntimeProjectWindowsRequest(state, request) {
+    return !!request && request.credentialGeneration === state.credentialGeneration &&
+        request.project === state.selectedProject && request.projectGeneration === state.projectGeneration &&
+        request.generation === state.projectWindowsGeneration;
 }
 function wrapWorkflowRequest(state, request) {
     if (!request || !state.selectedProject)

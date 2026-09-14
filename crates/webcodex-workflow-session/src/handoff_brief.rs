@@ -7,6 +7,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 
 use crate::{
     normalize_observed_project_path, redact_and_bound_instruction, SessionSummary,
@@ -247,10 +248,35 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
     brief
 }
 
+#[derive(Default)]
+struct JsonByteCounter(usize);
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "serialized JSON length overflow",
+            )
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len<T: serde::Serialize + ?Sized>(
+    value: &T,
+) -> Result<usize, serde_json::Error> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
 pub fn handoff_brief_size(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(value).unwrap_or(usize::MAX)
 }
 
 fn instruction_projection(instruction: Option<&str>) -> Value {
@@ -744,28 +770,9 @@ fn enforce_hard_limit(brief: &mut Value) {
     while handoff_brief_size(brief) >= HANDOFF_BRIEF_HARD_MAX_BYTES
         && pop_plain_array_item(brief, "/next_actions")
     {}
-    while handoff_brief_size(brief) >= HANDOFF_BRIEF_HARD_MAX_BYTES {
-        let root_len = brief
-            .pointer("/task/root_instruction/excerpt")
-            .and_then(Value::as_str)
-            .map(str::len)
-            .unwrap_or(0);
-        let latest_len = brief
-            .pointer("/task/latest_instruction/excerpt")
-            .and_then(Value::as_str)
-            .map(str::len)
-            .unwrap_or(0);
-        if root_len == 0 && latest_len == 0 {
-            break;
-        }
-        let pointer = if root_len >= latest_len {
-            "/task/root_instruction"
-        } else {
-            "/task/latest_instruction"
-        };
-        if !pop_instruction_char(brief, pointer) {
-            break;
-        }
+    let instruction_phase_size = handoff_brief_size(brief);
+    if instruction_phase_size >= HANDOFF_BRIEF_HARD_MAX_BYTES {
+        reduce_instruction_excerpts_to_fit(brief, instruction_phase_size);
     }
     debug_assert!(
         handoff_brief_size(brief) < HANDOFF_BRIEF_HARD_MAX_BYTES,
@@ -802,21 +809,93 @@ fn pop_plain_array_item(brief: &mut Value, pointer: &str) -> bool {
         .is_some()
 }
 
-fn pop_instruction_char(brief: &mut Value, pointer: &str) -> bool {
-    let Some(instruction) = brief.pointer_mut(pointer).and_then(Value::as_object_mut) else {
-        return false;
-    };
-    let Some(mut excerpt) = instruction
-        .get("excerpt")
+fn serialized_json_char_content_len(ch: char) -> usize {
+    let mut buffer = [0_u8; 4];
+    let encoded = ch.encode_utf8(&mut buffer);
+    serialized_json_len(encoded)
+        .expect("one Unicode scalar always serializes as JSON")
+        .saturating_sub(2)
+}
+
+fn instruction_excerpt(brief: &Value, pointer: &str) -> Option<String> {
+    brief
+        .pointer(&format!("{pointer}/excerpt"))
         .and_then(Value::as_str)
         .map(str::to_string)
-    else {
-        return false;
+}
+
+fn instruction_truncated(brief: &Value, pointer: &str) -> bool {
+    brief
+        .pointer(&format!("{pointer}/truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn write_instruction_excerpt(brief: &mut Value, pointer: &str, excerpt: String) {
+    let Some(instruction) = brief.pointer_mut(pointer).and_then(Value::as_object_mut) else {
+        return;
     };
-    if excerpt.pop().is_none() {
-        return false;
+    instruction.insert("excerpt".to_string(), Value::String(excerpt));
+    instruction.insert("truncated".to_string(), Value::Bool(true));
+}
+
+fn reduce_instruction_excerpts_to_fit(brief: &mut Value, mut serialized_size: usize) -> usize {
+    const ROOT: &str = "/task/root_instruction";
+    const LATEST: &str = "/task/latest_instruction";
+
+    let mut root = instruction_excerpt(brief, ROOT);
+    let mut latest = instruction_excerpt(brief, LATEST);
+    let mut root_truncated = instruction_truncated(brief, ROOT);
+    let mut latest_truncated = instruction_truncated(brief, LATEST);
+    let mut root_changed = false;
+    let mut latest_changed = false;
+    let mut removed = 0;
+
+    while serialized_size >= HANDOFF_BRIEF_HARD_MAX_BYTES {
+        let root_len = root.as_deref().map_or(0, str::len);
+        let latest_len = latest.as_deref().map_or(0, str::len);
+        if root_len == 0 && latest_len == 0 {
+            break;
+        }
+
+        let (excerpt, truncated, changed) = if root_len >= latest_len {
+            (&mut root, &mut root_truncated, &mut root_changed)
+        } else {
+            (&mut latest, &mut latest_truncated, &mut latest_changed)
+        };
+        let Some(excerpt) = excerpt.as_mut() else {
+            break;
+        };
+        let Some(ch) = excerpt.pop() else {
+            break;
+        };
+
+        serialized_size = serialized_size.saturating_sub(serialized_json_char_content_len(ch));
+        if !*truncated {
+            // `false` is one serialized byte longer than `true`. The old
+            // one-char reducer flips this marker on the first successful pop.
+            serialized_size = serialized_size.saturating_sub(1);
+            *truncated = true;
+        }
+        *changed = true;
+        removed += 1;
     }
-    instruction.insert("excerpt".to_string(), json!(excerpt));
-    instruction.insert("truncated".to_string(), json!(true));
-    true
+
+    if root_changed {
+        write_instruction_excerpt(brief, ROOT, root.expect("changed root excerpt exists"));
+    }
+    if latest_changed {
+        write_instruction_excerpt(
+            brief,
+            LATEST,
+            latest.expect("changed latest instruction excerpt exists"),
+        );
+    }
+    removed
+}
+
+#[cfg(test)]
+pub(crate) fn reduce_instruction_excerpts_for_test(brief: &mut Value) -> (usize, usize) {
+    let size = handoff_brief_size(brief);
+    (reduce_instruction_excerpts_to_fit(brief, size), 1)
 }

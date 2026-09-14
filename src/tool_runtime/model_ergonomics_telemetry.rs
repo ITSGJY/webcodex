@@ -8,6 +8,7 @@ use super::edit_tool_telemetry::{edit_tool_surface, EditToolSurface};
 use super::sessions::SessionContextRevisionAck;
 use super::tool_definition::model_visible_tool_definitions;
 use super::{ToolResult, RECOVERY_KIND_VALUES};
+use crate::json_measurement::serialized_json_len;
 use serde::Serialize;
 use serde_json::Value;
 #[cfg(test)]
@@ -211,7 +212,7 @@ impl ModelErgonomicsCompletion {
         &self,
         result: &ToolResult,
     ) -> Option<ModelErgonomicsRecord> {
-        let serialized_result_bytes = serde_json::to_vec(result).ok()?.len();
+        let serialized_result_bytes = serialized_json_len(result).ok()?;
         Some(self.record_from_parts(
             result.success,
             &result.output,
@@ -228,7 +229,7 @@ impl ModelErgonomicsCompletion {
     ) -> Option<ModelErgonomicsRecord> {
         let success = structured_content.get("success")?.as_bool()?;
         let output = structured_content.get("output")?;
-        let serialized_result_bytes = serde_json::to_vec(structured_content).ok()?.len();
+        let serialized_result_bytes = serialized_json_len(structured_content).ok()?;
         Some(self.record_from_parts(success, output, Some(serialized_result_bytes)))
     }
 
@@ -468,6 +469,16 @@ fn has_context_handoff_recovery_call(output: &Value) -> bool {
         == Some("session_handoff_summary")
 }
 
+#[derive(Serialize)]
+struct ContinuityProjection<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_context_revision: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_continuity: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_recovery: Option<&'a Value>,
+}
+
 fn continuity_facts(ack_shape: ContextAckShape, output: &Value) -> ContinuityFacts {
     let eligible = !matches!(ack_shape, ContextAckShape::Unsupported);
     if !eligible {
@@ -548,23 +559,19 @@ fn continuity_facts(ack_shape: ContextAckShape, output: &Value) -> ContinuityFac
     };
     // Count only the final continuity overlay, including its safe watermark.
     // Explicit handoff business content is already in serialized_result_bytes.
-    let projection: serde_json::Map<String, Value> = [
-        "session_context_revision",
-        "session_continuity",
-        "session_recovery",
-    ]
-    .into_iter()
-    .filter_map(|key| {
-        output
-            .get(key)
-            .map(|value| (key.to_string(), value.clone()))
-    })
-    .collect();
-    let recovery_bytes = if projection.is_empty() {
+    let projection = ContinuityProjection {
+        session_context_revision: output.get("session_context_revision"),
+        session_continuity: output.get("session_continuity"),
+        session_recovery: output.get("session_recovery"),
+    };
+    let recovery_bytes = if projection.session_context_revision.is_none()
+        && projection.session_continuity.is_none()
+        && projection.session_recovery.is_none()
+    {
         0
     } else {
-        serde_json::to_vec(&projection)
-            .map(|bytes| bytes.len() as u64)
+        serialized_json_len(&projection)
+            .map(|bytes| bytes as u64)
             .unwrap_or(0)
     };
     ContinuityFacts {

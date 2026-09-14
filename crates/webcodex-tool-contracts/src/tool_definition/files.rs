@@ -112,7 +112,7 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Adaptive Runtime preferred batch-capable project-text search, including when only one query is needed. Run 1 to 8 independent searches with isolated failures and at most two Runner requests in flight. Each query defaults to regex; prefer pattern_mode=literal for identifiers, snippets, paths, and exact text, and request context explicitly. Batch continuation is whole-query via authoritative next_index; an individual truncated query has no safe match cursor and should be refined instead.",
             search_project_texts_input_schema,
-        )),
+        ).with_gpt_action_description("Batch-search project text with 1..8 independent queries. Prefer literal mode for exact text. Whole-query batch continuation uses next_index; truncated individual queries must be narrowed/refined, not cursor-guessed.")),
         40,
     ),
 ];
@@ -142,7 +142,7 @@ pub(super) const READ_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Adaptive Runtime preferred batch-capable inspect tool, including when only one known range is needed. Reads 1 to 8 UTF-8 ranges in request order with isolated failures. Partial items return positional read_range continuations whose one-item read_files recovery binds the exact resolved Project id, business session_id, and result budget. Compare sha256 before joining ranges because reads are not snapshot-stable. Budget omission returns batch_items with remaining original items; next_index is evidence, not a read_files input. If no part of the first item fits, increase_result_budget suggests bounded max_result_bytes; zero progress at the hard cap exposes no fake continuation. Complete a current partial item before later batch recovery. Primary batch budget defaults to ~64 KiB, capped at 512 KiB for explicit broad/deep inspection; Session overlays remain bounded.",
             read_files_input_schema,
-        )),
+        ).with_gpt_action_description("Batch-read 1..8 UTF-8 project ranges. Complete a partial current item before later batch continuation; compare sha256 because reads are not snapshot-stable. Increase result budget only when recovery explicitly suggests it.")),
         50,
     ),
 ];

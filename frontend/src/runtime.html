@@ -132,6 +132,17 @@
             <p id="runtime-projects-empty" class="muted small empty-copy" hidden>No Projects match this filter.</p>
           </section>
 
+          <section id="runtime-project-window-activity-panel" class="sidebar-section project-window-panel" hidden>
+            <div class="sidebar-section-head">
+              <h2>Window activity</h2>
+              <span id="runtime-project-windows-count" class="count-badge">0</span>
+            </div>
+            <span id="runtime-project-windows-status" class="muted small" role="status"></span>
+            <div id="runtime-project-windows-list" class="runtime-window-list project-window-list" role="group" aria-label="Project Window activity"></div>
+            <p id="runtime-project-windows-empty" class="muted small empty-copy" hidden>No Window activity recorded for this project.</p>
+            <p id="runtime-project-windows-unavailable" class="muted small empty-copy" hidden>Window activity requires runtime:read. Project-scoped Session access remains available.</p>
+          </section>
+
           <section id="runtime-workflow-sessions-panel" class="sidebar-section sessions-panel">
             <div class="sidebar-section-head">
               <h2>Sessions</h2>

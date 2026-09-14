@@ -1,5 +1,6 @@
 use super::{RecoveryKind, ToolResult, ToolRuntime};
 use crate::auth::{AuthContext, AuthKind};
+use crate::json_digest::update_sha256_with_json;
 use crate::runner_http::RunnerFeature;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
@@ -1324,17 +1325,22 @@ fn intent_fingerprint(
     config: &BTreeMap<String, CodingAgentConfigValue>,
     timeout_secs: u64,
 ) -> String {
-    let canonical = serde_json::to_vec(&json!({
+    const DOMAIN: &[u8] = b"webcodex-coding-agent-intent-v1\0";
+    let canonical = json!({
         "project": project,
         "provider": provider,
         "instruction": instruction,
         "config": config,
         "timeout_secs": timeout_secs,
-    }))
-    .unwrap_or_default();
+    });
     let mut hasher = Sha256::new();
-    hasher.update(b"webcodex-coding-agent-intent-v1\0");
-    hasher.update(&canonical);
+    hasher.update(DOMAIN);
+    if update_sha256_with_json(&mut hasher, &canonical).is_err() {
+        // Match the historical `to_vec(...).unwrap_or_default()` fallback:
+        // keep the domain prefix and hash no JSON bytes.
+        hasher = Sha256::new();
+        hasher.update(DOMAIN);
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -2162,5 +2168,17 @@ mod tests {
         let c = intent_fingerprint("agent:x:p", "codex", "different", &config, 30);
         assert_eq!(a, b);
         assert_ne!(a, c);
+
+        let canonical = json!({
+            "project": "agent:x:p",
+            "provider": "codex",
+            "instruction": "inspect",
+            "config": &config,
+            "timeout_secs": 30,
+        });
+        let mut buffered = Sha256::new();
+        buffered.update(b"webcodex-coding-agent-intent-v1\0");
+        buffered.update(serde_json::to_vec(&canonical).unwrap());
+        assert_eq!(a, format!("{:x}", buffered.finalize()));
     }
 }

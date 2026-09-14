@@ -68,7 +68,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Canonical bootstrap for ordinary coding/review. Use project or client_id+path. Omit session_id for a fresh Workflow Session; supply it for exact resume of an active accessible Session; never guesses prior Session. Defaults return bounded project instructions, workflow guidance, and Skills/Plugin selection metadata, which grants no authority. Skill bodies require skill_read_file; Plugin calls require plugin_tool describe. Set include_* false only when the current model context retains that material; Session/window/transport/credential/Server identity never proves retention. Fresh contexts keep defaults true on resume; include_extension_catalog=false skips discovery. Checkout accepts Project or Runner path and does not require Git; mode=worktree resolves an exact Git base and manages an isolated worktree without bypassing Project authority.",
             work_on_project_input_schema,
-        )),
+        ).with_gpt_action_description("Start or resume exact project work. Use project or client_id+path; omit session_id for a fresh Workflow Session. Defaults return project/workflow/extension context. worktree mode creates an isolated Runner-managed Git worktree without widening authority.")),
         10,
     ),
     adaptive_runtime_direct(
@@ -128,7 +128,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Optionally present one exact coding Workflow Session as a persistent read-only Work Result MCP App card when a user-visible work summary is genuinely useful. Requires explicit project + session_id, creates no work, runs no validation/review, changes no Session lifecycle, and grants no authority. The returned Work Result is the card's initial authoritative snapshot; do not call merely to acknowledge a clean worktree and do not call repeatedly to refresh. Later refresh is user-driven inside the existing card through one exact app-only state read per click. Presentation is UX only, never a correctness requirement; repeated explicit presentation may create another Host card.",
             work_result_input_schema,
-        )),
+        ))
+        .with_gpt_action_unsupported(),
         155,
     ),
     def(
@@ -529,7 +530,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ),
             "Read-only handoff for multi-step tasks, explicit session_id. Reads session ledger collaboration and ledger-derived validation. Diagnostics use bounded tails or safe result metadata; validation.parser.available is false if absent. Use the default full view to recover unknown context; summary_only, limit below 20, or disabled include_* components cannot establish a new ACK baseline. No checkpoint allocation; grants no authority.",
             session_handoff_summary_input_schema,
-        ))),
+        ).with_gpt_action_description("Recover an explicit Workflow Session for multi-step work. Use full defaults to rebuild context/ACK baseline; summary_only or reduced sections are diagnostic only. Read-only and grants no authority."))),
         16,
     ),
 ];

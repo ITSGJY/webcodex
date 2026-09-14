@@ -2,6 +2,7 @@ use super::sessions;
 use super::tool_definition::runtime_tool_is_shell_like;
 use super::{RecoveryKind, ToolResult};
 use crate::auth::AuthContext;
+use crate::json_measurement::serialized_json_len;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -410,8 +411,8 @@ fn bounded_model_facing_recovery_events(
         .take(SESSION_CONTINUITY_RECOVERY_EVENT_LIMIT)
     {
         events.insert(0, model_facing_recovery_event(event));
-        let fits = serde_json::to_vec(&events)
-            .map(|bytes| bytes.len() <= SESSION_CONTINUITY_RECOVERY_EVENT_BYTES)
+        let fits = serialized_json_len(&events)
+            .map(|bytes| bytes <= SESSION_CONTINUITY_RECOVERY_EVENT_BYTES)
             .unwrap_or(false);
         if !fits {
             events.remove(0);

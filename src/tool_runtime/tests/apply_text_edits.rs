@@ -140,10 +140,17 @@ fn apply_text_edits_occurrence_and_recovery_schemas_are_model_visible() {
     .unwrap_or_else(|error| panic!("scoped conflict recovery must match output schema: {error}"));
 
     let openapi = crate::openapi::build_openapi_spec();
-    let occurrence = &openapi["components"]["schemas"]["ToolCallRequest"]["properties"]["changes"]
-        ["items"]["properties"]["edits"]["items"]["properties"]["occurrence"];
-    assert_eq!(occurrence["type"], "integer");
-    assert_eq!(occurrence["minimum"], 1);
+    let action = &openapi["paths"]["/api/actions/apply_text_edits"]["post"];
+    assert_eq!(action["operationId"], "apply_text_edits");
+    let action_edit_variants = action["requestBody"]["content"]["application/json"]["schema"]
+        ["properties"]["changes"]["items"]["oneOf"][0]["properties"]["edits"]["items"]["oneOf"]
+        .as_array()
+        .expect("Action apply_text_edits edit variants");
+    assert_eq!(action_edit_variants.len(), 4);
+    for variant in action_edit_variants {
+        assert_eq!(variant["properties"]["occurrence"]["type"], "integer");
+        assert_eq!(variant["properties"]["occurrence"]["minimum"], 1);
+    }
     assert!(spec.description.contains("occurrence"));
     assert!(spec.description.contains("line_scope"));
     assert!(spec.description.contains("global source order"));

@@ -173,20 +173,20 @@ sudo webcodex runner logs --scope system --lines 100
 
 Also verify the server URL, local token files, and Runner `allowed_roots`. Missing or empty `allowed_roots` defaults to `$HOME`; explicit `allowed_roots` replaces that default.
 
-### `listRuntimeTools` full response is too large
+### `tool_manifest` discovery is too broad
 
-Full `listRuntimeTools` includes expanded schemas and metadata. For GPT Actions,
-prefer `callRuntimeTool` with `tool="tool_manifest"` for daily discovery. For a
-focused schema/debug view, call `listRuntimeTools` with `summary_only=true` plus
-`category`, `features`, or `limit`.
+For GPT Actions, call the canonical `tool_manifest` operation directly and prefer
+an exact `tool_name` or a `category` / `intent` filter for compact discovery. The
+generic Actions surface no longer exposes the retired `listRuntimeTools` facade.
 
 ### GPT Action still uses an old schema
 
 Re-import the OpenAPI schema from the deployed `/openapi.json`, then check the
-operation count. The current recommended count is 25 and the GPT Actions limit
-is 30. If the count exceeds 30, do not deploy the schema as-is; artifact upload
-tools should remain runtime-only behind `callRuntimeTool`, not promoted to new
-dedicated Actions.
+operation count. It is derived from the current Adaptive Direct projection plus
+`call_runtime_tool`, so do not compare it with a fixed recommended count. The
+generated surface must remain below the GPT Actions 30-operation ceiling; if it
+reaches that ceiling, change the canonical Adaptive projection or a real protocol
+exception rather than silently truncating the schema.
 
 ### MCP tool list looks stale
 
@@ -241,10 +241,10 @@ the smoke at another safe Runner-backed git project.
 
 ### `operation_count` exceeds 30
 
-The GPT Actions surface must stay at or below 30 operations. Keep runtime-only
-tools, including chunked artifact upload tools, behind `callRuntimeTool` unless
-there is an explicit product decision and operation budget for a dedicated
-Action.
+The generated GPT Actions surface must stay below 30 operations. Long-tail
+runtime tools, including chunked artifact upload tools, remain behind
+`call_runtime_tool`; direct operations are derived from the canonical Adaptive
+Direct surface rather than a separate Actions allowlist.
 
 ### `artifact_upload_chunk` says `path` is missing
 

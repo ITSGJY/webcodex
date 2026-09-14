@@ -160,20 +160,19 @@ sudo webcodex runner logs --scope system --lines 100
 
 同时确认 server URL、本地 token files 和 Runner `allowed_roots`。缺失或为空的 `allowed_roots` 默认使用 `$HOME`；显式 `allowed_roots` 会覆盖该默认值。
 
-### `listRuntimeTools` full response 过大
+### `tool_manifest` discovery 范围过大
 
-完整 `listRuntimeTools` 会包含展开后的 schemas 和 metadata。GPT Actions 的日常
-discovery 应优先使用 `callRuntimeTool` 且 `tool="tool_manifest"`。需要聚焦
-schema/debug 时，再调用 `listRuntimeTools`，并传
-`summary_only=true` 加 `category`、`features` 或 `limit`。
+GPT Actions 应直接调用 canonical `tool_manifest` operation，并优先传 exact
+`tool_name`，或使用 `category` / `intent` filter 来保持 discovery 紧凑。generic
+Actions surface 已不再暴露退休的 `listRuntimeTools` facade。
 
 ### GPT Action 仍在使用旧 schema
 
 从已部署的 `/openapi.json` 重新导入 OpenAPI schema，然后检查 operation count。
-当前推荐值是 25，GPT Actions 上限是 30。如果 count 超过 30，不要直接部署该
-schema；artifact upload tools 应继续作为 runtime-only tools 通过
-`callRuntimeTool` 使用，不要新增 dedicated Actions。兼容编辑工具也应继续通过
-`callRuntimeTool` 使用。
+该数量由当前 Adaptive Direct projection 加 `call_runtime_tool` 动态派生，不应再和
+固定“推荐数量”比较。生成 surface 必须保持在 GPT Actions 的 30-operation ceiling
+以下；如果达到 ceiling，应调整 canonical Adaptive projection 或真实的 protocol
+exception，而不是静默截断 schema。
 
 ### MCP tool list 看起来是旧的
 
@@ -226,9 +225,9 @@ Runner-backed git project。
 
 ### `operation_count` 超过 30
 
-GPT Actions surface 必须保持在 30 operations 以内。runtime-only tools，包括
-chunked artifact upload tools，应继续放在 `callRuntimeTool` 后面，除非有明确的
-产品决策和 operation budget 来新增 dedicated Action。
+生成的 GPT Actions surface 必须保持在 30 operations 以下。long-tail runtime
+tools（包括 chunked artifact upload tools）继续通过 `call_runtime_tool` 调用；direct
+operations 从 canonical Adaptive Direct surface 派生，不维护单独的 Actions allowlist。
 
 ### `artifact_upload_chunk` 报 `path` 缺失
 

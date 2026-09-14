@@ -1,5 +1,6 @@
 use crate::auth::AuthContext;
 use crate::db::AdminProjectAudit;
+use crate::json_digest::update_sha256_with_json;
 use crate::runner_http::{RunnerFeature, RunnerRegistry};
 use crate::runner_protocol::RunnerProjectSummary;
 use crate::tool_runtime::{ToolResult, ToolRuntime};
@@ -430,7 +431,7 @@ impl AdminProjectLifecycleService {
         }
         let subject = subject_id(auth);
         let key_hash = digest(key.as_bytes());
-        let request_hash = digest(&serde_json::to_vec(request).unwrap_or_default());
+        let request_hash = digest_json_or_empty(request);
         let lock_scope = format!("{subject}\u{1f}{action}\u{1f}{target}\u{1f}{key_hash}");
         let operation_lock = {
             let mut locks = idempotency_locks().lock().await;
@@ -799,6 +800,14 @@ fn subject_id(auth: &AuthContext) -> String {
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
+fn digest_json_or_empty<T: Serialize + ?Sized>(value: &T) -> String {
+    let mut hasher = Sha256::new();
+    if update_sha256_with_json(&mut hasher, value).is_err() {
+        // Match the historical `to_vec(...).unwrap_or_default()` fallback.
+        hasher = Sha256::new();
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
 fn project_projection_reconcile_response(
     project: &str,
     outcome: &str,
@@ -854,6 +863,20 @@ mod tests {
     use crate::auth::AuthKind;
     use crate::runner_http::ShellJobStartMetadata;
     use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest, ShellJobOpRequest};
+
+    #[test]
+    fn idempotency_json_digest_matches_buffered_hash() {
+        let value = json!({
+            "project": "agent:test:demo",
+            "escaped": "line\n\"quoted\"\\slash",
+            "unicode": "你好 🦀",
+            "nested": [1, true, null, {"key": "value"}]
+        });
+        assert_eq!(
+            digest_json_or_empty(&value),
+            digest(&serde_json::to_vec(&value).unwrap())
+        );
+    }
 
     fn user_auth(username: &str) -> AuthContext {
         AuthContext {

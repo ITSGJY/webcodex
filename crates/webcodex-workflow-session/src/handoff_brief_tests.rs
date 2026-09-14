@@ -14,6 +14,24 @@ use webcodex_core::workflow_session_contract::SessionMode;
 
 const PROJECT: &str = "test-project";
 
+#[test]
+fn handoff_brief_size_matches_buffered_json_bytes() {
+    for value in [
+        json!("plain ASCII"),
+        json!("quote=\" slash=\\ control=\n\t"),
+        json!("Unicode 你好 🦀 日本語"),
+        json!({
+            "nested": [null, true, 42, {"escaped": "line\nnext", "unicode": "界"}],
+            "object": {"path": "src/quoted_\\\".rs"}
+        }),
+    ] {
+        assert_eq!(
+            handoff_brief_size(&value),
+            serde_json::to_vec(&value).unwrap().len()
+        );
+    }
+}
+
 fn store_with_limit(max_events: usize) -> SessionStore {
     SessionStore::new(16, max_events)
 }
@@ -713,6 +731,104 @@ fn handoff_brief_next_action_priority_is_stable() {
     assert!(brief["next_actions"].as_array().unwrap().len() <= HANDOFF_NEXT_ACTIONS_MAX_ITEMS);
 }
 
+fn legacy_pop_instruction_char(brief: &mut Value, pointer: &str) -> bool {
+    let Some(instruction) = brief.pointer_mut(pointer).and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(mut excerpt) = instruction
+        .get("excerpt")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if excerpt.pop().is_none() {
+        return false;
+    }
+    instruction.insert("excerpt".to_string(), json!(excerpt));
+    instruction.insert("truncated".to_string(), json!(true));
+    true
+}
+
+fn legacy_instruction_reduction(mut brief: Value) -> (Value, usize) {
+    let mut full_measurements = 0;
+    loop {
+        full_measurements += 1;
+        if serde_json::to_vec(&brief).unwrap().len() < HANDOFF_BRIEF_HARD_MAX_BYTES {
+            break;
+        }
+        let root_len = brief
+            .pointer("/task/root_instruction/excerpt")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or(0);
+        let latest_len = brief
+            .pointer("/task/latest_instruction/excerpt")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or(0);
+        if root_len == 0 && latest_len == 0 {
+            break;
+        }
+        let pointer = if root_len >= latest_len {
+            "/task/root_instruction"
+        } else {
+            "/task/latest_instruction"
+        };
+        if !legacy_pop_instruction_char(&mut brief, pointer) {
+            break;
+        }
+    }
+    (brief, full_measurements)
+}
+
+#[test]
+fn handoff_instruction_reduction_matches_legacy_greedy_with_far_fewer_full_measurements() {
+    let root = format!("{}{}", "\"\\\n\t".repeat(110), "界".repeat(160));
+    let latest = format!("{}{}", "\\\"\r\t".repeat(100), "新".repeat(200));
+    assert_eq!(root.chars().count(), HANDOFF_INSTRUCTION_MAX_CHARS);
+    assert_eq!(latest.chars().count(), HANDOFF_INSTRUCTION_MAX_CHARS);
+    let source = json!({
+        "version": 1,
+        "task": {
+            "root_instruction": {"excerpt": root, "truncated": false},
+            "latest_instruction": {"excerpt": latest, "truncated": false},
+        },
+        "fixed_padding": "p".repeat(6_400),
+        "deterministic": true,
+    });
+    assert!(serde_json::to_vec(&source).unwrap().len() >= HANDOFF_BRIEF_HARD_MAX_BYTES);
+
+    let (legacy, legacy_full_measurements) = legacy_instruction_reduction(source.clone());
+    let mut optimized = source;
+    let (removed, optimized_full_measurements) =
+        crate::handoff_brief::reduce_instruction_excerpts_for_test(&mut optimized);
+
+    assert_eq!(
+        optimized, legacy,
+        "optimized reduction must preserve the old greedy result bit-for-bit"
+    );
+    assert!(
+        removed >= 64,
+        "fixture must exercise substantial instruction reduction: {removed}"
+    );
+    assert_eq!(optimized_full_measurements, 1);
+    assert_eq!(legacy_full_measurements, removed + 1);
+    assert!(legacy_full_measurements >= 65);
+    assert!(legacy_full_measurements >= optimized_full_measurements * 64);
+    assert!(serde_json::to_vec(&optimized).unwrap().len() < HANDOFF_BRIEF_HARD_MAX_BYTES);
+    assert_eq!(optimized["task"]["root_instruction"]["truncated"], true);
+    assert_eq!(optimized["task"]["latest_instruction"]["truncated"], true);
+    let root = optimized["task"]["root_instruction"]["excerpt"]
+        .as_str()
+        .unwrap();
+    let latest = optimized["task"]["latest_instruction"]["excerpt"]
+        .as_str()
+        .unwrap();
+    assert!(std::str::from_utf8(root.as_bytes()).is_ok());
+    assert!(std::str::from_utf8(latest.as_bytes()).is_ok());
+}
+
 fn mutate_feedback_to_worst_case(feedback: &mut Value) {
     let long_path =
         |prefix: &str, index: usize| format!("{prefix}/{index:03}_{}.rs", "x".repeat(470));
@@ -725,9 +841,9 @@ fn mutate_feedback_to_worst_case(feedback: &mut Value) {
 #[test]
 fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
     let store = store_with_limit(200);
-    let root = format!("root {} {}", "\"\\\\\n\t".repeat(180), "界".repeat(600));
+    let root = format!("{}{}", "\u{0001}".repeat(500), "🦀".repeat(100));
     let session_id = start_session(&store, &root);
-    let latest = format!("latest {} {}", "\"\\\\\n\t".repeat(180), "新".repeat(600));
+    let latest = format!("{}{}", "\u{0002}".repeat(500), "界".repeat(100));
     add_instruction(&store, &session_id, &latest);
     let summary = store.summary(&session_id, Some(200)).unwrap();
     let validation = passed_validation();
@@ -752,7 +868,7 @@ fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
     });
     mutate_feedback_to_worst_case(&mut feedback);
     let mut workspace = dirty_workspace(0);
-    workspace["branch"] = json!(format!("feature/{}", "b".repeat(240)));
+    workspace["branch"] = json!(format!("feature/{}", "🦀".repeat(256)));
     let brief = build_handoff_brief(HandoffBriefInput {
         session_summary: &summary,
         continuation_feedback: &feedback,
@@ -765,10 +881,25 @@ fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
         existing_suggested_actions: None,
     });
     let bytes = handoff_brief_size(&brief);
+    assert_eq!(bytes, serde_json::to_vec(&brief).unwrap().len());
     assert!(bytes < HANDOFF_BRIEF_HARD_MAX_BYTES, "{bytes}");
     assert_eq!(brief["progress"]["recent_files"]["truncated"], true);
     assert_eq!(brief["progress"]["changes"]["truncated"], true);
     assert_eq!(brief["validation"]["open_failures"]["truncated"], true);
+    let root_chars = brief["task"]["root_instruction"]["excerpt"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    let latest_chars = brief["task"]["latest_instruction"]["excerpt"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    assert!(
+        root_chars < HANDOFF_INSTRUCTION_MAX_CHARS || latest_chars < HANDOFF_INSTRUCTION_MAX_CHARS,
+        "fixture must reach hard-limit instruction reduction: root={root_chars} latest={latest_chars}"
+    );
 }
 
 #[test]

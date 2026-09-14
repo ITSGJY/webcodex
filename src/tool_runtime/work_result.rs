@@ -2,6 +2,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::auth::AuthContext;
+use crate::json_digest::update_sha256_with_json;
 
 use super::handoff::review_evidence_summary_for_session;
 use super::session_context::{
@@ -122,10 +123,19 @@ impl ToolRuntime {
             &review,
             history_partial,
         );
-        let state_bytes = serde_json::to_vec(&projection).unwrap_or_default();
-        projection["state_version"] = json!(format!("wr1_{:x}", Sha256::digest(state_bytes)));
+        projection["state_version"] = json!(work_result_state_version(&projection));
         ToolResult::ok(json!({"work_result": projection}))
     }
+}
+
+pub(crate) fn work_result_state_version(projection: &Value) -> String {
+    let mut hasher = Sha256::new();
+    if update_sha256_with_json(&mut hasher, projection).is_err() {
+        // Preserve the historical `to_vec(...).unwrap_or_default()` fallback:
+        // serialization failure hashes an empty byte sequence, never a partial one.
+        hasher = Sha256::new();
+    }
+    format!("wr1_{:x}", hasher.finalize())
 }
 
 pub(crate) fn build_work_result_projection(

@@ -8,11 +8,13 @@
 pub(crate) use webcodex_core::plugin::*;
 
 use crate::auth::{AuthContext, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE};
+use crate::json_measurement::serialized_json_len;
 use crate::tool_runtime::sessions::SessionTransport;
 use crate::tool_runtime::specialized::{
     SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
 };
 use crate::tool_runtime::{PluginToolCall, ToolResult, ToolRuntime};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -922,6 +924,19 @@ pub(crate) fn project_plugin_catalog_projection(
     catalog: &ProjectPluginCatalog,
     max_bytes: usize,
 ) -> Value {
+    const DISCOVERY_HINT: &str =
+        "Use explicit plugin_tool list and describe for broader or current schema discovery.";
+
+    #[derive(Serialize)]
+    struct ProjectionMeasure<'a> {
+        catalog_revision: &'a str,
+        total_count: usize,
+        returned_count: usize,
+        truncated: bool,
+        entries: &'a [ProjectPluginCatalogEntry],
+        discovery_hint: Option<&'static str>,
+    }
+
     fn value(catalog: &ProjectPluginCatalog, entries: &[ProjectPluginCatalogEntry]) -> Value {
         let truncated = entries.len() < catalog.total_count;
         json!({
@@ -930,26 +945,32 @@ pub(crate) fn project_plugin_catalog_projection(
             "returned_count": entries.len(),
             "truncated": truncated,
             "entries": entries,
-            "discovery_hint": truncated.then_some(
-                "Use explicit plugin_tool list and describe for broader or current schema discovery."
-            ),
+            "discovery_hint": truncated.then_some(DISCOVERY_HINT),
         })
     }
 
-    let mut entries = Vec::new();
-    for entry in &catalog.entries {
-        let mut candidate = entries.clone();
-        candidate.push(entry.clone());
-        if serde_json::to_vec(&value(catalog, &candidate))
-            .map(|bytes| bytes.len() <= max_bytes)
+    let mut returned_count = 0;
+    for candidate_count in 1..=catalog.entries.len() {
+        let entries = &catalog.entries[..candidate_count];
+        let truncated = entries.len() < catalog.total_count;
+        let measure = ProjectionMeasure {
+            catalog_revision: &catalog.catalog_revision,
+            total_count: catalog.total_count,
+            returned_count: entries.len(),
+            truncated,
+            entries,
+            discovery_hint: truncated.then_some(DISCOVERY_HINT),
+        };
+        if serialized_json_len(&measure)
+            .map(|bytes| bytes <= max_bytes)
             .unwrap_or(false)
         {
-            entries.push(entry.clone());
+            returned_count = candidate_count;
         } else {
             break;
         }
     }
-    value(catalog, &entries)
+    value(catalog, &catalog.entries[..returned_count])
 }
 
 fn project_catalog_reason(error: &GatewayError) -> &'static str {

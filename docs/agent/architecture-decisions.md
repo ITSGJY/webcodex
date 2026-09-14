@@ -449,8 +449,11 @@ baseline; additive capabilities do not expand its required set, and absence is
 handled as unavailable rather than inferred authority. Durable DB, Workflow
 Session, and registry state is migrated or quarantined deterministically rather
 than silently reinterpreted. MCP `structuredContent` remains the canonical
-machine-readable `tools/call` result; `content.text` is only the concise human
-fallback.
+machine-readable `tools/call` result; `content.text` is the concise human
+fallback by default. A named host that cannot expose `structuredContent` may use
+the explicit `WEBCODEX_MCP_TEXT_JSON_COMPAT=true` compatibility projection to
+mirror that same canonical JSON into standard text content without changing the
+source of truth.
 
 The product concept and public lifecycle namespace are **Runner**. Before the
 `v0.4.0` compatibility floor, the local primary config filename is normalized

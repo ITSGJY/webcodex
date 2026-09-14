@@ -3,6 +3,7 @@
 use super::files::{SearchOptions, SearchRequest};
 use super::project_resolution::ResolvedProject;
 use super::{SearchProjectTextsQuery, ToolResult, ToolRuntime};
+use crate::json_measurement::serialized_json_len;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -98,17 +99,13 @@ fn serialized_batch_len(output: &Value) -> usize {
 }
 
 fn serialized_value_len(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(value).unwrap_or(usize::MAX)
 }
 
 fn projected_batch_serialized_len(output: &Value, default_timeouts: &[bool]) -> usize {
     let mut projected = ToolResult::ok(output.clone());
     super::dispatch::sparsify_search_batch_success_for_model(default_timeouts, &mut projected);
-    serde_json::to_vec(&projected)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
 fn projected_search_item_len(item: &Value, default_timeout: bool) -> usize {
@@ -448,9 +445,7 @@ pub(crate) fn apply_model_facing_output_budget(
 fn final_model_result_len(output: &Value, default_timeouts: &[bool]) -> usize {
     let mut projected = ToolResult::ok(output.clone());
     super::dispatch::sparsify_search_batch_success_for_model(default_timeouts, &mut projected);
-    serde_json::to_vec(&projected)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
 fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {

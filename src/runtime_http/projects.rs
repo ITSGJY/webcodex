@@ -7,9 +7,9 @@ use serde_json::Value;
 
 /// `POST /api/projects/register` — thin REST wrapper over
 /// `ToolCall::RegisterProject`. Mutation with side effects; registers an
-/// existing directory as a WebCodex project on the selected Runner. Dedicated
-/// GPT Action (`registerProject`); also reachable via callRuntimeTool / MCP
-/// tools/call.
+/// existing directory as a WebCodex project on the selected Runner. Kept as a
+/// legacy REST compatibility endpoint; model-facing GPT Actions are projected
+/// from the canonical runtime surface instead.
 #[derive(Debug, Deserialize)]
 struct RegisterProjectRequest {
     pub client_id: String,
@@ -27,9 +27,8 @@ struct RegisterProjectRequest {
 /// `POST /api/projects/create` — thin REST wrapper over
 /// `ToolCall::CreateProject`. Mutation with side effects; creates a new directory
 /// or explicitly adopts an existing empty directory on the selected Runner, then
-/// registers it as a WebCodex project.
-/// Dedicated GPT Action (`createProject`); also reachable via callRuntimeTool
-/// / MCP tools/call.
+/// registers it as a WebCodex project. Kept as a legacy REST compatibility
+/// endpoint; it does not define a GPT Action operation or model vocabulary.
 #[derive(Debug, Deserialize)]
 struct CreateProjectRequest {
     pub client_id: String,

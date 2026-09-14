@@ -102,7 +102,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Preferred structured cargo test with scoped args and bounded output. lib=true selects Cargo --lib directly; lib=false and omission keep ordinary target selection. filter is one Rust substring passed as `cargo test FILTER`, not a place for `--exact`, `--nocapture`, or other Cargo/libtest flags; zero-test results are not validation proof and return recovery guidance. Normal execution requires non-zero executed-test evidence; explicit require_tests=false opts out when no min_tests minimum is requested, while require_tests=true/min_tests enforce a proven minimum. no_run=true is compile-only and does not require executed-test-count proof. sync_wait_secs only controls same execution Job handoff grace.",
             cargo_test_input_schema,
-        )
+        ).with_gpt_action_description("Run structured cargo tests with bounded output. A successful proof requires executed-test evidence unless explicitly opted out; use min_tests/require_tests when count matters. Long validation continues as the same Job.")
         .with_execution(super::ToolExecutionContract::new(
             super::ToolExecutionForm::StructuredValidation,
             super::ToolExecutionLifetime::Runner,

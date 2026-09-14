@@ -725,7 +725,7 @@ fn mcp_file_import_trust_decision_reports_exact_failure_stage() {
         Some(&mcp_import_oauth_auth(&client.client_id)),
     );
     assert_eq!(trusted.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(trusted.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(trusted.trust, HostFileImportTrust::TrustedMcpHostFile);
     assert_eq!(trusted.client_id_configured, Some(true));
     assert_eq!(trusted.active_client_registration_found, Some(true));
 }
@@ -777,7 +777,7 @@ async fn adaptive_gateway_file_import_preserves_target_aware_host_trust_impl() {
     let decision = take_last_mcp_host_file_import_trust_decision()
         .expect("gateway target must be recognized before host-file trust selection");
     assert_eq!(decision.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(decision.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(decision.trust, HostFileImportTrust::TrustedMcpHostFile);
     assert_eq!(status, StatusCode::OK, "body: {body:?}");
     assert_eq!(body["result"]["structuredContent"]["success"], false);
     assert!(body["result"]["structuredContent"]["error"]
@@ -839,7 +839,7 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
         Some(&verified),
     );
     assert_eq!(decision.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(decision.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(decision.trust, HostFileImportTrust::TrustedMcpHostFile);
 
     let project_tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_import_runtime(project_tmp.path(), Some("alice")).await;
@@ -863,7 +863,7 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
                 "output_dir": "paper/export",
                 "targets": ["stateless-import.pptx"],
                 "overwrite": false,
-                "trusted_mcp_host_file_import": false
+                "host_file_import_provenance": "GptActionOpenAiHost"
             }
         })),
     )
@@ -872,7 +872,7 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
     let mcp_decision = take_last_mcp_host_file_import_trust_decision()
         .expect("mcp_post must evaluate host-file trust for the import tool");
     assert_eq!(mcp_decision.reason, HostFileImportTrustReason::Trusted);
-    assert_eq!(mcp_decision.trust, HostFileImportTrust::TrustedOAuthClient);
+    assert_eq!(mcp_decision.trust, HostFileImportTrust::TrustedMcpHostFile);
 
     // Stages D-E: the kernel injects the internal provenance bit after JSON
     // deserialization and dispatch crosses the pre-network provenance gate to
@@ -1129,7 +1129,7 @@ async fn mcp_file_import_untrusted_callers_fail_before_dns_impl() {
     assert_eq!(status, StatusCode::OK, "body: {body:?}");
     assert_eq!(body["result"]["isError"], true);
     let serialized = serde_json::to_string(&body).unwrap();
-    assert!(serialized.contains("explicitly trusted OAuth MCP client"));
+    assert!(serialized.contains("explicitly trusted OAuth MCP host-file rewrite"));
     assert!(!serialized.contains(temporary_url));
     assert_eq!(
         crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
@@ -1143,7 +1143,7 @@ async fn mcp_file_import_untrusted_callers_fail_before_dns_impl() {
     assert_eq!(body["result"]["isError"], true);
     assert!(serde_json::to_string(&body)
         .unwrap()
-        .contains("explicitly trusted OAuth MCP client"));
+        .contains("explicitly trusted OAuth MCP host-file rewrite"));
     assert_eq!(
         crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
         0,

@@ -186,18 +186,19 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     let git_diff_hunks_desc = git_diff_hunks.description.to_lowercase();
     for phrase in [
         "targeted/paged",
-        "scope-bound",
-        "replay",
-        "scope",
-        "paging inputs",
-        "later records",
+        "scope/fence-bound",
         "max_page_bytes",
         "raw producer page",
         "512 kib",
         "final model-facing",
-        "hunk_line_limit",
-        "larger max_hunk_lines",
-        "narrower paths",
+        "next complete-line fragment",
+        "parser-ready suggested_call",
+        "next_continuation",
+        "recovery.continuation",
+        "later-record only",
+        "recovery.omitted_lines",
+        "bounded refinement",
+        "exact hunk-fragment token",
     ] {
         assert!(
             git_diff_hunks_desc.contains(phrase),
@@ -210,16 +211,18 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         .expect("git_diff_hunks continuation description")
         .to_lowercase();
     for phrase in [
-        "repeat the exact original",
+        "later-record page cursor",
+        "next complete-line fragment",
+        "scope/fence-bound",
+        "parser-ready suggested_call",
+        "exact original effective scope/paging inputs",
         "base_commit/head_commit",
         "cached/worktree mode",
         "paths",
         "max_hunks",
         "max_hunk_lines",
         "max_page_bytes",
-        "later records",
-        "scope-bound",
-        "does not reconstruct",
+        "later-record and hunk-fragment continuations remain distinct identities",
     ] {
         assert!(
             continuation_desc.contains(phrase),

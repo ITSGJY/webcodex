@@ -93,15 +93,17 @@ the exact gateway contract even when no Plugin-capable Runner is online.
 The same canonical `plugin_tool` request parser and action-aware gateway executor
 serve MCP and the generic Tool Runtime used by OpenAPI/GPT Actions. A surface
 that advertises `plugin_tool` can therefore call it; MCP does not have a separate
-Plugin implementation. For generic `callRuntimeTool`, use the canonical nested
-`params` envelope for the complete Plugin contract because the outer `tool`
-field already selects `plugin_tool` and the provider-local `tool` name belongs
-inside Plugin arguments:
+Plugin implementation. On the current generic GPT Actions surface, `plugin_tool`
+is a direct canonical operation, so pass its normal business arguments directly:
 
 ```json
-{"tool":"plugin_tool","params":{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}}
-{"tool":"plugin_tool","params":{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}}
+{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}
+{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}
 ```
+
+The separate `call_runtime_tool` operation is only for Adaptive long-tail tools
+whose manifest route is `gateway`; direct tools such as `plugin_tool` must not be
+re-routed through it. Its generic envelope is canonical `{tool, arguments}`.
 
 The static ToolDefinition is intentionally a worst-case discovery contract.
 Execution policy is classified from the validated action before Session or

@@ -7,10 +7,10 @@ use super::tool_definition::{
     tool_definitions, RunnerCapabilityRequirement, ToolActivityInteraction, ToolActivityKind,
     ToolActivityPresentation, ToolActivitySemantics, ToolAuditPolicy, ToolContextContinuityPolicy,
     ToolDefinition, ToolDiffReviewEvidence, ToolEffectAnnotations, ToolExecutionContract,
-    ToolExecutionForm, ToolExplorationEvidence, ToolOperatorExtensionFamily, ToolReviewEvidence,
-    ToolSessionEvidencePolicy, ToolValidationIdentityKind, PERMISSION_RISK_ARTIFACT_WRITE,
-    PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL,
-    PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE, TOOL_CATEGORY_JOB,
+    ToolExecutionForm, ToolExplorationEvidence, ToolGptActionExposure, ToolOperatorExtensionFamily,
+    ToolReviewEvidence, ToolSessionEvidencePolicy, ToolValidationIdentityKind,
+    PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH,
+    PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE, TOOL_CATEGORY_JOB,
 };
 
 impl ToolDefinition {
@@ -68,6 +68,20 @@ impl ToolDefinition {
 
     pub fn adaptive_runtime_direct_rank(self) -> Option<u16> {
         self.model_surface.adaptive_runtime_direct_rank
+    }
+
+    pub fn gpt_action_exposure(self) -> ToolGptActionExposure {
+        self.model_surface.gpt_action_exposure
+    }
+
+    pub fn supports_gpt_actions(self) -> bool {
+        self.visibility.is_model_visible()
+            && self.gpt_action_exposure() == ToolGptActionExposure::Inherit
+    }
+
+    pub fn gpt_action_description(self) -> Option<&'static str> {
+        self.model_spec
+            .map(|spec| spec.gpt_action_description.unwrap_or(spec.description))
     }
 
     pub fn context_continuity_policy(self) -> ToolContextContinuityPolicy {
@@ -439,6 +453,23 @@ pub fn adaptive_runtime_direct_tool_definitions() -> Vec<&'static ToolDefinition
         )
     });
     definitions
+}
+
+/// GPT Actions ordinary direct exposure is a pure projection of Adaptive
+/// Runtime Direct. Protocol exceptions stay on the canonical ToolDefinition;
+/// there is deliberately no second rank or operation registry.
+pub fn gpt_action_direct_tool_definitions() -> Vec<&'static ToolDefinition> {
+    adaptive_runtime_direct_tool_definitions()
+        .into_iter()
+        .filter(|definition| definition.supports_gpt_actions())
+        .collect()
+}
+
+/// Admission predicate shared by GPT Action direct/gateway adapters. It says
+/// only that the canonical model-visible tool is protocol-compatible with GPT
+/// Actions; authority and execution remain kernel-owned.
+pub fn gpt_action_tool_supported(tool_name: &str) -> bool {
+    lookup_tool_definition(tool_name).is_some_and(|definition| definition.supports_gpt_actions())
 }
 
 pub fn model_visible_tool_names_csv() -> String {

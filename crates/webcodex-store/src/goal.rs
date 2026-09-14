@@ -1,6 +1,6 @@
 use super::agent_task::AGENT_TASK_ID_PREFIX;
 use super::communication::{
-    digest_text, new_id, now_unix_ms, validate_communication_principal, validate_id,
+    digest_json, digest_text, new_id, now_unix_ms, validate_communication_principal, validate_id,
     CommunicationPrincipal,
 };
 use super::Database;
@@ -891,10 +891,7 @@ fn validate_idempotency_key(value: &str) -> Result<String, GoalStoreError> {
 }
 
 fn goal_request_hash(value: &serde_json::Value) -> String {
-    digest_text(
-        "webcodex.goal.request.v1",
-        &serde_json::to_string(value).expect("Goal request serializes"),
-    )
+    digest_json("webcodex.goal.request.v1", value).expect("Goal request serializes")
 }
 
 fn lookup_idempotent_goal(

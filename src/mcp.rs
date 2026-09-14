@@ -10,6 +10,7 @@ use crate::action_audit::{ActionAudit, ActionAuditRecord};
 use crate::auth::AuthContext;
 use crate::connector_runtime::{ConnectorRuntime, ConnectorRuntimeSlot};
 use crate::json_error;
+use crate::json_measurement::serialized_json_len;
 #[cfg(test)]
 use crate::model_surface::ModelSurface;
 use crate::model_surface::RuntimeExposure;
@@ -249,8 +250,8 @@ fn mcp_tools_list_audit_summary(
     compact_schemas: bool,
 ) -> Option<Value> {
     let tools = result.get("tools")?.as_array()?;
-    let serialized_tools_bytes = serde_json::to_vec(&result["tools"]).ok()?.len() as u64;
-    let serialized_result_bytes = serde_json::to_vec(result).ok()?.len() as u64;
+    let serialized_tools_bytes = serialized_json_len(&result["tools"]).ok()? as u64;
+    let serialized_result_bytes = serialized_json_len(result).ok()? as u64;
     let gateway_tool_included = tools.iter().any(|tool| {
         tool.get("name").and_then(Value::as_str) == Some(crate::mcp_gateway::MCP_TOOL_NAME)
     });

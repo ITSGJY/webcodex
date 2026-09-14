@@ -221,6 +221,7 @@ fn build_projects_router(
                 .hoop(crate::AuthMiddleware)
                 .push(Router::with_path("tools/list").post(tools_list))
                 .push(Router::with_path("tools/call").post(tools_call))
+                .push(Router::with_path("actions/{tool_name}").post(gpt_action_invoke))
                 .push(
                     Router::with_path("artifacts/import")
                         .post(import_conversation_files_to_project),
@@ -570,7 +571,7 @@ async fn http_runtime_status_optional_body_accepts_empty_and_rejects_malformed_j
 }
 
 // =========================================================================
-// Phase 2: callRuntimeTool / /api/tools/call generic entry point
+// Legacy /api/tools/call generic entry point
 // =========================================================================
 
 fn phase2_service() -> (tempfile::TempDir, salvo::Service) {
@@ -1512,7 +1513,7 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
             "session_id": business_session_id,
             TOOL_CALL_RECORDING_SESSION_ID_FIELD: tracking_session_id,
             "kind": "guidance",
-            "message": "Keep this behind callRuntimeTool.",
+            "message": "Keep this behind call_runtime_tool.",
             "tags": ["openapi", "constraint"],
             "priority": "normal"
         }))
@@ -1845,6 +1846,27 @@ async fn oauth_tools_call(
     (status, body, challenge)
 }
 
+async fn oauth_action_call(
+    service: &Service,
+    token: &str,
+    path_tool: &str,
+    body: Value,
+) -> (StatusCode, Value, Option<String>) {
+    let mut resp = TestClient::post(format!("http://localhost/api/actions/{path_tool}"))
+        .bearer_auth(token)
+        .json(&body)
+        .send(service)
+        .await;
+    let status = effective_status(&resp);
+    let challenge = resp
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = resp.take_json::<Value>().await.unwrap();
+    (status, body, challenge)
+}
+
 fn assert_oauth_scope_rejected(
     status: StatusCode,
     body: &Value,
@@ -2097,6 +2119,327 @@ async fn oauth2_tools_call_unknown_tool_fails_closed() {
     let (status, body, challenge) =
         oauth_tools_call(&service, &token, "definitely_not_a_tool", Value::Null).await;
     assert_oauth_scope_rejected(status, &body, challenge.as_deref(), None);
+}
+
+#[tokio::test]
+async fn gpt_action_direct_and_gateway_admission_fail_closed() {
+    let (_tmp, service) = phase2_service();
+
+    let (status, body, _) =
+        oauth_action_call(&service, "secret", "runtime_status", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["success"], true);
+
+    for (tool, body) in [
+        (
+            "read_files",
+            json!({"project": "demo", "items": [{"path": "README.md"}]}),
+        ),
+        (
+            "run_shell",
+            json!({"project": "demo", "command": "echo hi"}),
+        ),
+    ] {
+        let (status, body, _) = oauth_action_call(&service, "secret", tool, body).await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "{tool}: {body:?}");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("not a direct GPT Action"),
+            "{tool}: {body:?}"
+        );
+        assert!(
+            !rendered.contains("not available through GPT Actions"),
+            "{tool}: {body:?}"
+        );
+    }
+
+    for tool in [
+        "present_goal_plan",
+        "present_agent_continuation",
+        "export_project_artifact",
+        "definitely_not_a_tool",
+    ] {
+        let (status, body, _) = oauth_action_call(&service, "secret", tool, json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tool}: {body:?}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not available through GPT Actions"));
+    }
+
+    let (status, body, _) = oauth_action_call(
+        &service,
+        "secret",
+        "apply_patch",
+        json!({"project":"demo","patch":"*** Begin Patch\n*** End Patch"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body:?}");
+    assert!(body["error"].as_str().unwrap_or("").contains("long-tail"));
+
+    let (status, body, _) = oauth_action_call(
+        &service,
+        "secret",
+        "call_runtime_tool",
+        json!({
+            "tool": "apply_patch",
+            "arguments": {"project":"demo","patch":"*** Begin Patch\n*** End Patch"}
+        }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "body: {body:?}");
+    assert!(!body
+        .to_string()
+        .contains("not admitted on the adaptive runtime surface"));
+
+    let (status, body, _) = oauth_action_call(
+        &service,
+        "secret",
+        "call_runtime_tool",
+        json!({"tool":"read_files","arguments":{"project":"demo","items":[{"path":"README.md"}]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body:?}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("direct GPT Action"));
+
+    for target in [
+        "present_goal_plan",
+        "start_session",
+        "definitely_not_a_tool",
+    ] {
+        let (status, body, _) = oauth_action_call(
+            &service,
+            "secret",
+            "call_runtime_tool",
+            json!({"tool":target,"arguments":{}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{target}: {body:?}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not available through GPT Actions"));
+    }
+}
+
+#[tokio::test]
+async fn oauth2_gpt_action_direct_scope_outcomes_match_mcp_direct_policy() {
+    let (_tmp, service, token) = phase2_oauth_service("project:read");
+    let (status, body, _) = oauth_action_call(
+        &service,
+        &token,
+        "read_files",
+        json!({"project":"demo","items":[{"path":"README.md"}]}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+
+    let (_tmp, service, token) = phase2_oauth_service("runtime:read");
+    let (status, body, challenge) = oauth_action_call(
+        &service,
+        &token,
+        "read_files",
+        json!({"project":"demo","items":[{"path":"README.md"}]}),
+    )
+    .await;
+    assert_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_PROJECT_READ),
+    );
+
+    let (_tmp, service, token) = phase2_oauth_service("job:run");
+    let (status, body, _) = oauth_action_call(
+        &service,
+        &token,
+        "run_shell",
+        json!({"project":"demo","command":"echo hi"}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+
+    let (_tmp, service, token) = phase2_oauth_service("project:read");
+    let (status, body, challenge) = oauth_action_call(
+        &service,
+        &token,
+        "run_shell",
+        json!({"project":"demo","command":"echo hi"}),
+    )
+    .await;
+    assert_oauth_scope_rejected(
+        status,
+        &body,
+        challenge.as_deref(),
+        Some(crate::auth::SCOPE_JOB_RUN),
+    );
+}
+
+#[tokio::test]
+async fn gpt_action_direct_cannot_bypass_project_owner_authority() {
+    use crate::runner_protocol::{RunnerProjectSummary, RunnerRegisterRequest};
+
+    let config = test_config_oauth2(Some("secret"));
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "bob");
+    let client = seed_oauth_client(&db, &user);
+    let token =
+        seed_oauth_access_token_with_shared_key_hash(&db, &client, &user, "project:read", None);
+
+    let registry = Arc::new(RunnerRegistry::default());
+    registry
+        .register(crate::test_support::current_runner_registration(
+            RunnerRegisterRequest {
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                client_id: "owned".to_string(),
+                runner_instance_id: "inst-owned".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: None,
+                owner: Some("alice".to_string()),
+                hostname: None,
+                host_context: None,
+                capabilities: Default::default(),
+                policy: None,
+            },
+        ))
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &registry,
+        "owned",
+        "inst-owned",
+        vec![RunnerProjectSummary {
+            id: "demo".to_string(),
+            name: Some("demo".to_string()),
+            path: "C:/private/alice/demo".to_string(),
+            allow_patch: true,
+            kind: Some("repo".to_string()),
+            registration_source: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: None,
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 1,
+            shell_profile: None,
+        }],
+    )
+    .await;
+    let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(registry));
+    let service = Service::new(build_projects_router(config, db, runtime));
+
+    let (status, body, challenge) = oauth_action_call(
+        &service,
+        &token,
+        "read_files",
+        json!({"project":"agent:owned:demo","items":[{"path":"README.md"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body:?}");
+    assert!(
+        challenge.is_none(),
+        "Project authority denial is not a missing-scope challenge"
+    );
+    assert_eq!(body["success"], false);
+    assert_eq!(body["output"]["error_kind"], "unknown_project");
+    assert_eq!(body["output"]["candidates"], json!([]));
+    let rendered = body.to_string();
+    assert!(!rendered.contains("C:/private/alice/demo"));
+    assert!(!rendered.contains("alice"));
+}
+
+#[tokio::test]
+async fn gpt_action_direct_still_obeys_permission_gate() {
+    use crate::tool_runtime::permissions::{AuthorityMode, PermissionEvaluator};
+
+    let root = tempfile::tempdir().unwrap();
+    let (runtime, _registry) = register_import_agent(root.path()).await;
+    let runtime = Arc::new(
+        Arc::try_unwrap(runtime)
+            .ok()
+            .unwrap()
+            .with_permission_evaluator(PermissionEvaluator::with_mode(AuthorityMode::Restricted)),
+    );
+    let (_tmp, db) = test_db();
+    let service = Service::new(build_projects_router(
+        test_config(Some("secret")),
+        db,
+        runtime,
+    ));
+    let (status, body, _) = oauth_action_call(
+        &service,
+        "secret",
+        "run_shell",
+        json!({"project":"agent:importer:demo","command":"echo hi"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body:?}");
+    assert_eq!(body["success"], false);
+    assert_eq!(body["output"]["permission"]["status"], "denied");
+    assert_eq!(
+        body["output"]["permission"]["reason"],
+        "restricted_requires_human_authorization"
+    );
+}
+
+#[tokio::test]
+async fn gpt_action_file_import_rewrites_host_shape_and_keeps_provenance_private() {
+    let root = tempfile::tempdir().unwrap();
+    let (runtime, _registry) = register_import_agent(root.path()).await;
+    let (_tmp, db) = test_db();
+    let service = Service::new(build_projects_router(
+        test_config(Some("secret")),
+        db,
+        runtime,
+    ));
+
+    let (status, body, _) = oauth_action_call(
+        &service,
+        "secret",
+        "import_conversation_files_to_project",
+        json!({
+            "project":"agent:importer:demo",
+            "openaiFileIdRefs":[{
+                "name":"paper.pdf",
+                "download_link":"https://example.invalid/not-openai"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body:?}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("OpenAI file host"),
+        "body: {body:?}"
+    );
+
+    let (status, body, _) = oauth_action_call(
+        &service,
+        "secret",
+        "import_conversation_files_to_project",
+        json!({
+            "project":"agent:importer:demo",
+            "openaiFileIdRefs":[{"download_link":"https://files.oaiusercontent.com/file"}],
+            "host_file_import_provenance":"GptActionOpenAiHost"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body:?}");
+    assert!(!body["error"].as_str().unwrap_or("").is_empty());
 }
 
 #[tokio::test]

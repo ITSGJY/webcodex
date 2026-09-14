@@ -5,6 +5,7 @@ use super::{
     ContinuationCarrier, ContinuationKind, ContinuationSemantics, ReadFilesItem, SuggestedToolCall,
     ToolCall, ToolResult, ToolRuntime,
 };
+use crate::json_measurement::serialized_json_len;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -380,18 +381,14 @@ fn serialized_batch_len(output: &Value) -> usize {
 }
 
 fn serialized_value_len(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(value).unwrap_or(usize::MAX)
 }
 
 fn projected_batch_serialized_len(output: &Value, projection: &ReadModelProjection) -> usize {
     let mut projected = ToolResult::ok(output.clone());
     add_actionable_read_continuations(projection, &mut projected);
     super::dispatch::sparsify_complete_read_success("read_files", &mut projected);
-    serde_json::to_vec(&projected)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
 fn projected_read_item_len(item: &Value, projection: &ReadModelProjection) -> usize {
@@ -675,9 +672,7 @@ fn final_model_result_len(output: &Value, projection: &ReadModelProjection) -> u
     let mut projected = ToolResult::ok(output.clone());
     add_actionable_read_continuations(projection, &mut projected);
     super::dispatch::sparsify_complete_read_success("read_files", &mut projected);
-    serde_json::to_vec(&projected)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
 fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {

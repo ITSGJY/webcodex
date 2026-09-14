@@ -65,6 +65,13 @@ export function formatRecentSessionStatusText(meta, language) {
         + (meta.truncated ? (language === "zh-CN" ? " · 前 " : " · top ") + String(meta.returned || 0) : "")
         + (meta.scan_truncated ? (language === "zh-CN" ? " · 扫描不完整" : " · partial scan") : "");
 }
+export function formatProjectWindowStatusText(returned, total, truncated, language) {
+    if (!truncated)
+        return "";
+    return language === "zh-CN"
+        ? String(returned) + " / " + String(total) + " 个窗口 · 有界"
+        : String(returned) + " of " + String(total) + " Windows · bounded";
+}
 export function renderProjectSelectorTree(deviceSelect, projectList, sessionsPanel, options) {
     const tr = (text) => translate(text, options.language);
     const countLabel = (count, singular) => localizedCountLabel(count, singular, options.language);
@@ -92,6 +99,7 @@ export function renderProjectSelectorTree(deviceSelect, projectList, sessionsPan
     }
     const visibleDevices = options.projectDeviceFilter ? [options.projectDeviceFilter] : options.devices;
     let sessionsAttached = false;
+    let windowsAttached = false;
     for (const clientId of visibleDevices) {
         const deviceProjects = projectsByDevice.get(clientId) || [];
         const runner = options.runnerRows.find((candidate) => String(candidate?.client_id || "") === clientId);
@@ -187,6 +195,9 @@ export function renderProjectSelectorTree(deviceSelect, projectList, sessionsPan
                 addSignal(tr("OFFLINE"), "tone-fail");
             else if (project.agent_status && project.agent_status !== "online")
                 addSignal(tr(String(project.agent_status).toUpperCase()), "tone-warn");
+            if (project.id === options.selectedProject && (options.selectedProjectWindowActiveCount ?? 0) > 0) {
+                addSignal(options.language === "zh-CN" ? "窗口活跃" : "WINDOW ACTIVE", "tone-runtime", options.language === "zh-CN" ? "活跃的主机窗口请求" : "Active host window request");
+            }
             if (runningSessions > 0) {
                 addSignal(options.language === "zh-CN" ? "运行中 " + runningSessions : runningSessions + " running", "tone-runtime", countLabel(runningSessions, "running Session"));
             }
@@ -229,14 +240,25 @@ export function renderProjectSelectorTree(deviceSelect, projectList, sessionsPan
             });
             workspace.appendChild(row);
             deviceProjectList.appendChild(workspace);
-            if (project.id === options.selectedProject && sessionsPanel) {
-                sessionsPanel.hidden = false;
-                workspace.appendChild(sessionsPanel);
-                sessionsAttached = true;
+            if (project.id === options.selectedProject) {
+                if (options.windowPanel) {
+                    options.windowPanel.hidden = false;
+                    workspace.appendChild(options.windowPanel);
+                    windowsAttached = true;
+                }
+                if (sessionsPanel) {
+                    sessionsPanel.hidden = false;
+                    workspace.appendChild(sessionsPanel);
+                    sessionsAttached = true;
+                }
             }
         }
         group.appendChild(deviceProjectList);
         projectList.appendChild(group);
+    }
+    if (options.windowPanel && !windowsAttached) {
+        options.windowPanel.hidden = true;
+        projectList.appendChild(options.windowPanel);
     }
     if (sessionsPanel && !sessionsAttached) {
         sessionsPanel.hidden = true;

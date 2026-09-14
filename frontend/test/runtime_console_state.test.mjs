@@ -26,6 +26,8 @@ import {
   selectRuntimeProject,
   refreshRuntimeSessionList,
   isCurrentRuntimeSessionListRequest,
+  refreshRuntimeProjectWindows,
+  isCurrentRuntimeProjectWindowsRequest,
   selectRuntimeWorkflowSession,
   selectRuntimeSessionLocation,
   refreshRuntimeWorkflowSession,
@@ -93,12 +95,23 @@ test("runtime credential and project generations fence stale project responses",
   assert.equal(isCurrentRuntimeSessionListRequest(state, listA), false);
   assert.equal(isCurrentRuntimeSessionListRequest(state, refreshedA), true);
 
+  const windowReqA = refreshRuntimeProjectWindows(state);
+  assert.equal(windowReqA.project, "agent:a:project");
+  assert.equal(isCurrentRuntimeProjectWindowsRequest(state, windowReqA), true);
+  const refreshedWindowA = refreshRuntimeProjectWindows(state);
+  assert.equal(isCurrentRuntimeProjectWindowsRequest(state, windowReqA), false);
+  assert.equal(isCurrentRuntimeProjectWindowsRequest(state, refreshedWindowA), true);
+
   const listB = selectRuntimeProject(state, "device-b", "agent:b:project");
   assert.equal(state.selectedDevice, "device-b");
   assert.equal(state.selectedProject, "agent:b:project");
   assert.equal(isCurrentRuntimeProjectsRequest(state, projectsDuringA), false);
   assert.equal(isCurrentRuntimeSessionListRequest(state, refreshedA), false);
   assert.equal(isCurrentRuntimeSessionListRequest(state, listB), true);
+  assert.equal(isCurrentRuntimeProjectWindowsRequest(state, refreshedWindowA), false);
+  const windowReqB = refreshRuntimeProjectWindows(state);
+  assert.equal(windowReqB.project, "agent:b:project");
+  assert.equal(isCurrentRuntimeProjectWindowsRequest(state, windowReqB), true);
   assert.equal(state.workflow.selectedSessionId, "");
   assert.equal(state.workflow.snapshot, null);
 });
@@ -622,3 +635,60 @@ test("navigation and inspector source contracts maintain disclosure hierarchy an
   assert.match(source, /function selectRecentSession[\s\S]*if \(clientId\) revealRunner\(clientId\)/);
   assert.match(navigationSource, /group\.open = resolveRunnerDisclosure\(storedDisclosure, defaultOpen\)/);
 });
+
+test("project-scoped window activity contracts maintain separation, fencing, and hierarchy", async () => {
+  const [html, css, source, navigationSource] = await Promise.all([
+    readFile(new URL("../src/runtime.html", import.meta.url), "utf8"),
+    readFile(new URL("../src/runtime.css", import.meta.url), "utf8"),
+    readFile(new URL("../src/runtime.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src/runtime_navigation.ts", import.meta.url), "utf8"),
+  ]);
+
+  // HTML hierarchy: project window panel mounted directly above sessions panel
+  assert.match(html, /<section id="runtime-project-window-activity-panel"[^>]*class="[^"]*project-window-panel/);
+  assert.match(html, /id="runtime-project-windows-count"/);
+  assert.match(html, /id="runtime-project-windows-status"/);
+  assert.match(html, /id="runtime-project-windows-list"/);
+  assert.match(html, /id="runtime-project-windows-empty"/);
+  assert.match(html, /id="runtime-project-windows-unavailable"/);
+  const windowPanelIndex = html.indexOf('id="runtime-project-window-activity-panel"');
+  const sessionsPanelIndex = html.indexOf('id="runtime-workflow-sessions-panel"');
+  assert.ok(windowPanelIndex > 0 && sessionsPanelIndex > windowPanelIndex, "Window activity panel must precede Workflow Sessions panel in HTML");
+
+  // CSS styling
+  assert.match(css, /\.project-window-panel,\s*\.sessions-panel/);
+  assert.match(css, /\.project-window-list\s*\{[^}]*gap:\s*4px/);
+
+  // Source contract: fetchProjectWindows fences by project and limits to 10
+  const fetchProjWindowsStart = source.indexOf("async function fetchProjectWindows");
+  const fetchProjWindowsEnd = source.indexOf("function hideDetail", fetchProjWindowsStart);
+  const fetchProjWindows = source.slice(fetchProjWindowsStart, fetchProjWindowsEnd);
+  assert.match(fetchProjWindows, /api\("windows",\s*\{\s*project:\s*request\.project,\s*limit:\s*PROJECT_WINDOW_LIMIT\s*\}/);
+  assert.match(fetchProjWindows, /isCurrentRuntimeProjectWindowsRequest\(state, request\)/);
+  assert.match(fetchProjWindows, /response\.status === 403[\s\S]*projectWindowAvailability = "unavailable"/);
+  assert.doesNotMatch(fetchProjWindows, /response\.status === 403[\s\S]*lock\(/);
+  assert.match(fetchProjWindows, /!response[\s\S]*projectWindowAvailability = "stale"/);
+  assert.match(fetchProjWindows, /!response\.ok \|\| !response\.data[\s\S]*projectWindowAvailability = "stale"/);
+  assert.match(source, /function projectWindowActiveCount\(\)[\s\S]*projectWindowAvailability !== "available"[\s\S]*return 0/);
+
+  // Global windows fetch contract remains decoupled (limit 100, no project scope)
+  const refreshWindowsStart = source.indexOf("async function refreshWindows");
+  const refreshWindowsEnd = source.indexOf("function openWindowInspector", refreshWindowsStart);
+  const refreshWindows = source.slice(refreshWindowsStart, refreshWindowsEnd);
+  assert.match(refreshWindows, /api\("windows",\s*\{\s*limit:\s*100\s*\}/);
+  assert.doesNotMatch(refreshWindows, /project:/);
+
+  // Navigation: windowPanel mounting before sessionsPanel, and WINDOW ACTIVE signal
+  assert.match(navigationSource, /if \(options\.windowPanel\) \{\s*options\.windowPanel\.hidden = false;\s*workspace\.appendChild\(options\.windowPanel\);\s*windowsAttached = true;\s*\}/);
+  assert.match(navigationSource, /workspace\.appendChild\(sessionsPanel\)/);
+  assert.match(navigationSource, /WINDOW ACTIVE/);
+  assert.match(navigationSource, /options\.selectedProjectWindowActiveCount \?\? 0\) > 0/);
+
+  // Navigation to global inspector
+  const openInspectorStart = source.indexOf("function openWindowInspector");
+  const openInspectorEnd = source.indexOf("function projectWindowActiveCount", openInspectorStart);
+  const openInspector = source.slice(openInspectorStart, openInspectorEnd);
+  assert.match(openInspector, /applyWorkspaceView\("windows"\)/);
+  assert.match(openInspector, /selectedWindowKey = key/);
+});
+

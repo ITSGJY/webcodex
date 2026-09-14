@@ -66,7 +66,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 ),
                 "Canonical default guarded edit path after read_files for ordinary model-generated changes on the current worktree. Transactional and SHA-guarded: pass each existing file's current read SHA as expected_sha256; exact matches are unique by default, occurrence stays global source order, and line_scope optionally fences matches. Supports transactional multi-file edits; empty insert_before/insert_after text is a provable no-op that does not invalidate the batch. Many changed lines alone are not a reason to choose apply_patch. On conflict_recovery.direct_retry_safe=true, use the returned candidate occurrence/range without rereading; reread only when reread_required=true. Use apply_patch only when contextual or large multi-hunk form is materially clearer; external raw diffs use apply_unified_diff.",
                 apply_text_edits_input_schema,
-            ),
+            ).with_gpt_action_description("Apply 1..16 transactional guarded file changes using current sha256 for existing files. Prefer exact edits/create/delete/rename; conflicts return structured recovery. The whole batch preflights before mutation."),
             PERMISSION_RISK_WRITE,
         ),
         60,

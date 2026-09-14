@@ -6,7 +6,7 @@
 
 use super::files::MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES;
 use super::sessions::SessionTransport;
-use super::tool_call::OpenAiHostFileRef;
+use super::tool_call::{HostFileImportProvenance, OpenAiHostFileRef};
 use super::{ToolCall, ToolResult, ToolRuntime};
 use crate::artifact_policy::ooxml_extension_for_mime;
 use crate::auth::AuthContext;
@@ -782,21 +782,29 @@ impl ToolRuntime {
             targets,
             overwrite,
             session_id,
-            trusted_mcp_host_file_import,
+            host_file_import_provenance,
         } = call
         else {
             unreachable!("dispatch_conversation_import_tool called with non-import tool")
         };
-        if !matches!(transport, SessionTransport::Mcp) {
-            return ToolResult::err(
-                "import_conversation_files_to_project requires the MCP host file-reference mechanism; use the dedicated /api/artifacts/import GPT Action outside MCP",
-            );
-        }
-        if !trusted_mcp_host_file_import {
-            return ToolResult::err(
-                "import_conversation_files_to_project requires an explicitly trusted OAuth MCP client",
-            );
-        }
+        let download_policy = match (transport, host_file_import_provenance) {
+            (SessionTransport::Mcp, HostFileImportProvenance::TrustedMcpHostFile) => {
+                ConversationImportDownloadPolicy::TrustedMcpHostFile
+            }
+            (SessionTransport::Api, HostFileImportProvenance::GptActionOpenAiHost) => {
+                ConversationImportDownloadPolicy::GptActionOpenAiHost
+            }
+            (SessionTransport::Mcp, _) => {
+                return ToolResult::err(
+                    "import_conversation_files_to_project requires an explicitly trusted OAuth MCP host-file rewrite",
+                );
+            }
+            (SessionTransport::Api, _) => {
+                return ToolResult::err(
+                    "import_conversation_files_to_project requires trusted GPT Action/OpenAI host file provenance",
+                );
+            }
+        };
         self.import_conversation_files(
             ImportConversationFilesInput {
                 openai_file_id_refs: openai_file_id_refs.into_iter().map(Into::into).collect(),
@@ -808,7 +816,7 @@ impl ToolRuntime {
             },
             auth,
             transport,
-            ConversationImportDownloadPolicy::TrustedMcpHostFile,
+            download_policy,
         )
         .await
     }

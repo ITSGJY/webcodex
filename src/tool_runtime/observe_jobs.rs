@@ -5,6 +5,7 @@ use super::{
     ObserveJobsWakeOn, RecoveryKind, SuggestedToolCall, ToolResult, ToolRuntime,
 };
 use crate::auth::AuthContext;
+use crate::json_measurement::serialized_json_len;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -201,9 +202,9 @@ fn batch_output(
 }
 
 fn serialized_batch_fits(output: &Value) -> bool {
-    serde_json::to_vec(&ToolResult::ok(output.clone()))
+    serialized_json_len(&ToolResult::ok(output.clone()))
         .map(|bytes| {
-            bytes.len()
+            bytes
                 <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
                     .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
         })

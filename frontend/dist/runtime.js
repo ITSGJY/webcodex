@@ -658,6 +658,7 @@ function initialRuntimeConsoleState() {
         selectedProject: "",
         projectGeneration: 0,
         sessionListGeneration: 0,
+        projectWindowsGeneration: 0,
         workflow: initialWorkflowSessionState(),
         collaboration: emptyCollaborationState(),
     };
@@ -671,6 +672,7 @@ function invalidateRuntimeCredential(state) {
     state.selectedProject = "";
     state.projectGeneration += 1;
     state.sessionListGeneration += 1;
+    state.projectWindowsGeneration += 1;
     clearWorkflowSessionSelection(state.workflow);
     resetCollaborationState(state.collaboration);
 }
@@ -721,6 +723,7 @@ function selectRuntimeProject(state, device, project) {
     state.selectedProject = project;
     state.projectGeneration += 1;
     state.sessionListGeneration += 1;
+    state.projectWindowsGeneration += 1;
     clearWorkflowSessionSelection(state.workflow);
     resetCollaborationState(state.collaboration);
     return refreshRuntimeSessionList(state);
@@ -740,6 +743,22 @@ function isCurrentRuntimeSessionListRequest(state, request) {
     return !!request && request.credentialGeneration === state.credentialGeneration &&
         request.project === state.selectedProject && request.projectGeneration === state.projectGeneration &&
         request.generation === state.sessionListGeneration;
+}
+function refreshRuntimeProjectWindows(state) {
+    if (!state.selectedProject)
+        return null;
+    state.projectWindowsGeneration += 1;
+    return {
+        credentialGeneration: state.credentialGeneration,
+        project: state.selectedProject,
+        projectGeneration: state.projectGeneration,
+        generation: state.projectWindowsGeneration,
+    };
+}
+function isCurrentRuntimeProjectWindowsRequest(state, request) {
+    return !!request && request.credentialGeneration === state.credentialGeneration &&
+        request.project === state.selectedProject && request.projectGeneration === state.projectGeneration &&
+        request.generation === state.projectWindowsGeneration;
 }
 function wrapWorkflowRequest(state, request) {
     if (!request || !state.selectedProject)
@@ -871,6 +890,10 @@ const RUNTIME_ZH_TEXT = {
     "Filter by Project name, id, Runner, or workspace path": "按项目名称、ID、运行器或工作空间路径筛选",
     "No project selected": "尚未选择项目",
     "No Projects match this filter.": "没有符合当前筛选条件的项目。",
+    "Window activity": "窗口活动",
+    "Project Window activity": "项目窗口活动",
+    "No Window activity recorded for this project.": "此项目没有记录到窗口活动。",
+    "Window activity requires runtime:read. Project-scoped Session access remains available.": "查看窗口活动需要 runtime:read 权限；仍可访问项目范围内的会话。",
     "Sessions": "会话",
     "Workflow Sessions": "工作流会话",
     "No retained Workflow Sessions for this project.": "此项目没有保留的工作流会话。",
@@ -1145,6 +1168,10 @@ const RUNTIME_ZH_TEXT = {
     "BUILD DIFFERENT": "构建不一致",
     "DIRTY": "有未提交更改",
     "SESSION SCAN PARTIAL": "会话扫描不完整",
+    "WINDOW ACTIVE": "窗口活跃",
+    "Active host window request": "活跃的主机窗口请求",
+    "Open Window inspector": "打开窗口检查器",
+    "runtime:read required": "需要 runtime:read 权限",
 };
 const ZH_COUNT_LABELS = {
     "Runner": "台运行器",
@@ -1152,7 +1179,9 @@ const ZH_COUNT_LABELS = {
     "Project": "个项目",
     "visible Project": "个可见项目",
     "matching Project": "个匹配项目",
+    "Window": "个窗口",
     "Session": "个会话",
+    "linked Session": "个关联会话",
     "retained Session": "个保留会话",
     "active Session": "个活跃会话",
     "running Session": "个运行中会话",
@@ -1197,9 +1226,12 @@ function translateStaticNodeValue(source, language = "en") {
         return source;
     return match[1] + translate(match[2], language) + match[3];
 }
-function localizedCountLabel(value, singular, plural = singular + "s", language = "en") {
+function localizedCountLabel(value, singular, pluralOrLanguage, language = "en") {
+    const isLang = pluralOrLanguage === "en" || pluralOrLanguage === "zh-CN";
+    const plural = isLang || !pluralOrLanguage ? singular + "s" : pluralOrLanguage;
+    const lang = isLang ? pluralOrLanguage : (language || "en");
     const count = typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
-    if (language === "zh-CN")
+    if (lang === "zh-CN")
         return count + " " + (ZH_COUNT_LABELS[singular] || RUNTIME_ZH_TEXT[singular] || singular);
     return count + " " + (count === 1 ? singular : plural);
 }
@@ -1624,7 +1656,7 @@ function renderWindowActivityRows(node, activities, options = {}) {
         node.appendChild(item);
     }
 }
-function createWindowCard(row, selectedWindowKey, onSelect, now = Date.now()) {
+function createWindowCard(row, selectedWindowKey, onSelect, now = Date.now(), language) {
     const key = String(row?.client_window_key || "");
     if (!key)
         return null;
@@ -1640,7 +1672,7 @@ function createWindowCard(row, selectedWindowKey, onSelect, now = Date.now()) {
     const active = document.createElement("span");
     active.className = "chip" + (Number(row?.active_count || 0) > 0 ? " tone-runtime" : "");
     active.textContent = Number(row?.active_count || 0) > 0
-        ? String(row.active_count) + " active"
+        ? (language === "zh-CN" ? String(row.active_count) + " 个活跃" : String(row.active_count) + " active")
         : String(row?.source || "window");
     head.appendChild(title);
     head.appendChild(active);
@@ -1648,19 +1680,19 @@ function createWindowCard(row, selectedWindowKey, onSelect, now = Date.now()) {
     const call = document.createElement("span");
     call.className = "muted small";
     call.textContent = row?.last_tool_call_at_ms
-        ? "Last WebCodex call " + windowAgeLabel(row.last_tool_call_at_ms, now)
-        : "Last WebCodex activity " + windowAgeLabel(row?.last_seen_at_ms, now);
+        ? (language === "zh-CN" ? "最后调用 " : "Last WebCodex call ") + windowAgeLabel(row.last_tool_call_at_ms, now)
+        : (language === "zh-CN" ? "最后活动 " : "Last WebCodex activity ") + windowAgeLabel(row?.last_seen_at_ms, now);
     button.appendChild(call);
     const meaningful = document.createElement("span");
     meaningful.className = "muted small";
     meaningful.textContent = row?.last_meaningful_activity_at_ms
-        ? "Last meaningful work " + windowAgeLabel(row.last_meaningful_activity_at_ms, now)
-        : "No meaningful WebCodex work recorded";
+        ? (language === "zh-CN" ? "最后有效工作 " : "Last meaningful work ") + windowAgeLabel(row.last_meaningful_activity_at_ms, now)
+        : (language === "zh-CN" ? "未记录到有效 WebCodex 工作" : "No meaningful WebCodex work recorded");
     button.appendChild(meaningful);
     const links = document.createElement("span");
     links.className = "muted small";
-    links.textContent = localizedCountLabel(Number(row?.linked_session_count || 0), "linked Session")
-        + (Number(row?.recorder_gap_count || 0) ? " · " + String(row.recorder_gap_count) + " recorder gap" : "");
+    links.textContent = localizedCountLabel(Number(row?.linked_session_count || 0), "linked Session", "linked Sessions", language)
+        + (Number(row?.recorder_gap_count || 0) ? " · " + String(row.recorder_gap_count) + (language === "zh-CN" ? " 个记录断层" : " recorder gap") : "");
     button.appendChild(links);
     button.addEventListener("click", () => onSelect(key));
     return button;
@@ -1801,6 +1833,19 @@ function renderWindowCards(node, windowRows, selectedWindowKey, onSelect, now = 
         const card = createWindowCard(row, selectedWindowKey, onSelect, now);
         if (card)
             node.appendChild(card);
+    }
+}
+function renderProjectWindowCards(node, windowRows, onSelect, now = Date.now(), language) {
+    if (!node)
+        return;
+    while (node.firstChild)
+        node.removeChild(node.firstChild);
+    for (const row of windowRows) {
+        const card = createWindowCard(row, "", onSelect, now, language);
+        if (card) {
+            card.title = translate("Open Window inspector", language);
+            node.appendChild(card);
+        }
     }
 }
 
@@ -2650,6 +2695,13 @@ function formatRecentSessionStatusText(meta, language) {
         + (meta.truncated ? (language === "zh-CN" ? " · 前 " : " · top ") + String(meta.returned || 0) : "")
         + (meta.scan_truncated ? (language === "zh-CN" ? " · 扫描不完整" : " · partial scan") : "");
 }
+function formatProjectWindowStatusText(returned, total, truncated, language) {
+    if (!truncated)
+        return "";
+    return language === "zh-CN"
+        ? String(returned) + " / " + String(total) + " 个窗口 · 有界"
+        : String(returned) + " of " + String(total) + " Windows · bounded";
+}
 function renderProjectSelectorTree(deviceSelect, projectList, sessionsPanel, options) {
     const tr = (text) => translate(text, options.language);
     const countLabel = (count, singular) => localizedCountLabel(count, singular, options.language);
@@ -2677,6 +2729,7 @@ function renderProjectSelectorTree(deviceSelect, projectList, sessionsPanel, opt
     }
     const visibleDevices = options.projectDeviceFilter ? [options.projectDeviceFilter] : options.devices;
     let sessionsAttached = false;
+    let windowsAttached = false;
     for (const clientId of visibleDevices) {
         const deviceProjects = projectsByDevice.get(clientId) || [];
         const runner = options.runnerRows.find((candidate) => String(candidate?.client_id || "") === clientId);
@@ -2772,6 +2825,9 @@ function renderProjectSelectorTree(deviceSelect, projectList, sessionsPanel, opt
                 addSignal(tr("OFFLINE"), "tone-fail");
             else if (project.agent_status && project.agent_status !== "online")
                 addSignal(tr(String(project.agent_status).toUpperCase()), "tone-warn");
+            if (project.id === options.selectedProject && (options.selectedProjectWindowActiveCount ?? 0) > 0) {
+                addSignal(options.language === "zh-CN" ? "窗口活跃" : "WINDOW ACTIVE", "tone-runtime", options.language === "zh-CN" ? "活跃的主机窗口请求" : "Active host window request");
+            }
             if (runningSessions > 0) {
                 addSignal(options.language === "zh-CN" ? "运行中 " + runningSessions : runningSessions + " running", "tone-runtime", countLabel(runningSessions, "running Session"));
             }
@@ -2814,14 +2870,25 @@ function renderProjectSelectorTree(deviceSelect, projectList, sessionsPanel, opt
             });
             workspace.appendChild(row);
             deviceProjectList.appendChild(workspace);
-            if (project.id === options.selectedProject && sessionsPanel) {
-                sessionsPanel.hidden = false;
-                workspace.appendChild(sessionsPanel);
-                sessionsAttached = true;
+            if (project.id === options.selectedProject) {
+                if (options.windowPanel) {
+                    options.windowPanel.hidden = false;
+                    workspace.appendChild(options.windowPanel);
+                    windowsAttached = true;
+                }
+                if (sessionsPanel) {
+                    sessionsPanel.hidden = false;
+                    workspace.appendChild(sessionsPanel);
+                    sessionsAttached = true;
+                }
             }
         }
         group.appendChild(deviceProjectList);
         projectList.appendChild(group);
+    }
+    if (options.windowPanel && !windowsAttached) {
+        options.windowPanel.hidden = true;
+        projectList.appendChild(options.windowPanel);
     }
     if (sessionsPanel && !sessionsAttached) {
         sessionsPanel.hidden = true;
@@ -3259,6 +3326,14 @@ let windowTimer = 0;
 let windowRows = [];
 let selectedWindowKey = "";
 let selectedWindowDetail = null;
+const PROJECT_WINDOW_LIMIT = 10;
+let projectWindowsAbort = null;
+let projectWindowRows = [];
+let projectWindowAvailability = "idle";
+let projectWindowTruncated = false;
+let projectWindowTotal = 0;
+let projectWindowProjectId = "";
+let renderedProjectWindowSignature = "";
 let projectRows = [];
 let homeProjectRows = [];
 let runnerRows = [];
@@ -3356,8 +3431,10 @@ function renderLanguageSensitiveUi() {
     }
     renderRunnerFleet(runnerRows);
     renderRecentSessions(recentSessionRows, recentSessionMetaSnapshot);
-    if (state.selectedProject)
+    if (state.selectedProject) {
         renderSessionList(sessionRows, sessionListMetaSnapshot);
+        renderProjectWindows();
+    }
     const snapshot = state.workflow?.snapshot;
     if (snapshot)
         renderDetail(snapshot, false);
@@ -3756,8 +3833,10 @@ function abortProjectWork() {
     abort(sessionsAbort);
     abort(detailAbort);
     abortCollaboration();
+    abort(projectWindowsAbort);
     sessionsAbort = null;
     detailAbort = null;
+    projectWindowsAbort = null;
 }
 function stopProjectSearchTimer() {
     if (projectSearchTimer)
@@ -3907,6 +3986,12 @@ async function refreshWindows(refreshSelected = true) {
         renderWindowDetail(null);
     }
 }
+function openWindowInspector(key) {
+    selectedWindowKey = key;
+    applyWorkspaceView("windows");
+    renderWindowList();
+    void refreshWindowDetail();
+}
 function renderSessionWindowCorrelation(detail) {
     const available = detail?.window_activity_available === true;
     show("runtime-linked-windows-unavailable", !available);
@@ -3915,18 +4000,105 @@ function renderSessionWindowCorrelation(detail) {
     const links = available && Array.isArray(detail?.linked_windows) ? detail.linked_windows : [];
     setText("runtime-linked-windows-status", available ? runtimeCountLabel(links.length, "Window") : "runtime:read unavailable");
     if (available) {
-        renderSessionWindowCorrelationLinks(linkedNode, links, (key) => {
-            selectedWindowKey = key;
-            applyWorkspaceView("windows");
-            renderWindowList();
-            void refreshWindowDetail();
-        });
+        renderSessionWindowCorrelationLinks(linkedNode, links, (key) => openWindowInspector(key));
     }
     const gaps = available && Array.isArray(detail?.window_activity_after_last_session_record)
         ? detail.window_activity_after_last_session_record
         : [];
     show("runtime-recorder-gap-panel", gaps.length > 0);
     renderWindowActivities(el("runtime-recorder-gap-activity"), gaps, true);
+}
+function projectWindowActiveCount() {
+    if (projectWindowAvailability !== "available")
+        return 0;
+    return projectWindowRows.reduce((sum, w) => sum + Math.max(0, Number(w?.active_count || 0)), 0);
+}
+function clearProjectWindows() {
+    projectWindowRows = [];
+    projectWindowAvailability = "idle";
+    projectWindowTruncated = false;
+    projectWindowTotal = 0;
+    projectWindowProjectId = "";
+    renderedProjectWindowSignature = "";
+    renderProjectWindows();
+}
+function renderProjectWindows() {
+    const list = el("runtime-project-windows-list");
+    if (!list)
+        return;
+    if (projectWindowAvailability === "unavailable") {
+        clearNode(list);
+        show("runtime-project-windows-empty", false);
+        show("runtime-project-windows-unavailable", true);
+        setText("runtime-project-windows-count", "—");
+        setText("runtime-project-windows-status", tr("runtime:read required"));
+        return;
+    }
+    show("runtime-project-windows-unavailable", false);
+    const count = projectWindowRows.length;
+    setText("runtime-project-windows-count", String(count));
+    setText("runtime-project-windows-status", projectWindowAvailability === "stale"
+        ? tr(count > 0 ? "Refresh failed · showing previous data" : "refresh unavailable")
+        : formatProjectWindowStatusText(count, projectWindowTotal, projectWindowTruncated, runtimeLanguage));
+    show("runtime-project-windows-empty", count === 0 && projectWindowAvailability === "available");
+    const signature = renderFingerprint([
+        runtimeLanguage,
+        projectWindowProjectId,
+        projectWindowRows,
+        projectWindowTruncated,
+        projectWindowTotal,
+        projectWindowAvailability,
+    ]);
+    if (signature === renderedProjectWindowSignature)
+        return;
+    renderedProjectWindowSignature = signature;
+    renderProjectWindowCards(list, projectWindowRows, (key) => openWindowInspector(key), Date.now(), runtimeLanguage);
+}
+async function fetchProjectWindows(request) {
+    abort(projectWindowsAbort);
+    const controller = new AbortController();
+    projectWindowsAbort = controller;
+    const response = await api("windows", { project: request.project, limit: PROJECT_WINDOW_LIMIT }, controller.signal);
+    if (projectWindowsAbort === controller)
+        projectWindowsAbort = null;
+    if (!isCurrentRuntimeProjectWindowsRequest(state, request))
+        return false;
+    if (!response) {
+        projectWindowAvailability = "stale";
+        projectWindowProjectId = request.project;
+        renderProjectWindows();
+        renderProjectSelectors(projectRows, projectRowsTruncated);
+        return false;
+    }
+    if (response.status === 401) {
+        lock("Credential rejected.");
+        return false;
+    }
+    if (response.status === 403) {
+        projectWindowRows = [];
+        projectWindowAvailability = "unavailable";
+        projectWindowProjectId = request.project;
+        projectWindowTruncated = false;
+        projectWindowTotal = 0;
+        renderProjectWindows();
+        renderProjectSelectors(projectRows, projectRowsTruncated);
+        return false;
+    }
+    if (!response.ok || !response.data) {
+        projectWindowAvailability = "stale";
+        projectWindowProjectId = request.project;
+        renderProjectWindows();
+        renderProjectSelectors(projectRows, projectRowsTruncated);
+        return false;
+    }
+    projectWindowRows = Array.isArray(response.data.windows) ? response.data.windows : [];
+    projectWindowAvailability = "available";
+    projectWindowProjectId = request.project;
+    projectWindowTruncated = !!response.data.truncated;
+    projectWindowTotal = typeof response.data.total === "number" ? response.data.total : projectWindowRows.length;
+    renderProjectWindows();
+    renderProjectSelectors(projectRows, projectRowsTruncated);
+    return true;
 }
 function hideDetail() {
     const messageSearch = el("runtime-message-search");
@@ -3964,6 +4136,7 @@ function clearSessionSurface() {
     abortCollaboration();
     hideDetail();
     resetCollaborationComposerUi();
+    clearProjectWindows();
 }
 function lock(message = "", clearRemembered = true) {
     setMobileNavigationOpen(false, false);
@@ -4001,13 +4174,19 @@ function lock(message = "", clearRemembered = true) {
     renderWindowDetail(null);
     resetCommunicationSurface();
     const projectList = el("runtime-project-list");
+    const windowPanel = el("runtime-project-window-activity-panel");
     const sessionsPanel = el("runtime-workflow-sessions-panel");
     renderedProjectSelectorsSignature = "";
     renderedRunnerFleetSignature = "";
     renderedRecentSessionsSignature = "";
+    windowPanel?.remove();
     sessionsPanel?.remove();
     clearNode(projectList);
     if (projectList && sessionsPanel) {
+        if (windowPanel) {
+            windowPanel.hidden = true;
+            projectList.appendChild(windowPanel);
+        }
         sessionsPanel.hidden = true;
         projectList.appendChild(sessionsPanel);
     }
@@ -4210,6 +4389,9 @@ async function fetchProjects(request, unlocking = false) {
         const listRequest = refreshRuntimeSessionList(state);
         if (listRequest)
             void fetchSessions(listRequest);
+        const windowRequest = refreshRuntimeProjectWindows(state);
+        if (windowRequest)
+            void fetchProjectWindows(windowRequest);
     }
     return true;
 }
@@ -4258,6 +4440,7 @@ function renderProjectSelectors(projects, truncated) {
     if (!deviceSelect || !projectList)
         return;
     const effective = effectiveProjects(projects);
+    const activeWindowCount = projectWindowActiveCount();
     const signature = renderFingerprint({
         language: runtimeLanguage,
         selectedDevice: state.selectedDevice,
@@ -4269,11 +4452,14 @@ function renderProjectSelectors(projects, truncated) {
         knownProjectDevices,
         projects: effective,
         runners: runnerRows.map((runner) => [runner?.client_id, runner?.connected, runner?.status]),
+        activeWindowCount,
     });
     if (signature === renderedProjectSelectorsSignature)
         return;
     renderedProjectSelectorsSignature = signature;
+    const windowPanel = el("runtime-project-window-activity-panel");
     const sessionsPanel = el("runtime-workflow-sessions-panel");
+    windowPanel?.remove();
     sessionsPanel?.remove();
     const devices = projectSelectorDevices(projects);
     renderProjectSelectorTree(deviceSelect, projectList, sessionsPanel, {
@@ -4287,6 +4473,8 @@ function renderProjectSelectors(projects, truncated) {
         storedDeviceDisclosure: readDeviceDisclosure,
         onPersistDeviceDisclosure: writeDeviceDisclosure,
         onSelectProject: (clientId, projectId) => switchProject(clientId, projectId),
+        windowPanel,
+        selectedProjectWindowActiveCount: activeWindowCount,
     });
     const returnedProjects = runtimeProjectsForDevice(effective, projectDeviceFilter).length;
     const totalProjects = Math.max(returnedProjects, projectRowsTotal);
@@ -4304,12 +4492,15 @@ function switchProject(device, project) {
     if (device)
         revealRunner(device);
     const request = selectRuntimeProject(state, device, project);
+    const windowRequest = refreshRuntimeProjectWindows(state);
     renderProjectSelectors(projectRows, projectRowsTruncated);
     renderRunnerFleet(runnerRows);
     renderRecentSessions(recentSessionRows, null);
     renderSelectedProjectIdentity();
     if (request)
         void fetchSessions(request);
+    if (windowRequest)
+        void fetchProjectWindows(windowRequest);
     if (token)
         void fetchProjects(refreshRuntimeProjects(state, projectSearch, projectDeviceFilter));
 }
@@ -4401,6 +4592,9 @@ function selectRecentSession(session) {
     revealWorkflowSessionDetail();
     if (location.sessionListRequest)
         void fetchSessions(location.sessionListRequest);
+    const windowRequest = refreshRuntimeProjectWindows(state);
+    if (windowRequest)
+        void fetchProjectWindows(windowRequest);
     if (location.detailRequest)
         void fetchSessionDetail(location.detailRequest);
     const collaborationRequest = runtimeCollaborationRequest(state);
@@ -6037,11 +6231,13 @@ async function refreshAll() {
     const recoverCollaboration = runtimeCollaborationNeedsRefreshRecovery(state);
     const overviewRequest = refreshRuntimeOverview(state);
     const projectsRequest = refreshRuntimeProjects(state, projectSearch, projectDeviceFilter);
+    const windowRequest = refreshRuntimeProjectWindows(state);
     try {
         const [overviewOk, projectsOk, communicationOk] = await Promise.all([
             fetchOverview(overviewRequest),
             fetchProjects(projectsRequest),
             refreshCommunication(),
+            windowRequest ? fetchProjectWindows(windowRequest) : Promise.resolve(true),
         ]);
         if (!token)
             return;
@@ -6072,6 +6268,9 @@ function refreshAutoSurfaces() {
     const request = refreshRuntimeSessionList(state);
     if (request)
         void fetchSessions(request);
+    const windowRequest = refreshRuntimeProjectWindows(state);
+    if (windowRequest)
+        void fetchProjectWindows(windowRequest);
     void refreshCommunication(workspaceView === "operations");
 }
 function startAuto() {

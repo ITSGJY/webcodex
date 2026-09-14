@@ -70,6 +70,10 @@ export const RUNTIME_ZH_TEXT: Record<string, string> = {
   "Filter by Project name, id, Runner, or workspace path": "按项目名称、ID、运行器或工作空间路径筛选",
   "No project selected": "尚未选择项目",
   "No Projects match this filter.": "没有符合当前筛选条件的项目。",
+  "Window activity": "窗口活动",
+  "Project Window activity": "项目窗口活动",
+  "No Window activity recorded for this project.": "此项目没有记录到窗口活动。",
+  "Window activity requires runtime:read. Project-scoped Session access remains available.": "查看窗口活动需要 runtime:read 权限；仍可访问项目范围内的会话。",
   "Sessions": "会话",
   "Workflow Sessions": "工作流会话",
   "No retained Workflow Sessions for this project.": "此项目没有保留的工作流会话。",
@@ -344,6 +348,10 @@ export const RUNTIME_ZH_TEXT: Record<string, string> = {
   "BUILD DIFFERENT": "构建不一致",
   "DIRTY": "有未提交更改",
   "SESSION SCAN PARTIAL": "会话扫描不完整",
+  "WINDOW ACTIVE": "窗口活跃",
+  "Active host window request": "活跃的主机窗口请求",
+  "Open Window inspector": "打开窗口检查器",
+  "runtime:read required": "需要 runtime:read 权限",
 };
 
 export const ZH_COUNT_LABELS: Record<string, string> = {
@@ -352,7 +360,9 @@ export const ZH_COUNT_LABELS: Record<string, string> = {
   "Project": "个项目",
   "visible Project": "个可见项目",
   "matching Project": "个匹配项目",
+  "Window": "个窗口",
   "Session": "个会话",
+  "linked Session": "个关联会话",
   "retained Session": "个保留会话",
   "active Session": "个活跃会话",
   "running Session": "个运行中会话",
@@ -402,11 +412,14 @@ export function translateStaticNodeValue(source: string, language: RuntimeLangua
 export function localizedCountLabel(
   value: any,
   singular: string,
-  plural = singular + "s",
+  pluralOrLanguage?: string | RuntimeLanguage,
   language: RuntimeLanguage = "en"
 ): string {
+  const isLang = pluralOrLanguage === "en" || pluralOrLanguage === "zh-CN";
+  const plural = isLang || !pluralOrLanguage ? singular + "s" : pluralOrLanguage;
+  const lang = isLang ? pluralOrLanguage : (language || "en");
   const count = typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
-  if (language === "zh-CN") return count + " " + (ZH_COUNT_LABELS[singular] || RUNTIME_ZH_TEXT[singular] || singular);
+  if (lang === "zh-CN") return count + " " + (ZH_COUNT_LABELS[singular] || RUNTIME_ZH_TEXT[singular] || singular);
   return count + " " + (count === 1 ? singular : plural);
 }
 

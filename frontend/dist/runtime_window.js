@@ -109,7 +109,7 @@ export function renderWindowActivityRows(node, activities, options = {}) {
         node.appendChild(item);
     }
 }
-export function createWindowCard(row, selectedWindowKey, onSelect, now = Date.now()) {
+export function createWindowCard(row, selectedWindowKey, onSelect, now = Date.now(), language) {
     const key = String(row?.client_window_key || "");
     if (!key)
         return null;
@@ -125,7 +125,7 @@ export function createWindowCard(row, selectedWindowKey, onSelect, now = Date.no
     const active = document.createElement("span");
     active.className = "chip" + (Number(row?.active_count || 0) > 0 ? " tone-runtime" : "");
     active.textContent = Number(row?.active_count || 0) > 0
-        ? String(row.active_count) + " active"
+        ? (language === "zh-CN" ? String(row.active_count) + " 个活跃" : String(row.active_count) + " active")
         : String(row?.source || "window");
     head.appendChild(title);
     head.appendChild(active);
@@ -133,19 +133,19 @@ export function createWindowCard(row, selectedWindowKey, onSelect, now = Date.no
     const call = document.createElement("span");
     call.className = "muted small";
     call.textContent = row?.last_tool_call_at_ms
-        ? "Last WebCodex call " + windowAgeLabel(row.last_tool_call_at_ms, now)
-        : "Last WebCodex activity " + windowAgeLabel(row?.last_seen_at_ms, now);
+        ? (language === "zh-CN" ? "最后调用 " : "Last WebCodex call ") + windowAgeLabel(row.last_tool_call_at_ms, now)
+        : (language === "zh-CN" ? "最后活动 " : "Last WebCodex activity ") + windowAgeLabel(row?.last_seen_at_ms, now);
     button.appendChild(call);
     const meaningful = document.createElement("span");
     meaningful.className = "muted small";
     meaningful.textContent = row?.last_meaningful_activity_at_ms
-        ? "Last meaningful work " + windowAgeLabel(row.last_meaningful_activity_at_ms, now)
-        : "No meaningful WebCodex work recorded";
+        ? (language === "zh-CN" ? "最后有效工作 " : "Last meaningful work ") + windowAgeLabel(row.last_meaningful_activity_at_ms, now)
+        : (language === "zh-CN" ? "未记录到有效 WebCodex 工作" : "No meaningful WebCodex work recorded");
     button.appendChild(meaningful);
     const links = document.createElement("span");
     links.className = "muted small";
-    links.textContent = localizedCountLabel(Number(row?.linked_session_count || 0), "linked Session")
-        + (Number(row?.recorder_gap_count || 0) ? " · " + String(row.recorder_gap_count) + " recorder gap" : "");
+    links.textContent = localizedCountLabel(Number(row?.linked_session_count || 0), "linked Session", "linked Sessions", language)
+        + (Number(row?.recorder_gap_count || 0) ? " · " + String(row.recorder_gap_count) + (language === "zh-CN" ? " 个记录断层" : " recorder gap") : "");
     button.appendChild(links);
     button.addEventListener("click", () => onSelect(key));
     return button;
@@ -286,5 +286,18 @@ export function renderWindowCards(node, windowRows, selectedWindowKey, onSelect,
         const card = createWindowCard(row, selectedWindowKey, onSelect, now);
         if (card)
             node.appendChild(card);
+    }
+}
+export function renderProjectWindowCards(node, windowRows, onSelect, now = Date.now(), language) {
+    if (!node)
+        return;
+    while (node.firstChild)
+        node.removeChild(node.firstChild);
+    for (const row of windowRows) {
+        const card = createWindowCard(row, "", onSelect, now, language);
+        if (card) {
+            card.title = translate("Open Window inspector", language);
+            node.appendChild(card);
+        }
     }
 }

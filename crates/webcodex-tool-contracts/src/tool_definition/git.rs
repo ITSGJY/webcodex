@@ -90,7 +90,7 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Default inspect/review tool before final response. Read-only worktree overview with bounded hunks and compact Session signals; recent Session event history is omitted unless session_event_limit is explicitly positive. If hunks truncate, diff_review_handoff classifies page/line/mixed truncation and provides a parser-ready git_diff_hunks recovery call.",
             show_changes_input_schema,
-        )))),
+        ).with_gpt_action_description("Review current worktree changes and optional bounded diff hunks before handoff. If diff output truncates, follow the returned git_diff_hunks recovery call. Read-only; recent Session event history is opt-in.")))),
         130,
     ),
 ];
@@ -184,7 +184,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
             ),
             "Targeted/paged diff review for worktree/cached or exact base/head ranges, with paths and scope/fence-bound opaque continuation. max_page_bytes controls the raw producer page (64 KiB default, bounded below ordinary Runner result retention); it is separate from the 512 KiB final model-facing result ceiling. An opaque continuation may identify either later logical diff records or the next complete-line fragment of one exact hunk; follow the returned parser-ready suggested_call without interpreting the token. next_continuation and recovery.continuation remain later-record only, while recovery.omitted_lines may use bounded refinement or a distinct exact hunk-fragment token. Fixed byte/line ceilings never advertise fake recovery. Read-only.",
             git_diff_hunks_input_schema,
-        )))),
+        ).with_gpt_action_description("Read bounded diff hunks for worktree/cached or exact base/head ranges. Follow opaque continuation for later records; current-hunk truncation requires returned recovery guidance, not guessed offsets.")))),
         125,
     ),
     context_reobservable(git_like(model_spec(

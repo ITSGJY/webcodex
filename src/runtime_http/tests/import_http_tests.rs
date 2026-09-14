@@ -518,7 +518,7 @@ async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path_b
                 auth: Some(&auth),
                 window: None,
                 record_oauth_scope_denials: false,
-                host_file_import_trust: HostFileImportTrust::TrustedOAuthClient,
+                host_file_import_trust: HostFileImportTrust::TrustedMcpHostFile,
             },
         ),
     )
@@ -558,7 +558,7 @@ fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path() {
 }
 
 #[tokio::test]
-async fn runtime_conversation_import_rejects_non_mcp_transport() {
+async fn runtime_conversation_import_rejects_untrusted_api_transport() {
     use crate::auth::{AuthContext, AuthKind};
     use crate::runner_protocol::RunnerCapabilities;
     use crate::tool_runtime::ToolCall;
@@ -604,7 +604,7 @@ async fn runtime_conversation_import_rejects_non_mcp_transport() {
     assert!(result
         .error
         .as_deref()
-        .is_some_and(|error| error.contains("MCP host file-reference mechanism")));
+        .is_some_and(|error| error.contains("trusted GPT Action/OpenAI host file provenance")));
 }
 
 #[tokio::test]

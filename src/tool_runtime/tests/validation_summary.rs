@@ -129,25 +129,16 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
     );
 
     let openapi = crate::openapi::build_openapi_spec();
-    let tool_call = &openapi["components"]["schemas"]["ToolCallRequest"];
-    let description = tool_call["properties"]["tool"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(description.contains("validation_summary"));
-    for field in ["project", "session_id", "limit"] {
-        assert!(
-            tool_call["properties"].get(field).is_some(),
-            "missing {field}"
-        );
-    }
-    assert_eq!(tool_call["additionalProperties"], false);
-    let operation_count: usize = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|methods| methods.as_object().unwrap().len())
-        .sum();
-    assert_eq!(operation_count, 16);
+    assert!(openapi["paths"]
+        .get("/api/actions/validation_summary")
+        .is_none());
+    assert!(webcodex_tool_contracts::gpt_action_tool_supported(
+        "validation_summary"
+    ));
+    assert_eq!(
+        crate::model_surface::adaptive_runtime_gateway_target_route("validation_summary"),
+        crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
+    );
 }
 
 #[tokio::test]

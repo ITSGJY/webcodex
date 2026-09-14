@@ -27,6 +27,8 @@ mod db;
 mod host_console_http;
 mod job_observation;
 mod job_receipts;
+mod json_digest;
+mod json_measurement;
 mod mcp;
 mod mcp_gateway;
 mod model_surface;
@@ -378,6 +380,10 @@ only for local/trusted-network demos."
         .push(
             Router::with_path(route_metadata::api_path(RouteId::ToolsCall))
                 .post(runtime_http::tools_call),
+        )
+        .push(
+            Router::with_path(route_metadata::api_path(RouteId::GptActionsInvoke))
+                .post(runtime_http::gpt_action_invoke),
         )
         .push(
             Router::with_path(route_metadata::api_path(RouteId::ArtifactsImport))

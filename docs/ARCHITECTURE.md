@@ -155,13 +155,18 @@ MCP / OpenAPI / Runtime HTTP --> ToolRuntime --+--> Project resolution --> Runne
 Runtime Console -----------------------> canonical Server HTTP/kernel paths above
 ```
 
-- `route_metadata` — canonical HTTP route identity, security/surface metadata,
-  and OpenAPI exposure. Public Action operation policy is bound directly to its
-  route; Connector routes bind canonical capability identities. Handler mounting
-  stays explicit in the HTTP modules.
-- `runtime_http` — REST runtime routes.
-- `mcp` — the MCP adapter and surface selection.
-- `openapi` — the GPT Actions schema.
+- `route_metadata` — canonical HTTP route identity plus security/surface metadata.
+  Legacy REST routes and the one dynamic GPT Action adapter remain ordinary HTTP
+  routes; generic GPT Action operation identity is no longer stored here.
+  Connector routes still bind canonical Connector capability identities.
+- `runtime_http` — REST runtime routes plus the shared `/api/actions/{tool_name}`
+  adapter. The Action adapter performs transport decoding/admission only and then
+  enters the same ToolRuntime kernel as the canonical runtime path.
+- `mcp` — the primary model-facing adapter and model-surface selection.
+- `openapi` — the generic GPT Actions compatibility projector. It derives direct
+  operations from the canonical Adaptive Runtime direct rank, removes only explicit
+  protocol-incompatible `ToolDefinition` exceptions, and adds `call_runtime_tool`
+  for the supported long tail. Project Connector OpenAPI remains capability-based.
 - `connector_runtime` — the canonical project-bound coding path.
 - `tool_runtime` — protocol-independent tool parsing, dispatch, project
   resolution, registry metadata, sessions, handoff, hygiene, files, Git,

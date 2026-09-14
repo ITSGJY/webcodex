@@ -86,9 +86,6 @@ pub use computer::{
     computer_snapshot_display_input_schema, computer_snapshot_input_schema,
     computer_write_clipboard_input_schema,
 };
-#[cfg(any(test, feature = "root-test-support"))]
-pub use discovery::ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER;
-pub use discovery::{accepted_flattened_args_for_spec, generic_tool_call_flattened_args_for_spec};
 pub use discovery::{
     empty_input_schema, list_projects_input_schema, list_runners_input_schema,
     list_tools_input_schema, read_tool_trace_input_schema, runtime_status_input_schema,

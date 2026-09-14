@@ -454,16 +454,24 @@ protocol-level refresh-token scope and grants no extra WebCodex permission.
 ## GPT Actions and MCP
 
 - **MCP:** connect a client to `https://your-domain.example/mcp` with a user
-  API token (`wc_pat_*`) or, when OAuth is enabled, the OAuth flow.
+  API token (`wc_pat_*`) or, when OAuth is enabled, the OAuth flow. MCP remains
+  the primary ChatGPT integration.
 - **GPT Actions:** import `https://your-domain.example/openapi.json` into a
-  Custom GPT with HTTP Bearer authentication.
+  Custom GPT with HTTP Bearer authentication. On a generic runtime Server this
+  projects the same canonical Adaptive Runtime model surface: current Adaptive
+  Direct tools become direct snake_case Action operations and supported long-tail
+  tools use `call_runtime_tool`. MCP-only protocol presentation is excluded.
 
-Both use the same user API token and the same ToolRuntime. The OpenAPI schema
-intentionally excludes users, token, pairing/enrollment, setup, doctor, npm,
-server-management, and audit endpoints. Use `webcodex` for those tasks.
+After upgrading from the older generic Action facade, re-import `/openapi.json`
+to pick up the canonical operation names. Existing legacy REST routes may remain
+for compatibility but are not part of the new model-facing schema.
 
-MCP and GPT Actions are documented in [MCP.md](MCP.md) and the client-specific
-setup in [AI Onboarding](AI_ONBOARDING.md).
+Both integrations enter the same ToolRuntime authority path. GPT Actions does not
+introduce a separate scope, Project-authority, permission, Runner-capability, or
+retry policy. Project-bound Connector deployments keep their independent canonical
+fourteen-capability MCP/OpenAPI surface.
+
+See [GPT Actions](GPT_ACTIONS.md), [MCP](MCP.md), and [AI Onboarding](AI_ONBOARDING.md).
 
 ## Operations
 

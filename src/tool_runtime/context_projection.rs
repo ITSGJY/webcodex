@@ -4,6 +4,8 @@ use super::startup_brief::{
 };
 use super::{ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
+use crate::json_measurement::serialized_json_len;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -126,10 +128,23 @@ fn projection_envelope(materials: Vec<Value>, truncated: bool) -> Value {
     })
 }
 
+#[derive(Serialize)]
+struct ContextProjectionMeasure<'a> {
+    timing: &'static str,
+    applies_to_current_effect: bool,
+    materials: &'a [Value],
+    truncated: bool,
+}
+
 fn fits_projection_budget(materials: &[Value], truncated: bool) -> bool {
-    serde_json::to_vec(&projection_envelope(materials.to_vec(), truncated))
-        .map(|bytes| bytes.len() <= MAX_CONTEXT_PROJECTION_BYTES)
-        .unwrap_or(false)
+    serialized_json_len(&ContextProjectionMeasure {
+        timing: "post_tool",
+        applies_to_current_effect: false,
+        materials,
+        truncated,
+    })
+    .map(|bytes| bytes <= MAX_CONTEXT_PROJECTION_BYTES)
+    .unwrap_or(false)
 }
 
 fn unavailable(key: &str, reason_code: &str) -> Value {
@@ -256,26 +271,24 @@ impl ToolRuntime {
                 })
             };
 
-            let mut candidate = materials.clone();
-            candidate.push(material.clone());
-            if fits_projection_budget(&candidate, truncated) {
-                materials.push(material);
+            materials.push(material);
+            if fits_projection_budget(&materials, truncated) {
                 continue;
             }
+            materials.pop();
 
             truncated = true;
             let bounded = unavailable(key, "context_projection_budget_exceeded");
-            let mut bounded_candidate = materials.clone();
-            bounded_candidate.push(bounded.clone());
-            if fits_projection_budget(&bounded_candidate, true) {
-                materials.push(bounded);
+            materials.push(bounded);
+            if !fits_projection_budget(&materials, true) {
+                materials.pop();
             }
         }
 
         let projection = projection_envelope(materials, truncated);
         debug_assert!(
-            serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= MAX_CONTEXT_PROJECTION_BYTES)
+            serialized_json_len(&projection)
+                .map(|bytes| bytes <= MAX_CONTEXT_PROJECTION_BYTES)
                 .unwrap_or(false),
             "context projection must stay inside its independent budget"
         );

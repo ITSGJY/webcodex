@@ -421,11 +421,29 @@ where
 #[serde(deny_unknown_fields)]
 pub struct OpenAiHostFileRef {
     pub download_url: String,
-    pub file_id: String,
+    #[serde(default)]
+    pub file_id: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
     #[serde(default)]
     pub file_name: Option<String>,
+}
+
+/// Adapter-derived provenance for host file references. This is deliberately
+/// skipped by serde on ToolCall: caller/model JSON can never grant either trust
+/// path, and the two host mechanisms cannot impersonate one another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostFileImportProvenance {
+    #[default]
+    Untrusted,
+    GptActionOpenAiHost,
+    TrustedMcpHostFile,
+}
+
+impl HostFileImportProvenance {
+    pub fn is_trusted(self) -> bool {
+        !matches!(self, Self::Untrusted)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -662,8 +680,7 @@ pub enum ToolCall {
     /// open todos/risks/questions/guidance, recent failed tool calls, and
     /// optional workspace, checkpoint, and ledger-derived validation metadata.
     /// Read-only; never calls an LLM or generates natural-language summaries.
-    /// Exposed only through runtime tools / MCP / `callRuntimeTool` (no
-    /// dedicated OpenAPI op).
+    /// Model/API exposure is derived from the canonical ToolDefinition surface.
     SessionHandoffSummary {
         session_id: String,
         #[serde(default)]
@@ -1861,11 +1878,11 @@ pub enum ToolCall {
         overwrite: Option<bool>,
         #[serde(default)]
         session_id: Option<String>,
-        /// Internal provenance bit set only by the MCP HTTP adapter after
-        /// authenticating the OAuth client registration. Never deserialized
-        /// from model/caller arguments and never serialized back out.
+        /// Internal host-file provenance set only by a trusted protocol
+        /// adapter. Never deserialized from model/caller arguments and never
+        /// serialized back out.
         #[serde(skip)]
-        trusted_mcp_host_file_import: bool,
+        host_file_import_provenance: HostFileImportProvenance,
     },
 
     /// Prepare one project artifact for standards-native MCP resource export.
@@ -1958,9 +1975,8 @@ pub enum ToolCall {
     /// Apply a bounded transactional batch of edit/create/delete/rename file
     /// changes via the owning Runner. Every existing input file requires a
     /// sha256 precondition and every change is preflighted before the first
-    /// mutation. `dry_run` computes the full plan without writing. Exposed only
-    /// through runtime tools / MCP / `callRuntimeTool` (no dedicated OpenAPI
-    /// operation).
+    /// mutation. `dry_run` computes the full plan without writing. Model/API
+    /// exposure is derived from the canonical ToolDefinition surface.
     ApplyTextEdits {
         project: String,
         changes: Vec<ApplyFileChangeInput>,
@@ -1976,8 +1992,8 @@ pub enum ToolCall {
     /// path names, and large untracked files. Never cleans, deletes, restores,
     /// or modifies the project. Never reads file contents, env values, tokens,
     /// or stdout/stderr bodies. Suspicious secret files are identified by
-    /// path/name only. Exposed only through runtime tools / MCP /
-    /// `callRuntimeTool` (no dedicated OpenAPI op).
+    /// path/name only. Model/API exposure is derived from the canonical
+    /// ToolDefinition surface.
     WorkspaceHygieneCheck {
         project: String,
         #[serde(default)]
@@ -2711,14 +2727,14 @@ impl ToolCall {
             );
         }
         // Reject unknown tool names up front with a helpful message that lists
-        // every accepted tool and points the caller at listRuntimeTools. This
-        // avoids leaking a raw serde "unknown variant" error and gives custom
-        // GPTs an actionable discovery hint.
+        // every accepted tool and points the caller at canonical discovery. This
+        // avoids leaking a raw serde "unknown variant" error and gives model/API
+        // callers an actionable discovery hint.
         let definition = lookup_tool_definition(name).ok_or_else(|| {
             format!(
-                "unknown tool '{}'. Available tools: {}. Call listRuntimeTools \
-                 (POST /api/tools/list) or the list_tools runtime tool to \
-                 discover accepted tool names.",
+                "unknown tool '{}'. Available tools: {}. Call tool_manifest with \
+                 an exact tool_name (or use its category/intent views) to discover \
+                 accepted model-visible tool names.",
                 name,
                 model_visible_tool_names_csv()
             )

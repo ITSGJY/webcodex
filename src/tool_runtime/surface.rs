@@ -6,10 +6,7 @@
 
 use super::kernel::ToolProtocolCapabilities;
 use super::metadata::ToolAuthorityPolicy;
-use super::registry::{
-    accepted_flattened_args_for_spec, registered_tool_specs,
-    stateless_operator_extension_tool_specs,
-};
+use super::registry::{registered_tool_specs, stateless_operator_extension_tool_specs};
 use super::runtime::ToolRuntime;
 use super::tool_definition::{
     available_tool_manifest_intent_names, is_model_visible_tool_name, resolve_tool_manifest_intent,
@@ -185,8 +182,8 @@ impl ToolRuntime {
                 registered_tool_categories()
             },
             "recommended_flows": recommended_flows(),
-            "recommended_next": "For daily GPT Action discovery, call callRuntimeTool with tool=tool_manifest. Use full listRuntimeTools only when debugging schemas.",
-            "hint": "Full listRuntimeTools responses include schemas and may be large. Use summary_only=true with category, features, or limit for focused discovery.",
+            "recommended_next": "Use tool_manifest directly for focused discovery; long-tail Adaptive Runtime tools are invoked through call_runtime_tool.",
+            "hint": "Prefer exact tool_name or category/intent filters for compact discovery; availability describes routing only and grants no authority.",
         });
         if !bounded_request {
             output["filtered_count"] = json!(total_count);
@@ -889,7 +886,6 @@ pub(super) fn compact_manifest_tool_entry(
     let mut entry = json!({
         "name": name,
         "category": runtime_tool_category(name),
-        "accepted_flattened_args": accepted_flattened_args_for_spec(spec),
         "deprecated_or_unsupported_args": [],
         "provider": m.provider_id,
         "effect": m.effect.manifest_label(),

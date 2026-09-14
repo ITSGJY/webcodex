@@ -11,7 +11,11 @@ import {
   renderSessionWindowCorrelationLinks,
   formatWindowDetailFields,
   renderWindowCards,
+  renderProjectWindowCards,
 } from "../dist/runtime_window.js";
+import {
+  formatProjectWindowStatusText,
+} from "../dist/runtime_navigation.js";
 
 function createMockElement(tag = "div") {
   const listeners = new Map();
@@ -424,4 +428,83 @@ test("renderWindowCards populates container with window cards", () => {
     container.children[1].click();
     assert.equal(clicked, "w2");
   });
+});
+
+test("createWindowCard correctly renders 0 linked Sessions, active count, and last meaningful work", () => {
+  withMockDom(() => {
+    let clickedKey = "";
+    const card = createWindowCard(
+      {
+        client_window_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        active_count: 1,
+        source: "openai-session",
+        last_seen_at_ms: 9800,
+        last_tool_call_at_ms: 9500,
+        last_meaningful_activity_at_ms: 9000,
+        linked_session_count: 0,
+        recorder_gap_count: 0,
+      },
+      "",
+      (key) => {
+        clickedKey = key;
+      },
+      10000,
+      "en",
+    );
+
+    assert.ok(card);
+    assert.equal(card.className.includes("selected"), false);
+    assert.equal(card.getAttribute("aria-current"), null);
+    assert.equal(card.querySelector(".chip")?.textContent, "1 active");
+    assert.match(card.textContent, /Last WebCodex call/);
+    assert.match(card.textContent, /Last meaningful work/);
+    assert.match(card.textContent, /0 linked Sessions/);
+
+    card.click();
+    assert.equal(clickedKey, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+  });
+});
+
+test("renderProjectWindowCards populates project-scoped window cards with inspector title", () => {
+  withMockDom(() => {
+    const container = document.createElement("div");
+    let inspectedKey = "";
+    const rows = [
+      {
+        client_window_key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        active_count: 0,
+        source: "openai-session",
+        last_seen_at_ms: 9000,
+        last_meaningful_activity_at_ms: 9000,
+        linked_session_count: 0,
+      },
+    ];
+
+    renderProjectWindowCards(
+      container,
+      rows,
+      (k) => {
+        inspectedKey = k;
+      },
+      10000,
+      "en",
+    );
+
+    assert.equal(container.children.length, 1);
+    const card = container.children[0];
+    assert.equal(card.title, "Open Window inspector");
+    assert.equal(card.className.includes("selected"), false);
+    assert.equal(card.querySelector(".chip")?.textContent, "openai-session");
+    assert.match(card.textContent, /0 linked Sessions/);
+
+    card.click();
+    assert.equal(inspectedKey, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+  });
+});
+
+test("formatProjectWindowStatusText formats non-truncated and truncated status in en and zh-CN", () => {
+  assert.equal(formatProjectWindowStatusText(5, 5, false, "en"), "");
+  assert.equal(formatProjectWindowStatusText(5, 5, false, "zh-CN"), "");
+  assert.equal(formatProjectWindowStatusText(10, 25, true, "en"), "10 of 25 Windows · bounded");
+  assert.equal(formatProjectWindowStatusText(10, 25, true, "zh-CN"), "10 / 25 个窗口 · 有界");
 });

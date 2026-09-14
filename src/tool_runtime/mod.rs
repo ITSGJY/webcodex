@@ -112,7 +112,6 @@ pub(crate) use files::{
     validate_project_artifact_export_snapshot, ProjectArtifactExportSnapshot,
     MAX_PROJECT_ARTIFACT_EXPORT_BYTES, MAX_READ_PROJECT_ARTIFACT_LENGTH,
 };
-pub(crate) use patch::MAX_UNIFIED_DIFF_BYTES;
 #[cfg(test)]
 pub(crate) use permissions::{AuthorityMode, PermissionEvaluator};
 #[cfg(test)]
@@ -124,8 +123,9 @@ pub(crate) use session_context::workflow_session_authority_fingerprint;
 #[cfg(test)]
 pub(crate) use sessions::{SessionCreateOptions, SessionGuards, SessionSummary};
 pub use tool_call::{
-    AgentWaitEventSelectorCall, ObserveJobsItem, ObserveJobsWakeOn, PluginToolCall, ReadFilesItem,
-    SearchPatternMode, SearchProjectTextsQuery, SearchResultMode, SshResourceToolCall, ToolCall,
+    AgentWaitEventSelectorCall, HostFileImportProvenance, ObserveJobsItem, ObserveJobsWakeOn,
+    PluginToolCall, ReadFilesItem, SearchPatternMode, SearchProjectTextsQuery, SearchResultMode,
+    SshResourceToolCall, ToolCall,
 };
 pub(crate) use tool_call::{
     TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD, TOOL_CALL_WRAPPER_FIELDS,
@@ -156,12 +156,9 @@ pub use tool_spec::ToolSpec;
 #[cfg(test)]
 pub(crate) use project_resolution::ProjectResolverErrorKind;
 pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverError};
-#[cfg(test)]
-pub(crate) use registry::accepted_flattened_args_for_spec;
 pub(crate) use registry::{
-    agent_continuation_app_tool_specs, generic_tool_call_flattened_args_for_spec,
-    goal_plan_app_tool_specs, registered_tool_specs, stateless_operator_extension_tool_specs,
-    work_result_app_tool_specs,
+    agent_continuation_app_tool_specs, goal_plan_app_tool_specs, registered_tool_specs,
+    stateless_operator_extension_tool_specs, work_result_app_tool_specs,
 };
 #[cfg(test)]
 pub(crate) use registry::{

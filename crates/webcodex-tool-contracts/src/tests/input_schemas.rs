@@ -519,11 +519,17 @@ fn cargo_fmt_conditional_timeout_schema_matches_contract() {
     assert!(validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 120})
     ));
-    assert!(!validates(
+    assert!(validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 120, "sync_wait_secs": 1})
     ));
-    assert!(!validates(
+    assert!(validates(
         &json!({"project": "demo", "timeout_secs": 120, "sync_wait_secs": 1})
+    ));
+    assert!(!validates(
+        &json!({"project": "demo", "check": false, "timeout_secs": 120, "sync_wait_secs": 0})
+    ));
+    assert!(!validates(
+        &json!({"project": "demo", "timeout_secs": 120, "sync_wait_secs": 0})
     ));
     assert!(validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 121})

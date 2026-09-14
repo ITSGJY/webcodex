@@ -8,6 +8,7 @@ use crate::db::{
     ProjectMemoryScopeRecord, MAX_MEMORIES_GLOBAL, MAX_MEMORY_BOOTSTRAP_BYTES,
     MAX_MEMORY_SCOPE_LIST_LIMIT, MAX_MEMORY_SEARCH_LIMIT, MAX_MEMORY_SEARCH_RESULT_BYTES,
 };
+use crate::json_measurement::serialized_json_len;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -329,8 +330,8 @@ impl ToolRuntime {
                 "truncated": true,
                 "memories": candidate,
             });
-            if serde_json::to_vec(&probe)
-                .map(|bytes| bytes.len() <= MAX_MEMORY_SEARCH_RESULT_BYTES)
+            if serialized_json_len(&probe)
+                .map(|bytes| bytes <= MAX_MEMORY_SEARCH_RESULT_BYTES)
                 .unwrap_or(false)
             {
                 returned.push(descriptor);
@@ -720,8 +721,8 @@ impl ToolRuntime {
                 "truncated": candidate.len() < total_count,
                 "memories": candidate,
             });
-            if serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= MAX_MEMORY_BOOTSTRAP_BYTES)
+            if serialized_json_len(&projection)
+                .map(|bytes| bytes <= MAX_MEMORY_BOOTSTRAP_BYTES)
                 .unwrap_or(false)
             {
                 memories.push(descriptor);
@@ -739,8 +740,8 @@ impl ToolRuntime {
             "memories": memories,
         });
         debug_assert!(
-            serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= MAX_MEMORY_BOOTSTRAP_BYTES)
+            serialized_json_len(&projection)
+                .map(|bytes| bytes <= MAX_MEMORY_BOOTSTRAP_BYTES)
                 .unwrap_or(false),
             "memory.bootstrap projection must remain independently bounded"
         );

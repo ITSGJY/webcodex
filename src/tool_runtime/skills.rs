@@ -8,6 +8,7 @@ use super::startup_brief::{
 };
 use super::{SuggestedToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
+use crate::json_measurement::serialized_json_len;
 use crate::runner_http::{EnqueueRunnerSkillError, RunnerFeature};
 use crate::runner_protocol::{ShellFileOpRequest, ShellRunResponse};
 use serde::{Deserialize, Serialize};
@@ -687,8 +688,8 @@ impl ToolRuntime {
             "has_more": read.has_more,
             "next_start_line": read.next_start_line,
         });
-        if serde_json::to_vec(&output)
-            .map(|bytes| bytes.len() > MAX_SKILL_READ_RESULT_BYTES)
+        if serialized_json_len(&output)
+            .map(|bytes| bytes > MAX_SKILL_READ_RESULT_BYTES)
             .unwrap_or(true)
         {
             return skill_error(
@@ -1111,8 +1112,8 @@ impl ToolRuntime {
             "has_more": read.has_more,
             "next_start_line": read.next_start_line,
         });
-        if serde_json::to_vec(&output)
-            .map(|bytes| bytes.len() > MAX_SKILL_READ_RESULT_BYTES)
+        if serialized_json_len(&output)
+            .map(|bytes| bytes > MAX_SKILL_READ_RESULT_BYTES)
             .unwrap_or(true)
         {
             return skill_error(
@@ -1863,27 +1864,25 @@ impl SkillCatalog {
         let mut descriptors = Vec::new();
         let hard_end = offset.saturating_add(limit).min(total_count);
         for skill in filtered.iter().skip(offset).take(limit) {
-            let mut candidate = descriptors.clone();
-            candidate.push(json!(skill.descriptor));
-            let candidate_value = catalog_page_envelope(
+            descriptors.push(json!(skill.descriptor));
+            if catalog_page_serialized_len(
                 project,
                 &self.catalog_revision,
                 total_count,
                 offset,
                 hard_end,
-                candidate.clone(),
+                &descriptors,
                 self.invalid_count,
                 &self.diagnostics,
                 self.discovery_truncated,
-            );
-            if serde_json::to_vec(&candidate_value)
-                .map(|bytes| bytes.len() <= byte_budget)
-                .unwrap_or(false)
+            )
+            .map(|bytes| bytes <= byte_budget)
+            .unwrap_or(false)
             {
-                descriptors = candidate;
-            } else {
-                break;
+                continue;
             }
+            descriptors.pop();
+            break;
         }
         let next_offset = offset.saturating_add(descriptors.len());
         catalog_page_envelope(
@@ -1898,6 +1897,49 @@ impl SkillCatalog {
             self.discovery_truncated,
         )
     }
+}
+
+#[derive(Serialize)]
+struct SkillCatalogPageMeasure<'a> {
+    project: &'a str,
+    catalog_revision: &'a str,
+    total_count: usize,
+    returned_count: usize,
+    offset: usize,
+    next_offset: Option<usize>,
+    truncated: bool,
+    skills: &'a [Value],
+    invalid_count: usize,
+    diagnostics: &'a [Value],
+    discovery_truncated: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn catalog_page_serialized_len(
+    project: &str,
+    catalog_revision: &str,
+    total_count: usize,
+    offset: usize,
+    next_offset: usize,
+    skills: &[Value],
+    invalid_count: usize,
+    diagnostics: &[Value],
+    discovery_truncated: bool,
+) -> Result<usize, serde_json::Error> {
+    let truncated = next_offset < total_count;
+    serialized_json_len(&SkillCatalogPageMeasure {
+        project,
+        catalog_revision,
+        total_count,
+        returned_count: skills.len(),
+        offset,
+        next_offset: truncated.then_some(next_offset),
+        truncated,
+        skills,
+        invalid_count,
+        diagnostics,
+        discovery_truncated,
+    })
 }
 
 fn catalog_page_envelope(

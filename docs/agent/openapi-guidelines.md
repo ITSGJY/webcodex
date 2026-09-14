@@ -1,148 +1,173 @@
 # OpenAPI / GPT Action Guidelines
 
-Product and integration detail for GPT Actions and OpenAPI exposure.
-Repository-wide rules are in [`AGENTS.md`](../../AGENTS.md). This document
-owns the API-specific invariants and product guidance linked from that guide.
+Product and integration rules for the generic GPT Actions compatibility surface.
 
-Related: [`GPT_ACTIONS.md`](../GPT_ACTIONS.md), [`MCP.md`](../MCP.md).
+Related: [`GPT_ACTIONS.md`](../GPT_ACTIONS.md), [`MCP.md`](../MCP.md), and [`tool-contract-guidelines.md`](tool-contract-guidelines.md).
 
----
+## 1. Canonical ownership
 
-## 1. Surface synchronization
+`ToolDefinition` is the single source of truth for runtime tool identity, canonical `ToolSpec`, input/output schemas, semantic contract, scope/authority policy, risk/approval metadata, and Adaptive Runtime direct rank.
 
-When adding or renaming a runtime tool, update **all** of:
+Generic GPT Actions **must not** maintain a second tool registry, operation vocabulary, rank table, permission table, Project-authority table, Runner-capability table, or retry/execution policy.
 
-1. `ToolCall` enum / parser  
-2. `KNOWN_TOOL_NAMES`  
-3. metadata  
-4. registry schema  
-5. OAuth runtime tool policy  
-6. OpenAPI accepted names / examples  
-7. MCP schema tests  
-8. consistency tests  
+For a generic runtime Server:
 
-Runtime parser/metadata/OAuth policy must stay synchronized for every known tool.
-The **model-visible** registry, MCP `tools/list`, `tool_manifest`, and GPT Actions
-`ToolCallRequest` selector/flattened fields must separately stay synchronized with
-`registered_tool_specs()`. Internal or retired runtime names must not leak names
-or implementation-only fields into the model-facing Action schema.
+```text
+Adaptive Runtime Direct
+  - ToolDefinition.gpt_action_exposure == Unsupported
+  = GPT Action direct operations
 
-## Route/OpenAPI ownership
+Adaptive Runtime model-visible long tail
+  + GPT-Action-supported
+  = call_runtime_tool targets
+```
 
-- `RouteSpec` owns canonical HTTP method/path, scope/auth surface, audit class,
-  and whether a route projects as `Hidden`, a dedicated Public Action, or a
-  Connector capability binding. Handler mounting remains explicit in the owning
-  HTTP modules; OpenAPI metadata is never an authorization source.
-- A Public Action projection carries the static product operation policy used by
-  `/openapi.json`: operation id, summary/description, request/response component
-  identities, explicit consequential policy, and typed request-example identity.
-  The Public OpenAPI projector iterates canonical routes directly; do not add a
-  second handwritten path/operation registry or post-generation route filter.
-- Connector capability semantics remain owned by
-  `webcodex_connector_runtime::surface::capability_specs()` (description, input
-  and output schemas, and annotations such as `readOnlyHint`). `RouteSpec` owns
-  only the capability-to-HTTP-route binding; the Connector OpenAPI projector
-  combines those two canonical sources.
-- Component construction in `openapi::schemas()` remains a separate manual schema
-  projection. Route operation ownership does not require a schema-DSL rewrite.
+Tests must lock this relationship, not a hard-coded current direct-tool list. Changing `adaptive_runtime_direct(..., rank)` should automatically change ordinary GPT Action direct exposure.
 
----
+Project Connector is intentionally separate: its MCP and OpenAPI surfaces continue to derive from the canonical Connector `CapabilitySpec` registry.
 
----
+## 2. Action-specific state is presentation/transport only
 
-## 2. Exposure rules (invariants)
+The only normal GPT Action-specific declarations are:
 
-- Do **not** expose legacy `/api/codex` routes in GPT Action OpenAPI.
-- Do **not** expose agent token management or pairing endpoints in GPT Action
-  OpenAPI.
-- WebCodex GPT Actions must stay **below the 30-operation GPT Actions limit**.
-  Verify the current OpenAPI operation count through generation/tests rather
-  than relying on any document for a fixed count. **Do not hard-code** a live
-  operation total in agent rules.
+- an optional short presentation description when the canonical description exceeds the Action importer limit;
+- an explicit `Unsupported` exposure exception for a concrete protocol incompatibility.
 
----
+Do not add `gpt_action_rank` or a name-based exposure allowlist. Do not exclude a tool merely because its schema is complex, its canonical description is long, or it is used infrequently.
 
-## 3. Product labeling and discovery
+Protocol-only tools such as MCP App presentation, MCP ResourceLink export, or operations whose useful semantics depend on a separately authorized MCP Host binding may be marked unsupported. The reason must be protocol capability, not model preference.
 
-- Prefer **non-consequential** labels for read-only, discovery, onboarding, and
-  bounded local project setup actions.
-- `registerProject` and `createProject` are **non-consequential** onboarding
-  actions when constrained by agent policy, allowed roots, and non-overwrite
-  defaults.
-- Keep **destructive actions consequential**: shell/job execution, raw writes,
-  patch application, delete/restore/discard, imports, and generic dispatch.
-- `callRuntimeTool` is advanced/generic; use dedicated Actions only for stable
-  common workflows that fit the operation budget.
-- When adding future runtime tools, default to `callRuntimeTool` exposure unless
-  there is an explicit product reason and operation-count budget for a dedicated
-  Action.
-- `listRuntimeTools` full detail discovery includes expanded schemas and may be
-  too large for GPT Actions. Daily discovery should prefer
-  `callRuntimeTool(tool="tool_manifest")`; once the exact target is known, pass
-  `tool_name=<exact-name>` to that manifest call to retrieve its description, input
-  schema, current invocation route, and decision-relevant effect/risk/authority
-  metadata. Full output schemas and duplicate inventory bookkeeping stay out of
-  this exact view.
-  Focused `listRuntimeTools` calls should be reserved for schema/debug work and
-  pass `summary_only=true` with `category`, `features`, or `limit`. Prefer
-  `runtime_status` or the tool manifest for the current tool count; the
-  response-size issue is expanded schema/metadata, not a fixed tool count.
+## 3. Canonical operation names and schemas
 
----
+Direct operation IDs are the canonical snake_case runtime tool names. Do not introduce camelCase aliases such as `getRuntimeStatus` or `runProjectShellCommand`.
 
-## 4. Project smoke and capabilities
+Each direct Action request body starts from the canonical `ToolSpec.input_schema`. A GPT Action projector may alter only presentation/host-transport details that the Action host actually rewrites. It must not change canonical business semantics such as type, required fields, enum values, oneOf/anyOf shape, numeric/string bounds, patterns, or `additionalProperties` policy.
 
-- `list_projects` project entries expose `capabilities`.
-- Smoke selection should prefer `capabilities.recommended_for_smoke=true`.
-- Git smoke must require `capabilities.git_available=true`.
+The one generic escape hatch is `call_runtime_tool`:
 
----
+```json
+{
+  "tool": "exact_runtime_tool_name",
+  "arguments": {}
+}
+```
 
-## 5. Artifact upload tools
+The gateway schema is closed and contains only `tool` and `arguments`. No `params` alias and no flattened top-level business-argument union are part of the GPT Action contract. Direct targets should use their direct Action operation; ModelHidden, unknown, recursive, and GPT-Action-unsupported targets fail closed.
 
-Chunked artifact upload tools remain runtime-only through `callRuntimeTool`;
-do not promote them to dedicated GPT Action operations:
+Legacy `/api/tools/call` REST compatibility may retain historical decoding behavior, but that compatibility is not model-facing OpenAPI authority and must not leak into `/openapi.json` or `tool_manifest`.
 
-- `artifact_upload_begin`
-- `artifact_upload_chunk`
-- `artifact_upload_finish`
-- `artifact_upload_abort`
+## 4. Description limits
 
-`artifact_upload_chunk`, `artifact_upload_finish`, and `artifact_upload_abort`
-must repeat the exact `path` used by `artifact_upload_begin`. This binds
-`upload_id` to the requested target artifact path.
+GPT Actions has a hard **300-character** limit for operation/tool descriptions. Keep this separate from the canonical/MCP model-description budget.
 
-Artifact smoke paths should use `artifacts/smoke/<name>.artifact` or
-`artifacts/smoke/<name>.txt`. Verify abort cleanup with
-`artifact_upload_abort.final_file_exists` or
-`read_project_artifact_metadata(allow_missing=true)`, not with expected read
-failures. `policy_rejected` means policy blocked the request before a write.
+Rules:
 
----
+- canonical description <= 300 characters: inherit it unchanged;
+- canonical description > 300 characters: provide an explicit compact Action description on the same `ToolDefinition`;
+- never mechanically truncate an operation/tool description;
+- generated schema/property descriptions may use the shared sentence-aware bounded presentation projector;
+- schema description projection must change only description text, never schema semantics.
 
-## 6. Flattened Action fields
+The generated generic OpenAPI document must be recursively tested so **every** `description` field is <= 300 characters.
 
-- GPT Actions should prefer **flattened top-level fields** over the direct
-  `params` envelope.
-- Use `recording_session_id` for generic wrapper recorder metadata.
-- Use `session_id` as tool business input.
-- When a **model-visible** runtime tool is expected to work through GPT Action
-  `callRuntimeTool` with flattened top-level fields, `ToolCallRequest.properties`
-  must expose **every** flattened field that GPT Actions need (including nested
-  object/list payload fields such as `edits`, `validation`, `labels`,
-  `checkpoint_id`, `confirm`, `dry_run`, `include_untracked`, and
-  `include_diff_stat`). Internal implementation primitives and retired tool names
-  must not contribute flattened model fields. A retired wire name fails closed;
-  supported direct callers use the canonical model-visible tool contract and
-  `params` envelope rather than an out-of-band compatibility schema.
-- Add/update tests that fail when flattened Action fields are missing.
-- Do **not** loosen `additionalProperties` to `true` as a workaround — list the
-  needed flattened fields explicitly.
+Compact Action operation copy should prioritize: what the tool does, when to choose it, and the key continuation/recovery choice. Do not repeat Bearer-auth, scope, Runner-authority, or general safety boilerplate in every operation description.
 
-Closed schemas and low-friction normalization are complementary. Keep unknown
-fields rejected so typos cannot silently change intent, but make declared
-non-semantic bounds tolerant when the runtime can safely normalize them. For
-example, a presentation/result budget may accept an oversized value and clamp it
-inside the documented bound instead of forcing a second model turn; authority,
-identity/fence, destructive, and effect-selecting fields remain exact. See
-[`tool-contract-guidelines.md`](tool-contract-guidelines.md).
+## 5. Operation budget
+
+Generic GPT Actions must stay below the host's 30-operation limit. The generated surface is Adaptive Direct minus explicit unsupported exceptions plus `call_runtime_tool`.
+
+Do not silently truncate operations. CI must fail if the derived projection reaches the limit so the developer explicitly decides whether a protocol-supported direct tool should move out of Adaptive Direct or whether a real GPT Action protocol exception exists.
+
+The Custom GPT importer also rejects OpenAPI schemas at 1 MB. Keep the generic Action document comfortably below that host ceiling: CI checks both compact and pretty-printed JSON against an internal 800,000-byte budget. Direct request schemas remain canonical, but response schemas intentionally expose only the real `ToolResult { success, output, error? }` envelope with generic `output`; complete canonical output schemas stay in `ToolSpec`/MCP rather than being duplicated into every Action response.
+
+## 6. HTTP adapter and authority
+
+The generic runtime exposes one shared authenticated adapter:
+
+```text
+POST /api/actions/<canonical_tool_name>
+```
+
+OpenAPI enumerates the concrete direct paths plus `/api/actions/call_runtime_tool`; the HTTP router may use one dynamic path handler internally.
+
+Runtime path admission and OpenAPI exposure must consume the same canonical derived surface. A manually constructed `/api/actions/internal_tool` request must not bypass model visibility or GPT Action exposure policy.
+
+The adapter owns only:
+
+- HTTP/OpenAPI decoding;
+- canonical tool identity and direct/gateway admission;
+- host-derived protocol provenance;
+- response framing/presentation.
+
+Real execution must enter `ToolRuntime::call_tool_with_context(...)` (or the same canonical kernel path). OAuth/PAT scopes, Project authority, permission/approval gates, Runner capability checks, path policy, Session fences, destructive rules, idempotency, retry semantics, and effects remain kernel-owned.
+
+If HTTP middleware needs body/path-aware scope admission, derive it from canonical tool metadata. Do not create a per-Action scope table. The kernel remains the final fail-closed authority.
+
+## 7. Consequential hint
+
+`x-openai-isConsequential` is a ChatGPT host UX hint, not permission authority.
+
+Derive it from canonical semantic/approval metadata. A simple projection is:
+
+- `ToolApprovalPolicy::None` -> `false`;
+- any standard, inherited, or unknown approval requirement -> `true`.
+
+`call_runtime_tool` itself is consequential because it may dispatch a mutating long-tail target. Never maintain a tool-name consequential allowlist.
+
+## 8. Host file provenance
+
+`import_conversation_files_to_project` has two distinct legitimate host provenance paths:
+
+- GPT Action/OpenAI Action file-reference rewrite;
+- trusted OAuth MCP host-file rewrite.
+
+Authorization still comes from canonical ToolRuntime policy. Provenance is private adapter-derived metadata and selects the correct bounded download policy.
+
+The public ToolSpec must not contain a provenance field. Model JSON must not be able to assert GPT Action provenance, MCP trust, or convert one mode into the other. Action-specific file-reference field-name adaptation belongs in the Action adapter/projector, not in a duplicate business handler.
+
+## 9. Legacy REST routes
+
+Old REST endpoints such as `/api/runtime/status`, `/api/tools/call`, `/api/projects/run_shell`, `/api/jobs/tail`, and similar operational compatibility routes may remain mounted when they still serve CLI, tests, or external REST users.
+
+They are not generic GPT Action operations and stay `Hidden` from the new `/openapi.json`. Route metadata describes HTTP security/surface facts; it no longer owns a generic `PublicAction` operation registry.
+
+## 10. Project Connector boundary
+
+Do not fold the project-bound Connector into the generic Adaptive projection. Connector MCP/OpenAPI remains a `CapabilitySpec` projection with its existing operation names, schemas, project binding, task workflow, and authority semantics.
+
+Any generic GPT Actions refactor must run the Connector OpenAPI/capability bijection tests and preserve the fourteen-capability surface unless the task explicitly changes Connector product semantics.
+
+## 11. Tests that matter
+
+At minimum, keep focused invariants for:
+
+- GPT Action direct definitions equal current Adaptive Direct definitions minus explicit `Unsupported` definitions, preserving Adaptive rank order;
+- `apply_text_edits` is direct while an ordinary long-tail tool such as `apply_patch` routes through the gateway;
+- unsupported protocol-only tools are neither direct nor gateway-callable;
+- operation IDs are canonical snake_case names and old camelCase IDs are absent;
+- generated operation count is < 30 with no truncation;
+- compact and pretty-printed generic OpenAPI JSON remain below the internal 800,000-byte import budget;
+- direct request schemas equal canonical ToolSpec input schemas except declared presentation/host overlays;
+- every generated OpenAPI `description` is <= 300 characters while canonical/MCP descriptions retain their independent budget;
+- canonical descriptions over 300 require an explicit Action presentation override;
+- gateway body is exactly `{tool, arguments}`;
+- ModelHidden/unknown/unsupported targets fail closed;
+- direct Action requests enter the same kernel and match MCP authority outcomes for representative read and mutating/execution tools;
+- permission-gate denial remains effective through Action HTTP;
+- GPT Action and MCP file-import provenance cannot be asserted by public JSON;
+- Project Connector OpenAPI remains generated from its canonical capability registry.
+
+Retire tests that only preserve the old camelCase facade, `PublicAction` registry, giant `ToolCallRequest` flattened schema, or flattened manifest guidance. Tests should protect current authority/schema truth, not dead compatibility architecture.
+
+## 12. Review checklist
+
+Before landing a GPT Actions change:
+
+- inspect generated operation count and names;
+- scan the complete generated OpenAPI document for description length;
+- verify no legacy REST route leaked into generic model-facing OpenAPI;
+- verify no second scope/permission/exposure table was introduced;
+- verify all direct operations still use canonical ToolSpec inputs;
+- verify gateway admission is canonical and fail-closed;
+- verify file provenance remains private adapter metadata;
+- run generic OpenAPI, HTTP Action adapter, MCP surface/scope, Connector OpenAPI, and file-import focused tests.

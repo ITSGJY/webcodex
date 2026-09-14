@@ -4,7 +4,8 @@ use crate::tool_request_trace::{
     estimate_json_bytes, new_trace_id, scope_active_trace, ToolRequestLifecycle,
 };
 use crate::tool_runtime::kernel::{
-    ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
+    HostFileImportTrust, ToolCallContext, ToolCallErrorStatus,
+    ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
 use crate::tool_runtime::model_ergonomics_telemetry::ModelErgonomicsCompletion;
 use crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD;
@@ -274,10 +275,10 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
             return;
         }
     };
-    guard.capture_payload("raw_request_body", &tool_call_trace_raw_body(&body));
     let (tool, params) = match extract_tool_call(&body) {
         Ok(pair) => pair,
         Err(msg) => {
+            guard.capture_payload_lazy("raw_request_body", || tool_call_trace_raw_body(&body));
             // Params-level failure: not yet in ToolRuntime.
             guard.parsed("invalid_tool_call");
             let body = serde_json::json!({
@@ -294,13 +295,13 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
         }
     };
     guard.set_tool_name(Some(tool.clone()));
+    guard.capture_payload_lazy("raw_request_body", || tool_call_trace_raw_body(&body));
     let window = crate::client_window::api_window(req, res);
     guard.set_client_window(Some(&window));
     guard.parsed("ok");
-    guard.capture_payload(
-        "effective_arguments",
-        &tool_call_trace_effective_arguments(&tool, &params),
-    );
+    guard.capture_payload_lazy("effective_arguments", || {
+        tool_call_trace_effective_arguments(&tool, &params)
+    });
     // dispatch_started only after argument extraction succeeds and immediately
     // before ToolRuntime dispatch.
     guard.dispatch_started();
@@ -488,7 +489,7 @@ fn tool_call_trace_effective_arguments(tool: &str, params: &Value) -> Value {
     }
 }
 
-/// Extract `(tool, params)` from a raw `callRuntimeTool` request body.
+/// Extract `(tool, params)` from the legacy generic REST `/api/tools/call` body.
 ///
 /// Accepted shapes (all route to the same tool dispatch):
 /// - `{"tool":"list_tools"}`
@@ -497,11 +498,12 @@ fn tool_call_trace_effective_arguments(tool: &str, params: &Value) -> Value {
 /// - `{"tool":"show_changes","project":"agent:c:p"}`
 /// - `{"tool":"git_status","project":"agent:c:p","recording_session_id":"wc_sess_..."}`
 ///
-/// Non-null `params` take precedence over flattened GPT Action fields. A null
+/// Non-null `params` take precedence over legacy flattened REST fields. A null
 /// `params` wrapper is treated as absent. When `params` is absent/null, every
 /// top-level field except `tool` and reserved metadata like
-/// `recording_session_id` is collected into the params object for GPT Action
-/// compatibility. The retired `arguments` wrapper is rejected explicitly.
+/// `recording_session_id` is collected into the params object for REST
+/// compatibility. GPT Actions do not use this envelope. The retired `arguments`
+/// wrapper is rejected explicitly.
 /// Top-level `session_id` is not reserved here; it remains a normal flattened
 /// tool argument for tools such as `session_summary`. Returns a human-readable
 /// error string (never including the raw body) when the body is not a JSON
@@ -526,9 +528,9 @@ fn extract_tool_call(body: &Value) -> Result<(String, Value), String> {
     if obj.contains_key("arguments") {
         return Err("field 'arguments' is no longer supported; use 'params' or flattened top-level tool arguments".to_string());
     }
-    // Non-null params take precedence over flattened GPT Action fields. Some
-    // Action runtimes emit optional object properties as explicit nulls, which
-    // must not erase valid flattened tool arguments.
+    // Non-null params take precedence over legacy flattened REST fields. Some
+    // clients emit optional object properties as explicit nulls, which must not
+    // erase valid flattened compatibility arguments.
     let params = if let Some(params) = obj
         .get(TOOL_CALL_PARAMS_FIELD)
         .filter(|params| !params.is_null())
@@ -559,6 +561,239 @@ fn extract_recording_session_id(body: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+fn parse_gpt_action_gateway(body: Value) -> Result<(String, Value), String> {
+    let mut object = body
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "call_runtime_tool body must be a JSON object".to_string())?;
+    if object.len() != 2 || !object.contains_key("tool") || !object.contains_key("arguments") {
+        return Err("call_runtime_tool accepts exactly {tool, arguments}".to_string());
+    }
+    let tool = object
+        .remove("tool")
+        .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
+        .filter(|tool| !tool.is_empty())
+        .ok_or_else(|| "call_runtime_tool field 'tool' must be a non-empty string".to_string())?;
+    let arguments = object
+        .remove("arguments")
+        .filter(Value::is_object)
+        .ok_or_else(|| "call_runtime_tool field 'arguments' must be an object".to_string())?;
+    Ok((tool, arguments))
+}
+
+fn rewrite_gpt_action_file_params(arguments: &mut Value) -> Result<(), String> {
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| "GPT Action request body must be a JSON object".to_string())?;
+    let Some(refs) = object.get_mut("openaiFileIdRefs") else {
+        return Ok(());
+    };
+    let refs = refs
+        .as_array_mut()
+        .ok_or_else(|| "openaiFileIdRefs must be an array".to_string())?;
+    for file_ref in refs {
+        let source = file_ref.as_object().ok_or_else(|| {
+            "openaiFileIdRefs entries must be host file-reference objects".to_string()
+        })?;
+        if source
+            .keys()
+            .any(|key| !matches!(key.as_str(), "name" | "id" | "mime_type" | "download_link"))
+        {
+            return Err("GPT Action file references contain unsupported fields".to_string());
+        }
+        let download_url = source
+            .get("download_link")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "GPT Action file reference requires download_link".to_string())?
+            .to_string();
+        let mut canonical = serde_json::Map::new();
+        canonical.insert("download_url".to_string(), Value::String(download_url));
+        if let Some(value) = source.get("id").and_then(Value::as_str) {
+            canonical.insert("file_id".to_string(), Value::String(value.to_string()));
+        }
+        if let Some(value) = source.get("mime_type").and_then(Value::as_str) {
+            canonical.insert("mime_type".to_string(), Value::String(value.to_string()));
+        }
+        if let Some(value) = source.get("name").and_then(Value::as_str) {
+            canonical.insert("file_name".to_string(), Value::String(value.to_string()));
+        }
+        *file_ref = Value::Object(canonical);
+    }
+    Ok(())
+}
+
+fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> {
+    use crate::model_surface::AdaptiveRuntimeGatewayTargetRoute;
+
+    if !webcodex_tool_contracts::gpt_action_tool_supported(target) {
+        return Err(format!(
+            "runtime tool '{target}' is not available through GPT Actions"
+        ));
+    }
+    let route = crate::model_surface::adaptive_runtime_gateway_target_route(target);
+    if path_tool == crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
+        return match route {
+            AdaptiveRuntimeGatewayTargetRoute::Gateway => Ok(()),
+            AdaptiveRuntimeGatewayTargetRoute::Direct => Err(format!(
+                "runtime tool '{target}' is a direct GPT Action; use /api/actions/{target}"
+            )),
+            AdaptiveRuntimeGatewayTargetRoute::Recursive => {
+                Err("call_runtime_tool cannot target itself".to_string())
+            }
+            AdaptiveRuntimeGatewayTargetRoute::Unknown => Err(format!(
+                "runtime tool '{target}' is not admitted on the adaptive runtime surface"
+            )),
+        };
+    }
+    if path_tool != target {
+        return Err("GPT Action direct path/tool mismatch".to_string());
+    }
+    match route {
+        AdaptiveRuntimeGatewayTargetRoute::Direct => Ok(()),
+        AdaptiveRuntimeGatewayTargetRoute::Gateway => Err(format!(
+            "runtime tool '{target}' is long-tail; use /api/actions/call_runtime_tool"
+        )),
+        AdaptiveRuntimeGatewayTargetRoute::Recursive
+        | AdaptiveRuntimeGatewayTargetRoute::Unknown => Err(format!(
+            "runtime tool '{target}' is not a direct GPT Action"
+        )),
+    }
+}
+
+#[handler]
+pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(path_tool) = req.param::<String>("tool_name") else {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(json_error(
+            StatusCode::BAD_REQUEST,
+            "missing GPT Action tool name",
+        ));
+        return;
+    };
+    let Some(runtime) = require_runtime(depot, res) else {
+        return;
+    };
+    let body: Value = match req.parse_json().await {
+        Ok(body) => body,
+        Err(error) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid JSON: {error}"),
+            ));
+            return;
+        }
+    };
+    let (tool, arguments) = if path_tool == crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    {
+        match parse_gpt_action_gateway(body) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(json_error(StatusCode::BAD_REQUEST, message));
+                return;
+            }
+        }
+    } else {
+        if !body.is_object() {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(
+                StatusCode::BAD_REQUEST,
+                "GPT Action request body must be a JSON object",
+            ));
+            return;
+        }
+        (path_tool.clone(), body)
+    };
+    if let Err(message) = gpt_action_admit_target(&path_tool, &tool) {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(json_error(StatusCode::BAD_REQUEST, message));
+        return;
+    }
+    let mut arguments = arguments;
+    if tool == "import_conversation_files_to_project" {
+        if let Err(message) = rewrite_gpt_action_file_params(&mut arguments) {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(StatusCode::BAD_REQUEST, message));
+            return;
+        }
+    }
+
+    let recording_session_id = arguments
+        .as_object()
+        .and_then(|object| object.get(TOOL_CALL_RECORDING_SESSION_ID_FIELD))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
+    let window = crate::client_window::api_window(req, res);
+    let import_provenance = if tool == "import_conversation_files_to_project" {
+        HostFileImportTrust::GptActionOpenAiHost
+    } else {
+        HostFileImportTrust::Untrusted
+    };
+    let audit = ActionAudit::start(req, depot, "/api/actions/{tool_name}", "gpt_action");
+    let outcome = runtime
+        .call_tool_with_context(
+            KernelToolCallRequest {
+                tool_name: tool.clone(),
+                arguments,
+            },
+            ToolCallContext {
+                transport: ToolTransport::Api,
+                session_id: recording_session_id.as_deref(),
+                auth: auth.as_ref(),
+                window: Some(&window),
+                record_oauth_scope_denials: true,
+                host_file_import_trust: import_provenance,
+            },
+        )
+        .await;
+
+    match outcome.error_status {
+        Some(ToolCallErrorStatus::InsufficientScope {
+            required_scope,
+            description,
+        }) => {
+            record_action_tools_call_pre_result_failure(
+                &audit,
+                &tool,
+                StatusCode::FORBIDDEN,
+                outcome.model_ergonomics.as_ref(),
+                "insufficient_scope",
+            );
+            crate::auth::render_scope_forbidden(res, auth.as_ref(), required_scope, description);
+        }
+        Some(ToolCallErrorStatus::InvalidArguments { message }) => {
+            record_action_tools_call_pre_result_failure(
+                &audit,
+                &tool,
+                StatusCode::BAD_REQUEST,
+                outcome.model_ergonomics.as_ref(),
+                "invalid_arguments",
+            );
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(json_error(StatusCode::BAD_REQUEST, message));
+        }
+        None => {
+            let result = outcome
+                .result
+                .expect("tool kernel outcome without error must include result");
+            let (status, response) = prepare_action_tools_call_response(
+                &audit,
+                &tool,
+                outcome.project,
+                result,
+                outcome.model_ergonomics.as_ref(),
+            );
+            res.status_code(status);
+            res.render(Json(response));
+        }
+    }
 }
 
 #[handler]
