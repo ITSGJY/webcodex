@@ -147,6 +147,8 @@ async fn lease_stale_instance_result_rejected() {
             exit_code: Some(0),
             stdout: Some("hi".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -177,6 +179,8 @@ async fn lease_stale_instance_result_rejected() {
             exit_code: Some(0),
             stdout: Some("hi".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })

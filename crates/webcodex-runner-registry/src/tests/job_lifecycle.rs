@@ -97,6 +97,8 @@ async fn terminal_observed_poll_complete_and_log() {
             exit_code: Some(0),
             stdout: Some("hello\n".to_string()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(20),
             error: None,
         })

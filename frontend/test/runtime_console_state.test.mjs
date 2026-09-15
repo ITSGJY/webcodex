@@ -653,7 +653,7 @@ test("project-scoped window activity contracts maintain separation, fencing, and
   assert.match(html, /id="runtime-project-windows-unavailable"/);
   const windowPanelIndex = html.indexOf('id="runtime-project-window-activity-panel"');
   const sessionsPanelIndex = html.indexOf('id="runtime-workflow-sessions-panel"');
-  assert.ok(windowPanelIndex > 0 && sessionsPanelIndex > windowPanelIndex, "Window activity panel must precede Workflow Sessions panel in HTML");
+  assert.ok(sessionsPanelIndex > 0 && windowPanelIndex > sessionsPanelIndex, "Workflow Sessions panel must precede Window activity panel in HTML");
 
   // CSS styling
   assert.match(css, /\.project-window-panel,\s*\.sessions-panel/);

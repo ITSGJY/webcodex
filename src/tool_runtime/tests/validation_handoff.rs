@@ -86,6 +86,8 @@ async fn complete_sync_shell_lifecycle(
                 exit_code,
                 stdout: Some(stdout.to_string()),
                 stderr: Some(stderr.to_string()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(5),
                 error: error.map(str::to_string),
             },
@@ -2603,6 +2605,8 @@ async fn cargo_fmt_ensure_formatted_ignores_sync_wait_and_skips_mutation_when_al
             exit_code: Some(0),
             stdout: Some("".to_string()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(5),
             error: None,
         })

@@ -418,6 +418,28 @@ fn mcp_context_projection_output_schema() -> Value {
     })
 }
 
+const IGNORED_INVOCATION_METADATA_FIELD: &str = "ignored_invocation_metadata";
+
+pub(super) fn ignored_invocation_metadata(
+    tool_name: &str,
+    context_revision: Option<&Value>,
+) -> Vec<&'static str> {
+    if context_revision.is_some() && !runtime_tool_accepts_context_ack(tool_name) {
+        vec![crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(super) fn attach_ignored_invocation_metadata(result: &mut ToolResult, fields: &[&str]) {
+    if fields.is_empty() {
+        return;
+    }
+    if let Some(output) = result.output.as_object_mut() {
+        output.insert(IGNORED_INVOCATION_METADATA_FIELD.to_string(), json!(fields));
+    }
+}
+
 fn add_context_projection_to_output_shape(
     schema: &mut Value,
     projection_schema: &Value,
@@ -426,6 +448,18 @@ fn add_context_projection_to_output_shape(
     if schema.get("type").and_then(Value::as_str) == Some("object") {
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             properties.insert("context_projection".to_string(), projection_schema.clone());
+            if !accepts_context_ack {
+                properties.insert(IGNORED_INVOCATION_METADATA_FIELD.to_string(), json!({
+                    "type": "array",
+                    "maxItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "enum": [crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD]
+                    },
+                    "description": "These known wrapper metadata fields were accepted but not consumed by this target. The main tool call still executed normally; omit them on future calls."
+                }));
+            }
             if accepts_context_ack {
                 properties.insert("session_context_revision".to_string(), json!({
                     "type": "integer", "minimum": 0,
@@ -572,17 +606,20 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
                     "description": format!("Request bounded context material after this tool's main effect/observation; keys are open-ended and currently include {}. This sidecar grants no authority and cannot make requested guidance a retroactive precondition of the current effect. Recover missing project or Memory guidance on a read/observation call before any later dependent mutation.", crate::tool_runtime::context_projection::context_material_keys_csv())
                 }),
             );
-            if accepts_context_ack {
-                properties.insert(
-                    crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
-                        .to_string(),
-                    json!({
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Echo the latest retained session_context_revision; omit when unknown."
-                    }),
-                );
-            }
+            let ack_description = if accepts_context_ack {
+                "Echo the latest retained session_context_revision when known. Only use a revision actually retained in model context. This is tool-specific invocation metadata; never copy it into a tool whose current contract says it is ignored/inapplicable."
+            } else {
+                "Optional wrapper metadata accepted for invocation ergonomics only. This tool does not consume Session Context ACK and does not advance the checkpoint. Normally omit this field; if supplied it is ignored and the business call still executes."
+            };
+            properties.insert(
+                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
+                    .to_string(),
+                json!({
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": ack_description
+                }),
+            );
             add_stateless_context_projection_output_schema(tool, accepts_context_ack);
         }
     }
@@ -2061,13 +2098,14 @@ pub(super) async fn handle_call(
     } else {
         Vec::new()
     };
-    // Tolerate cached old schemas: strip the public wrapper from every operator
-    // request. The adapter preserves only the normalized wire shape; whether the
-    // concrete tool may consume it as continuity proof is decided by the kernel
-    // from the trusted surface capability plus canonical ToolDefinition policy.
+    // Context ACK is known invocation metadata on stateless operator surfaces.
+    // Strip it before concrete business parsing; the target ToolDefinition still
+    // exclusively decides whether the kernel may consume it as continuity proof.
     let context_revision = context_continuity_surface_capable
         .then(|| strip_stateless_ack_session_context_revision(&mut params.arguments))
         .flatten();
+    let ignored_invocation_metadata =
+        ignored_invocation_metadata(&params.name, context_revision.as_ref());
     let ack_session_context_revision = if context_continuity_surface_capable {
         session_context_revision_ack_from_wire(context_revision)
     } else {
@@ -2115,7 +2153,7 @@ pub(super) async fn handle_call(
     if let Some(slot) = correlation_out.as_deref_mut() {
         *slot = outcome.correlation.clone();
     }
-    let result = match outcome.error_status {
+    let mut result = match outcome.error_status {
         Some(ToolCallErrorStatus::InsufficientScope {
             required_scope,
             description,
@@ -2150,6 +2188,7 @@ pub(super) async fn handle_call(
             .expect("tool kernel outcome without error must include result"),
     };
     debug_assert_eq!(outcome.success, result.success);
+    attach_ignored_invocation_metadata(&mut result, &ignored_invocation_metadata);
     if let Some(lc) = lifecycle.as_deref() {
         // Protocol layer produced a JSON-RPC result (not -32xxx).
         // Tool kernel success is independent (isError / structuredContent).

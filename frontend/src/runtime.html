@@ -103,7 +103,7 @@
           </button>
           <button id="runtime-view-windows" class="sidebar-view-item" type="button" data-runtime-view="windows">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18M8 4v5" /></svg>
-            <span>Windows</span>
+            <span>Window Activity</span>
             <span id="runtime-window-navigation-health" class="sidebar-view-meta">Activity</span>
           </button>
         </nav>
@@ -132,17 +132,6 @@
             <p id="runtime-projects-empty" class="muted small empty-copy" hidden>No Projects match this filter.</p>
           </section>
 
-          <section id="runtime-project-window-activity-panel" class="sidebar-section project-window-panel" hidden>
-            <div class="sidebar-section-head">
-              <h2>Window activity</h2>
-              <span id="runtime-project-windows-count" class="count-badge">0</span>
-            </div>
-            <span id="runtime-project-windows-status" class="muted small" role="status"></span>
-            <div id="runtime-project-windows-list" class="runtime-window-list project-window-list" role="group" aria-label="Project Window activity"></div>
-            <p id="runtime-project-windows-empty" class="muted small empty-copy" hidden>No Window activity recorded for this project.</p>
-            <p id="runtime-project-windows-unavailable" class="muted small empty-copy" hidden>Window activity requires runtime:read. Project-scoped Session access remains available.</p>
-          </section>
-
           <section id="runtime-workflow-sessions-panel" class="sidebar-section sessions-panel">
             <div class="sidebar-section-head">
               <h2>Sessions</h2>
@@ -152,6 +141,17 @@
             <span id="runtime-session-search-status" class="muted small" role="status"></span>
             <ul id="runtime-session-list" class="session-list" aria-label="Workflow Sessions"></ul>
             <p id="runtime-sessions-empty" class="muted small empty-copy" hidden>No retained Workflow Sessions for this project.</p>
+          </section>
+
+          <section id="runtime-project-window-activity-panel" class="sidebar-section project-window-panel" hidden>
+            <div class="sidebar-section-head">
+              <h2>Window activity</h2>
+              <span id="runtime-project-windows-count" class="count-badge">0</span>
+            </div>
+            <span id="runtime-project-windows-status" class="muted small" role="status"></span>
+            <div id="runtime-project-windows-list" class="runtime-window-list project-window-list" role="group" aria-label="Project Window activity"></div>
+            <p id="runtime-project-windows-empty" class="muted small empty-copy" hidden>No Window activity recorded for this project.</p>
+            <p id="runtime-project-windows-unavailable" class="muted small empty-copy" hidden>Window activity requires runtime:read. Project-scoped Session access remains available.</p>
           </section>
 
           <details id="runtime-recent-panel" class="recent-panel" open>
@@ -190,12 +190,12 @@
           <div id="runtime-navigation-windows" class="sidebar-view-panel" hidden>
             <section class="sidebar-section runtime-window-navigation-section">
               <div class="sidebar-section-head">
-                <h2>WebCodex windows</h2>
+                <h2>WebCodex Window activity</h2>
                 <span id="runtime-window-list-count" class="count-badge">0</span>
               </div>
               <p class="operations-navigation-copy muted small">Host Window liveness and correlation evidence. Window identity never grants execution or Session authority.</p>
               <span id="runtime-window-list-status" class="muted small" role="status">Window activity has not been loaded yet.</span>
-              <div id="runtime-window-list" class="runtime-window-list" role="group" aria-label="WebCodex Windows"></div>
+              <div id="runtime-window-list" class="runtime-window-list" role="group" aria-label="WebCodex Window activity"></div>
               <p id="runtime-window-list-empty" class="muted small empty-copy" hidden>No WebCodex activity is available.</p>
             </section>
           </div>
@@ -370,7 +370,7 @@
             <header class="operations-heading windows-heading">
               <div>
                 <p class="eyebrow">Window activity</p>
-                <h2 id="runtime-windows-heading">WebCodex host windows</h2>
+                <h2 id="runtime-windows-heading">Window activity</h2>
                 <p class="muted">Shows WebCodex calls and correlations only. It cannot observe model reasoning or determine whether the ChatGPT frontend is frozen.</p>
               </div>
               <span id="runtime-window-live-badge" class="operations-live"><i aria-hidden="true"></i><span>3s activity refresh</span></span>

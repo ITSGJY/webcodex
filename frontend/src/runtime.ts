@@ -64,6 +64,7 @@ import {
   resolveRunnerDisclosure,
   runtimeWindowShortKey,
   runtimeWindowActivityLabel,
+  runtimeWindowAvailabilityAfterHttpResponse,
 } from "./runtime_console_state.js";
 import {
   formatWorkspaceBreadcrumb,
@@ -124,6 +125,8 @@ import {
   formatWindowDetailFields,
   renderWindowCards,
   renderProjectWindowCards,
+  formatWindowEmptyState,
+  formatWindowListStatusText,
 } from "./runtime_window.js";
 import {
   parseAgentIds,
@@ -225,12 +228,14 @@ let windowsAbort: AbortController | null = null;
 let windowDetailAbort: AbortController | null = null;
 let windowTimer = 0;
 let windowRows: any[] = [];
+let windowAvailability: "idle" | "loading" | "available" | "stale" | "unavailable" = "idle";
+let windowVisibilityScope: "global" | "principal" = "principal";
 let selectedWindowKey = "";
 let selectedWindowDetail: any | null = null;
 const PROJECT_WINDOW_LIMIT = 10;
 let projectWindowsAbort: AbortController | null = null;
 let projectWindowRows: any[] = [];
-let projectWindowAvailability: "idle" | "available" | "stale" | "unavailable" = "idle";
+let projectWindowAvailability: "idle" | "loading" | "available" | "stale" | "unavailable" = "idle";
 let projectWindowTruncated = false;
 let projectWindowTotal = 0;
 let projectWindowProjectId = "";
@@ -350,6 +355,8 @@ function renderLanguageSensitiveUi(): void {
     renderSessionList(sessionRows, sessionListMetaSnapshot);
     renderProjectWindows();
   }
+  renderWindowList();
+  renderWindowDetail(selectedWindowDetail);
   const snapshot = state.workflow?.snapshot;
   if (snapshot) renderDetail(snapshot, false);
   else if (!state.workflow?.selectedSessionId) hideDetail();
@@ -432,7 +439,7 @@ function renderWorkspaceHeading(): void {
   }
   if (workspaceView === "windows") {
     setText("runtime-breadcrumb-runner", tr("Runtime workspace"));
-    setText("runtime-breadcrumb-project", tr("Windows"));
+    setText("runtime-breadcrumb-project", tr("Window Activity"));
     setText(
       "runtime-session-title",
       selectedWindowKey ? "Window " + runtimeWindowShortKey(selectedWindowKey) : tr("Window activity"),
@@ -809,12 +816,14 @@ function renderWindowActivities(node: HTMLElement | null, activities: any[], com
 function renderWindowList(): void {
   const node = el("runtime-window-list");
   setText("runtime-window-list-count", String(windowRows.length));
+  const emptyCopy = formatWindowEmptyState(windowAvailability, windowVisibilityScope, false, runtimeLanguage);
+  setText("runtime-window-list-empty", emptyCopy);
   show("runtime-window-list-empty", windowRows.length === 0);
   setText(
     "runtime-window-list-status",
-    windowRows.length ? runtimeCountLabel(windowRows.length, "Window") : tr("No WebCodex activity"),
+    formatWindowListStatusText(windowAvailability, windowRows.length, windowVisibilityScope, runtimeLanguage),
   );
-  renderWindowCards(node, windowRows, selectedWindowKey, (key) => void selectWindow(key));
+  renderWindowCards(node, windowRows, selectedWindowKey, (key) => void selectWindow(key), Date.now(), runtimeLanguage);
 }
 
 function renderWindowDetail(detail: any | null): void {
@@ -837,12 +846,16 @@ function renderWindowDetail(detail: any | null): void {
   renderWindowActiveRequests(
     el("runtime-window-active-requests"),
     Array.isArray(detail.active_requests) ? detail.active_requests : [],
-    { onCopyTrace: (traceId) => void copyRuntimeValue(traceId) },
+    {
+      language: runtimeLanguage,
+      onCopyTrace: (traceId) => void copyRuntimeValue(traceId),
+    },
   );
   renderWindowLinkedSessions(
     el("runtime-window-linked-sessions"),
     Array.isArray(detail.linked_sessions) ? detail.linked_sessions : [],
     (session) => openWindowLinkedSession(session),
+    runtimeLanguage,
   );
   renderWindowActivities(el("runtime-window-activity"), Array.isArray(detail.activity) ? detail.activity : []);
   renderWorkspaceHeading();
@@ -886,21 +899,38 @@ async function refreshWindows(refreshSelected = true): Promise<void> {
   abort(windowsAbort);
   const controller = new AbortController();
   windowsAbort = controller;
+  if (windowAvailability === "idle") {
+    windowAvailability = "loading";
+    renderWindowList();
+  }
   const response = await api("windows", { limit: 100 }, controller.signal);
-  if (windowsAbort === controller) windowsAbort = null;
+  // A superseded or navigation-cancelled request must not overwrite the newer Window state.
+  if (windowsAbort !== controller) return;
+  windowsAbort = null;
+  // RuntimeApiClient returns null only for AbortError. Cancellation is not a refresh failure.
   if (!response) return;
   if (response.status === 401) return lock("Credential rejected.");
-  if (response.status === 403) {
+  const nextAvailability = runtimeWindowAvailabilityAfterHttpResponse(
+    response.status,
+    response.ok,
+    !!response.data,
+  );
+  if (nextAvailability === "unavailable") {
     windowRows = [];
     selectedWindowKey = "";
+    windowAvailability = nextAvailability;
     renderWindowList();
     renderWindowDetail(null);
-    setText("runtime-window-list-status", "runtime:read required");
     return;
   }
-  if (!response.ok || !response.data) {
-    setText("runtime-window-list-status", "Could not refresh Window activity.");
+  if (nextAvailability === "stale") {
+    windowAvailability = nextAvailability;
+    renderWindowList();
     return;
+  }
+  windowAvailability = nextAvailability;
+  if (response.data.visibility?.scope === "global" || response.data.visibility?.scope === "principal") {
+    windowVisibilityScope = response.data.visibility.scope;
   }
   windowRows = Array.isArray(response.data.windows) ? response.data.windows : [];
   if (!selectedWindowKey && windowRows.length) selectedWindowKey = String(windowRows[0]?.client_window_key || "");
@@ -925,9 +955,15 @@ function renderSessionWindowCorrelation(detail: any): void {
   const linkedNode = el("runtime-linked-windows");
   clearNode(linkedNode);
   const links = available && Array.isArray(detail?.linked_windows) ? detail.linked_windows : [];
-  setText("runtime-linked-windows-status", available ? runtimeCountLabel(links.length, "Window") : "runtime:read unavailable");
+  setText("runtime-linked-windows-status", available ? runtimeCountLabel(links.length, "Window") : tr("runtime:read unavailable"));
   if (available) {
-    renderSessionWindowCorrelationLinks(linkedNode, links, (key) => openWindowInspector(key));
+    renderSessionWindowCorrelationLinks(
+      linkedNode,
+      links,
+      (key) => openWindowInspector(key),
+      Date.now(),
+      runtimeLanguage,
+    );
   }
   const gaps = available && Array.isArray(detail?.window_activity_after_last_session_record)
     ? detail.window_activity_after_last_session_record
@@ -973,6 +1009,8 @@ function renderProjectWindows(): void {
       ? tr(count > 0 ? "Refresh failed · showing previous data" : "refresh unavailable")
       : formatProjectWindowStatusText(count, projectWindowTotal, projectWindowTruncated, runtimeLanguage)
   );
+  const projectEmptyCopy = formatWindowEmptyState(projectWindowAvailability, windowVisibilityScope, true, runtimeLanguage);
+  setText("runtime-project-windows-empty", projectEmptyCopy);
   show("runtime-project-windows-empty", count === 0 && projectWindowAvailability === "available");
 
   const signature = renderFingerprint([
@@ -1032,6 +1070,9 @@ async function fetchProjectWindows(request: any): Promise<boolean> {
   }
   projectWindowRows = Array.isArray(response.data.windows) ? response.data.windows : [];
   projectWindowAvailability = "available";
+  if (response.data.visibility?.scope === "global" || response.data.visibility?.scope === "principal") {
+    windowVisibilityScope = response.data.visibility.scope;
+  }
   projectWindowProjectId = request.project;
   projectWindowTruncated = !!response.data.truncated;
   projectWindowTotal = typeof response.data.total === "number" ? response.data.total : projectWindowRows.length;
@@ -1107,6 +1148,8 @@ function lock(message = "", clearRemembered = true): void {
   collaborationPendingMessages = 0;
   clearSessionSurface();
   windowRows = [];
+  windowAvailability = "idle";
+  windowVisibilityScope = "principal";
   selectedWindowKey = "";
   selectedWindowDetail = null;
   stopWindowAuto();
@@ -1123,12 +1166,12 @@ function lock(message = "", clearRemembered = true): void {
   sessionsPanel?.remove();
   clearNode(projectList);
   if (projectList && sessionsPanel) {
+    sessionsPanel.hidden = true;
+    projectList.appendChild(sessionsPanel);
     if (windowPanel) {
       windowPanel.hidden = true;
       projectList.appendChild(windowPanel);
     }
-    sessionsPanel.hidden = true;
-    projectList.appendChild(sessionsPanel);
   }
   clearNode(el("runtime-recent-session-list"));
   clearNode(el("runtime-runner-list"));
@@ -1391,6 +1434,7 @@ function renderProjectSelectors(projects: any[], truncated: boolean): void {
     projects: effective,
     runners: runnerRows.map((runner) => [runner?.client_id, runner?.connected, runner?.status]),
     activeWindowCount,
+    selectedProjectWindowCount: projectWindowRows.length,
   });
   if (signature === renderedProjectSelectorsSignature) return;
   renderedProjectSelectorsSignature = signature;
@@ -1416,6 +1460,7 @@ function renderProjectSelectors(projects: any[], truncated: boolean): void {
       onSelectProject: (clientId, projectId) => switchProject(clientId, projectId),
       windowPanel,
       selectedProjectWindowActiveCount: activeWindowCount,
+      selectedProjectWindowCount: projectWindowRows.length,
     },
   );
   const returnedProjects = runtimeProjectsForDevice(effective, projectDeviceFilter).length;

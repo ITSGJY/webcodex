@@ -1169,6 +1169,34 @@ pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request(
     .await;
 }
 
+pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request_with_truncation(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    request_id: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) {
+    runtime
+        .runner_registry
+        .complete(RunnerResultRequest {
+            client_id: client_id.to_string(),
+            runner_instance_id: "inst".to_string(),
+            request_id: request_id.to_string(),
+            exit_code: Some(exit_code),
+            stdout: Some(stdout.to_string()),
+            stderr: Some(stderr.to_string()),
+            stdout_truncated,
+            stderr_truncated,
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+}
+
 pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request_for_instance(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -1187,6 +1215,8 @@ pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request_for_ins
             exit_code: Some(exit_code),
             stdout: Some(stdout.to_string()),
             stderr: Some(stderr.to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })

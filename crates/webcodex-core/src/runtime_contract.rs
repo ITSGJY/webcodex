@@ -17,7 +17,7 @@ pub const DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 64 * 1024;
 /// Keep producer stdout comfortably below the ordinary 256 KiB per-stream
 /// Runner result-retention default, leaving headroom for framing and metadata.
 pub const MAX_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 192 * 1024;
-pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 512;
+pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 192;
 pub const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
 pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
 
@@ -124,7 +124,7 @@ impl ContinuationSemantics {
 }
 
 pub const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 9;
+pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 10;
 pub const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
 
 /// Validate a Runner project path without applying host-local filesystem semantics.

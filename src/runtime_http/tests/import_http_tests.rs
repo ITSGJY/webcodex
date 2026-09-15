@@ -194,6 +194,8 @@ async fn complete_import_artifact_uploads(
                             .to_string(),
                     ),
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(1),
                     error: None,
                 })
@@ -229,6 +231,8 @@ async fn complete_import_artifact_uploads(
                     .to_string(),
                 ),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })
@@ -277,6 +281,8 @@ async fn complete_import_artifact_uploads(
                                 .to_string(),
                             ),
                             stderr: None,
+                            stdout_truncated: false,
+                            stderr_truncated: false,
                             duration_ms: Some(1),
                             error: None,
                         })
@@ -308,6 +314,8 @@ async fn complete_import_artifact_uploads(
                                 .to_string(),
                             ),
                             stderr: None,
+                            stdout_truncated: false,
+                            stderr_truncated: false,
                             duration_ms: Some(1),
                             error: None,
                         })
@@ -340,6 +348,8 @@ async fn complete_import_artifact_uploads(
                                 .to_string(),
                             ),
                             stderr: None,
+                            stdout_truncated: false,
+                            stderr_truncated: false,
                             duration_ms: Some(1),
                             error: None,
                         })

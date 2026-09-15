@@ -111,6 +111,48 @@ preserving an unused historical shape. Durable persisted truth, mixed-version
 Server/Runner protocol, published artifacts, and named external consumers are
 separate compatibility domains and must be handled explicitly.
 
+### Model-projection deletion test
+
+A model-facing result field should normally survive only when it can change at
+least one of these decisions:
+
+- how the business result is interpreted;
+- which target, authority, fence, retry, or continuation identity is safe;
+- whether the observation is complete, partial, stale, or uncertain;
+- which exact next action the model should take.
+
+If deleting a field leaves all of those decisions unchanged, omit it from the
+default model projection. Keep it in an internal typed contract, test invariant,
+telemetry record, operator/Console view, or exceptional diagnostic when those
+consumers still need it.
+
+Internal proof contracts answer why the Runtime knows an operation, observation,
+or follow-up is safe; the model projection answers what the model must know or do
+next. Do not serialize scope digests, MAC/proof state, cursor/carrier classes, or
+recovery bookkeeping merely to explain the Runtime's own safety proof when they do
+not change a model decision.
+
+One exception to deletion-by-derivation is an intentionally stable semantic
+abstraction over a broader or evolving internal taxonomy. A derived field may stay
+model-facing when its purpose is to let callers reason against a deliberately
+smaller contract than the underlying status/state variants. Treat such a field as
+an explicit semantic firewall with its own documented invariant, not as a
+convenience duplicate.
+
+In particular, a parser-ready `suggested_call` or continuation call should not
+normally be accompanied by a second classification vocabulary such as
+`kind`/`carrier`, `safe_cursor`, `recommended_order`, or a duplicate raw token
+when those fields merely restate the same next action. Internal continuation and
+recovery taxonomies may remain useful implementation SSOTs without becoming
+per-result concepts the model must learn. Likewise, counts that are exactly an
+array length and success booleans fully implied by one authoritative lifecycle
+state should be omitted unless they carry independent meaning.
+
+Prefer **progressive disclosure**: ordinary success returns sparse business truth
+and one actionable follow-up; reset, truncation, reconciliation, malformed-source,
+or other exceptional paths may expose the additional bounded forensic evidence
+needed to explain or safely recover the anomaly.
+
 ## 4. Success is sparse; failure is decision-complete
 
 Successful calls should foreground the business result and omit redundant derived

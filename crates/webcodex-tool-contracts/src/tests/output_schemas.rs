@@ -51,10 +51,13 @@ fn structured_execution_output(
         });
     }
     if promoted_to_job {
-        instance["output"]["continuation_semantics"] = serde_json::json!({
-            "kind": "observe",
-            "carrier": "observation_token"
-        });
+        for key in [
+            "promoted_to_job",
+            "observation_token",
+            "async_handoff_available",
+        ] {
+            instance["output"].as_object_mut().unwrap().remove(key);
+        }
     }
     instance
 }
@@ -62,37 +65,6 @@ fn structured_execution_output(
 #[test]
 fn t2_continuation_output_schemas_distinguish_cursor_kinds_and_carriers() {
     let specs = registered_tool_specs();
-
-    let read_files = spec_named(&specs, "read_files");
-    let read_full = &read_files.output_schema["properties"]["output"]["anyOf"][0]["anyOf"][0];
-    let range_semantics = &read_full["properties"]["items"]["items"]["properties"]["continuation"]
-        ["properties"]["continuation_semantics"]["properties"];
-    assert_eq!(range_semantics["kind"]["const"], "page");
-    assert_eq!(range_semantics["carrier"]["const"], "position");
-
-    let variants = read_full["properties"]["continuation"]["oneOf"]
-        .as_array()
-        .unwrap();
-    let mut seen = std::collections::BTreeSet::new();
-    for variant in variants {
-        let kind = variant["properties"]["kind"]["const"].as_str().unwrap();
-        let semantics = &variant["properties"]["continuation_semantics"]["properties"];
-        seen.insert((
-            kind.to_string(),
-            semantics["kind"]["const"].as_str().unwrap().to_string(),
-            semantics["carrier"]["const"].as_str().unwrap().to_string(),
-        ));
-    }
-    assert!(seen.contains(&(
-        "batch_items".to_string(),
-        "batch".to_string(),
-        "index".to_string()
-    )));
-    assert!(seen.contains(&(
-        "increase_result_budget".to_string(),
-        "refine".to_string(),
-        "none".to_string()
-    )));
 
     let coding = spec_named(&specs, "coding_agent_observe");
     let coding_semantics = &coding.output_schema["properties"]["output"]["properties"]
@@ -105,132 +77,79 @@ fn t2_continuation_output_schemas_distinguish_cursor_kinds_and_carriers() {
         ["continuation_semantics"]["properties"];
     assert_eq!(session_semantics["kind"]["const"], "observe");
     assert_eq!(session_semantics["carrier"]["const"], "observation_token");
-
-    let git = spec_named(&specs, "git_diff_hunks");
-    let recovery = &git.output_schema["properties"]["output"]["properties"]["recovery"];
-    let page_semantics = &recovery["properties"]["continuation"]["properties"]
-        ["continuation_semantics"]["anyOf"][0]["properties"];
-    assert_eq!(page_semantics["kind"]["const"], "page");
-    assert_eq!(page_semantics["carrier"]["const"], "opaque_token");
-    let refine_semantics = &recovery["properties"]["omitted_lines"]["properties"]
-        ["continuation_semantics"]["anyOf"][0]["properties"];
-    assert_eq!(refine_semantics["kind"]["const"], "refine");
-    assert_eq!(refine_semantics["carrier"]["const"], "none");
-    let fragment_semantics = &recovery["properties"]["omitted_lines"]["properties"]
-        ["continuation_semantics"]["anyOf"][1]["properties"];
-    assert_eq!(fragment_semantics["kind"]["const"], "page");
-    assert_eq!(fragment_semantics["carrier"]["const"], "opaque_token");
 }
 
 #[test]
-fn git_diff_hunks_omitted_line_recovery_schema_accepts_only_canonical_refine_or_fragment_shapes() {
+fn git_diff_hunks_recovery_schema_accepts_only_sparse_actionable_lanes() {
     let specs = registered_tool_specs();
     let git = spec_named(&specs, "git_diff_hunks");
-    let recovery_schema = &git.output_schema["properties"]["output"]["properties"]["recovery"];
-    let continuation_lane = json!({
-        "available": false,
-        "recovers_later_hunks": false,
-        "recovers_omitted_lines": false,
-        "continuation_semantics": null,
-        "next_call": null
+    let schema = &git.output_schema["properties"]["output"]["properties"]["recovery"];
+    let arguments = json!({
+        "project": "agent:special:webcodex", "paths": ["a.txt"],
+        "max_hunks": 10, "max_hunk_lines": 400, "max_page_bytes": 65536, "cached": false
     });
-    let refine_arguments = json!({
-        "project": "agent:special:webcodex",
-        "paths": ["a.txt"],
-        "max_hunks": 10,
-        "max_hunk_lines": 400,
-        "max_page_bytes": 65536,
-        "cached": false
-    });
-    let fragment_arguments = json!({
-        "project": "agent:special:webcodex",
-        "paths": ["a.txt"],
-        "max_hunks": 10,
-        "max_hunk_lines": 400,
-        "max_page_bytes": 65536,
-        "cached": false,
-        "continuation": "wcdh1.fragment"
-    });
-    let refine = json!({
-        "kind": "hunk_lines",
-        "tool": "git_diff_hunks",
-        "arguments": refine_arguments.clone(),
-        "safe_continuation_for_omitted_lines": false,
-        "continuation": continuation_lane.clone(),
-        "omitted_lines": {
-            "present": true,
-            "recoverable": true,
-            "reason_code": "larger_max_hunk_lines_available",
-            "path_provenance": "exact",
-            "paths": ["a.txt"],
-            "continuation_semantics": {"kind": "refine", "carrier": "none"},
-            "next_call": {"tool": "git_diff_hunks", "arguments": refine_arguments}
-        }
-    });
-    test_support::validate_schema_instance(&refine, recovery_schema).unwrap();
+    let refine = json!({"current_hunk": {
+        "reason_code": "larger_max_hunk_lines_available",
+        "next_call": {"tool": "git_diff_hunks", "arguments": arguments}
+    }});
+    test_support::validate_schema_instance(&refine, schema).unwrap();
+    let mut fragment = refine.clone();
+    fragment["current_hunk"]["reason_code"] = json!("hunk_fragment_continuation_available");
+    assert!(test_support::validate_schema_instance(&fragment, schema).is_err());
+    fragment["current_hunk"]["next_call"]["arguments"]["continuation"] = json!("wcdh2.fragment");
+    test_support::validate_schema_instance(&fragment, schema).unwrap();
+    let mut mixed = fragment.clone();
+    mixed["later_hunks"] = json!({"next_call": fragment["current_hunk"]["next_call"]});
+    mixed["later_hunks"]["next_call"]["arguments"]["continuation"] = json!("wcdh2.page");
+    test_support::validate_schema_instance(&mixed, schema).unwrap();
+    mixed.as_object_mut().unwrap().remove("current_hunk");
+    test_support::validate_schema_instance(&mixed, schema).unwrap();
 
-    let fragment = json!({
-        "kind": "hunk_lines",
-        "tool": "git_diff_hunks",
-        "arguments": fragment_arguments.clone(),
-        "safe_continuation_for_omitted_lines": true,
-        "continuation": continuation_lane,
-        "omitted_lines": {
-            "present": true,
-            "recoverable": true,
-            "reason_code": "hunk_fragment_continuation_available",
-            "path_provenance": "exact",
-            "paths": ["a.txt"],
-            "continuation_semantics": {"kind": "page", "carrier": "opaque_token"},
-            "next_call": {"tool": "git_diff_hunks", "arguments": fragment_arguments}
-        }
-    });
-    test_support::validate_schema_instance(&fragment, recovery_schema).unwrap();
-
-    let mut fragment_with_refine_semantics = fragment.clone();
-    fragment_with_refine_semantics["omitted_lines"]["continuation_semantics"] =
-        json!({"kind": "refine", "carrier": "none"});
-    assert!(test_support::validate_schema_instance(
-        &fragment_with_refine_semantics,
-        recovery_schema,
-    )
-    .is_err());
-
-    let mut fragment_without_safe_cursor = fragment.clone();
-    fragment_without_safe_cursor["safe_continuation_for_omitted_lines"] = json!(false);
-    assert!(
-        test_support::validate_schema_instance(&fragment_without_safe_cursor, recovery_schema,)
-            .is_err()
-    );
-
-    let mut fragment_without_call = fragment.clone();
-    fragment_without_call["omitted_lines"]["next_call"] = Value::Null;
-    assert!(
-        test_support::validate_schema_instance(&fragment_without_call, recovery_schema).is_err()
-    );
-
-    let mut refine_with_fragment_semantics = refine.clone();
-    refine_with_fragment_semantics["omitted_lines"]["continuation_semantics"] =
-        json!({"kind": "page", "carrier": "opaque_token"});
-    assert!(test_support::validate_schema_instance(
-        &refine_with_fragment_semantics,
-        recovery_schema,
-    )
-    .is_err());
-
-    let mut unrecoverable = fragment;
-    unrecoverable["arguments"] = Value::Null;
-    unrecoverable["safe_continuation_for_omitted_lines"] = json!(false);
-    unrecoverable["omitted_lines"]["recoverable"] = json!(false);
-    unrecoverable["omitted_lines"]["reason_code"] =
-        json!("page_byte_budget_prevents_proven_recovery");
-    unrecoverable["omitted_lines"]["continuation_semantics"] = Value::Null;
-    unrecoverable["omitted_lines"]["next_call"] = Value::Null;
-    test_support::validate_schema_instance(&unrecoverable, recovery_schema).unwrap();
-
-    unrecoverable["omitted_lines"]["continuation_semantics"] =
-        json!({"kind": "page", "carrier": "opaque_token"});
-    assert!(test_support::validate_schema_instance(&unrecoverable, recovery_schema).is_err());
+    for reason in [
+        "page_byte_budget_prevents_proven_recovery",
+        "max_hunk_lines_ceiling_reached",
+        "max_hunk_lines_ceiling_insufficient",
+        "bounded_recovery_unavailable",
+    ] {
+        let mut blocked = json!({"current_hunk": {"reason_code": reason}});
+        test_support::validate_schema_instance(&blocked, schema).unwrap();
+        blocked["current_hunk"]["next_call"] = fragment["current_hunk"]["next_call"].clone();
+        assert!(test_support::validate_schema_instance(&blocked, schema).is_err());
+    }
+    for field in [
+        "kind",
+        "arguments",
+        "tool",
+        "safe_continuation_for_omitted_lines",
+        "continuation",
+        "omitted_lines",
+    ] {
+        let mut duplicate = fragment.clone();
+        duplicate[field] = Value::Null;
+        assert!(test_support::validate_schema_instance(&duplicate, schema).is_err());
+    }
+    for field in [
+        "present",
+        "recoverable",
+        "continuation_semantics",
+        "paths",
+        "path_provenance",
+    ] {
+        let mut duplicate = fragment.clone();
+        duplicate["current_hunk"][field] = Value::Null;
+        assert!(test_support::validate_schema_instance(&duplicate, schema).is_err());
+    }
+    for invalid in [
+        json!({}),
+        json!({"later_hunks": {"next_call": null}}),
+        json!({"current_hunk": {"reason_code": "hunk_fragment_continuation_available"}}),
+    ] {
+        assert!(test_support::validate_schema_instance(&invalid, schema).is_err());
+    }
+    let mut invalid_refine = refine;
+    invalid_refine["current_hunk"]["next_call"]["arguments"]["continuation"] =
+        json!("wcdh2.fragment");
+    assert!(test_support::validate_schema_instance(&invalid_refine, schema).is_err());
 }
 
 #[test]
@@ -269,17 +188,15 @@ fn inspection_truthfulness_schemas_keep_typed_missing_and_canonical_diff_recover
         hunk["properties"]["source_completeness"]["enum"],
         json!(["complete", "unknown"])
     );
-    let handoff = &properties["diff_review_handoff"]["properties"];
-    assert!(handoff.get("tool").is_none());
-    assert!(handoff.get("suggested_call").is_none());
+    let handoff = &properties["diff_review_handoff"];
+    assert_eq!(handoff["required"], json!(["next_call"]));
     assert_eq!(
-        handoff["recovery"]["properties"]["tool"]["const"],
+        handoff["properties"]["next_call"]["properties"]["tool"]["const"],
         "git_diff_hunks"
     );
-    assert!(handoff["recovery"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("Canonical parser-ready"));
+    for legacy in ["scope", "reason", "truncation_reasons", "recovery"] {
+        assert!(handoff["properties"].get(legacy).is_none(), "{legacy}");
+    }
 }
 
 fn continuation_feedback_subschema(specs: &[ToolSpec], tool: &str) -> Value {
@@ -428,8 +345,8 @@ fn git_diff_hunks_output_schema_keeps_page_and_model_budgets_distinct() {
         .as_str()
         .unwrap()
         .contains("producer-page"));
-    let recovery = &output["recovery"]["properties"]["continuation"]["properties"]["next_call"]
-        ["anyOf"][0]["properties"]["arguments"];
+    let recovery = &output["recovery"]["properties"]["later_hunks"]["properties"]["next_call"]
+        ["properties"]["arguments"];
     assert_eq!(
         recovery["properties"]["max_page_bytes"]["minimum"],
         16 * 1024
@@ -724,127 +641,58 @@ fn observe_jobs_failure_item_schema_closes_recovery_metadata() {
 }
 
 #[test]
-fn read_continuation_output_schemas_accept_actionable_recovery_shapes() {
-    let read_files = output_schema_for_tool("read_files");
-    test_support::validate_schema_instance(
-        &json!({
-            "success": true,
-            "output": {
-                "project": "agent:oe:demo",
-                "requested_count": 3,
-                "returned_count": 1,
-                "succeeded_count": 1,
-                "failed_count": 0,
-                "items": [{
-                    "index": 0,
-                    "path": "src/0.rs",
-                    "success": true,
-                    "output": {
-                        "text": "first",
-                        "format": "plain",
-                        "path": "src/0.rs",
-                        "sha256": "b".repeat(64),
-                        "start_line": 1,
-                        "limit": 100,
-                        "total_lines": 200,
-                        "returned_lines": 50,
-                        "end_line": 50,
-                        "has_more": true,
-                        "next_start_line": 51,
-                        "budget_truncated": true,
-                        "budget_next_limit": 50
-                    },
-                    "error": null,
-                    "continuation": {
-                        "kind": "read_range",
-                        "safe_cursor": true,
-                        "source_sha256": "b".repeat(64),
-                        "snapshot_stable": false,
-                        "continuation_semantics": {
-                            "kind": "page",
-                            "carrier": "position"
-                        },
-                        "suggested_call": {
-                            "tool": "read_files",
-                            "arguments": {
-                                "project": "agent:oe:demo",
-                                "items": [{
-                                    "path": "src/0.rs",
-                                    "start_line": 51,
-                                    "limit": 50
-                                }]
-                            }
-                        }
-                    }
-                }],
-                "output_truncated": true,
-                "next_index": 0,
-                "truncation_reason": "batch_response_budget",
-                "continuation": {
-                    "kind": "batch_items",
-                    "safe_cursor": true,
-                    "next_index": 1,
-                    "recommended_order": "after_partial_item",
-                    "continuation_semantics": {
-                        "kind": "batch",
-                        "carrier": "index"
-                    },
-                    "suggested_call": {
-                        "tool": "read_files",
-                        "arguments": {
-                            "project": "agent:oe:demo",
-                            "session_id": "wc_sess_demo",
-                            "items": [
-                                {"path": "src/1.rs"},
-                                {"path": "src/2.rs", "start_line": 4, "limit": 20}
-                            ]
-                        }
-                    }
-                }
-            },
-            "error": null
-        }),
-        &read_files,
-    )
-    .unwrap();
-
-    test_support::validate_schema_instance(
-        &json!({
-            "success": true,
-            "output": {
-                "project": "agent:oe:demo",
-                "requested_count": 1,
-                "returned_count": 0,
-                "succeeded_count": 0,
-                "failed_count": 0,
-                "items": [],
-                "output_truncated": true,
-                "next_index": 0,
-                "truncation_reason": "batch_response_budget",
-                "continuation": {
-                    "kind": "increase_result_budget",
-                    "safe_cursor": false,
-                    "next_index": 0,
-                    "suggested_max_result_bytes": 524288,
-                    "continuation_semantics": {
-                        "kind": "refine",
-                        "carrier": "none"
-                    },
-                    "suggested_call": {
-                        "tool": "read_files",
-                        "arguments": {
-                            "project": "agent:oe:demo",
-                            "items": [{"path": "src/0.rs"}],
-                            "max_result_bytes": 524288
-                        }
-                    }
-                }
-            },
-            "error": null
-        }),
-        &read_files,
-    )
-    .unwrap();
+fn read_continuation_output_schemas_accept_one_action_and_snapshot_truth() {
+    let schema = output_schema_for_tool("read_files");
+    let mut result = json!({"success": true, "output": {
+        "project": "agent:oe:demo", "requested_count": 3, "returned_count": 1,
+        "succeeded_count": 1, "failed_count": 0,
+        "items": [{"index": 0, "path": "src/0.rs", "success": true, "error": null,
+            "output": {"text": "first", "format": "plain", "path": "src/0.rs",
+                "read_revision": 3817291045227_u64, "start_line": 1, "limit": 100, "total_lines": 200,
+                "returned_lines": 50, "end_line": 50, "has_more": true, "budget_truncated": true}}],
+        "output_truncated": true, "truncation_reason": "batch_response_budget",
+        "suggested_call": {"tool": "read_files", "arguments": {"project": "agent:oe:demo", "session_id": "wc_sess_demo",
+            "items": [{"path": "src/0.rs", "start_line": 51, "limit": 50, "expected_read_revision": 3817291045227_u64}, {"path": "src/1.rs"}, {"path": "src/2.rs", "start_line": 4, "limit": 20}]}}
+    }});
+    test_support::validate_schema_instance(&result, &schema).unwrap();
+    let mut invalid_fence = result.clone();
+    invalid_fence["output"]["suggested_call"]["arguments"]["items"][0]["expected_read_revision"] =
+        json!(0);
+    assert!(test_support::validate_schema_instance(&invalid_fence, &schema).is_err());
+    let mut digest_leak = result.clone();
+    digest_leak["output"]["items"][0]["output"]["sha256"] = json!("b".repeat(64));
+    assert!(test_support::validate_schema_instance(&digest_leak, &schema).is_err());
+    for field in [
+        "continuation",
+        "next_index",
+        "recommended_order",
+        "safe_cursor",
+        "continuation_semantics",
+    ] {
+        let mut duplicate = result.clone();
+        duplicate["output"][field] = Value::Null;
+        assert!(test_support::validate_schema_instance(&duplicate, &schema).is_err());
+    }
+    let mut duplicate = result.clone();
+    duplicate["output"]["items"][0]["continuation"] = result["output"]["suggested_call"].clone();
+    assert!(test_support::validate_schema_instance(&duplicate, &schema).is_err());
+    let mut missing_snapshot = result.clone();
+    missing_snapshot["output"]["items"][0]["output"]
+        .as_object_mut()
+        .unwrap()
+        .remove("read_revision");
+    assert!(test_support::validate_schema_instance(&missing_snapshot, &schema).is_err());
+    result["output"]["items"] = json!([]);
+    result["output"]["returned_count"] = json!(0);
+    result["output"]["succeeded_count"] = json!(0);
+    result["output"]["suggested_call"]["arguments"]["max_result_bytes"] = json!(524288);
+    test_support::validate_schema_instance(&result, &schema).unwrap();
+    result["output"]
+        .as_object_mut()
+        .unwrap()
+        .remove("suggested_call");
+    result["output"]["truncation_reason"] = json!("hard_result_cap");
+    test_support::validate_schema_instance(&result, &schema).unwrap();
 }
 
 #[test]
@@ -944,7 +792,6 @@ fn key_tool_output_schemas_include_expected_fields() {
         "executor",
         "execution_source",
         "execution_state",
-        "execution_success",
         "expectation_satisfied",
         "promoted_to_job",
         "terminal",
@@ -1287,21 +1134,21 @@ fn key_tool_output_schemas_include_expected_fields() {
                     Some("completed"),
                 ),
             ),
-            ("non-promoted execution with continuation semantics", {
+            ("handoff without its observation token", {
                 let mut instance = structured_execution_output(
                     execution_source,
-                    "completed",
-                    true,
+                    "running",
                     true,
                     false,
                     true,
-                    None,
-                    None,
+                    false,
+                    Some("job-1"),
+                    Some("running"),
                 );
-                instance["output"]["continuation_semantics"] = serde_json::json!({
-                    "kind": "observe",
-                    "carrier": "observation_token"
-                });
+                instance["output"]["continuation"]["arguments"]["items"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("after_observation_token");
                 instance
             }),
             (
@@ -1975,9 +1822,7 @@ fn write_project_file_output_schema_include_metadata_fields() {
         "execution_state",
         "error_kind",
         "failure_kind",
-        "recovery_action",
-        "retry_guidance",
-        "error",
+        "recovery",
     ] {
         assert!(
             output_schema_properties(&specs, "write_project_file").contains_key(field),
@@ -1985,6 +1830,19 @@ fn write_project_file_output_schema_include_metadata_fields() {
         );
     }
     assert!(!output_schema_properties(&specs, "write_project_file").contains_key("warning"));
+    for removed in [
+        "recovery_action",
+        "retry_guidance",
+        "expected_read_revision",
+        "reread_required",
+        "suggested_call",
+        "error",
+    ] {
+        assert!(
+            !output_schema_properties(&specs, "write_project_file").contains_key(removed),
+            "write_project_file still exposes {removed}"
+        );
+    }
     assert_eq!(
         output_schema_property(&specs, "write_project_file", "bytes_written")["type"],
         "integer"
@@ -2621,4 +2479,40 @@ fn assert_outcome_model_schema_fields(output_props: &serde_json::Map<String, Val
         json!(["clean", "warning", "error"])
     );
     assert_eq!(output_props["informational_notes"]["type"], "array");
+}
+
+#[test]
+fn agent_wait_model_schema_separates_matches_from_durable_bookkeeping() {
+    let specs = registered_tool_specs();
+    let wait_id = format!("wc_agent_wait_{}", "1".repeat(32));
+    let matched = serde_json::json!({
+        "task_id": format!("wc_agent_task_{}", "2".repeat(32)),
+        "task_attempt_id": format!("wc_agent_task_attempt_{}", "3".repeat(32)),
+        "terminal_task_state": "succeeded"
+    });
+    for tool in [
+        "wait_for_agent_events",
+        "read_agent_wait",
+        "cancel_agent_wait",
+    ] {
+        let schema = &spec_named(&specs, tool).output_schema["properties"]["output"]["properties"]
+            ["agent_wait"];
+        for state in ["waiting", "triggered", "resumed", "cancelled"] {
+            let mut wait = serde_json::json!({"wait_id": wait_id, "state": state});
+            if matches!(state, "triggered" | "resumed") {
+                wait["matches"] = serde_json::json!([matched]);
+            }
+            test_support::validate_schema_instance(&wait, schema).unwrap();
+            let mut duplicate = wait.clone();
+            duplicate["match_count"] = serde_json::json!(1);
+            assert!(test_support::validate_schema_instance(&duplicate, schema).is_err());
+            if matches!(state, "triggered" | "resumed") {
+                let mut missing = wait.clone();
+                missing.as_object_mut().unwrap().remove("matches");
+                assert!(test_support::validate_schema_instance(&missing, schema).is_err());
+                wait["matches"][0]["sequence"] = serde_json::json!(1);
+                assert!(test_support::validate_schema_instance(&wait, schema).is_err());
+            }
+        }
+    }
 }

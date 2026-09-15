@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp::tools::{attach_ignored_invocation_metadata, ignored_invocation_metadata};
 
 async fn wait_for_mcp_agent_request(
     registry: &crate::runner_http::RunnerRegistry,
@@ -688,11 +689,12 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("missing {name} schema"));
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();
-        assert!(
-            !properties.contains_key(
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
-            ),
-            "{name} must not advertise context ACK"
+        assert!(properties.contains_key(
+            crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD
+        ));
+        assert_eq!(
+            properties["ack_session_context_revision"]["description"],
+            "Optional wrapper metadata accepted for invocation ergonomics only. This tool does not consume Session Context ACK and does not advance the checkpoint. Normally omit this field; if supplied it is ignored and the business call still executes."
         );
         assert!(properties.contains_key(
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
@@ -718,7 +720,13 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         ));
         assert_eq!(
             properties["ack_session_context_revision"]["description"],
-            "Echo the latest retained session_context_revision; omit when unknown."
+            "Echo the latest retained session_context_revision when known. Only use a revision actually retained in model context. This is tool-specific invocation metadata; never copy it into a tool whose current contract says it is ignored/inapplicable."
+        );
+        assert!(
+            !serde_json::to_string(&tool["outputSchema"])
+                .unwrap()
+                .contains("ignored_invocation_metadata"),
+            "{name} must not advertise ignored metadata it can never emit"
         );
         assert!(
             tool["outputSchema"]["properties"]["output"]["properties"]["session_continuity"]
@@ -774,6 +782,10 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         .contains("\"session_context_continuation\""));
     assert!(read_files_output.contains("context_projection"));
     assert!(read_files_output.contains("post_tool"));
+    assert!(read_files_output.contains("ignored_invocation_metadata"));
+    assert!(read_files_output.contains("accepted but not consumed by this target"));
+    assert!(!read_files_output.contains("session_continuity"));
+    assert!(!read_files_output.contains("session_recovery"));
     let list_tools = full["tools"]
         .as_array()
         .unwrap()
@@ -953,28 +965,81 @@ fn stateless_context_revision_ack_is_request_scoped_and_removed_before_parsing()
 }
 
 #[test]
-fn reobservable_tool_strips_cached_context_ack_without_accepting_it() {
+fn reobservable_tool_accepts_known_context_ack_as_ignored_invocation_metadata() {
     let mut arguments = json!({
         "project": "proj",
         "items": [{"path": "src/lib.rs"}],
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 41,
     });
     let ack = strip_stateless_ack_session_context_revision(&mut arguments).unwrap();
-    assert_eq!(ack, json!(41));
     assert!(arguments
         .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD)
         .is_none());
+    crate::tool_runtime::ToolCall::from_tool_name("read_files", arguments.clone())
+        .expect("known wrapper metadata must be stripped before concrete read_files parsing");
 
-    let accepts_ack =
-        crate::tool_runtime::tool_definition::runtime_tool_accepts_context_ack("read_files");
-    assert!(!accepts_ack);
+    assert!(!crate::tool_runtime::tool_definition::runtime_tool_accepts_context_ack("read_files"));
+    assert!(
+        !crate::tool_runtime::tool_definition::runtime_tool_advances_context_checkpoint(
+            "read_files"
+        )
+    );
+    let ignored = ignored_invocation_metadata("read_files", Some(&ack));
     assert_eq!(
-        session_context_revision_ack_from_wire(Some(ack)),
+        ignored,
+        vec![crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD]
+    );
+    let mut result = ToolResult::ok(json!({"items": []}));
+    attach_ignored_invocation_metadata(&mut result, &ignored);
+    assert_eq!(
+        result.output["ignored_invocation_metadata"],
+        json!(["ack_session_context_revision"])
+    );
+    for field in [
+        "session_context_revision",
+        "session_continuity",
+        "session_recovery",
+    ] {
+        assert!(result.output.get(field).is_none(), "unexpected {field}");
+    }
+
+    let mut no_metadata = ToolResult::ok(json!({"items": []}));
+    attach_ignored_invocation_metadata(&mut no_metadata, &[]);
+    assert_eq!(no_metadata.output, json!({"items": []}));
+
+    let unknown_business_argument = json!({
+        "project": "proj",
+        "items": [{"path": "src/lib.rs"}],
+        "totally_unknown_business_argument": true,
+    });
+    assert!(
+        crate::tool_runtime::ToolCall::from_tool_name("read_files", unknown_business_argument)
+            .is_err()
+    );
+}
+
+#[test]
+fn context_ack_capable_tool_consumes_ack_without_ignored_metadata() {
+    let mut arguments = json!({
+        "project": "proj",
+        "changes": [{"kind": "create", "path": "new.txt", "content": "x"}],
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 41,
+    });
+    let ack = strip_stateless_ack_session_context_revision(&mut arguments).unwrap();
+    crate::tool_runtime::ToolCall::from_tool_name("apply_text_edits", arguments)
+        .expect("ACK wrapper must be stripped before concrete apply_text_edits parsing");
+    assert!(
+        crate::tool_runtime::tool_definition::runtime_tool_accepts_context_ack("apply_text_edits")
+    );
+    assert_eq!(
+        session_context_revision_ack_from_wire(Some(ack.clone())),
         crate::tool_runtime::sessions::SessionContextRevisionAck::Revision(41)
     );
-
-    crate::tool_runtime::ToolCall::from_tool_name("read_files", arguments)
-        .expect("cached ACK must be stripped before concrete read_files parsing");
+    let ignored = ignored_invocation_metadata("apply_text_edits", Some(&ack));
+    assert!(ignored.is_empty());
+    let mut result = ToolResult::ok(json!({"changed": true}));
+    attach_ignored_invocation_metadata(&mut result, &ignored);
+    assert!(result.output.get("ignored_invocation_metadata").is_none());
 }
 
 #[test]
@@ -1426,6 +1491,8 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
             exit_code: Some(0),
             stdout: Some(stdout),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -1827,6 +1894,155 @@ async fn mcp_tools_call_rejects_legacy_reserved_session_id_before_dispatch() {
 }
 
 #[tokio::test]
+async fn mcp_read_files_ignores_inapplicable_context_ack_without_consuming_it() {
+    use crate::runner_protocol::{
+        RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest, RunnerResultRequest,
+    };
+    use webcodex_workspace::file_read_range::{self, EffectiveRange};
+
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let client_id = "mcp-read-files-wrapper-metadata";
+    let runner_instance_id = "inst-mcp-read-files-wrapper-metadata";
+    let project_name = "repo";
+    runtime
+        .runner_registry
+        .register(crate::test_support::current_runner_registration(
+            RunnerRegisterRequest {
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                client_id: client_id.to_string(),
+                runner_instance_id: runner_instance_id.to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: None,
+                owner: None,
+                hostname: None,
+                host_context: None,
+                capabilities: RunnerCapabilities {
+                    file_read: true,
+                    ..Default::default()
+                },
+                policy: None,
+            },
+        ))
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        runner_instance_id,
+        vec![RunnerProjectSummary {
+            id: project_name.to_string(),
+            name: Some(project_name.to_string()),
+            path: "/remote/repo".to_string(),
+            allow_patch: true,
+            kind: Some("repo".to_string()),
+            registration_source: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: None,
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 1,
+            shell_profile: None,
+        }],
+    )
+    .await;
+    let project = crate::tool_runtime::runner_project_runtime_id(client_id, project_name);
+    let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
+    auth.is_bootstrap = true;
+    let call = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc(
+                    "tools/call",
+                    Some(json!(320)),
+                    mcp_2026_params(json!({
+                        "name": "read_files",
+                        "arguments": {
+                            "project": project,
+                            "items": [{"path": "src/lib.rs"}],
+                            crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 42
+                        }
+                    })),
+                ),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+
+    let request = wait_for_mcp_agent_request(
+        &runtime.runner_registry,
+        client_id,
+        runner_instance_id,
+        "read_files ignored metadata",
+    )
+    .await;
+    assert_eq!(request.kind, "file_read");
+    assert_eq!(request.path.as_deref(), Some("src/lib.rs"));
+    let start = request.start_line.unwrap();
+    let end = request.end_line.unwrap();
+    let range = EffectiveRange::new(Some(start), Some(end - start + 1));
+    let read = file_read_range::read_range_from(&b"small\n"[..], range).unwrap();
+    let stdout = json!({
+        "format": "webcodex.file_read_range.v1",
+        "content": read.content,
+        "sha256": read.sha256,
+        "total_lines": read.total_lines,
+        "start_line": read.start_line,
+        "limit": read.limit,
+    })
+    .to_string();
+    runtime
+        .runner_registry
+        .complete(RunnerResultRequest {
+            client_id: client_id.to_string(),
+            runner_instance_id: runner_instance_id.to_string(),
+            request_id: request.request_id,
+            exit_code: Some(0),
+            stdout: Some(stdout),
+            stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+
+    let outcome = call.await.unwrap();
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("expected read_files success, got {outcome:?}");
+    };
+    assert_eq!(value["result"]["isError"], false);
+    let output = &value["result"]["structuredContent"]["output"];
+    assert_eq!(output["items"][0]["output"]["text"], "small");
+    assert_eq!(
+        output["ignored_invocation_metadata"],
+        json!(["ack_session_context_revision"])
+    );
+    for field in [
+        "session_context_revision",
+        "session_continuity",
+        "session_recovery",
+    ] {
+        assert!(output.get(field).is_none(), "unexpected {field}: {output}");
+    }
+}
+
+#[tokio::test]
 async fn stateless_mcp_ack_wrapper_is_removed_before_concrete_dispatch_and_is_request_scoped() {
     let runtime = test_runtime();
     let session = runtime
@@ -2211,6 +2427,8 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
                 exit_code: Some(0),
                 stdout: Some(stdout),
                 stderr: Some(String::new()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })

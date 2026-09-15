@@ -117,6 +117,9 @@ pub struct ToolRuntime {
     pub(crate) session_shells: SessionShellRegistry,
     pub(crate) semantic_navigation_probe_timeout: Duration,
     pub(crate) repository_overview_probe_timeout: Duration,
+    /// Process-local model-facing handles for exact full-file read snapshots.
+    /// Clones share the registry; a Server runtime restart creates a new epoch.
+    pub(crate) read_revisions: Arc<super::read_revisions::ReadRevisionRegistry>,
     /// One deadline shared by every item in a `read_files` batch.
     pub(crate) read_files_deadline: Duration,
     /// One deadline shared by every query in a `search_project_texts` batch.
@@ -199,6 +202,7 @@ impl ToolRuntime {
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
             repository_overview_probe_timeout:
                 super::coding_task::DEFAULT_REPOSITORY_OVERVIEW_PROBE_TIMEOUT,
+            read_revisions: Arc::new(super::read_revisions::ReadRevisionRegistry::new()),
             read_files_deadline: super::read_files::DEFAULT_READ_FILES_DEADLINE,
             search_project_texts_deadline:
                 super::search_project_texts::DEFAULT_SEARCH_PROJECT_TEXTS_DEADLINE,

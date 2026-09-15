@@ -74,7 +74,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolSemanticContract { effect: super::ToolEffect::Observe, risk: Read, approval: super::ToolApprovalPolicy::None, idempotency: super::ToolIdempotency::PureRead },
                 Some(COMMUNICATION_READ), false, NoPath, false, false, super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Read one exact caller-owned AgentWait with bounded source and matching fact references. The result contains no source Task instruction/result/reason/log/fence/token and grants no Task, Project, Goal, Session, or execution authority; re-read source domains independently.",
+            "Read one exact caller-owned AgentWait: wait_id, state, and matching Task/Attempt identities with terminal states when present. The result contains no source Task instruction/result/reason/log/fence/token and grants no Task, Project, Goal, Session, or execution authority; re-read source domains independently.",
             read_agent_wait_input_schema,
         ),
         COMMUNICATION_READ_SCOPES,

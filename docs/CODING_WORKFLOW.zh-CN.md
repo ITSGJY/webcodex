@@ -56,11 +56,11 @@ Bootstrap 只读取固定的几个指令入口，不会扫描所有子目录规�
 
 ## 编辑
 
-模型生成的普通编辑，在 `read_files` 已经拿到当前文件内容和 SHA 时，canonical/default 路径是 `apply_text_edits`。现有文件把读取结果中的 SHA 作为 `expected_sha256`；exact selector 默认要求唯一，需要显式消歧时再使用 `line_scope`/`occurrence`。即使一次修改很多行，默认路径仍然不变；“改动行数多”本身不是选择 `apply_patch` 的理由。只有当 contextual patch 明显更自然、large/multi-hunk rewrite 用 guarded exact edit 表达明显笨重，或 patch-style context 本身更清楚地表达修改关系时，才使用 `apply_patch`。对于 repetitive code，每个 patch chunk 都必须带稳定且唯一的 surrounding context，优先使用 containing function / impl / type / test / module；不要只拿重复出现的单行或短片段作为 mutation anchor。默认 `matching_mode=unique` 仍要求唯一 mutation target。只有明确需要 stale-context/concurrency fence 时才使用 `matching_mode=exact_unique`。输入本身已经是标准 unified diff 时才使用 `apply_unified_diff`。
+模型生成的普通编辑，在 `read_files` 读取当前源码后，canonical/default 路径是 `apply_text_edits`。`read_revision` 是模型侧的 snapshot handle；需要 whole-file stale-context fence 时，把它作为 `expected_read_revision`。全局唯一的 exact local edit 可以不带 revision；使用位置型 `line_scope`/`occurrence`、delete 或 rename 时必须携带。ToolRuntime 会在内部把 revision 解析成 Runner 的精确 SHA guard，模型不需要复制 digest。即使一次修改很多行，默认路径仍然不变；“改动行数多”本身不是选择 `apply_patch` 的理由。只有当 contextual patch 明显更自然、large/multi-hunk rewrite 用 guarded exact edit 表达明显笨重，或 patch-style context 本身更清楚地表达修改关系时，才使用 `apply_patch`。对于 repetitive code，每个 patch chunk 都必须带稳定且唯一的 surrounding context，优先使用 containing function / impl / type / test / module；不要只拿重复出现的单行或短片段作为 mutation anchor。保持请求原有的 matching guard，不要削弱明确的 stale-context/concurrency fence。输入本身已经是标准 unified diff 时才使用 `apply_unified_diff`。
 
 Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重新读取当前源码，并基于最新状态重新生成原本的编辑。
 
-遇到 `matching_mode_rejected` 时，保持 matching guard，不要切换到 `first_match`。先重新读取当前源码；如果已经有 current source + SHA，而且原本修改很容易表达成 exact edit，优先转为 `apply_text_edits`。如果 patch 形式仍明显更合适，则消费返回的有界 `recovery.action=read_files` / `recovery.items`，并保留原请求的 patch guard：原来是 `matching_mode=unique` 时，补充稳定且唯一的上下文后仍以 `unique` 重试；原来是 `exact_unique` 时，基于 exact current source 重新生成并继续使用 `exact_unique`。不要降级明确的 stale-context/concurrency fence。
+遇到 `matching_mode_rejected` 时，保持 matching guard，不要切换到 `first_match`。先重新读取当前源码；如果原本修改很容易表达成 exact edit，优先转为 `apply_text_edits`，需要位置型或更强的 whole-file fence 时使用当前 `read_revision`。如果 patch 形式仍明显更合适，则消费返回的有界、parser-ready `read_files` recovery call，并保留原请求的 patch guard。不要降级明确的 stale-context/concurrency fence。
 
 对于确定性的 `context_mismatch`，同样消费有界 `read_files` recovery，并基于 current source 重新生成 patch；不要盲目重复相同 patch。若结果是 `outcome_unknown`，先检查 workspace，再决定是否允许任何写入重试。
 

@@ -748,6 +748,8 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },

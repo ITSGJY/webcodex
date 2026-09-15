@@ -138,6 +138,7 @@ export interface RenderProjectSelectorOptions {
   onSelectProject: (clientId: string, projectId: string) => void;
   windowPanel?: HTMLElement | null;
   selectedProjectWindowActiveCount?: number;
+  selectedProjectWindowCount?: number;
 }
 
 export function renderProjectSelectorTree(
@@ -273,6 +274,9 @@ export function renderProjectSelectorTree(
             ? String(project.sessions.returned_sessions || 0) + " / " + String(project.sessions.retained_sessions || 0) + " 个会话"
             : String(project.sessions.returned_sessions || 0) + " / " + String(project.sessions.retained_sessions || 0) + " Sessions"
           : countLabel(project.sessions.retained_sessions, "Session"));
+        if (project.id === options.selectedProject && typeof options.selectedProjectWindowCount === "number") {
+          metaParts.push(countLabel(options.selectedProjectWindowCount, "Window"));
+        }
         if (typeof project.sessions.latest_updated_at === "number") {
           metaParts.push((options.language === "zh-CN" ? "更新于 " : "updated ") + updatedLabel(project.sessions.latest_updated_at));
         }
@@ -291,28 +295,28 @@ export function renderProjectSelectorTree(
       workspace.appendChild(row);
       deviceProjectList.appendChild(workspace);
       if (project.id === options.selectedProject) {
-        if (options.windowPanel) {
-          options.windowPanel.hidden = false;
-          workspace.appendChild(options.windowPanel);
-          windowsAttached = true;
-        }
         if (sessionsPanel) {
           sessionsPanel.hidden = false;
           workspace.appendChild(sessionsPanel);
           sessionsAttached = true;
+        }
+        if (options.windowPanel) {
+          options.windowPanel.hidden = false;
+          workspace.appendChild(options.windowPanel);
+          windowsAttached = true;
         }
       }
     }
     group.appendChild(deviceProjectList);
     projectList.appendChild(group);
   }
-  if (options.windowPanel && !windowsAttached) {
-    options.windowPanel.hidden = true;
-    projectList.appendChild(options.windowPanel);
-  }
   if (sessionsPanel && !sessionsAttached) {
     sessionsPanel.hidden = true;
     projectList.appendChild(sessionsPanel);
+  }
+  if (options.windowPanel && !windowsAttached) {
+    options.windowPanel.hidden = true;
+    projectList.appendChild(options.windowPanel);
   }
 }
 

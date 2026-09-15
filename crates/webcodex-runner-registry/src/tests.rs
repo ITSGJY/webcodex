@@ -297,6 +297,8 @@ mod abandoned_sync;
 mod apply_patch;
 #[path = "tests/apply_text_edit_line_scope.rs"]
 mod apply_text_edit_line_scope;
+#[path = "tests/apply_text_edit_local_guard.rs"]
+mod apply_text_edit_local_guard;
 #[path = "tests/apply_text_edit_occurrence.rs"]
 mod apply_text_edit_occurrence;
 #[path = "tests/artifact_export.rs"]
@@ -335,6 +337,8 @@ mod mcp_gateway;
 mod plugin_gateway;
 #[path = "tests/polling.rs"]
 mod polling;
+#[path = "tests/project_file_read.rs"]
+mod project_file_read;
 #[path = "tests/project_inventory.rs"]
 mod project_inventory;
 #[path = "tests/project_projection.rs"]

@@ -4456,14 +4456,14 @@ impl ToolCall {
                 project,
                 path,
                 overwrite,
-                expected_sha256,
+                expected_read_revision,
                 ..
             } => serde_json::json!({
                 "project": project,
                 "path": path,
                 "content_present": true,
                 "overwrite": overwrite,
-                "expected_sha256_present": expected_sha256.as_ref().is_some_and(|v| !v.is_empty()),
+                "expected_read_revision_present": expected_read_revision.is_some(),
             }),
             Self::SaveProjectArtifact {
                 project,
@@ -4592,7 +4592,7 @@ impl ToolCall {
                     "kinds": kind_list,
                     "paths": changes.iter().map(|change| change.path.as_str()).collect::<Vec<_>>(),
                     "destination_paths": changes.iter().filter_map(|change| change.to_path.as_deref()).collect::<Vec<_>>(),
-                    "expected_sha256_count": changes.iter().filter(|change| change.expected_sha256.is_some()).count(),
+                    "expected_read_revision_count": changes.iter().filter(|change| change.expected_read_revision.is_some()).count(),
                     "dry_run": dry_run,
                 })
             }

@@ -123,6 +123,38 @@ fn search_project_texts_query_schema_declares_bounded_advanced_inputs() {
 }
 
 #[test]
+fn read_files_snapshot_fence_schema_matches_read_revision_contract() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "read_files").input_schema;
+    let fence = &schema["properties"]["items"]["items"]["properties"]["expected_read_revision"];
+    assert_eq!(fence["type"], "integer");
+    assert_eq!(fence["minimum"], 1);
+    assert_eq!(fence["maximum"], 9_007_199_254_740_991_u64);
+    let description = fence["description"].as_str().unwrap_or_default();
+    assert!(description.contains("suggested_call"));
+    assert!(description.contains("should not invent"));
+
+    let request = |revision: Value| {
+        json!({
+            "project": "demo",
+            "items": [{"path": "src/lib.rs", "expected_read_revision": revision}]
+        })
+    };
+    assert!(
+        test_support::validate_schema_instance(&request(json!(3_817_291_045_227_u64)), schema)
+            .is_ok()
+    );
+    for invalid in [
+        json!(0),
+        json!(9_007_199_254_740_992_u64),
+        json!("3817"),
+        Value::Null,
+    ] {
+        assert!(test_support::validate_schema_instance(&request(invalid), schema).is_err());
+    }
+}
+
+#[test]
 fn batch_inspection_result_budget_schema_defers_bounds_to_runtime_clamp() {
     let specs = registered_tool_specs();
     for name in ["read_files", "search_project_texts"] {

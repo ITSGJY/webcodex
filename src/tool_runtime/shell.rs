@@ -27,6 +27,8 @@ pub(crate) struct ProjectCommandOutput {
     pub(crate) exit_code: Option<i32>,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
     pub(crate) duration_ms: u64,
     pub(crate) error: Option<String>,
     pub(crate) execution_state: ShellCommandExecutionState,
@@ -279,6 +281,8 @@ impl ToolRuntime {
                     exit_code,
                     stdout: response.stdout.unwrap_or_default(),
                     stderr,
+                    stdout_truncated: response.stdout_truncated,
+                    stderr_truncated: response.stderr_truncated,
                     duration_ms: response.duration_ms.unwrap_or_default(),
                     execution_state,
                     error: response.error,
@@ -294,6 +298,8 @@ impl ToolRuntime {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: 0,
                     error: Some(
                         if execution_state == ShellCommandExecutionState::NotStarted {
@@ -317,6 +323,8 @@ impl ToolRuntime {
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: wait_timeout.saturating_mul(1_000),
                     error: Some(format!(
                         "timed out waiting {wait_timeout} seconds for agent shell result"
@@ -910,6 +918,8 @@ mod lifecycle_tests {
             exit_code: None,
             stdout: None,
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: None,
             error: Some("Rejected before starting command".to_string()),
             request_dispatched: Some(true),

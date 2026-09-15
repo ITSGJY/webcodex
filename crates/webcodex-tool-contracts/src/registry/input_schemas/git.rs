@@ -156,7 +156,7 @@ pub fn git_diff_hunks_input_schema() -> Value {
         (
             "continuation",
             "string",
-            "Opaque continuation returned by git_diff_hunks. It may identify either a later-record page cursor or the next complete-line fragment of one exact hunk; token type is opaque and scope/fence-bound. Follow the returned parser-ready suggested_call and repeat its exact original effective scope/paging inputs unchanged (base_commit/head_commit for committed mode, cached/worktree mode, paths, max_hunks, max_hunk_lines, and max_page_bytes). Later-record and hunk-fragment continuations remain distinct identities.",
+            "Compact opaque runtime continuation returned by git_diff_hunks. Copy it verbatim only through the returned parser-ready suggested_call; do not interpret it. It may identify either a later-record page cursor or the next complete-line fragment of one exact hunk; token type is opaque and scope/fence-bound. Repeat its exact original effective scope/paging inputs unchanged (base_commit/head_commit for committed mode, cached/worktree mode, paths, max_hunks, max_hunk_lines, and max_page_bytes). Later-record and hunk-fragment continuations remain distinct identities.",
             false,
         ),
     ]));

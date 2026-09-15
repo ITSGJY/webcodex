@@ -15,6 +15,7 @@ pub enum RunnerFeature {
     ArtifactExportStreamingMetadata,
     StructuredFileDelete,
     ApplyTextEditOccurrence,
+    ApplyTextEditLocalGuardWithoutSha,
     ApplyTextEditLineScope,
     ApplyPatch,
     ApplyPatchMatchMetadata,
@@ -78,6 +79,7 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::ArtifactExportStreamingMetadata,
     RunnerFeature::StructuredFileDelete,
     RunnerFeature::ApplyTextEditOccurrence,
+    RunnerFeature::ApplyTextEditLocalGuardWithoutSha,
     RunnerFeature::ApplyTextEditLineScope,
     RunnerFeature::ApplyPatch,
     RunnerFeature::ApplyPatchMatchMetadata,
@@ -161,6 +163,9 @@ impl RunnerFeature {
             }
             Self::StructuredFileDelete => wire::RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE,
             Self::ApplyTextEditOccurrence => wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
+            Self::ApplyTextEditLocalGuardWithoutSha => {
+                wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA
+            }
             Self::ApplyTextEditLineScope => wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
             Self::ApplyPatch => wire::RUNNER_CAPABILITY_APPLY_PATCH,
             Self::ApplyPatchMatchMetadata => wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
@@ -240,6 +245,9 @@ impl RunnerFeature {
             }
             wire::RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE => Self::StructuredFileDelete,
             wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE => Self::ApplyTextEditOccurrence,
+            wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA => {
+                Self::ApplyTextEditLocalGuardWithoutSha
+            }
             wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE => Self::ApplyTextEditLineScope,
             wire::RUNNER_CAPABILITY_APPLY_PATCH => Self::ApplyPatch,
             wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA => Self::ApplyPatchMatchMetadata,
@@ -340,6 +348,7 @@ impl RunnerFeature {
             | Self::StructuredCargoTestExecutionPolicy
             | Self::StructuredCargoTestLib
             | Self::ApplyTextEditLineScope
+            | Self::ApplyTextEditLocalGuardWithoutSha
             | Self::ApplyPatch
             | Self::ApplyPatchMatchMetadata
             | Self::ApplyPatchMatchingMode
@@ -385,6 +394,9 @@ impl RunnerFeature {
             }
             Self::StructuredFileDelete => capabilities.structured_file_delete,
             Self::ApplyTextEditOccurrence => capabilities.apply_text_edit_occurrence,
+            Self::ApplyTextEditLocalGuardWithoutSha => {
+                capabilities.apply_text_edit_local_guard_without_sha
+            }
             Self::ApplyTextEditLineScope => capabilities.apply_text_edit_line_scope,
             Self::ApplyPatch => capabilities.apply_patch,
             Self::ApplyPatchMatchMetadata => capabilities.apply_patch_match_metadata,

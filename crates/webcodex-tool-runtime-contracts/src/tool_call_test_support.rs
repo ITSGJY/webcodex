@@ -88,7 +88,7 @@ fn sample_field_value(field: &str) -> Value {
         "changes" => json!([{
             "kind": "edit",
             "path": "src/lib.rs",
-            "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expected_read_revision": 3817291045227_u64,
             "edits": [{"kind": "replace_exact", "old_text": "a", "new_text": "b"}]
         }]),
         "prompt" => json!("summarize"),

@@ -7,6 +7,41 @@ use crate::auth::AuthContext;
 use crate::db::{AgentWaitEventSelector, NewAgentWait};
 use serde_json::json;
 
+/// Project only after canonical recording. Store, audit and the App-only state
+/// reader keep the complete durable Wait, including revision and target fences.
+pub(super) fn agent_wait_model_projection(result: &mut ToolResult) {
+    if !result.success {
+        return;
+    }
+    let Some(wait) = result
+        .output
+        .get_mut("agent_wait")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    wait.retain(|key, _| matches!(key.as_str(), "wait_id" | "state" | "matches"));
+    if let Some(matches) = wait
+        .get_mut("matches")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if matches.is_empty() {
+            wait.remove("matches");
+        } else {
+            for matched in matches {
+                if let Some(matched) = matched.as_object_mut() {
+                    matched.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "task_id" | "task_attempt_id" | "terminal_task_state"
+                        )
+                    });
+                }
+            }
+        }
+    }
+}
+
 impl ToolRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn wait_for_agent_events(

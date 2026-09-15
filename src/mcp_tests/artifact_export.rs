@@ -101,6 +101,8 @@ async fn complete_mcp_export_request(
             exit_code: Some(0),
             stdout: Some(stdout.to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -192,6 +194,8 @@ async fn complete_mcp_export_metadata_with_max(
                 .to_string(),
             ),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -308,6 +312,8 @@ async fn complete_mcp_export_resource_read(
                 exit_code: Some(0),
                 stdout: Some(stdout),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })

@@ -383,6 +383,8 @@ async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_wai
             exit_code: Some(0),
             stdout: Some("{}".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })

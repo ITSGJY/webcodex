@@ -8,13 +8,12 @@
 //! rendering approval/result/review/validation projections. They live here so
 //! the runtime module reads as orchestration rather than a wall of formatting.
 
-use super::wire_models::{FilesSearchInput, SearchResultMode};
+use super::wire_models::{ConnectorApplyFileChangeInput, FilesSearchInput, SearchResultMode};
 use super::{execution, ConnectorCallOutcome};
 use crate::{ConnectorPermission, ConnectorWindowId};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use webcodex_core::apply_edits_shared::ApplyFileChangeInput;
 use webcodex_store::{
     ConnectorApproval, ConnectorApprovalGate, ConnectorTaskResult, ConnectorTaskSnapshot,
     ConnectorTaskState, ConnectorTaskStoreError, ConnectorWindowBinding,
@@ -579,13 +578,13 @@ pub(super) fn command_action_hash(request_sha256: &str, precondition: &str) -> S
 
 pub(super) fn edit_operation_hash(
     task: &ConnectorTaskSnapshot,
-    changes: &[ApplyFileChangeInput],
+    changes: &[ConnectorApplyFileChangeInput],
     dry_run: bool,
 ) -> String {
     let serialized = serde_json::to_vec(changes).unwrap_or_default();
     let mut hasher = Sha256::new();
     for field in [
-        b"webcodex.edits_apply.v2".as_slice(),
+        b"webcodex.edits_apply.v3".as_slice(),
         task.task_id.as_bytes(),
         task.run_id.as_bytes(),
         &[u8::from(dry_run)],

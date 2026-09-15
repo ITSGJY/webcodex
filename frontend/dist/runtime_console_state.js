@@ -1,5 +1,10 @@
 import { initialWorkflowSessionState, selectWorkflowSession, refreshWorkflowSessionDetail, clearWorkflowSessionSelection, isCurrentWorkflowSessionDetailRequest, adoptWorkflowSessionDetail, } from "./workflow_session_state.js";
 import { emptyCollaborationState, resetCollaborationState, } from "./runtime_collaboration_state.js";
+export function runtimeWindowAvailabilityAfterHttpResponse(status, ok, hasData) {
+    if (status === 403)
+        return "unavailable";
+    return ok && hasData ? "available" : "stale";
+}
 function compareText(left, right) {
     return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -252,18 +257,19 @@ export function runtimeWindowShortKey(value) {
         return key;
     return key.slice(0, 8) + "…" + key.slice(-4);
 }
-export function runtimeWindowActivityLabel(timestampMs, nowMs) {
+export function runtimeWindowActivityLabel(timestampMs, nowMs, language) {
     const value = Number(timestampMs);
-    if (!Number.isFinite(value) || value <= 0)
-        return "No WebCodex activity";
+    if (!Number.isFinite(value) || value <= 0) {
+        return language === "zh-CN" ? "无 WebCodex 活动" : "No WebCodex activity";
+    }
     const elapsed = Math.max(0, nowMs - value);
     if (elapsed < 1000)
-        return "just now";
+        return language === "zh-CN" ? "刚刚" : "just now";
     if (elapsed < 60000)
-        return Math.floor(elapsed / 1000) + "s ago";
+        return language === "zh-CN" ? Math.floor(elapsed / 1000) + " 秒前" : Math.floor(elapsed / 1000) + "s ago";
     if (elapsed < 3600000)
-        return Math.floor(elapsed / 60000) + "m ago";
+        return language === "zh-CN" ? Math.floor(elapsed / 60000) + " 分钟前" : Math.floor(elapsed / 60000) + "m ago";
     if (elapsed < 86400000)
-        return Math.floor(elapsed / 3600000) + "h ago";
-    return Math.floor(elapsed / 86400000) + "d ago";
+        return language === "zh-CN" ? Math.floor(elapsed / 3600000) + " 小时前" : Math.floor(elapsed / 3600000) + "h ago";
+    return language === "zh-CN" ? Math.floor(elapsed / 86400000) + " 天前" : Math.floor(elapsed / 86400000) + "d ago";
 }

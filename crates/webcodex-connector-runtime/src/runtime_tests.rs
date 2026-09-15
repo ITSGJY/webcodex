@@ -11,6 +11,7 @@ const GRANT: &str = "wc_pgrant_1111111111111111";
 #[derive(Default)]
 struct ScriptedHost {
     invokes: AtomicUsize,
+    invoke_requests: Mutex<Vec<ConnectorToolRequest>>,
     registrations: AtomicUsize,
     starts: AtomicUsize,
     stops: AtomicUsize,
@@ -22,9 +23,10 @@ struct ScriptedHost {
 impl ConnectorExecutionHost for ScriptedHost {
     fn invoke_tool(
         &self,
-        _request: ConnectorToolRequest,
+        request: ConnectorToolRequest,
     ) -> ConnectorHostFuture<'_, Result<Value, ConnectorToolFailure>> {
         self.invokes.fetch_add(1, Ordering::SeqCst);
+        self.invoke_requests.lock().unwrap().push(request);
         Box::pin(async move {
             match self.invoke_error.lock().unwrap().take() {
                 Some(error) => Err(error),
@@ -525,6 +527,86 @@ async fn edit_operation_exact_retry_replays_without_second_host_call() {
     assert!(second.ok, "{}", second.body);
     assert_eq!(second.body["data"]["idempotent_replay"], true);
     assert_eq!(fx.host.invokes.load(Ordering::SeqCst), 1);
+    let requests = fx.host.invoke_requests.lock().unwrap();
+    let change = &requests[0].arguments["changes"][0];
+    assert_eq!(change["kind"], "create");
+    assert_eq!(change["path"], "x.txt");
+    assert_eq!(change["content"], "x");
+    for absent in [
+        "to_path",
+        "edits",
+        "expected_read_revision",
+        "expected_sha256",
+    ] {
+        assert!(
+            change.get(absent).is_none(),
+            "unexpected {absent}: {change}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn edits_apply_projects_read_revision_without_runner_sha_fields() {
+    let fx = fixture();
+    let started = start_normal(&fx).await;
+    let task_id = started.body["task_id"].as_str().unwrap();
+    let out = fx
+        .call(
+            "edits_apply",
+            json!({
+                "task_id": task_id,
+                "operation_id": "edit-revision",
+                "changes": [{
+                    "kind": "edit",
+                    "path": "src/lib.rs",
+                    "expected_read_revision": 3817291045227_u64,
+                    "edits": [{
+                        "kind": "replace_exact",
+                        "old_text": "old",
+                        "new_text": "new"
+                    }]
+                }]
+            }),
+        )
+        .await;
+    assert!(out.ok, "{}", out.body);
+    let requests = fx.host.invoke_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tool_name, "apply_text_edits");
+    let change = &requests[0].arguments["changes"][0];
+    assert_eq!(change["expected_read_revision"], 3817291045227_u64);
+    assert!(change.get("expected_sha256").is_none());
+    assert!(change.get("content").is_none());
+    assert!(change.get("to_path").is_none());
+    let edit = &change["edits"][0];
+    assert_eq!(edit["kind"], "replace_exact");
+    assert_eq!(edit["old_text"], "old");
+    assert_eq!(edit["new_text"], "new");
+    assert!(edit.get("anchor_text").is_none());
+}
+
+#[tokio::test]
+async fn edits_apply_rejects_legacy_expected_sha256_before_host_invoke() {
+    let fx = fixture();
+    let started = start_normal(&fx).await;
+    let task_id = started.body["task_id"].as_str().unwrap();
+    let out = fx
+        .call(
+            "edits_apply",
+            json!({
+                "task_id": task_id,
+                "operation_id": "edit-legacy-sha",
+                "changes": [{
+                    "kind": "edit",
+                    "path": "src/lib.rs",
+                    "expected_sha256": "a".repeat(64),
+                    "edits": [{"kind": "replace_exact", "old_text": "old", "new_text": "new"}]
+                }]
+            }),
+        )
+        .await;
+    assert_eq!(out.body["error"]["code"], "invalid_arguments");
+    assert_eq!(fx.host.invokes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

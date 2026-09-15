@@ -38,6 +38,9 @@ fn process_execution_state_schema() -> Value {
 }
 
 fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
+    let mut continuation = observe_job_continuation_schema();
+    continuation["properties"]["arguments"]["properties"]["items"]["items"]["required"] =
+        json!(["job_id", "after_observation_token"]);
     json!([
         {
             "if": {
@@ -48,7 +51,6 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                     {"required": ["command_ok"]},
                     {"required": ["failure_kind"]},
                     {"required": ["tool_failure"]},
-                    {"required": ["promoted_to_job"]},
                     {"required": ["terminal"]},
                     {"required": ["job_id"]},
                     {"required": ["job_status"]},
@@ -71,7 +73,6 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
         {
             "if": {
                 "anyOf": [
-                    {"required": ["promoted_to_job"]},
                     {"required": ["terminal"]},
                     {"required": ["job_id"]},
                     {"required": ["job_status"]},
@@ -82,13 +83,11 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
             },
             "then": {
                 "required": [
-                    "promoted_to_job",
                     "terminal",
                     "job_id",
                     "job_status",
                     "effective_timeout_secs",
                     "sync_wait_secs",
-                    "async_handoff_available",
                     "execution_state",
                     "command_started",
                     "command_completed"
@@ -97,10 +96,10 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
         },
         {
             "if": {
-                "properties": {"promoted_to_job": {"const": true}},
-                "required": ["promoted_to_job"]
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"]
             },
-            "then": {"required": ["activity", "continuation", "continuation_semantics"]}
+            "then": {"required": ["activity", "continuation"]}
         },
         {
             "if": {"required": ["async_handoff_available"]},
@@ -114,7 +113,6 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                         "command_ok": {"const": true}
                     },
                     "required": [
-                        "async_handoff_available",
                         "execution_state",
                         "command_started",
                         "command_completed",
@@ -123,13 +121,11 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 },
                 "else": {
                     "required": [
-                        "promoted_to_job",
                         "terminal",
                         "job_id",
                         "job_status",
                         "effective_timeout_secs",
                         "sync_wait_secs",
-                        "async_handoff_available",
                         "execution_state",
                         "command_started",
                         "command_completed"
@@ -146,7 +142,6 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "properties": {
                     "command_started": {"const": false},
                     "command_completed": {"const": false},
-                    "promoted_to_job": {"const": false},
                     "terminal": {"const": true}
                 },
                 "required": ["command_started", "command_completed"]
@@ -175,7 +170,6 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "properties": {
                     "command_started": {"const": true},
                     "command_completed": {"const": true},
-                    "promoted_to_job": {"const": false},
                     "terminal": {"const": true}
                 },
                 "required": ["command_started", "command_completed"]
@@ -190,7 +184,6 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "properties": {
                     "command_started": {"const": true},
                     "command_completed": {"const": false},
-                    "promoted_to_job": {"const": false},
                     "terminal": {"const": true}
                 },
                 "required": ["command_started", "command_completed"]
@@ -205,13 +198,11 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "properties": {
                     "command_started": {"const": false},
                     "command_completed": {"const": false},
-                    "promoted_to_job": {"const": true},
                     "terminal": {"const": false}
                 },
                 "required": [
                     "command_started",
                     "command_completed",
-                    "promoted_to_job",
                     "terminal"
                 ]
             }
@@ -225,26 +216,25 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "properties": {
                     "command_started": {"const": true},
                     "command_completed": {"const": false},
-                    "promoted_to_job": {"const": true},
                     "terminal": {"const": false}
                 },
                 "required": [
                     "command_started",
                     "command_completed",
-                    "promoted_to_job",
                     "terminal"
                 ]
             }
         },
         {
             "if": {
-                "properties": {"promoted_to_job": {"const": true}},
-                "required": ["promoted_to_job"]
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"]
             },
             "then": {
                 "properties": {
                     "job_id": {"type": "string", "minLength": 1},
                     "job_status": {"type": "string", "minLength": 1},
+                    "continuation": continuation,
                     "observation_token": {"type": "string", "minLength": 1},
                     "terminal": {"const": false},
                     "command_completed": {"const": false},
@@ -256,24 +246,21 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "required": [
                     "job_id",
                     "job_status",
-                    "observation_token",
                     "terminal",
                     "command_completed",
-                    "async_handoff_available"
                 ]
             }
         },
         {
             "if": {
-                "properties": {"promoted_to_job": {"const": false}},
-                "required": ["promoted_to_job"]
+                "properties": {"job_id": {"type": "null"}},
+                "required": ["job_id"]
             },
             "then": {
                 "properties": {
                     "job_id": {"type": "null"},
                     "job_status": {"type": "null"},
                     "continuation": {"enum": []},
-                    "continuation_semantics": {"enum": []},
                     "execution_state": {
                         "enum": ["not_started", "outcome_unknown", "completed", "timed_out"]
                     }
@@ -308,7 +295,7 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             "promoted_to_job",
             schema_type(
                 "boolean",
-                "True only when the same original execution continues as a durable Job. Omitted after ordinary synchronous terminal success; exposed only when the initiating tool selects explicit durable handoff.",
+                "Exceptional handoff receipt only. Normal durable handoff exposes job_id, job_status, terminal and the parser-ready continuation call.",
             ),
         ),
         (
@@ -336,15 +323,7 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             "observation_token",
             nullable_schema(
                 "string",
-                "Current Job observation token when a continuation was exposed.",
-            ),
-        ),
-        (
-            "continuation_semantics",
-            continuation_semantics_schema(
-                ContinuationKind::Observe,
-                ContinuationCarrier::ObservationToken,
-                "A promoted execution continues by observing the exact Job stream; observation_token is a delta cursor, never execution or retry authority.",
+                "Exceptional receipt token; normal handoff carries it only in continuation.arguments.items[0].after_observation_token.",
             ),
         ),
         ("continuation", observe_job_continuation_schema()),
@@ -367,7 +346,7 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             "async_handoff_available",
             schema_type(
                 "boolean",
-                "Whether this Runner can continue the same original execution as a durable Job. Omitted after ordinary synchronous terminal success; exposed only when this tool's durable handoff path is relevant.",
+                "Whether this Runner supports durable handoff, when fallback or exceptional evidence requires it. Omitted when a normal Job handoff already proves availability.",
             ),
         ),
         (
@@ -530,7 +509,7 @@ fn observe_jobs_output_schema() -> Value {
         "properties": {
             "job_id": schema_type("string", "Runtime Job id."),
             "status": schema_type("string", "Canonical current Job status."),
-            "terminal": schema_type("boolean", "Canonical terminal classification; never inferred from batch counts."),
+            "terminal": schema_type("boolean", "Stable terminal/nonterminal abstraction over Job lifecycle variants; never inferred from batch counts."),
             "changed": schema_type("boolean", "Whether lifecycle revision or Server epoch differs from the supplied observation token."),
             "log_delta_status": {
                 "type": "string",
@@ -543,11 +522,6 @@ fn observe_jobs_output_schema() -> Value {
                 "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN,
                 "description": "Opaque authoritative token copied unchanged from the canonical Job observation for the next after_observation_token."
             },
-            "continuation_semantics": continuation_semantics_schema(
-                ContinuationKind::Observe,
-                ContinuationCarrier::ObservationToken,
-                "Compact Job observation retains the same exact Job-bound observation cursor semantics as the canonical result.",
-            ),
             "exit_code": schema_type("integer", "Terminal process exit code when available and meaningful."),
             "command_execution_state": job_command_execution_state_schema(),
             "activity": job_activity_schema(),
@@ -587,7 +561,7 @@ fn observe_jobs_output_schema() -> Value {
         },
         "required": [
             "job_id", "status", "terminal", "changed", "log_delta_status",
-            "observation_token", "continuation_semantics"
+            "observation_token"
         ]
     });
     let mut item = json!({
@@ -758,12 +732,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ("terminal", schema_type("boolean", "False after successful detached Job admission.")),
                 ("effective_timeout_secs", schema_type("integer", "Total detached process runtime budget in seconds.")),
                 ("created_at", schema_type("integer", "Durable Job creation timestamp.")),
-                ("observation_token", nullable_schema("string", "Current Job observation token when available.")),
-                ("continuation_semantics", continuation_semantics_schema(
-                    ContinuationKind::Observe,
-                    ContinuationCarrier::ObservationToken,
-                    "Detached Job follow-up observes the same exact durable Job with its Job-bound observation token; this is not replay authority.",
-                )),
                 ("continuation", observe_job_continuation_schema()),
                 ("last_update_seq", nullable_schema("integer", "Latest agent update sequence when available.")),
                 ("redispatched", schema_type("boolean", "False when bounded replay recovery returns an existing Job.")),
@@ -771,7 +739,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             schema["properties"]["output"]["properties"]["execution_source"]["const"] =
                 json!("run_detached_process");
             require_success_output_field(&mut schema, "continuation");
-            require_success_output_field(&mut schema, "continuation_semantics");
             Some(schema)
         }
         "run_process" => {
@@ -864,13 +831,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 (
                     "execution_state",
                     process_execution_state_schema(),
-                ),
-                (
-                    "execution_success",
-                    schema_type(
-                        "boolean",
-                        "Present only for an explicit public result expectation. True only when the process reached a completed known exit-0 result; independent from outer ToolResult success and from expectation_satisfied.",
-                    ),
                 ),
                 (
                     "expectation_satisfied",
@@ -1151,15 +1111,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "created_at",
                 schema_type("integer", "Job creation timestamp."),
             ),
-            (
-                "observation_token",
-                schema_type("string", "Opaque Job-bound observation token. Return it unchanged as after_observation_token for one bounded wait."),
-            ),
-            ("continuation_semantics", continuation_semantics_schema(
-                ContinuationKind::Observe,
-                ContinuationCarrier::ObservationToken,
-                "run_job returns an immediate asynchronous Job whose next observation uses this Job-bound token; the token is not execution identity or retry authority.",
-            )),
             ("continuation", observe_job_continuation_schema()),
             (
                 "last_update_seq",
@@ -1167,7 +1118,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ]);
             require_success_output_field(&mut schema, "continuation");
-            require_success_output_field(&mut schema, "continuation_semantics");
             Some(schema)
         }
         "list_jobs" => Some(wrapped_output_schema(vec![

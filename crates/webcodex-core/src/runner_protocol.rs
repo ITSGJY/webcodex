@@ -159,6 +159,12 @@ pub const RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE: &str = "structured_file_dele
 /// selector in ApplyTextEditInput. Missing on older Runners is false and is
 /// never inferred from other file capabilities, protocol, build, transport, or OS.
 pub const RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE: &str = "apply_text_edit_occurrence";
+/// The Runner can prove globally unique exact local edit targets against its
+/// current file content without requiring a historical whole-file SHA guard.
+/// Missing on older Runners is false and is never inferred from file_write,
+/// occurrence/line_scope support, protocol generation, build, transport, or OS.
+pub const RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA: &str =
+    "apply_text_edit_local_guard_without_sha";
 /// The Runner understands and enforces ApplyTextEditInput.line_scope as a
 /// 1-based inclusive full-match containment fence. Missing on older Runners is
 /// false and is never inferred from occurrence, protocol generation, file_write,
@@ -428,6 +434,7 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA,
     RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE,
     RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA,
     RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
     RUNNER_CAPABILITY_APPLY_PATCH,
     RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
@@ -524,6 +531,10 @@ pub struct RunnerCapabilities {
     /// Runners is false and is never inferred from another capability.
     #[serde(default, skip_serializing_if = "is_false")]
     pub apply_text_edit_occurrence: bool,
+    /// Globally unique exact local edits may omit expected_sha256. The Runner
+    /// still fences preflight-to-mutation races with the planned source SHA.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub apply_text_edit_local_guard_without_sha: bool,
     /// Correct enforcement of ApplyTextEditInput.line_scope. Missing on older
     /// Runners is false and is never inferred from occurrence or generation.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -924,6 +935,7 @@ impl Default for RunnerCapabilities {
             artifact_export_streaming_metadata: false,
             structured_file_delete: false,
             apply_text_edit_occurrence: false,
+            apply_text_edit_local_guard_without_sha: false,
             apply_text_edit_line_scope: false,
             apply_patch: false,
             apply_patch_match_metadata: false,
@@ -1797,6 +1809,10 @@ pub struct ShellRunResponse {
     pub stdout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stdout_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stderr_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1941,6 +1957,10 @@ pub struct RunnerResultRequest {
     pub stdout: Option<String>,
     #[serde(default)]
     pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stdout_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stderr_truncated: bool,
     #[serde(default)]
     pub duration_ms: Option<u64>,
     #[serde(default)]
@@ -2428,6 +2448,7 @@ mod envelope_tests {
                 artifact_export_streaming_metadata: false,
                 structured_file_delete: false,
                 apply_text_edit_occurrence: false,
+                apply_text_edit_local_guard_without_sha: false,
                 apply_text_edit_line_scope: false,
                 apply_patch: false,
                 apply_patch_match_metadata: false,
@@ -3425,6 +3446,8 @@ mod envelope_tests {
                     exit_code: Some(0),
                     stdout: Some("hi".to_string()),
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(5),
                     error: None,
                 },
@@ -3649,6 +3672,7 @@ mod envelope_tests {
                 "artifact_export_streaming_metadata",
                 "structured_file_delete",
                 "apply_text_edit_occurrence",
+                "apply_text_edit_local_guard_without_sha",
                 "apply_text_edit_line_scope",
                 "apply_patch",
                 "apply_patch_match_metadata",
@@ -3743,6 +3767,40 @@ mod envelope_tests {
     }
 
     #[test]
+    fn runner_result_truncation_evidence_is_additive_and_backward_compatible() {
+        let legacy = r#"{
+            "client_id": "oe",
+            "agent_instance_id": "22222222-2222-2222-2222-222222222222",
+            "request_id": "req-legacy",
+            "exit_code": 0,
+            "stdout": "ok",
+            "stderr": ""
+        }"#;
+        let legacy: RunnerResultRequest = serde_json::from_str(legacy).unwrap();
+        assert!(!legacy.stdout_truncated);
+        assert!(!legacy.stderr_truncated);
+
+        let current = RunnerResultRequest {
+            client_id: "oe".to_string(),
+            runner_instance_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            request_id: "req-current".to_string(),
+            exit_code: Some(0),
+            stdout: Some("tail".to_string()),
+            stderr: Some("tail".to_string()),
+            stdout_truncated: true,
+            stderr_truncated: true,
+            duration_ms: Some(1),
+            error: None,
+        };
+        let encoded = serde_json::to_string(&current).unwrap();
+        assert!(encoded.contains("\"stdout_truncated\":true"));
+        assert!(encoded.contains("\"stderr_truncated\":true"));
+        let decoded: RunnerResultRequest = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.stdout_truncated);
+        assert!(decoded.stderr_truncated);
+    }
+
+    #[test]
     fn poll_result_job_update_round_trip_agent_instance_id() {
         let poll = RunnerPollRequest {
             client_id: "oe".to_string(),
@@ -3762,6 +3820,8 @@ mod envelope_tests {
             exit_code: Some(0),
             stdout: None,
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: None,
             error: None,
         };

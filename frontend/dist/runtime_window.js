@@ -6,8 +6,8 @@ export function windowDateTimeLabel(timestampMs, language) {
         return translate("time unavailable", language);
     return new Date(value).toLocaleString(language === "zh-CN" ? "zh-CN" : "en");
 }
-export function windowAgeLabel(timestampMs, now = Date.now()) {
-    return runtimeWindowActivityLabel(timestampMs, now);
+export function windowAgeLabel(timestampMs, now = Date.now(), language) {
+    return runtimeWindowActivityLabel(timestampMs, now, language);
 }
 export function runtimeProjectClientId(project) {
     const value = String(project || "");
@@ -44,7 +44,7 @@ export function renderWindowActivityRows(node, activities, options = {}) {
         item.appendChild(head);
         const facts = document.createElement("div");
         facts.className = "chips window-activity-facts";
-        appendChipElement(facts, String(activity?.status || "unknown"));
+        appendChipElement(facts, translate(String(activity?.status || "unknown"), language));
         if (activity?.project)
             appendChipElement(facts, String(activity.project));
         if (activity?.activity_presentation) {
@@ -53,31 +53,31 @@ export function renderWindowActivityRows(node, activities, options = {}) {
         if (activity?.activity_kind)
             appendChipElement(facts, String(activity.activity_kind));
         if (activity?.meaningful)
-            appendChipElement(facts, "meaningful", "tone-runtime");
+            appendChipElement(facts, translate("meaningful", language), "tone-runtime");
         if (activity?.recorder_gap_session_id)
-            appendChipElement(facts, "recorder gap", "tone-warn");
+            appendChipElement(facts, translate("recorder gap", language), "tone-warn");
         if (activity?.response_streaming === true) {
-            appendChipElement(facts, "streaming timing unavailable", "tone-warn");
+            appendChipElement(facts, translate("streaming timing unavailable", language), "tone-warn");
         }
         else if (typeof activity?.service_ms === "number") {
-            appendChipElement(facts, "service " + String(activity.service_ms) + " ms");
+            appendChipElement(facts, (language === "zh-CN" ? "服务耗时 " : "service ") + String(activity.service_ms) + " ms");
         }
         else if (activity?.meaningful) {
-            appendChipElement(facts, "service unavailable");
+            appendChipElement(facts, translate("service unavailable", language));
         }
         if (activity?.meaningful) {
             if (typeof activity?.next_call_gap_ms === "number") {
-                appendChipElement(facts, "next gap " + String(activity.next_call_gap_ms) + " ms");
+                appendChipElement(facts, (language === "zh-CN" ? "下次间隔 " : "next gap ") + String(activity.next_call_gap_ms) + " ms");
             }
             else {
-                appendChipElement(facts, "next gap unavailable");
+                appendChipElement(facts, translate("next gap unavailable", language));
             }
             if (typeof activity?.cycle_ms === "number") {
-                appendChipElement(facts, "cycle " + String(activity.cycle_ms) + " ms");
+                appendChipElement(facts, (language === "zh-CN" ? "周期 " : "cycle ") + String(activity.cycle_ms) + " ms");
             }
         }
         if (activity?.window_transition_kind === "overlap") {
-            appendChipElement(facts, "overlap from previous", "tone-warn");
+            appendChipElement(facts, translate("overlap from previous", language), "tone-warn");
         }
         item.appendChild(facts);
         const links = Array.isArray(activity?.workflow_sessions) ? activity.workflow_sessions : [];
@@ -92,7 +92,7 @@ export function renderWindowActivityRows(node, activities, options = {}) {
         if (activity?.recorder_gap_session_id) {
             const gap = document.createElement("div");
             gap.className = "window-gap-note small";
-            gap.textContent = "Recording was not continued for " + String(activity.recorder_gap_session_id) + ".";
+            gap.textContent = (language === "zh-CN" ? "记录未继续于会话 " : "Recording was not continued for ") + String(activity.recorder_gap_session_id) + ".";
             item.appendChild(gap);
         }
         if (activity?.server_trace_id) {
@@ -133,13 +133,13 @@ export function createWindowCard(row, selectedWindowKey, onSelect, now = Date.no
     const call = document.createElement("span");
     call.className = "muted small";
     call.textContent = row?.last_tool_call_at_ms
-        ? (language === "zh-CN" ? "最后调用 " : "Last WebCodex call ") + windowAgeLabel(row.last_tool_call_at_ms, now)
-        : (language === "zh-CN" ? "最后活动 " : "Last WebCodex activity ") + windowAgeLabel(row?.last_seen_at_ms, now);
+        ? (language === "zh-CN" ? "最后调用 " : "Last WebCodex call ") + windowAgeLabel(row.last_tool_call_at_ms, now, language)
+        : (language === "zh-CN" ? "最后活动 " : "Last WebCodex activity ") + windowAgeLabel(row?.last_seen_at_ms, now, language);
     button.appendChild(call);
     const meaningful = document.createElement("span");
     meaningful.className = "muted small";
     meaningful.textContent = row?.last_meaningful_activity_at_ms
-        ? (language === "zh-CN" ? "最后有效工作 " : "Last meaningful work ") + windowAgeLabel(row.last_meaningful_activity_at_ms, now)
+        ? (language === "zh-CN" ? "最后有效工作 " : "Last meaningful work ") + windowAgeLabel(row.last_meaningful_activity_at_ms, now, language)
         : (language === "zh-CN" ? "未记录到有效 WebCodex 工作" : "No meaningful WebCodex work recorded");
     button.appendChild(meaningful);
     const links = document.createElement("span");
@@ -156,10 +156,11 @@ export function renderWindowActiveRequests(activeNode, activeRequests, options =
     while (activeNode.firstChild)
         activeNode.removeChild(activeNode.firstChild);
     const now = options.now ?? Date.now();
+    const language = options.language;
     if (!activeRequests.length) {
         const empty = document.createElement("p");
         empty.className = "muted small";
-        empty.textContent = "No WebCodex request is currently active.";
+        empty.textContent = translate("No WebCodex request is currently active.", language);
         activeNode.appendChild(empty);
         return;
     }
@@ -173,8 +174,8 @@ export function renderWindowActiveRequests(activeNode, activeRequests, options =
         meta.className = "muted small";
         const facts = [
             request?.project,
-            request?.started_at_ms ? "started " + windowAgeLabel(request.started_at_ms, now) : null,
-            typeof request?.elapsed_ms === "number" ? String(request.elapsed_ms) + " ms elapsed" : null,
+            request?.started_at_ms ? (language === "zh-CN" ? "开始于 " : "started ") + windowAgeLabel(request.started_at_ms, now, language) : null,
+            typeof request?.elapsed_ms === "number" ? String(request.elapsed_ms) + (language === "zh-CN" ? " 毫秒已耗时" : " ms elapsed") : null,
         ].filter(Boolean).map(String);
         meta.textContent = facts.join(" · ");
         item.appendChild(meta);
@@ -183,6 +184,7 @@ export function renderWindowActiveRequests(activeNode, activeRequests, options =
             trace.type = "button";
             trace.className = "window-trace-copy";
             trace.textContent = "trace " + String(request.server_trace_id);
+            trace.title = translate("Copy trace id", language);
             if (options.onCopyTrace) {
                 trace.addEventListener("click", () => options.onCopyTrace(String(request.server_trace_id)));
             }
@@ -191,7 +193,7 @@ export function renderWindowActiveRequests(activeNode, activeRequests, options =
         activeNode.appendChild(item);
     }
 }
-export function renderWindowLinkedSessions(sessionsNode, linkedSessions, onOpenSession) {
+export function renderWindowLinkedSessions(sessionsNode, linkedSessions, onOpenSession, language) {
     if (!sessionsNode)
         return;
     while (sessionsNode.firstChild)
@@ -201,7 +203,7 @@ export function renderWindowLinkedSessions(sessionsNode, linkedSessions, onOpenS
         button.type = "button";
         button.className = "window-session-card";
         const title = document.createElement("strong");
-        title.textContent = String(session?.title || session?.workflow_session_id || "Workflow Session");
+        title.textContent = String(session?.title || session?.workflow_session_id || translate("Workflow Session", language));
         const meta = document.createElement("span");
         meta.className = "muted small";
         meta.textContent = [
@@ -218,11 +220,11 @@ export function renderWindowLinkedSessions(sessionsNode, linkedSessions, onOpenS
     if (!sessionsNode.childElementCount) {
         const empty = document.createElement("p");
         empty.className = "muted small";
-        empty.textContent = "No authorized Workflow Session links.";
+        empty.textContent = translate("No authorized Workflow Session links.", language);
         sessionsNode.appendChild(empty);
     }
 }
-export function renderSessionWindowCorrelationLinks(linkedNode, links, onSelectWindow, now = Date.now()) {
+export function renderSessionWindowCorrelationLinks(linkedNode, links, onSelectWindow, now = Date.now(), language) {
     if (!linkedNode)
         return;
     while (linkedNode.firstChild)
@@ -240,8 +242,8 @@ export function renderSessionWindowCorrelationLinks(linkedNode, links, onSelectW
         meta.className = "muted small";
         meta.textContent = [
             link?.source,
-            link?.last_seen_at_ms ? "last WebCodex activity " + windowAgeLabel(link.last_seen_at_ms, now) : null,
-            Number(link?.recorder_gap_count || 0) ? String(link.recorder_gap_count) + " recorder gap" : null,
+            link?.last_seen_at_ms ? (language === "zh-CN" ? "最后活动 " : "last WebCodex activity ") + windowAgeLabel(link.last_seen_at_ms, now, language) : null,
+            Number(link?.recorder_gap_count || 0) ? String(link.recorder_gap_count) + (language === "zh-CN" ? " 个记录断层" : " recorder gap") : null,
         ].filter(Boolean).map(String).join(" · ");
         button.appendChild(title);
         button.appendChild(meta);
@@ -251,7 +253,7 @@ export function renderSessionWindowCorrelationLinks(linkedNode, links, onSelectW
     if (!links.length) {
         const empty = document.createElement("p");
         empty.className = "muted small";
-        empty.textContent = "No linked Window evidence.";
+        empty.textContent = translate("No linked Window evidence.", language);
         linkedNode.appendChild(empty);
     }
 }
@@ -265,25 +267,63 @@ export function formatWindowDetailFields(detail, fallbackKey = "", now = Date.no
         source: String(detail.source || "—"),
         activeCount: String(Number(detail.active_count || 0)),
         lastCall: detail.last_tool_call_at_ms
-            ? windowAgeLabel(detail.last_tool_call_at_ms, now)
-            : "No completed tools/call activity",
+            ? windowAgeLabel(detail.last_tool_call_at_ms, now, language)
+            : translate("No completed tools/call activity", language),
         lastMeaningful: detail.last_meaningful_activity_at_ms
-            ? windowAgeLabel(detail.last_meaningful_activity_at_ms, now)
-            : "No meaningful WebCodex work recorded",
-        activeStatus: Number(detail.active_count || 0) ? "Active request" : "No active request",
+            ? windowAgeLabel(detail.last_meaningful_activity_at_ms, now, language)
+            : translate("No meaningful WebCodex work recorded", language),
+        activeStatus: translate(Number(detail.active_count || 0) ? "Active request" : "No active request", language),
         linkedStatus: localizedCountLabel(Number(detail.sessions_returned || 0), "Session", "Sessions", language) +
-            (detail.sessions_truncated ? " · bounded" : ""),
+            (detail.sessions_truncated ? " · " + translate("bounded", language) : ""),
         activityStatus: localizedCountLabel(Number(detail.activity_returned || 0), "event", "events", language) +
-            (detail.activity_truncated ? " · bounded" : ""),
+            (detail.activity_truncated ? " · " + translate("bounded", language) : ""),
     };
 }
-export function renderWindowCards(node, windowRows, selectedWindowKey, onSelect, now = Date.now()) {
+export function formatWindowEmptyState(availability, visibilityScope = "principal", isProjectScoped = false, language) {
+    if (availability === "unavailable") {
+        return translate("Window activity requires runtime:read.", language);
+    }
+    if (availability === "stale") {
+        return translate("Window activity could not be refreshed.", language);
+    }
+    if (availability === "available") {
+        if (isProjectScoped) {
+            if (visibilityScope === "principal") {
+                return translate("No Window activity is visible for this Project to this credential.", language);
+            }
+            return translate("No Window activity has been observed for this Project.", language);
+        }
+        if (visibilityScope === "principal") {
+            return translate("No Window activity is visible to this credential.", language);
+        }
+        return translate("No Window activity is visible.", language);
+    }
+    return translate("Loading Window activity…", language);
+}
+export function formatWindowListStatusText(availability, count, visibilityScope = "principal", language) {
+    if (availability === "unavailable") {
+        return translate("runtime:read required", language);
+    }
+    if (availability === "stale") {
+        if (count > 0) {
+            const countPart = localizedCountLabel(count, "Window", "Windows", language);
+            const stalePart = translate("refresh failed, showing previous data", language);
+            return countPart + " · " + stalePart;
+        }
+        return translate("Window activity could not be refreshed.", language);
+    }
+    if (count > 0) {
+        return localizedCountLabel(count, "Window", "Windows", language);
+    }
+    return formatWindowEmptyState(availability, visibilityScope, false, language);
+}
+export function renderWindowCards(node, windowRows, selectedWindowKey, onSelect, now = Date.now(), language) {
     if (!node)
         return;
     while (node.firstChild)
         node.removeChild(node.firstChild);
     for (const row of windowRows) {
-        const card = createWindowCard(row, selectedWindowKey, onSelect, now);
+        const card = createWindowCard(row, selectedWindowKey, onSelect, now, language);
         if (card)
             node.appendChild(card);
     }

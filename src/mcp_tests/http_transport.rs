@@ -185,6 +185,8 @@ fn spawn_stateless_observation_agent_executor(
                         exit_code: Some(exit_code),
                         stdout: Some(String::new()),
                         stderr: Some(stderr.to_string()),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })

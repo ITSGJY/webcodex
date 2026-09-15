@@ -43,6 +43,11 @@ export function activityKindLabel(activity: any, language?: RuntimeLanguage): st
   return labels[kind] || kind;
 }
 
+export function durationLabel(durationMs: number): string {
+  if (durationMs < 1000) return durationMs + " ms";
+  return (durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0) + " s";
+}
+
 export function activityFacts(activity: any, includeTiming: boolean, language?: RuntimeLanguage): string[] {
   const facts: string[] = [];
   if (activity && typeof activity.group_count === "number") {
@@ -63,7 +68,15 @@ export function activityFacts(activity: any, includeTiming: boolean, language?: 
       facts.push((language === "zh-CN" ? "执行 " : "execution ") + translate(String(activity.execution_state), language));
     }
   } else if (activity && activity.state) {
-    facts.push(String(activity.state));
+    facts.push(translate(String(activity.state), language));
+  }
+  if (includeTiming && activity && typeof activity.duration_ms === "number") {
+    facts.push(durationLabel(activity.duration_ms));
+  }
+  if (activity && typeof activity.exit_code === "number") {
+    // Label it explicitly as process exit code so that `state = failed` + `exit_code = 0`
+    // is clearly understood as a process exit code and never confused with action success.
+    facts.push((language === "zh-CN" ? "进程退出 " : "process exit ") + activity.exit_code);
   }
   if (activity && activity.job_id) {
     facts.push("job " + String(activity.job_id));

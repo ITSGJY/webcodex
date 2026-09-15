@@ -1,11 +1,9 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, continuation_semantics_schema, nullable_schema, permission_decision_schema,
-    schema_type, search_match_schema, session_hint_schema, suggested_tool_call_schema,
-    wrapped_output_schema,
+    array_schema, nullable_schema, permission_decision_schema, schema_type, search_match_schema,
+    session_hint_schema, suggested_tool_call_schema, wrapped_output_schema,
 };
-use webcodex_core::runtime_contract::{ContinuationCarrier, ContinuationKind};
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
@@ -139,29 +137,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     }
 }
 
-fn search_refinement_continuation_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "description": "Model-facing recovery hint for a single truncated query. Search match order is not a stable cursor, so this requires query refinement rather than offset paging.",
-        "properties": {
-            "kind": {"type": "string", "const": "refine_query"},
-            "safe_cursor": {"type": "boolean", "const": false},
-            "refine_with": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 5,
-                "uniqueItems": true,
-                "items": {
-                    "type": "string",
-                    "enum": ["path", "include_globs", "pattern", "result_mode", "limit"]
-                }
-            }
-        },
-        "required": ["kind", "safe_cursor", "refine_with"]
-    })
-}
-
 fn search_project_texts_output_schema() -> Value {
     let search_success_properties = json!({
         "path": schema_type("string", "Effective project-relative search root; omitted for the default project root in sparse complete matches success."),
@@ -185,8 +160,7 @@ fn search_project_texts_output_schema() -> Value {
                 {"type": "string", "enum": ["limit", "output_bytes", "timeout", "transport"]},
                 {"type": "null"}
             ]
-        },
-        "continuation": search_refinement_continuation_schema()
+        }
     });
     let search_success_full = json!({
         "type": "object",
@@ -382,34 +356,6 @@ fn search_project_texts_output_schema() -> Value {
     })
 }
 
-fn read_range_continuation_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "description": "Actionable positional continuation for unread lines in one file. The cursor is deterministic for the observed file position, but it is not a frozen snapshot: compare the next call's full-file sha256 with source_sha256 before concatenating ranges as one unchanged source.",
-        "properties": {
-            "kind": {"type": "string", "const": "read_range"},
-            "safe_cursor": {"type": "boolean", "const": true},
-            "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-            "snapshot_stable": {"type": "boolean", "const": false},
-            "continuation_semantics": continuation_semantics_schema(
-                ContinuationKind::Page,
-                ContinuationCarrier::Position,
-                "This read continues by positional file range; source_sha256 remains the separate source-consistency fence.",
-            ),
-            "suggested_call": suggested_tool_call_schema(
-                "read_files",
-                suggested_read_files_arguments_schema(),
-                "Parser-ready advisory read_files call for the next positional range. It grants no authority and is not a retry token.",
-            )
-        },
-        "required": [
-            "kind", "safe_cursor", "source_sha256", "snapshot_stable",
-            "continuation_semantics", "suggested_call"
-        ]
-    })
-}
-
 fn suggested_read_files_arguments_schema() -> Value {
     json!({
         "type": "object",
@@ -425,8 +371,14 @@ fn suggested_read_files_arguments_schema() -> Value {
                     "additionalProperties": false,
                     "properties": {
                         "path": schema_type("string", "Original project-relative path."),
-                        "start_line": schema_type("integer", "Original optional line offset, preserved exactly as accepted by read_files input normalization."),
-                        "limit": schema_type("integer", "Original optional line limit, preserved exactly as accepted by read_files input normalization.")
+                        "start_line": schema_type("integer", "Original line offset for unreturned items, or the next unread line for a partial range."),
+                        "limit": schema_type("integer", "Original limit for unreturned items, or the bounded remaining range for a partial item."),
+                        "expected_read_revision": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 9007199254740991_u64,
+                            "description": "Machine-carried snapshot fence: retained only when the original item already supplied one, or bound by Runtime to the observed read_revision for a continued partial range. Copy the enclosing suggested_call as returned; do not retarget this value."
+                        }
                     },
                     "required": ["path"]
                 }
@@ -447,90 +399,28 @@ fn suggested_read_files_arguments_schema() -> Value {
     })
 }
 
-fn read_batch_continuation_schema() -> Value {
-    let suggested_call = suggested_tool_call_schema(
-        "read_files",
-        suggested_read_files_arguments_schema(),
-        "Parser-ready advisory read_files call. Its arguments are domain-bounded and the call itself grants no authority.",
-    );
-    json!({
-        "oneOf": [
-            {
-                "type": "object",
-                "additionalProperties": false,
-                "description": "Safe continuation for original batch items that were not returned. next_index is their original request index; suggested_call already slices the original items, so next_index is not passed as an input cursor.",
-                "properties": {
-                    "kind": {"type": "string", "const": "batch_items"},
-                    "safe_cursor": {"type": "boolean", "const": true},
-                    "next_index": {"type": "integer", "minimum": 0, "maximum": 7},
-                    "recommended_order": {
-                        "type": "string",
-                        "enum": ["next", "after_partial_item"]
-                    },
-                    "continuation_semantics": continuation_semantics_schema(
-                        ContinuationKind::Batch,
-                        ContinuationCarrier::Index,
-                        "next_index identifies the next original batch-item boundary; the suggested_call already slices the remaining items and does not accept next_index as an input cursor.",
-                    ),
-                    "suggested_call": suggested_call.clone()
-                },
-                "required": [
-                    "kind", "safe_cursor", "next_index", "recommended_order",
-                    "continuation_semantics", "suggested_call"
-                ]
-            },
-            {
-                "type": "object",
-                "additionalProperties": false,
-                "description": "Budget refinement used only when the current primary result budget could not return any part of the first remaining item. This is not a cursor; the suggested budget is bounded by the explicit 512 KiB inspection hard cap.",
-                "properties": {
-                    "kind": {"type": "string", "const": "increase_result_budget"},
-                    "safe_cursor": {"type": "boolean", "const": false},
-                    "next_index": {"type": "integer", "const": 0},
-                    "suggested_max_result_bytes": {
-                        "type": "integer",
-                        "const": webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES
-                    },
-                    "continuation_semantics": continuation_semantics_schema(
-                        ContinuationKind::Refine,
-                        ContinuationCarrier::None,
-                        "This is parameter refinement, not a cursor: increase the bounded result budget and retry the read request shape without claiming positional continuity.",
-                    ),
-                    "suggested_call": suggested_call
-                },
-                "required": [
-                    "kind", "safe_cursor", "next_index", "suggested_max_result_bytes",
-                    "continuation_semantics", "suggested_call"
-                ]
-            }
-        ]
-    })
-}
-
 fn read_files_output_schema() -> Value {
     let default_limit = webcodex_core::runtime_contract::FILE_READ_DEFAULT_LIMIT;
     let read_success_properties = json!({
         "text": schema_type("string", "The single primary text representation."),
         "format": {"type": "string", "enum": ["plain", "numbered"]},
         "path": schema_type("string", "Project-relative path; omitted from a sparse complete item when identical to the outer item path."),
-        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "read_revision": {"type": "integer", "minimum": 1, "maximum": 9007199254740991_u64, "description": "Model-facing handle for this exact full-file Project/path/Runner snapshot."},
         "start_line": {"type": "integer", "minimum": 1},
         "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
         "total_lines": {"type": "integer", "minimum": 0},
         "returned_lines": {"type": "integer", "minimum": 0, "maximum": 2000},
         "end_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
         "has_more": {"type": "boolean"},
-        "next_start_line": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}]},
-        "budget_truncated": {"type": "boolean", "const": true},
-        "budget_next_limit": {"type": "integer", "minimum": 1, "maximum": 1999}
+        "budget_truncated": {"type": "boolean", "const": true}
     });
     let read_success_full = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": read_success_properties.clone(),
         "required": [
-            "text", "format", "path", "sha256", "start_line", "limit",
-            "total_lines", "returned_lines", "end_line", "has_more", "next_start_line"
+            "text", "format", "path", "read_revision", "start_line", "limit",
+            "total_lines", "returned_lines", "end_line", "has_more"
         ]
     });
     let mut read_success_sparse_properties = read_success_properties
@@ -544,9 +434,7 @@ fn read_files_output_schema() -> Value {
         "returned_lines",
         "end_line",
         "has_more",
-        "next_start_line",
         "budget_truncated",
-        "budget_next_limit",
     ] {
         read_success_sparse_properties.remove(key);
     }
@@ -571,7 +459,7 @@ fn read_files_output_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": read_success_sparse_properties,
-        "required": ["text", "sha256", "total_lines"],
+        "required": ["text", "read_revision", "total_lines"],
         "description": "Sparse model-facing item form for a provably complete default full-file read. The outer item path is the only navigation identity; inner path and range fields are omitted, and no continuation exists."
     });
     let read_success = json!({
@@ -587,7 +475,8 @@ fn read_files_output_schema() -> Value {
                 "enum": [
                     "invalid_path", "sensitive_path", "not_found", "not_file",
                     "permission_denied", "invalid_utf8", "range_too_large",
-                    "agent_unavailable", "timeout", "malformed_agent_response", "io_error"
+                    "agent_unavailable", "timeout", "malformed_agent_response", "io_error",
+                    "stale_read_revision"
                 ]
             },
             "path": schema_type("string", "Project-relative input path."),
@@ -603,8 +492,7 @@ fn read_files_output_schema() -> Value {
             "path": schema_type("string", "Project-relative input path."),
             "success": {"type": "boolean"},
             "output": {"anyOf": [read_success.clone(), read_failure.clone()]},
-            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "continuation": read_range_continuation_schema()
+            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]}
         },
         "required": ["index", "path", "success", "output", "error"],
         "allOf": [{
@@ -624,15 +512,17 @@ fn read_files_output_schema() -> Value {
             "failed_count": {"type": "integer", "minimum": 0, "maximum": 8},
             "items": {"type": "array", "maxItems": 8, "items": item_schema},
             "output_truncated": {"type": "boolean"},
-            "next_index": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 7}, {"type": "null"}]},
             "truncation_reason": {"type": "string", "enum": ["batch_response_budget", "hard_result_cap"]},
-            "continuation": read_batch_continuation_schema(),
+            "suggested_call": suggested_tool_call_schema(
+                "read_files", suggested_read_files_arguments_schema(),
+                "One parser-ready follow-up: unread returned ranges are fenced to their observed read_revision, followed by unreturned original items. Follow it directly; Runtime rejects a continued item if its file snapshot changed. A zero-progress request may instead raise max_result_bytes; at the hard cap no fake call is offered.",
+            ),
             "session_hint": session_hint_schema(),
             "permission": permission_decision_schema()
         },
         "required": [
             "project", "requested_count", "returned_count", "succeeded_count",
-            "failed_count", "items", "output_truncated", "next_index"
+            "failed_count", "items", "output_truncated"
         ]
     });
     let sparse_complete_item = json!({

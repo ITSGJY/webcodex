@@ -243,11 +243,11 @@ impl ModelErgonomicsCompletion {
         let mut record = self.record_from_parts(false, &Value::Null, None);
         record.error_kind = Some(error_kind.to_string());
         // The MCP outer hard timeout fires after dispatch and explicitly leaves
-        // terminal tool state unknown. A canonical edit therefore cannot be
+        // terminal tool state unknown. A structured/patch edit therefore cannot be
         // projected as a definite rejection merely because no ToolResult was
         // available to classify.
         if error_kind == "dispatch_hard_timeout"
-            && record.edit_surface.as_deref() == Some("canonical")
+            && record.edit_surface.as_deref() == Some("structured_or_patch")
         {
             record.edit_outcome = Some("uncertain".to_string());
         }
@@ -376,7 +376,7 @@ fn edit_facts(tool_name: &str, success: bool, output: &Value) -> EditFacts {
         conflict_kind: None,
     };
     match edit_tool_surface(tool_name) {
-        Some(EditToolSurface::Canonical)
+        Some(EditToolSurface::StructuredOrPatch)
             if matches!(tool_name, "apply_text_edits" | "apply_patch") =>
         {
             facts.conflict_kind = edit_conflict_kind(output);
@@ -405,7 +405,7 @@ fn edit_facts(tool_name: &str, success: bool, output: &Value) -> EditFacts {
                 Some("rejected".to_string())
             };
         }
-        Some(EditToolSurface::Canonical) if tool_name == "apply_unified_diff" => {
+        Some(EditToolSurface::StructuredOrPatch) if tool_name == "apply_unified_diff" => {
             let error_kind = output.get("error_kind").and_then(Value::as_str);
             facts.outcome = match (
                 output.get("applied").and_then(Value::as_bool),
@@ -436,16 +436,15 @@ fn edit_facts(tool_name: &str, success: bool, output: &Value) -> EditFacts {
 }
 
 fn edit_conflict_kind(output: &Value) -> Option<String> {
-    let value = output
-        .pointer("/conflict_recovery/conflict_kind")
-        .and_then(Value::as_str)?;
+    let value = output.get("error_kind").and_then(Value::as_str)?;
     matches!(
         value,
         "multiple_matches"
             | "match_not_found"
             | "occurrence_out_of_range"
+            | "occurrence_outside_line_scope"
             | "overlapping_edits"
-            | "sha256_mismatch"
+            | "stale_file_revision"
     )
     .then(|| value.to_string())
 }
@@ -872,14 +871,14 @@ mod tests {
     }
 
     #[test]
-    fn canonical_edit_pre_result_hard_timeout_is_uncertain_not_rejected() {
+    fn structured_or_patch_edit_pre_result_hard_timeout_is_uncertain_not_rejected() {
         for tool in ["apply_text_edits", "apply_patch", "apply_unified_diff"] {
             let record = completion(tool, 0).record_for_pre_result_failure("dispatch_hard_timeout");
             assert!(!record.success);
             assert_eq!(record.error_kind.as_deref(), Some("dispatch_hard_timeout"));
             assert_eq!(record.outcome_class(), "unknown");
             assert_eq!(record.serialized_result_bytes, None);
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), Some("uncertain"));
             assert_eq!(record.edit_conflict_kind, None);
         }
@@ -891,7 +890,7 @@ mod tests {
             assert_eq!(record.error_kind.as_deref(), Some(error_kind));
             assert_eq!(record.outcome_class(), "failure");
             assert_eq!(record.serialized_result_bytes, None);
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), Some("rejected"));
             assert_eq!(record.edit_conflict_kind, None);
         }
@@ -926,19 +925,19 @@ mod tests {
             ),
             (
                 false,
-                json!({"conflict_recovery": {"conflict_kind": "multiple_matches"}}),
+                json!({"error_kind": "multiple_matches"}),
                 Some("conflict"),
                 Some("multiple_matches"),
             ),
             (
                 false,
-                json!({"conflict_recovery": {"conflict_kind": "sha256_mismatch"}}),
+                json!({"error_kind": "stale_file_revision"}),
                 Some("conflict"),
-                Some("sha256_mismatch"),
+                Some("stale_file_revision"),
             ),
             (
                 false,
-                json!({"rollback_complete": false, "changed": true, "conflict_recovery": {"conflict_kind": "multiple_matches"}}),
+                json!({"rollback_complete": false, "changed": true, "error_kind": "multiple_matches"}),
                 Some("uncertain"),
                 Some("multiple_matches"),
             ),
@@ -953,7 +952,7 @@ mod tests {
                 .record_for_tool_result(&result)
                 .unwrap();
             assert_eq!(record.schema_version, 5);
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), outcome);
             assert_eq!(record.edit_conflict_kind.as_deref(), conflict_kind);
         }
@@ -1004,7 +1003,7 @@ mod tests {
             let record = completion("apply_unified_diff", 0)
                 .record_for_tool_result(&result)
                 .unwrap();
-            assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+            assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), outcome);
             assert_eq!(record.edit_conflict_kind, None);
         }
@@ -1026,7 +1025,7 @@ mod tests {
         let record = completion("apply_text_edits", 0)
             .record_for_tool_result(&result)
             .unwrap();
-        assert_eq!(record.edit_surface.as_deref(), Some("canonical"));
+        assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
         assert_eq!(record.edit_outcome.as_deref(), Some("rejected"));
         assert_eq!(record.edit_conflict_kind, None);
         let serialized = serde_json::to_string(&record).unwrap();
@@ -1045,7 +1044,7 @@ mod tests {
             let record = completion(tool, 0)
                 .record_for_tool_result(&ToolResult::ok(json!({"changed": true})))
                 .unwrap();
-            assert_eq!(record.edit_surface.as_deref(), Some("advanced"));
+            assert_eq!(record.edit_surface.as_deref(), Some("whole_file"));
             assert_eq!(record.edit_outcome, None);
             assert_eq!(record.edit_conflict_kind, None);
         }

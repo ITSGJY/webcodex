@@ -61,6 +61,7 @@ pub(crate) use project_resolution::ResolvedProject;
 mod project_tools;
 mod projects;
 mod read_files;
+mod read_revisions;
 mod registry;
 mod runtime;
 mod runtime_info;

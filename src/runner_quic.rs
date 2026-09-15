@@ -571,6 +571,7 @@ mod tests {
             structured_file_delete: true,
             apply_text_edit_occurrence: false,
             apply_text_edit_line_scope: false,
+            apply_text_edit_local_guard_without_sha: false,
             apply_patch: false,
             apply_patch_match_metadata: false,
             apply_patch_matching_mode: false,
@@ -1032,6 +1033,8 @@ mod tests {
                     exit_code: Some(0),
                     stdout: Some("hi\n".to_string()),
                     stderr: Some(String::new()),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(2),
                     error: None,
                 }

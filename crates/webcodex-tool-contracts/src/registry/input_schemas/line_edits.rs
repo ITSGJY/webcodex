@@ -6,7 +6,7 @@ fn line_scope_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Optional 1-based inclusive source-line safety fence against original batch content. The complete exact match or anchor must be contained. occurrence remains the global source-order exact occurrence and is never renumbered within the scope.",
+        "description": "Optional 1-based inclusive positional fence against the guarded source snapshot. The complete exact match or anchor must be contained. occurrence remains global source-order and is never renumbered within the scope. Because line_scope can disambiguate equal global candidates, using it requires expected_read_revision on the containing file change.",
         "properties": {
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1}
@@ -35,7 +35,7 @@ fn apply_text_edit_schema() -> Value {
                     "occurrence": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional 1-based global source-order exact occurrence selector. line_scope never renumbers occurrence; expected_sha256 remains authoritative."
+                        "description": "Optional 1-based global source-order exact occurrence selector. Positional selection requires expected_read_revision on the containing file change; line_scope never renumbers occurrence."
                     },
                     "line_scope": line_scope_schema()
                 },
@@ -54,7 +54,7 @@ fn apply_text_edit_schema() -> Value {
                     "occurrence": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional 1-based global source-order exact occurrence selector. line_scope never renumbers occurrence; expected_sha256 remains authoritative."
+                        "description": "Optional 1-based global source-order exact occurrence selector. Positional selection requires expected_read_revision on the containing file change; line_scope never renumbers occurrence."
                     },
                     "line_scope": line_scope_schema()
                 },
@@ -77,7 +77,7 @@ fn apply_text_edit_schema() -> Value {
                     "occurrence": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional 1-based global source-order exact occurrence selector. line_scope never renumbers occurrence; expected_sha256 remains authoritative."
+                        "description": "Optional 1-based global source-order exact occurrence selector. Positional selection requires expected_read_revision on the containing file change; line_scope never renumbers occurrence."
                     },
                     "line_scope": line_scope_schema()
                 },
@@ -100,7 +100,7 @@ fn apply_text_edit_schema() -> Value {
                     "occurrence": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional 1-based global source-order exact occurrence selector. line_scope never renumbers occurrence; expected_sha256 remains authoritative."
+                        "description": "Optional 1-based global source-order exact occurrence selector. Positional selection requires expected_read_revision on the containing file change; line_scope never renumbers occurrence."
                     },
                     "line_scope": line_scope_schema()
                 },
@@ -110,11 +110,27 @@ fn apply_text_edit_schema() -> Value {
     })
 }
 
-fn existing_file_sha256_schema() -> Value {
+fn apply_text_edit_schema_without_positional_selectors() -> Value {
+    let mut schema = apply_text_edit_schema();
+    for variant in schema["oneOf"]
+        .as_array_mut()
+        .expect("apply_text_edit_schema oneOf")
+    {
+        let properties = variant["properties"]
+            .as_object_mut()
+            .expect("exact edit properties");
+        properties.remove("occurrence");
+        properties.remove("line_scope");
+    }
+    schema
+}
+
+fn read_revision_schema(description: &str) -> Value {
     json!({
-        "type": "string",
-        "pattern": "^[a-f0-9]{64}$",
-        "description": "Required current-file sha256 for this existing-file change."
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 9007199254740991_u64,
+        "description": description
     })
 }
 
@@ -135,7 +151,7 @@ fn apply_file_change_schema() -> Value {
                 "properties": {
                     "kind": {"type": "string", "enum": ["edit"]},
                     "path": project_path_schema("Project-relative existing file to edit."),
-                    "expected_sha256": existing_file_sha256_schema(),
+                    "expected_read_revision": read_revision_schema("Optional full-file snapshot guard from read_files. Globally unique exact local edits may omit it; occurrence or line_scope requires it."),
                     "edits": {
                         "type": "array",
                         "minItems": 1,
@@ -144,7 +160,21 @@ fn apply_file_change_schema() -> Value {
                         "items": apply_text_edit_schema()
                     }
                 },
-                "required": ["kind", "path", "expected_sha256", "edits"]
+                "required": ["kind", "path", "edits"],
+                "allOf": [{
+                    "oneOf": [
+                        {"required": ["expected_read_revision"]},
+                        {
+                            "not": {"required": ["expected_read_revision"]},
+                            "properties": {
+                                "edits": {
+                                    "type": "array",
+                                    "items": apply_text_edit_schema_without_positional_selectors()
+                                }
+                            }
+                        }
+                    ]
+                }]
             },
             {
                 "type": "object",
@@ -165,9 +195,9 @@ fn apply_file_change_schema() -> Value {
                 "properties": {
                     "kind": {"type": "string", "enum": ["delete"]},
                     "path": project_path_schema("Project-relative existing file to delete."),
-                    "expected_sha256": existing_file_sha256_schema()
+                    "expected_read_revision": read_revision_schema("Required full-file snapshot guard from read_files for deletion.")
                 },
-                "required": ["kind", "path", "expected_sha256"]
+                "required": ["kind", "path", "expected_read_revision"]
             },
             {
                 "type": "object",
@@ -176,9 +206,9 @@ fn apply_file_change_schema() -> Value {
                     "kind": {"type": "string", "enum": ["rename"]},
                     "path": project_path_schema("Project-relative existing source file."),
                     "to_path": project_path_schema("Project-relative destination path; must differ from path."),
-                    "expected_sha256": existing_file_sha256_schema()
+                    "expected_read_revision": read_revision_schema("Required full-file snapshot guard from read_files for rename.")
                 },
-                "required": ["kind", "path", "to_path", "expected_sha256"]
+                "required": ["kind", "path", "to_path", "expected_read_revision"]
             }
         ]
     })

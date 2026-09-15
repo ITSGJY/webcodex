@@ -4,7 +4,7 @@ use crate::tool_runtime::git::{
 };
 use crate::tool_runtime::helpers::run_command_sync;
 use crate::tool_runtime::{
-    ApplyFileChangeInput, ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind,
+    ApplyFileChangeInput, ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, ToolRuntime,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -161,7 +161,7 @@ pub(in crate::tool_runtime::tests) fn text_edit(
 
 pub(in crate::tool_runtime::tests) fn edit_change(
     path: &str,
-    expected_sha256: &str,
+    _historical_sha256: &str,
     edits: Vec<ApplyTextEditInput>,
 ) -> ApplyFileChangeInput {
     ApplyFileChangeInput {
@@ -170,6 +170,31 @@ pub(in crate::tool_runtime::tests) fn edit_change(
         to_path: None,
         content: None,
         edits,
-        expected_sha256: Some(expected_sha256.to_string()),
+        expected_read_revision: None,
     }
+}
+
+pub(in crate::tool_runtime::tests) async fn seed_read_revision(
+    runtime: &ToolRuntime,
+    project: &str,
+    path: &str,
+    sha256: &str,
+) -> u64 {
+    let resolved = runtime.resolve_project_input(project).await.unwrap();
+    let runner = runtime
+        .runner_registry
+        .get_runner_view(&resolved.config.client_id)
+        .await
+        .expect("owning Runner");
+    runtime.read_revisions.observe(
+        super::super::super::read_revisions::ReadRevisionTarget {
+            project_id: resolved.resolved_id,
+            path: path.to_string(),
+            client_id: resolved.config.client_id,
+            runner_instance_id: runner.runner_instance_id,
+            project_root: resolved.config.path,
+            root_fingerprint: resolved.root_fingerprint,
+        },
+        sha256.to_string(),
+    )
 }

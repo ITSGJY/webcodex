@@ -10,6 +10,18 @@ import {
   emptyCollaborationState,
   resetCollaborationState,
 } from "./runtime_collaboration_state.js";
+import type { RuntimeLanguage } from "./runtime_i18n.js";
+
+export type RuntimeWindowAvailability = "idle" | "loading" | "available" | "stale" | "unavailable";
+
+export function runtimeWindowAvailabilityAfterHttpResponse(
+  status: number,
+  ok: boolean,
+  hasData: boolean,
+): RuntimeWindowAvailability {
+  if (status === 403) return "unavailable";
+  return ok && hasData ? "available" : "stale";
+}
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -296,13 +308,19 @@ export function runtimeWindowShortKey(value: unknown): string {
   return key.slice(0, 8) + "…" + key.slice(-4);
 }
 
-export function runtimeWindowActivityLabel(timestampMs: unknown, nowMs: number): string {
+export function runtimeWindowActivityLabel(
+  timestampMs: unknown,
+  nowMs: number,
+  language?: RuntimeLanguage,
+): string {
   const value = Number(timestampMs);
-  if (!Number.isFinite(value) || value <= 0) return "No WebCodex activity";
+  if (!Number.isFinite(value) || value <= 0) {
+    return language === "zh-CN" ? "无 WebCodex 活动" : "No WebCodex activity";
+  }
   const elapsed = Math.max(0, nowMs - value);
-  if (elapsed < 1000) return "just now";
-  if (elapsed < 60_000) return Math.floor(elapsed / 1000) + "s ago";
-  if (elapsed < 3_600_000) return Math.floor(elapsed / 60_000) + "m ago";
-  if (elapsed < 86_400_000) return Math.floor(elapsed / 3_600_000) + "h ago";
-  return Math.floor(elapsed / 86_400_000) + "d ago";
+  if (elapsed < 1000) return language === "zh-CN" ? "刚刚" : "just now";
+  if (elapsed < 60_000) return language === "zh-CN" ? Math.floor(elapsed / 1000) + " 秒前" : Math.floor(elapsed / 1000) + "s ago";
+  if (elapsed < 3_600_000) return language === "zh-CN" ? Math.floor(elapsed / 60_000) + " 分钟前" : Math.floor(elapsed / 60_000) + "m ago";
+  if (elapsed < 86_400_000) return language === "zh-CN" ? Math.floor(elapsed / 3_600_000) + " 小时前" : Math.floor(elapsed / 3_600_000) + "h ago";
+  return language === "zh-CN" ? Math.floor(elapsed / 86_400_000) + " 天前" : Math.floor(elapsed / 86_400_000) + "d ago";
 }

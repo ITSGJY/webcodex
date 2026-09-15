@@ -222,6 +222,9 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Exact occurrence selectors are a running-binary capability; the
             // running Runner advertises the canonical registration baseline.
             apply_text_edit_occurrence: false,
+            // SHA-less local exact edit proof is implemented by the running
+            // binary and must never be inferred from generated static config.
+            apply_text_edit_local_guard_without_sha: false,
             // Scoped exact matching is likewise runtime-only and must not be
             // inferred from generated config or occurrence support.
             apply_text_edit_line_scope: false,

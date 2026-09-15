@@ -85,10 +85,17 @@ pub(in crate::tool_runtime::tests) fn assert_observe_job_continuation(output: &V
     let hint = &output["continuation"];
     assert_eq!(hint["tool"], "observe_jobs");
     assert_eq!(hint["arguments"]["items"][0]["job_id"], output["job_id"]);
-    assert_eq!(
-        hint["arguments"]["items"][0]["after_observation_token"],
-        output["observation_token"]
-    );
+    if let Some(token) = output.get("observation_token") {
+        assert_eq!(
+            hint["arguments"]["items"][0]["after_observation_token"],
+            *token
+        );
+    } else {
+        assert!(hint["arguments"]["items"][0]["after_observation_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()));
+        assert!(output.get("continuation_semantics").is_none());
+    }
     let call = ToolCall::from_tool_name(hint["tool"].as_str().unwrap(), hint["arguments"].clone())
         .expect("Job continuation must be parser-ready");
     assert!(matches!(

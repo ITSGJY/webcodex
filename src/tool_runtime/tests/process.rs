@@ -209,6 +209,8 @@ async fn complete_process_lifecycle(
                 exit_code,
                 stdout: Some(stdout.to_string()),
                 stderr: Some(stderr.to_string()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(7),
                 error: error.map(str::to_string),
             },
@@ -336,12 +338,7 @@ async fn run_process_projects_explicit_expectation_truth_without_changing_execut
         .await;
         let result = task.await.unwrap();
         assert_eq!(result.success, expected_success, "{label}");
-        assert_eq!(
-            result.output["execution_success"],
-            exit_code == 0,
-            "{label}: {}",
-            result.output
-        );
+        assert!(result.output.get("execution_success").is_none(), "{label}");
         assert_eq!(
             result.output["expectation_satisfied"], expected_satisfied,
             "{label}: {}",
@@ -356,6 +353,8 @@ async fn run_process_projects_explicit_expectation_truth_without_changing_execut
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
             .unwrap_or_else(|error| panic!("{label} immediate result schema mismatch: {error}"));
         if exit_code != 0 {
+            assert_eq!(result.output["execution_state"], "completed", "{label}");
+            assert_eq!(result.output["exit_code"], exit_code, "{label}");
             assert_eq!(result.output["command_ok"], false, "{label}");
             assert_eq!(
                 result.output["failure_kind"], "command_exit_nonzero",
@@ -429,7 +428,16 @@ async fn run_process_expectation_projection_fails_closed_for_unknown_and_timeout
         .await;
         let result = task.await.unwrap();
         assert!(!result.success, "{label}");
-        assert_eq!(result.output["execution_success"], false, "{label}");
+        assert!(result.output.get("execution_success").is_none(), "{label}");
+        assert_eq!(
+            result.output["execution_state"],
+            if label == "timeout" {
+                "timed_out"
+            } else {
+                "outcome_unknown"
+            },
+            "{label}"
+        );
         assert_eq!(result.output["expectation_satisfied"], false, "{label}");
     }
 }
@@ -1393,7 +1401,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
     let handoff = task.await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert!(handoff.output.get("promoted_to_job").is_none());
     assert_eq!(handoff.output["terminal"], false);
     assert_eq!(handoff.output["execution_state"], "running");
     assert_eq!(handoff.output["command_started"], true);
@@ -1598,7 +1606,7 @@ async fn stop_job_stops_the_promoted_process_without_starting_a_replacement() {
     .await;
     let handoff = task.await.unwrap();
     let job_id = handoff.output["job_id"].as_str().unwrap().to_string();
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert!(handoff.output.get("promoted_to_job").is_none());
 
     let stopped = runtime
         .dispatch_with_auth(

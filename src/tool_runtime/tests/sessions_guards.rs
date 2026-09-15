@@ -44,6 +44,7 @@ async fn unknown_session_id_fails_before_execution_or_mutation() {
                 path: "README.md".to_string(),
                 start_line: None,
                 limit: None,
+                expected_read_revision: None,
             }],
             session_id: Some("wc_sess_missing".to_string()),
             with_line_numbers: None,
@@ -67,7 +68,7 @@ async fn unknown_session_id_fails_before_execution_or_mutation() {
             content: "nope".to_string(),
             session_id: Some("wc_sess_missing".to_string()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         })
         .await;
     assert!(!write.success);
@@ -103,6 +104,7 @@ async fn same_project_session_records_without_project_mismatch_warning() {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: Some(session_id),
                         with_line_numbers: None,
@@ -155,6 +157,7 @@ async fn read_only_cross_project_session_is_blocked_before_execution() {
                     path: "README.md".to_string(),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 }],
                 session_id: Some(session.session_id.clone()),
                 with_line_numbers: None,
@@ -198,7 +201,7 @@ async fn mutation_cross_project_session_fails_before_write() {
                 content: "nope\n".to_string(),
                 session_id: Some(session.session_id.clone()),
                 overwrite: None,
-                expected_sha256: None,
+                expected_read_revision: None,
             },
             Some(&auth),
         )
@@ -511,6 +514,7 @@ async fn read_only_session_allows_read_files_and_records_success() {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: Some(session_id),
                         with_line_numbers: None,
@@ -597,7 +601,7 @@ async fn read_only_session_rejects_write_project_file_before_mutation() {
             content: "nope".to_string(),
             session_id: Some(session.session_id.clone()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         })
         .await;
 
@@ -863,7 +867,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
                 content: "x".to_string(),
                 session_id: Some(session.session_id.clone()),
                 overwrite: None,
-                expected_sha256: None,
+                expected_read_revision: None,
             },
             Some(&bootstrap),
         )
@@ -885,6 +889,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: Some(session_id),
                         with_line_numbers: None,
@@ -991,7 +996,7 @@ async fn deny_shell_only_allows_write_tools() {
                         content: "x".to_string(),
                         session_id: Some(session_id),
                         overwrite: None,
-                        expected_sha256: None,
+                        expected_read_revision: None,
                     },
                     Some(&bootstrap),
                 )

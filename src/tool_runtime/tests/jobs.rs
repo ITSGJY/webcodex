@@ -260,6 +260,8 @@ async fn run_shell_via_agent_lifecycle_error(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: Some(error.to_string()),
             },
@@ -419,7 +421,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["promoted_to_job"], true);
+    assert!(result.output.get("promoted_to_job").is_none());
     assert_eq!(result.output["terminal"], false);
     assert_eq!(result.output["execution_state"], "running");
     assert_eq!(result.output["command_started"], true);
@@ -430,7 +432,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
     assert_eq!(result.output["purpose"], "diagnostic");
     assert_eq!(result.output["shell"], "bash");
     assert_eq!(result.output["cwd"], ".");
-    assert!(result.output["observation_token"].is_string());
+    assert_observe_job_continuation(&result.output);
     assert!(result.output.as_object().unwrap().contains_key("activity"));
     assert!(result.output["activity"].is_null());
     assert_run_shell_result_matches_schema(&result);
@@ -749,6 +751,7 @@ async fn long_run_shell_job_timeout_is_terminal_and_never_becomes_fake_outcome_u
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["job_id"], job_id);
+    // This direct Runtime call retains the internal receipt before model projection.
     assert_eq!(handoff.output["promoted_to_job"], true);
 
     update_agent_shell_job(
@@ -1078,6 +1081,8 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
                 exit_code: Some(-1),
                 stdout: Some("partial output".to_string()),
                 stderr: Some("runner stopped the process at its deadline".to_string()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1_000),
                 error: Some("runner timeout".to_string()),
             },
@@ -2540,5 +2545,53 @@ fn retired_job_log_parser_rejects_former_inputs() {
     ] {
         let error = ToolCall::from_tool_name("job_log", args).unwrap_err();
         assert!(error.contains("unknown tool"), "{error}");
+    }
+}
+
+#[test]
+fn job_handoff_model_projection_keeps_identity_and_exceptional_receipts() {
+    let receipt = json!({
+        "execution_state": "running", "job_id": "job-one", "job_status": "running", "terminal": false,
+        "promoted_to_job": true, "async_handoff_available": true,
+        "observation_token": "job-token-one",
+        "continuation_semantics": {"kind": "observe", "carrier": "observation_token"},
+        "continuation": super::super::jobs::observe_job_continuation("job-one", Some("job-token-one")),
+        "stdout_truncated": true, "stderr_truncated": false,
+    });
+    let mut model = ToolResult::ok(receipt.clone());
+    super::super::jobs::sparsify_job_handoff_model_result(&mut model);
+    for key in [
+        "promoted_to_job",
+        "async_handoff_available",
+        "observation_token",
+        "continuation_semantics",
+    ] {
+        assert!(model.output.get(key).is_none());
+        assert!(
+            receipt.get(key).is_some(),
+            "internal receipt stays complete"
+        );
+    }
+    assert_eq!(model.output["terminal"], false);
+    assert_eq!(model.output["job_status"], "running");
+    assert_eq!(model.output["stdout_truncated"], true);
+    assert_observe_job_continuation(&model.output);
+    assert_eq!(
+        serde_json::to_string(&model.output)
+            .unwrap()
+            .matches("job-token-one")
+            .count(),
+        1
+    );
+    for (field, value) in [
+        ("execution_state", json!("outcome_unknown")),
+        ("observation_token", json!("another-snapshot")),
+        ("job_id", json!("another-job")),
+    ] {
+        let mut exceptional = receipt.clone();
+        exceptional[field] = value;
+        let mut model = ToolResult::ok(exceptional.clone());
+        super::super::jobs::sparsify_job_handoff_model_result(&mut model);
+        assert_eq!(model.output, exceptional);
     }
 }

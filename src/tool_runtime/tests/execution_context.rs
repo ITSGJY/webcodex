@@ -703,6 +703,8 @@ async fn session_ssh_transport_failure_marks_remote_delivery_uncertain() {
                 exit_code: Some(255),
                 stdout: Some(String::new()),
                 stderr: Some("connection reset".to_string()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: Some("ssh transport failed after dispatch".to_string()),
             },
@@ -849,6 +851,8 @@ async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
             exit_code: None,
             stdout: None,
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: Some("cwd does not exist".to_string()),
         })

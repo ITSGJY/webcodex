@@ -552,11 +552,7 @@ fn observe_jobs_compact_projection_single_running_unchanged_keeps_actionable_sta
     assert_eq!(item["changed"], false);
     assert_eq!(item["log_delta_status"], "unchanged");
     assert_eq!(item["observation_token"], token);
-    assert_eq!(item["continuation_semantics"]["kind"], "observe");
-    assert_eq!(
-        item["continuation_semantics"]["carrier"],
-        "observation_token"
-    );
+    assert!(item.get("continuation_semantics").is_none());
     assert!(projected.output.get("continuation_semantics").is_none());
     assert_eq!(
         item["activity"],

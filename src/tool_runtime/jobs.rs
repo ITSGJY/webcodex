@@ -670,6 +670,50 @@ pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&
     .to_value()
 }
 
+/// Keep the internal handoff receipt intact for recording, then project the
+/// exact observe call as the sole observation-token carrier on normal handoff.
+pub(super) fn sparsify_job_handoff_model_result(result: &mut ToolResult) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    if !matches!(
+        output.get("execution_state").and_then(Value::as_str),
+        Some("queued" | "running" | "started" | "pending")
+    ) {
+        return;
+    }
+    let Some(job_id) = output
+        .get("job_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let call = &output["continuation"];
+    if call["tool"] != "observe_jobs" || call["arguments"]["items"][0]["job_id"] != job_id {
+        return;
+    }
+    let token = output.get("observation_token").and_then(Value::as_str);
+    if call["arguments"]["items"][0]["after_observation_token"].as_str() != token {
+        return;
+    }
+    output.remove("observation_token");
+    output.remove("continuation_semantics");
+    if output.get("promoted_to_job").and_then(Value::as_bool) == Some(true) {
+        output.remove("promoted_to_job");
+    }
+    if output
+        .get("async_handoff_available")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        output.remove("async_handoff_available");
+    }
+}
+
 fn list_jobs_recovery_suggested_call(project: Option<&str>) -> Value {
     let arguments = project.map_or_else(|| json!({}), |project| json!({"project": project}));
     SuggestedToolCall::new("list_jobs", arguments).to_value()

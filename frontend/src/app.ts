@@ -363,7 +363,7 @@ function workflowActivityFacts(activity: any, includeTiming: boolean): string[] 
     facts.push(durationLabel(activity.duration_ms));
   }
   if (activity && typeof activity.exit_code === "number") {
-    facts.push("exit " + activity.exit_code);
+    facts.push("process exit " + activity.exit_code);
   }
   if (activity && activity.job_id) {
     facts.push("job " + String(activity.job_id));

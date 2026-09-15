@@ -1185,6 +1185,7 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
                 path: "src/inspect.rs".to_string(),
                 start_line: None,
                 limit: None,
+                expected_read_revision: None,
             }],
             session_id: Some(session_id.clone()),
             with_line_numbers: None,

@@ -418,7 +418,7 @@ mod tests {
             Some("Existing absolute directory path on the Runner. Git is not required.")
         );
         let work_on_project = &find("work_on_project").description;
-        assert!(work_on_project.contains("Project or Runner path"));
+        assert!(work_on_project.contains("project or client_id+path"));
         assert!(work_on_project.contains("does not require Git"));
         assert!(work_on_project.contains("mode=worktree"));
         assert!(work_on_project.contains("exact Git base"));

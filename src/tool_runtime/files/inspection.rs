@@ -524,12 +524,26 @@ impl ToolRuntime {
         if let Some(failure) = validate_read_file_path(&path) {
             return failure;
         }
-        let proj = match self.resolve_project(&project).await {
-            Ok(project) => project,
+        let resolved = match self.resolve_project_input(&project).await {
+            Ok(resolved) => resolved,
             Err(error) => return ToolResult::err(error),
         };
+        let Some(runner) = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await
+        else {
+            return read_file_failure(ReadFileReason::RunnerUnavailable, Some(&path));
+        };
+        let Some(runner_project_id) =
+            crate::tool_runtime::runner_local_project_id(&resolved.resolved_id)
+        else {
+            return read_file_failure(ReadFileReason::RunnerUnavailable, Some(&path));
+        };
         self.read_one_validated_project_file(
-            &proj,
+            &resolved.config,
+            runner_project_id,
+            &runner.runner_instance_id,
             path,
             start_line,
             limit,
@@ -542,6 +556,8 @@ impl ToolRuntime {
     pub(crate) async fn read_one_resolved_project_file(
         &self,
         project: &ProjectConfig,
+        runner_project_id: &str,
+        expected_runner_instance_id: &str,
         path: String,
         start_line: Option<usize>,
         limit: Option<usize>,
@@ -556,6 +572,8 @@ impl ToolRuntime {
         }
         self.read_one_validated_project_file(
             project,
+            runner_project_id,
+            expected_runner_instance_id,
             path,
             start_line,
             limit,
@@ -568,6 +586,8 @@ impl ToolRuntime {
     async fn read_one_validated_project_file(
         &self,
         proj: &ProjectConfig,
+        runner_project_id: &str,
+        expected_runner_instance_id: &str,
         path: String,
         start_line: Option<usize>,
         limit: Option<usize>,
@@ -579,7 +599,7 @@ impl ToolRuntime {
         let (eff_start, _eff_limit, eff_end) = effective_read_file_range(start_line, limit);
         let (request_id, rx) = match self
             .runner_registry
-            .enqueue_file_op(
+            .enqueue_project_file_read(
                 ShellFileOpRequest {
                     op: "read".to_string(),
                     client_id,
@@ -601,6 +621,9 @@ impl ToolRuntime {
                     create_dirs: false,
                     wait_timeout_secs: wait_timeout,
                 },
+                runner_project_id,
+                &proj.path,
+                expected_runner_instance_id,
                 "tool_runtime".to_string(),
             )
             .await
@@ -1679,6 +1702,8 @@ mod tests {
             exit_code: None,
             stdout: None,
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: Some(message.to_string()),
             request_dispatched: Some(true),

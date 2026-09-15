@@ -219,6 +219,16 @@ while continuation, refinement, failure recovery, and Session context ACK remain
 separate semantic lanes. Duplicate aliases and compatibility projections are not
 kept without a named consumer.
 
+Internal protocol taxonomies do not automatically belong on the model surface.
+Typed continuation kinds/carriers, absolute cursors, lifecycle bookkeeping,
+timestamps, derived counts, and forensic recovery metadata can remain canonical
+inside WebCodex while the normal model projection exposes only the business
+result, correctness-critical identity/fence/completeness, and one unambiguous
+follow-up. Extra diagnostic detail is progressively disclosed when an exceptional
+state actually requires the model to reason about it. A field that cannot change
+the model's interpretation or next safe action is not model-facing merely because
+it is useful to implementation, tests, telemetry, or the operator Console.
+
 The standing detailed guidance is
 [`agent/tool-contract-guidelines.md`](agent/tool-contract-guidelines.md). Tool
 surface pruning and generalized composition are intentionally downstream of this

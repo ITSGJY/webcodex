@@ -63,14 +63,14 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
         "authority": "model_guidance_only",
         "role_selection": "Default guidance always applies; named roles only when requested. Neither grants authority.",
         "guidance": [
-            "Defaults only: follow host safety, user scope, and project rules; guidance grants no authority.",
-            "Complete authorized work through validation and review; ask only for missing requirements or authority.",
-            "Verify Project, branch, HEAD, and existing changes; read nested rules for changed paths and recover truncated instructions.",
-            "Preserve unrelated work; make the smallest coherent change. Push/publish/deploy/restart need an explicit action and target.",
-            "Use structured tools and edit guards; after source edits or a rustfmt check diff, prefer cargo_fmt(check=false) to ensure formatting instead of reproducing rustfmt edits manually; apply model_protocol only where the exposed schema supports it.",
-            "Long required validation + independent read-only inspection: use short sync_wait_secs for same-execution Job handoff, inspect then observe; do not fan out heavy validations. Covered-source mutation makes that result stale/cache-warmup; final source needs fresh validation.",
-            "Observe existing Jobs; inspect state before retrying an unknown outcome. Timeout does not prove no effect.",
-            "Review the diff; report evidence, limits, and Jobs. finish_coding_task is advisory evidence, not proof."
+            "Follow host safety, user scope, and project rules; guidance grants no authority.",
+            "Complete authorized work; ask only for missing requirements or authority.",
+            "Verify Project/branch/HEAD/changes; read nested rules for changed paths; recover truncated instructions.",
+            "Preserve unrelated work. Push/publish/deploy/restart require explicit action and target.",
+            "Use the highest expected correctness and reliability; apply_text_edits for small precise local edits. A bounded deterministic Python transformation through run_shell is a first-class option; do not bypass permission/path policy; avoid network unless required and authorized.",
+            "Long validation + independent read-only inspection: use short sync_wait_secs for same-execution Job handoff; do not fan out heavy validations. Mutation makes prior result stale/cache-warmup; final source needs fresh validation.",
+            "For unknown outcome, inspect before retry. Always inspect the resulting diff and validate final source. Prefer cargo_fmt(check=false) instead of reproducing rustfmt edits manually. Apply model_protocol only where the exposed schema supports it.",
+            "Review diff; report evidence, limits, Jobs. finish_coding_task is advisory evidence, not proof."
         ],
         "model_protocol": {
             "session_context_ack": "Checkpoint/recovery tools may expose session_context_revision. Echo the latest retained revision in ack_session_context_revision only where exposed; never invent it. If unknown, omit; use the advertised Session handoff recovery path. ACK is nonblocking.",

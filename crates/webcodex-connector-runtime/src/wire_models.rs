@@ -11,7 +11,7 @@
 use crate::{ConnectorRecipeId as RecipeId, ConnectorSemanticCheck as SemanticCheck};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use webcodex_core::apply_edits_shared::ApplyFileChangeInput;
+use webcodex_core::apply_edits_shared::{ApplyFileChangeKind, ApplyTextEditKind};
 use webcodex_core::lsp_bridge::{
     CallHierarchyDirection, DEFAULT_CALL_HIERARCHY_DEPTH, DEFAULT_CALL_HIERARCHY_LIMIT,
 };
@@ -219,12 +219,39 @@ fn default_code_impact_limit() -> usize {
     DEFAULT_CALL_HIERARCHY_LIMIT
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConnectorApplyTextEditInput {
+    pub(super) kind: ApplyTextEditKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) anchor_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConnectorApplyFileChangeInput {
+    pub(super) kind: ApplyFileChangeKind,
+    pub(super) path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) to_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) edits: Vec<ConnectorApplyTextEditInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) expected_read_revision: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EditsApplyInput {
     pub(super) task_id: String,
     pub(super) operation_id: String,
-    pub(super) changes: Vec<ApplyFileChangeInput>,
+    pub(super) changes: Vec<ConnectorApplyFileChangeInput>,
     #[serde(default)]
     pub(super) dry_run: Option<bool>,
 }

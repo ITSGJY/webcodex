@@ -57,6 +57,18 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
         "line scope is additive and must not become a generation-2 registration baseline"
     );
     assert!(
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+            .contains(&"apply_text_edit_local_guard_without_sha"),
+        "SHA-less local exact edit proof is additive and must not become a generation-2 registration baseline"
+    );
+    assert_eq!(
+        capabilities
+            .get("apply_text_edit_local_guard_without_sha")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "current Runner must explicitly advertise SHA-less local exact edit proof"
+    );
+    assert!(
         !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.contains(&"apply_patch"),
         "apply_patch is additive and must not become a generation-2 registration baseline"
     );
@@ -146,6 +158,7 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.structured_file_delete);
     assert!(caps.apply_text_edit_occurrence);
     assert!(caps.apply_text_edit_line_scope);
+    assert!(caps.apply_text_edit_local_guard_without_sha);
     assert!(caps.apply_patch);
     assert!(caps.async_jobs);
     assert!(caps.async_shell_jobs);

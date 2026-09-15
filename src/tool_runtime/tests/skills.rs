@@ -480,6 +480,8 @@ async fn call_kernel_with_fake_operator_store(
                         exit_code,
                         stdout,
                         stderr: Some(String::new()),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error,
                     })
@@ -2050,7 +2052,7 @@ async fn skill_surface_sidecar_privacy_and_authority_are_fenced() {
                 content: "blocked\n".to_string(),
                 session_id: None,
                 overwrite: None,
-                expected_sha256: None,
+                expected_read_revision: None,
             },
             Some(&bootstrap),
         )

@@ -175,8 +175,14 @@ mod select_lines_tests {
     }
 }
 
-pub(super) fn retain_ordinary_result_stream(value: Option<String>) -> Option<String> {
-    retain_result_stream_to(value, ORDINARY_RESULT_STREAM_RETENTION_BYTES)
+pub(super) fn retain_ordinary_result_stream_with_evidence(
+    value: Option<String>,
+) -> (Option<String>, bool) {
+    retain_result_stream_to_with_evidence(value, ORDINARY_RESULT_STREAM_RETENTION_BYTES)
+}
+
+pub(super) fn combine_result_stream_truncation(runner_reported: bool, server_side: bool) -> bool {
+    runner_reported || server_side
 }
 
 fn retain_live_job_stream(value: Option<String>) -> Option<String> {
@@ -184,21 +190,57 @@ fn retain_live_job_stream(value: Option<String>) -> Option<String> {
 }
 
 pub(super) fn retain_result_stream_to(value: Option<String>, max_bytes: usize) -> Option<String> {
-    value.map(|s| {
-        if s.len() <= max_bytes {
-            s
-        } else {
-            let mut start = s.len() - max_bytes;
-            while start < s.len() && !s.is_char_boundary(start) {
-                start += 1;
-            }
-            format!(
-                "[output truncated to last {} bytes]\n{}",
-                max_bytes,
-                &s[start..]
-            )
-        }
-    })
+    retain_result_stream_to_with_evidence(value, max_bytes).0
+}
+
+pub(super) fn retain_result_stream_to_with_evidence(
+    value: Option<String>,
+    max_bytes: usize,
+) -> (Option<String>, bool) {
+    let Some(s) = value else {
+        return (None, false);
+    };
+    if s.len() <= max_bytes {
+        return (Some(s), false);
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    (
+        Some(format!(
+            "[output truncated to last {} bytes]\n{}",
+            max_bytes,
+            &s[start..]
+        )),
+        true,
+    )
+}
+
+#[cfg(test)]
+mod result_retention_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn synchronous_result_retention_reports_server_side_truncation() {
+        let (small, small_truncated) =
+            retain_result_stream_to_with_evidence(Some("small".to_string()), 8);
+        assert_eq!(small.as_deref(), Some("small"));
+        assert!(!small_truncated);
+
+        let (large, large_truncated) =
+            retain_result_stream_to_with_evidence(Some("0123456789".to_string()), 4);
+        assert!(large_truncated);
+        assert!(large.unwrap().ends_with("6789"));
+    }
+
+    #[test]
+    fn runner_and_server_truncation_evidence_is_combined_with_or() {
+        assert!(!combine_result_stream_truncation(false, false));
+        assert!(combine_result_stream_truncation(true, false));
+        assert!(combine_result_stream_truncation(false, true));
+        assert!(combine_result_stream_truncation(true, true));
+    }
 }
 
 pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {

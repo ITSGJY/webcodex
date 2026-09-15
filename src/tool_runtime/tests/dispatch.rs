@@ -535,6 +535,8 @@ async fn cargo_test_agent_timeout_is_not_validation_failed() {
             exit_code: Some(-1),
             stdout: Some("partial cargo output\n".to_string()),
             stderr: Some("Command timed out after 60 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(60_000),
             error: Some("command timed out".to_string()),
         })

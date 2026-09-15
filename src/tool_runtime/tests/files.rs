@@ -281,7 +281,7 @@ async fn write_project_file_with_session_id_records_changed_path_without_content
                         content: "do-not-log-this-content\n".to_string(),
                         session_id: Some(session_id),
                         overwrite: None,
-                        expected_sha256: None,
+                        expected_read_revision: None,
                     },
                     Some(&bootstrap),
                 )
@@ -622,6 +622,8 @@ async fn delete_project_files_replacement_after_poll_reports_outcome_unknown() {
             exit_code: Some(0),
             stdout: Some(r#"{"deleted_paths":["tmp.txt"]}"#.to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -3125,6 +3127,8 @@ async fn search_agent_command_timeout_returns_search_timeout() {
                     .to_string(),
             ),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
@@ -3175,6 +3179,8 @@ async fn search_agent_execution_failure_is_structured_and_does_not_leak_diagnost
                     .to_string(),
             ),
             stderr: Some(private_diagnostic.to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(5),
             error: Some(private_diagnostic.to_string()),
         })
@@ -3231,6 +3237,8 @@ async fn search_agent_timeout_without_trusted_marker_cannot_return_partial_succe
             exit_code: Some(-1),
             stdout: Some("src/a.rs:1:needle\n".to_string()),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
@@ -3291,6 +3299,8 @@ async fn search_agent_timeout_with_complete_records_returns_partial_success() {
                     .to_string(),
             ),
             stderr: Some("command timed out after 1 seconds".to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1000),
             error: Some("command timed out".to_string()),
         })
@@ -3366,6 +3376,8 @@ async fn search_agent_outer_timeout_returns_search_timeout_and_cancels() {
             exit_code: Some(0),
             stdout: Some(String::new()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -4134,6 +4146,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
                     path: "../outside.txt".to_string(),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 }],
                 session_id: None,
                 with_line_numbers: None,
@@ -4149,6 +4162,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
                     path: "src/../../outside.txt".to_string(),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 }],
                 session_id: None,
                 with_line_numbers: None,
@@ -4164,6 +4178,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
                     path: "/etc/passwd".to_string(),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 }],
                 session_id: None,
                 with_line_numbers: None,
@@ -4179,6 +4194,7 @@ async fn project_read_adapters_reject_out_of_project_paths_before_agent_dispatch
                     path: "sub/../../../etc/passwd".to_string(),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 }],
                 session_id: None,
                 with_line_numbers: None,
@@ -4585,18 +4601,18 @@ async fn write_project_file_rejects_invalid_input_before_agent_dispatch() {
         .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("sensitive"));
-    // bad expected_sha256 format
+    // invalid model-facing read revision
     let result = runtime
         .write_project_file(
             "agent:c:p".to_string(),
             "EDIT_PROBE.txt".to_string(),
             "x".to_string(),
             Some(true),
-            Some("not-a-hash".to_string()),
+            Some(0),
         )
         .await;
     assert!(!result.success);
-    assert!(result.error.unwrap().contains("expected_sha256"));
+    assert!(result.error.unwrap().contains("expected_read_revision"));
 }
 
 #[test]

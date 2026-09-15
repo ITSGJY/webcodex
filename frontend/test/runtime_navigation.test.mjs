@@ -409,7 +409,7 @@ function withMockDom(fn) {
   }
 }
 
-test("renderProjectSelectorTree mounts windowPanel before sessionsPanel and adds WINDOW ACTIVE signal", () => {
+test("renderProjectSelectorTree mounts sessionsPanel before windowPanel and adds WINDOW ACTIVE signal", () => {
   withMockDom(() => {
     const deviceSelect = createMockElement("select");
     const projectList = createMockElement("div");
@@ -464,7 +464,7 @@ test("renderProjectSelectorTree mounts windowPanel before sessionsPanel and adds
     const sessionsIdx = workspace.children.indexOf(sessionsPanel);
     assert.ok(windowIdx >= 0, "windowPanel must be attached inside workspace");
     assert.ok(sessionsIdx >= 0, "sessionsPanel must be attached inside workspace");
-    assert.ok(windowIdx < sessionsIdx, "windowPanel must precede sessionsPanel in workspace DOM");
+    assert.ok(sessionsIdx < windowIdx, "sessionsPanel must precede windowPanel in workspace DOM");
     assert.equal(windowPanel.hidden, false);
     assert.equal(sessionsPanel.hidden, false);
 

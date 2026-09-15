@@ -230,6 +230,10 @@ pub struct ReadFilesItem {
     pub start_line: Option<usize>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Exact full-file snapshot fence. Runtime-generated read continuations carry
+    /// this automatically; callers should not invent or retarget revisions.
+    #[serde(default, deserialize_with = "deserialize_optional_read_revision")]
+    pub expected_read_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -283,6 +287,19 @@ where
         return Err(serde::de::Error::custom("path must not be empty"));
     }
     Ok(path)
+}
+
+fn deserialize_optional_read_revision<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let revision = u64::deserialize(deserializer)?;
+    if !(1..=9_007_199_254_740_991_u64).contains(&revision) {
+        return Err(serde::de::Error::custom(
+            "expected_read_revision must be a positive JSON-safe integer",
+        ));
+    }
+    Ok(Some(revision))
 }
 
 fn deserialize_non_empty_job_id<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -1834,7 +1851,7 @@ pub enum ToolCall {
     },
 
     /// Write a UTF-8 file in a project via the owning Runner. Creates new files
-    /// and, with `overwrite=true` plus the exact current `expected_sha256`,
+    /// and, with `overwrite=true` plus the current `expected_read_revision`,
     /// replaces existing ones without a stale read clobbering concurrent work.
     /// The server never reads the Runner filesystem directly; the write runs as
     /// a native agent file operation.
@@ -1847,7 +1864,7 @@ pub enum ToolCall {
         #[serde(default)]
         overwrite: Option<bool>,
         #[serde(default)]
-        expected_sha256: Option<String>,
+        expected_read_revision: Option<u64>,
     },
 
     /// Write a binary artifact in a project via the owning Runner. The payload is
@@ -1973,9 +1990,9 @@ pub enum ToolCall {
     },
 
     /// Apply a bounded transactional batch of edit/create/delete/rename file
-    /// changes via the owning Runner. Every existing input file requires a
-    /// sha256 precondition and every change is preflighted before the first
-    /// mutation. `dry_run` computes the full plan without writing. Model/API
+    /// changes via the owning Runner. Whole-file and positional changes carry
+    /// a model-facing read revision; globally unique local exact edits may omit
+    /// it. Every change is preflighted before the first mutation. `dry_run` computes the full plan without writing. Model/API
     /// exposure is derived from the canonical ToolDefinition surface.
     ApplyTextEdits {
         project: String,
@@ -2799,7 +2816,7 @@ impl ToolCall {
                 .is_some_and(|object| object.contains_key("expected_content_prefix"))
         {
             return Err(
-                "invalid arguments for tool 'write_project_file': field 'expected_content_prefix' is no longer supported; use expected_sha256"
+                "invalid arguments for tool 'write_project_file': field 'expected_content_prefix' is no longer supported; use expected_read_revision"
                     .to_string(),
             );
         }

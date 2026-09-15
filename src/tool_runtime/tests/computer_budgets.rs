@@ -80,6 +80,8 @@ async fn computer_display_snapshot_clamps_budget_before_runner_and_validates_eff
                 .to_string(),
             ),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })

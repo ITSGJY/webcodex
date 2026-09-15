@@ -55,17 +55,48 @@ fn wait_schema() -> Value {
     })
 }
 
+fn wait_model_schema() -> Value {
+    let mut schema = wait_schema();
+    let properties = schema["properties"].as_object_mut().unwrap();
+    properties.retain(|key, _| matches!(key.as_str(), "wait_id" | "state" | "matches"));
+    let matches = properties.get_mut("matches").unwrap();
+    matches["minItems"] = json!(1);
+    matches["items"]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "task_id" | "task_attempt_id" | "terminal_task_state"
+            )
+        });
+    matches["items"]["required"] = json!(["task_id", "task_attempt_id", "terminal_task_state"]);
+    schema["required"] = json!(["wait_id", "state"]);
+    schema["allOf"] = json!([
+        {
+            "if": {"properties": {"state": {"enum": ["triggered", "resumed"]}}, "required": ["state"]},
+            "then": {"required": ["matches"]}
+        },
+        {
+            "if": {"properties": {"state": {"const": "waiting"}}, "required": ["state"]},
+            "then": {"not": {"required": ["matches"]}}
+        }
+    ]);
+    schema
+}
+
 pub fn output_schema_for_tool(name: &str) -> Option<Value> {
     let schema = match name {
         "wait_for_agent_events" => wrapped_output_schema(vec![
-            ("agent_wait", wait_schema()),
+            ("agent_wait", wait_model_schema()),
             ("agent_continuation", super::communication::agent_continuation_projection_schema()),
             ("replayed", schema_type("boolean","True for exact keyed Wait creation replay.")),
             ("state_changed", schema_type("boolean","Whether this call first created the Wait and any immediate terminal-source matches.")),
         ]),
-        "read_agent_wait" | "agent_wait_state" => wrapped_output_schema(vec![("agent_wait", wait_schema())]),
+        "read_agent_wait" => wrapped_output_schema(vec![("agent_wait", wait_model_schema())]),
+        "agent_wait_state" => wrapped_output_schema(vec![("agent_wait", wait_schema())]),
         "cancel_agent_wait" => wrapped_output_schema(vec![
-            ("agent_wait", wait_schema()),
+            ("agent_wait", wait_model_schema()),
             ("replayed", schema_type("boolean","True for exact keyed cancellation replay.")),
             ("state_changed", schema_type("boolean","True only for the first successful pre-dispatch cancellation.")),
         ]),

@@ -347,6 +347,8 @@ async fn complete_one_agent_request(
             exit_code: Some(exit_code),
             stdout: Some(stdout.into()),
             stderr: Some(stderr.into()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -415,6 +417,8 @@ fn spawn_startup_agent_executor(registry: Arc<RunnerRegistry>) -> tokio::task::J
                         exit_code: Some(exit_code),
                         stdout: Some(stdout),
                         stderr: Some(stderr),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })
@@ -1809,6 +1813,8 @@ async fn api_show_changes_with_session_id() {
                 exit_code: Some(0),
                 stdout: Some(stdout),
                 stderr: Some(String::new()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })

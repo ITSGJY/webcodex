@@ -289,6 +289,8 @@ impl RunnerSink {
                 exit_code: result.exit_code,
                 stdout: result.stdout,
                 stderr: result.stderr,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: result.duration_ms,
                 error: result.error,
             },
@@ -314,6 +316,8 @@ impl RunnerSink {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -340,6 +344,8 @@ impl RunnerSink {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -365,6 +371,8 @@ impl RunnerSink {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -430,6 +438,8 @@ impl RunnerSink {
         let ShellCommandResult {
             result,
             execution_state,
+            stdout_truncated,
+            stderr_truncated,
         } = shell_result;
         let body = RunnerResultPayload {
             result: RunnerResultRequest {
@@ -439,6 +449,8 @@ impl RunnerSink {
                 exit_code: result.exit_code,
                 stdout: result.stdout,
                 stderr: result.stderr,
+                stdout_truncated,
+                stderr_truncated,
                 duration_ms: result.duration_ms,
                 error: result.error,
             },

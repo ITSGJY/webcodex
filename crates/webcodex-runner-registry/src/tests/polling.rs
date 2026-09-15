@@ -58,6 +58,8 @@ async fn registry_enqueues_polls_and_completes_shell_request() {
             exit_code: Some(0),
             stdout: Some("hello\n".to_string()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(12),
             error: None,
         })
@@ -118,6 +120,8 @@ async fn rejected_cross_client_result_does_not_consume_pending_request() {
             exit_code: Some(0),
             stdout: Some("spoofed\n".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -142,6 +146,8 @@ async fn rejected_cross_client_result_does_not_consume_pending_request() {
             exit_code: Some(0),
             stdout: Some("owner\n".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -232,6 +238,8 @@ async fn polling_out_of_order_results_resolve_only_their_original_waiters() {
                 exit_code: Some(0),
                 stdout: Some(stdout.to_string()),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })

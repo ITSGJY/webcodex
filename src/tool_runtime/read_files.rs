@@ -1,10 +1,8 @@
 //! Bounded multi-file reads built from the canonical single-file read core.
 
 use super::project_resolution::ResolvedProject;
-use super::{
-    ContinuationCarrier, ContinuationKind, ContinuationSemantics, ReadFilesItem, SuggestedToolCall,
-    ToolCall, ToolResult, ToolRuntime,
-};
+use super::read_revisions::ReadRevisionTarget;
+use super::{ReadFilesItem, SuggestedToolCall, ToolCall, ToolResult, ToolRuntime};
 use crate::json_measurement::serialized_json_len;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
@@ -76,19 +74,43 @@ impl ReadModelProjection {
     }
 }
 
-fn read_range_continuation(
-    project: &str,
+fn read_revision_target(
+    resolved: &ResolvedProject,
     path: &str,
-    output: &serde_json::Map<String, Value>,
-    session_id: Option<&str>,
-    with_line_numbers: Option<bool>,
-    max_result_bytes: Option<usize>,
-) -> Option<Value> {
+    runner_instance_id: &str,
+) -> ReadRevisionTarget {
+    ReadRevisionTarget {
+        project_id: resolved.resolved_id.clone(),
+        path: path.to_string(),
+        client_id: resolved.config.client_id.clone(),
+        runner_instance_id: runner_instance_id.to_string(),
+        project_root: resolved.config.path.clone(),
+        root_fingerprint: resolved.root_fingerprint.clone(),
+    }
+}
+
+fn stale_read_revision_failure(path: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        "read_file failed: stale_read_revision",
+        json!({
+            "error_kind": "read_file_failed",
+            "reason_code": "stale_read_revision",
+            "path": path,
+            "state_changed": false,
+        }),
+    )
+}
+
+fn read_range_next_item(item: &Value) -> Option<ReadFilesItem> {
+    if item.get("success").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let output = item.get("output")?.as_object()?;
     if output.get("has_more").and_then(Value::as_bool) != Some(true) {
         return None;
     }
+    let read_revision = output.get("read_revision")?.as_u64()?;
     let next_start_line = output.get("next_start_line")?.as_u64()? as usize;
-    let source_sha256 = output.get("sha256")?.as_str()?;
     let total_lines = output.get("total_lines")?.as_u64()? as usize;
     let remaining_lines = total_lines
         .saturating_sub(next_start_line)
@@ -101,62 +123,12 @@ fn read_range_continuation(
         .and_then(Value::as_u64)
         .or_else(|| output.get("limit").and_then(Value::as_u64))?
         as usize;
-    let limit = requested_limit.min(remaining_lines).max(1);
-    Some(json!({
-        "kind": "read_range",
-        "safe_cursor": true,
-        "source_sha256": source_sha256,
-        "snapshot_stable": false,
-        "continuation_semantics": ContinuationSemantics::new(
-            ContinuationKind::Page,
-            ContinuationCarrier::Position,
-        ).to_value(),
-        "suggested_call": SuggestedToolCall::new(
-            "read_files",
-            read_files_suggested_arguments(
-                project,
-                &[ReadFilesItem {
-                    path: path.to_string(),
-                    start_line: Some(next_start_line),
-                    limit: Some(limit),
-                }],
-                session_id,
-                with_line_numbers,
-                max_result_bytes,
-            ),
-        ).to_value()
-    }))
-}
-
-fn add_item_read_continuation(
-    item: &mut Value,
-    project: &str,
-    session_id: Option<&str>,
-    with_line_numbers: Option<bool>,
-    max_result_bytes: Option<usize>,
-) {
-    if item.get("success").and_then(Value::as_bool) != Some(true) {
-        return;
-    }
-    let Some(path) = item.get("path").and_then(Value::as_str).map(str::to_string) else {
-        return;
-    };
-    let continuation = item
-        .get("output")
-        .and_then(Value::as_object)
-        .and_then(|output| {
-            read_range_continuation(
-                project,
-                &path,
-                output,
-                session_id,
-                with_line_numbers,
-                max_result_bytes,
-            )
-        });
-    if let (Some(continuation), Some(item)) = (continuation, item.as_object_mut()) {
-        item.insert("continuation".to_string(), continuation);
-    }
+    Some(ReadFilesItem {
+        path: item.get("path")?.as_str()?.to_string(),
+        start_line: Some(next_start_line),
+        limit: Some(requested_limit.min(remaining_lines).max(1)),
+        expected_read_revision: Some(read_revision),
+    })
 }
 
 fn read_files_suggested_arguments(
@@ -175,6 +147,9 @@ fn read_files_suggested_arguments(
             }
             if let Some(limit) = item.limit {
                 suggested["limit"] = json!(limit);
+            }
+            if let Some(expected_read_revision) = item.expected_read_revision {
+                suggested["expected_read_revision"] = json!(expected_read_revision);
             }
             suggested
         })
@@ -195,108 +170,9 @@ fn read_files_suggested_arguments(
     arguments
 }
 
-fn add_batch_read_continuation(
-    output: &mut serde_json::Map<String, Value>,
-    project: &str,
-    original_items: &[ReadFilesItem],
-    session_id: Option<&str>,
-    with_line_numbers: Option<bool>,
-    max_result_bytes: Option<usize>,
-) {
-    if output.get("output_truncated").and_then(Value::as_bool) != Some(true) {
-        return;
-    }
-    let Some(next_index) = output.get("next_index").and_then(Value::as_u64) else {
-        return;
-    };
-    let next_index = next_index as usize;
-    if next_index >= original_items.len() {
-        return;
-    }
-    let returned_items = output.get("items").and_then(Value::as_array);
-    let partial_current = returned_items.is_some_and(|items| {
-        items.iter().any(|item| {
-            item.get("index").and_then(Value::as_u64) == Some(next_index as u64)
-                && item.get("success").and_then(Value::as_bool) == Some(true)
-                && item
-                    .get("output")
-                    .and_then(|output| output.get("budget_truncated"))
-                    .and_then(Value::as_bool)
-                    == Some(true)
-        })
-    });
-    let first_unreturned_index = next_index.saturating_add(usize::from(partial_current));
-
-    // If the primary response budget could not return even part of its first
-    // item, replaying the same request at the same budget cannot make progress.
-    // This is parameter refinement rather than a safe cursor: recommend the
-    // existing hard maximum, never a value above it.
-    if next_index == 0 && returned_items.is_some_and(Vec::is_empty) {
-        if max_result_bytes.unwrap_or(DEFAULT_READ_FILES_RESULT_BYTES) < MAX_SERIALIZED_OUTPUT_BYTES
-        {
-            output.insert(
-                "continuation".to_string(),
-                json!({
-                    "kind": "increase_result_budget",
-                    "safe_cursor": false,
-                    "next_index": 0,
-                    "suggested_max_result_bytes": MAX_SERIALIZED_OUTPUT_BYTES,
-                    "continuation_semantics": ContinuationSemantics::new(
-                        ContinuationKind::Refine,
-                        ContinuationCarrier::None,
-                    ).to_value(),
-                    "suggested_call": SuggestedToolCall::new(
-                        "read_files",
-                        read_files_suggested_arguments(
-                            project,
-                            original_items,
-                            session_id,
-                            with_line_numbers,
-                            Some(MAX_SERIALIZED_OUTPUT_BYTES),
-                        ),
-                    ).to_value()
-                }),
-            );
-        }
-        // At the hard cap the same zero-progress replay cannot prove forward
-        // progress. Omit recovery instead of advertising a fake safe cursor.
-        return;
-    }
-
-    if first_unreturned_index >= original_items.len() {
-        return;
-    }
-    let remaining = &original_items[first_unreturned_index..];
-    output.insert(
-        "continuation".to_string(),
-        json!({
-            "kind": "batch_items",
-            "safe_cursor": true,
-            "next_index": first_unreturned_index,
-            "recommended_order": if partial_current { "after_partial_item" } else { "next" },
-            "continuation_semantics": ContinuationSemantics::new(
-                ContinuationKind::Batch,
-                ContinuationCarrier::Index,
-            ).to_value(),
-            "suggested_call": SuggestedToolCall::new(
-                "read_files",
-                read_files_suggested_arguments(
-                    project,
-                    remaining,
-                    session_id,
-                    with_line_numbers,
-                    max_result_bytes,
-                ),
-            ).to_value()
-        }),
-    );
-}
-
-/// Add actionable model-only continuation metadata to successful reads. The
-/// source cursor remains positional: `source_sha256` identifies the file that
-/// produced the current range, while `snapshot_stable=false` makes explicit
-/// that a later positional read must compare its newly returned full-file hash
-/// before the model treats both ranges as one unchanged snapshot.
+/// Project one parser-ready follow-up for the invocation. Continued ranges are
+/// fenced to the read_revision observed for the returned partial item; original
+/// unreturned items retain exactly the caller-supplied shape.
 pub(crate) fn add_actionable_read_continuations(
     projection: &ReadModelProjection,
     result: &mut ToolResult,
@@ -304,37 +180,66 @@ pub(crate) fn add_actionable_read_continuations(
     if !result.success {
         return;
     }
-    match projection {
-        ReadModelProjection::None => {}
-        ReadModelProjection::Batch {
-            project,
-            items: original_items,
-            session_id,
-            with_line_numbers,
-            max_result_bytes,
-        } => {
-            if let Some(items) = result.output.get_mut("items").and_then(Value::as_array_mut) {
-                for item in items {
-                    add_item_read_continuation(
-                        item,
-                        project,
-                        session_id.as_deref(),
-                        *with_line_numbers,
-                        *max_result_bytes,
-                    );
-                }
+    let ReadModelProjection::Batch {
+        project,
+        items: original_items,
+        session_id,
+        with_line_numbers,
+        max_result_bytes,
+    } = projection
+    else {
+        return;
+    };
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    let Some(returned) = output.get("items").and_then(Value::as_array) else {
+        return;
+    };
+    let truncated = output.get("output_truncated").and_then(Value::as_bool) == Some(true);
+    let mut next_items = returned
+        .iter()
+        .filter_map(read_range_next_item)
+        .collect::<Vec<_>>();
+    let mut next_budget = *max_result_bytes;
+    if truncated {
+        let Some(next_index) = output.get("next_index").and_then(Value::as_u64) else {
+            return;
+        };
+        let next_index = next_index as usize;
+        if returned.is_empty() && next_index == 0 {
+            // Repeating a zero-progress request only helps with a larger budget.
+            // At the hard cap there is no proven next call.
+            if max_result_bytes.unwrap_or(DEFAULT_READ_FILES_RESULT_BYTES)
+                >= MAX_SERIALIZED_OUTPUT_BYTES
+            {
+                return;
             }
-            if let Some(output) = result.output.as_object_mut() {
-                add_batch_read_continuation(
-                    output,
+            next_budget = Some(MAX_SERIALIZED_OUTPUT_BYTES);
+        }
+        let current_returned = returned
+            .iter()
+            .any(|item| item["index"].as_u64() == Some(next_index as u64));
+        let first_unreturned = next_index.saturating_add(usize::from(current_returned));
+        if let Some(remaining) = original_items.get(first_unreturned..) {
+            next_items.extend_from_slice(remaining);
+        }
+    }
+    if !next_items.is_empty() {
+        output.insert(
+            "suggested_call".to_string(),
+            SuggestedToolCall::new(
+                "read_files",
+                read_files_suggested_arguments(
                     project,
-                    original_items,
+                    &next_items,
                     session_id.as_deref(),
                     *with_line_numbers,
-                    *max_result_bytes,
-                );
-            }
-        }
+                    next_budget,
+                ),
+            )
+            .to_value(),
+        );
     }
 }
 
@@ -391,24 +296,8 @@ fn projected_batch_serialized_len(output: &Value, projection: &ReadModelProjecti
     serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
-fn projected_read_item_len(item: &Value, projection: &ReadModelProjection) -> usize {
+fn projected_read_item_len(item: &Value) -> usize {
     let mut projected = item.clone();
-    if let ReadModelProjection::Batch {
-        project,
-        session_id,
-        with_line_numbers,
-        max_result_bytes,
-        ..
-    } = projection
-    {
-        add_item_read_continuation(
-            &mut projected,
-            project,
-            session_id.as_deref(),
-            *with_line_numbers,
-            *max_result_bytes,
-        );
-    }
     if projected["success"].as_bool() == Some(true) {
         let outer_path = projected
             .get("path")
@@ -419,6 +308,13 @@ fn projected_read_item_len(item: &Value, projection: &ReadModelProjection) -> us
             projected.get_mut("output").and_then(Value::as_object_mut),
         ) {
             super::dispatch::sparsify_complete_file_read_output(output, Some(&outer_path));
+            if output
+                .get("read_revision")
+                .and_then(Value::as_u64)
+                .is_some()
+            {
+                output.remove("sha256");
+            }
         }
     }
     serialized_value_len(&projected)
@@ -473,11 +369,7 @@ fn truncate_read_item(item: &Value, keep_lines: usize) -> Option<Value> {
     Some(projected)
 }
 
-fn truncate_read_item_to_fit(
-    item: &Value,
-    max_item_bytes: usize,
-    projection: &ReadModelProjection,
-) -> Option<Value> {
+fn truncate_read_item_to_fit(item: &Value, max_item_bytes: usize) -> Option<Value> {
     let returned_lines = item.get("output")?.get("returned_lines")?.as_u64()? as usize;
     if returned_lines <= 1 {
         return None;
@@ -491,7 +383,7 @@ fn truncate_read_item_to_fit(
         let Some(candidate) = truncate_read_item(item, keep) else {
             break;
         };
-        if projected_read_item_len(&candidate, projection) <= max_item_bytes {
+        if projected_read_item_len(&candidate) <= max_item_bytes {
             best = Some(candidate);
             low = keep.saturating_add(1);
         } else {
@@ -530,9 +422,8 @@ fn apply_output_budget(
     } else {
         "batch_response_budget"
     };
-    // The truncated empty shape fixes all outer-field byte costs up front.
-    // Counts and indices are single digits for this 1..=8 batch, so each item
-    // can then be accounted exactly by its own serialized size plus one comma.
+    // Estimate the outer follow-up cost from the empty truncated batch. The
+    // final exact measurement below also covers changed partial-range arguments.
     let base_len = projected_batch_serialized_len(
         &batch_output(
             project,
@@ -550,7 +441,7 @@ fn apply_output_budget(
 
     for item in completed {
         let index = item["index"].as_u64().unwrap_or(returned.len() as u64) as usize;
-        let item_len = projected_read_item_len(&item, projection);
+        let item_len = projected_read_item_len(&item);
         let candidate_item_count = returned.len() + 1;
         if projected_batch_len(
             base_len,
@@ -568,7 +459,7 @@ fn apply_output_budget(
             .saturating_sub(base_len)
             .saturating_sub(returned_item_bytes)
             .saturating_sub(separator_bytes);
-        if let Some(partial) = truncate_read_item_to_fit(&item, max_item_bytes, projection) {
+        if let Some(partial) = truncate_read_item_to_fit(&item, max_item_bytes) {
             returned.push(partial);
         }
         // A partial current item resumes from its next_start_line, while an
@@ -586,9 +477,8 @@ fn apply_output_budget(
         next_index,
         Some(truncation_reason),
     );
-    // Defensive exact serialization fallback. Normal accounting above is O(n)
-    // plus an O(log lines) partial-item search; this loop should never execute
-    // unless a future outer-field change invalidates the fixed-size arithmetic.
+    // The combined follow-up changes size with the partial range. Fit the last
+    // item against the exact invocation projection before dropping it entirely.
     while projected_batch_serialized_len(&output, projection) > payload_budget {
         let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) else {
             break;
@@ -597,10 +487,42 @@ fn apply_output_budget(
             break;
         };
         next_index = removed["index"].as_u64().map(|index| index as usize);
+        let prefix = items.clone();
+        let mut low = 1;
+        let mut high = removed["output"]["returned_lines"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(1) as usize;
+        let mut best = None;
+        while low <= high {
+            let keep = low + (high - low) / 2;
+            let Some(partial) = truncate_read_item(&removed, keep) else {
+                break;
+            };
+            let mut candidate_items = prefix.clone();
+            candidate_items.push(partial);
+            let candidate = batch_output(
+                project,
+                requested_count,
+                candidate_items,
+                true,
+                next_index,
+                Some(truncation_reason),
+            );
+            if projected_batch_serialized_len(&candidate, projection) <= payload_budget {
+                best = Some(candidate);
+                low = keep + 1;
+            } else {
+                high = keep.saturating_sub(1);
+            }
+        }
+        if let Some(candidate) = best {
+            return candidate;
+        }
         output = batch_output(
             project,
             requested_count,
-            items.clone(),
+            prefix,
             true,
             next_index,
             Some(truncation_reason),
@@ -829,9 +751,37 @@ impl ToolRuntime {
         }
 
         let runtime_project_id = resolved.resolved_id.clone();
+        let Some(runner_project_id) =
+            crate::tool_runtime::runner_local_project_id(&resolved.resolved_id).map(str::to_string)
+        else {
+            return ToolResult::err(
+                "read_files could not bind the resolved Project to a Runner-local project id",
+            );
+        };
         let requested_count = items.len();
         let with_line_numbers = with_line_numbers.unwrap_or(false);
         let deadline = Instant::now() + self.read_files_deadline;
+        // Capture the active Runner process before dispatch. A replacement that
+        // races this batch therefore makes these handles unusable rather than
+        // silently retargeting them to the replacement Runner.
+        let runner_instance_id = match self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await
+        {
+            Some(view) => view.runner_instance_id,
+            None => {
+                return ToolResult::err_with_output(
+                    "read_files could not bind the read snapshot to an active Runner process; retry after the Runner is available",
+                    json!({
+                        "project": runtime_project_id,
+                        "state_changed": false,
+                        "error_kind": "runner_unavailable",
+                        "retry_guidance": "retry read_files after the owning Runner is available"
+                    }),
+                )
+            }
+        };
 
         // The concurrency slot covers validation, enqueue, and response wait.
         // No request can reach the Runner until its future is polled by
@@ -840,11 +790,32 @@ impl ToolRuntime {
         let mut completed: Vec<Value> =
             stream::iter(items.into_iter().enumerate().map(|(index, item)| {
                 let project = &resolved.config;
+                let runner_project_id = runner_project_id.clone();
+                let runner_instance_id = runner_instance_id.clone();
                 async move {
                     let path = item.path;
-                    let result = self
+                    let target = read_revision_target(resolved, &path, &runner_instance_id);
+                    let expected_sha256 = match item.expected_read_revision {
+                        Some(revision) => match self.read_revisions.resolve(revision, &target) {
+                            Ok(sha256) => Some(sha256),
+                            Err(_) => {
+                                let result = stale_read_revision_failure(&path);
+                                return json!({
+                                    "index": index,
+                                    "path": path,
+                                    "success": false,
+                                    "output": result.output,
+                                    "error": result.error,
+                                });
+                            }
+                        },
+                        None => None,
+                    };
+                    let mut result = self
                         .read_one_resolved_project_file(
                             project,
+                            &runner_project_id,
+                            &runner_instance_id,
                             path.clone(),
                             item.start_line,
                             item.limit,
@@ -852,12 +823,35 @@ impl ToolRuntime {
                             deadline,
                         )
                         .await;
+                    if result.success {
+                        if let Some(expected_sha256) = expected_sha256.as_deref() {
+                            let actual_sha256 = result.output.get("sha256").and_then(Value::as_str);
+                            if actual_sha256 != Some(expected_sha256) {
+                                result = stale_read_revision_failure(&path);
+                            }
+                        }
+                    }
+                    let success = result.success;
+                    let error = result.error;
+                    let mut output = result.output;
+                    if success {
+                        if let Some(sha256) = output
+                            .get("sha256")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        {
+                            let read_revision = self.read_revisions.observe(target, sha256);
+                            if let Some(output) = output.as_object_mut() {
+                                output.insert("read_revision".to_string(), json!(read_revision));
+                            }
+                        }
+                    }
                     json!({
                         "index": index,
                         "path": path,
-                        "success": result.success,
-                        "output": result.output,
-                        "error": result.error,
+                        "success": success,
+                        "output": output,
+                        "error": error,
                     })
                 }
             }))
@@ -890,6 +884,7 @@ mod tests {
                     path: format!("src/{index}.rs"),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 })
                 .collect(),
             with_line_numbers: None,
@@ -908,6 +903,7 @@ mod tests {
                 "format": "plain",
                 "path": format!("src/{index}.rs"),
                 "sha256": "c".repeat(64),
+                "read_revision": 10_000_u64 + index as u64,
                 "start_line": start_line,
                 "limit": returned_lines,
                 "total_lines": start_line + returned_lines - 1,
@@ -933,6 +929,7 @@ mod tests {
                 "format": "plain",
                 "path": format!("src/{index}.rs"),
                 "sha256": "d".repeat(64),
+                "read_revision": 20_000_u64 + index as u64,
                 "start_line": 1,
                 "limit": default_limit,
                 "total_lines": returned_lines,
@@ -1065,7 +1062,11 @@ mod tests {
         let second = vec!["y".repeat(140 * 1024)];
         let third = vec!["z".to_string()];
         let mut projection = batch_projection(3, Some(legacy_budget));
-        if let ReadModelProjection::Batch { session_id, .. } = &mut projection {
+        if let ReadModelProjection::Batch {
+            items, session_id, ..
+        } = &mut projection
+        {
+            items[1].expected_read_revision = Some(1234);
             *session_id = Some("wc_sess_batch_recovery".to_string());
         }
         let output = apply_output_budget(
@@ -1085,12 +1086,7 @@ mod tests {
 
         let mut model = ToolResult::ok(output);
         add_actionable_read_continuations(&projection, &mut model);
-        let continuation = &model.output["continuation"];
-        assert_eq!(continuation["kind"], "batch_items");
-        assert_eq!(continuation["safe_cursor"], true);
-        assert_eq!(continuation["next_index"], 1);
-        assert_eq!(continuation["recommended_order"], "next");
-        let suggested = &continuation["suggested_call"];
+        let suggested = &model.output["suggested_call"];
         assert_eq!(suggested["tool"], "read_files");
         assert_eq!(
             suggested["arguments"]["session_id"],
@@ -1106,6 +1102,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["src/1.rs", "src/2.rs"]
         );
+        assert_eq!(
+            suggested["arguments"]["items"][0]["expected_read_revision"],
+            1234
+        );
+        assert!(suggested["arguments"]["items"][1]
+            .get("expected_read_revision")
+            .is_none());
         let next = ToolCall::from_tool_name(
             suggested["tool"].as_str().unwrap(),
             suggested["arguments"].clone(),
@@ -1126,81 +1129,57 @@ mod tests {
     }
 
     #[test]
-    fn partial_item_and_later_batch_items_expose_distinct_ordered_recovery() {
+    fn partial_item_and_remaining_items_have_one_ordered_call() {
         let lines = (0..900)
             .map(|index| format!("第{index:04}行-{}", "界".repeat(40)))
             .collect::<Vec<_>>();
-        let later = vec!["later".to_string()];
-        let last = vec!["last".to_string()];
-        let projection = batch_projection(3, None);
-        let output = apply_output_budget(
-            "agent:oe:demo",
-            3,
-            vec![
-                default_complete_item(0, &lines),
-                ranged_item(1, 1, &later),
-                ranged_item(2, 1, &last),
-            ],
-            None,
-            &projection,
-        );
-        // Canonical compatibility remains unchanged: the raw batch next_index
-        // still identifies the partial current item.
-        assert_eq!(output["next_index"], 0);
-        assert_eq!(output["items"].as_array().unwrap().len(), 1);
-        assert_eq!(output["items"][0]["output"]["budget_truncated"], true);
-
-        let mut model = ToolResult::ok(output);
-        add_actionable_read_continuations(&projection, &mut model);
-        let item_continuation = &model.output["items"][0]["continuation"];
-        assert_eq!(item_continuation["kind"], "read_range");
-        assert_eq!(item_continuation["safe_cursor"], true);
-        let expected_next_start = model.output["items"][0]["output"]["next_start_line"]
-            .as_u64()
-            .unwrap();
-        let expected_limit = model.output["items"][0]["output"]["budget_next_limit"]
-            .as_u64()
-            .unwrap();
-        assert_eq!(
-            item_continuation["suggested_call"]["arguments"]["items"][0]["start_line"],
-            expected_next_start
-        );
-        assert_eq!(
-            item_continuation["suggested_call"]["arguments"]["items"][0]["limit"],
-            expected_limit
-        );
-        ToolCall::from_tool_name(
-            item_continuation["suggested_call"]["tool"]
-                .as_str()
-                .unwrap(),
-            item_continuation["suggested_call"]["arguments"].clone(),
-        )
-        .expect("partial item continuation must parse");
-
-        let batch_continuation = &model.output["continuation"];
-        assert_eq!(batch_continuation["kind"], "batch_items");
-        assert_eq!(batch_continuation["safe_cursor"], true);
-        assert_eq!(batch_continuation["next_index"], 1);
-        assert_eq!(
-            batch_continuation["recommended_order"],
-            "after_partial_item"
-        );
-        let suggested = &batch_continuation["suggested_call"];
-        assert!(suggested["arguments"].get("next_index").is_none());
-        assert_eq!(
-            suggested["arguments"]["items"]
+        for (count, partial_index) in [(1, 0), (3, 0), (3, 1), (3, 2)] {
+            let projection = batch_projection(count, None);
+            let completed = (0..count)
+                .map(|index| {
+                    if index == partial_index {
+                        default_complete_item(index, &lines)
+                    } else {
+                        default_complete_item(index, &["complete".to_string()])
+                    }
+                })
+                .collect();
+            let output = apply_output_budget("agent:oe:demo", count, completed, None, &projection);
+            let partial = &output["items"][partial_index]["output"];
+            assert_eq!(partial["budget_truncated"], true);
+            let next_start = partial["next_start_line"].clone();
+            let next_limit = partial["budget_next_limit"].clone();
+            let revision = partial["read_revision"].clone();
+            let mut model = ToolResult::ok(output);
+            add_actionable_read_continuations(&projection, &mut model);
+            super::super::dispatch::sparsify_complete_read_success("read_files", &mut model);
+            let call = &model.output["suggested_call"];
+            ToolCall::from_tool_name(call["tool"].as_str().unwrap(), call["arguments"].clone())
+                .unwrap();
+            let remaining = call["arguments"]["items"].as_array().unwrap();
+            assert_eq!(remaining.len(), count - partial_index);
+            assert_eq!(remaining[0]["start_line"], next_start);
+            assert_eq!(remaining[0]["limit"], next_limit);
+            assert_eq!(remaining[0]["expected_read_revision"], revision);
+            for item in remaining.iter().skip(1) {
+                assert!(item.get("expected_read_revision").is_none());
+            }
+            for (offset, item) in remaining.iter().enumerate() {
+                assert_eq!(item["path"], format!("src/{}.rs", partial_index + offset));
+            }
+            assert_eq!(
+                model.output["items"][partial_index]["output"]["read_revision"],
+                revision
+            );
+            assert!(model.output.get("next_index").is_none());
+            assert!(model.output.get("continuation").is_none());
+            assert!(model.output["items"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|item| item["path"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["src/1.rs", "src/2.rs"]
-        );
-        ToolCall::from_tool_name(
-            suggested["tool"].as_str().unwrap(),
-            suggested["arguments"].clone(),
-        )
-        .expect("later batch continuation must parse");
+                .all(|item| item.get("continuation").is_none()));
+            assert!(serde_json::to_vec(&model).unwrap().len() <= DEFAULT_READ_FILES_RESULT_BYTES);
+        }
     }
 
     #[test]
@@ -1220,15 +1199,7 @@ mod tests {
 
         let mut model = ToolResult::ok(output);
         add_actionable_read_continuations(&projection, &mut model);
-        let continuation = &model.output["continuation"];
-        assert_eq!(continuation["kind"], "increase_result_budget");
-        assert_eq!(continuation["safe_cursor"], false);
-        assert_eq!(continuation["next_index"], 0);
-        assert_eq!(
-            continuation["suggested_max_result_bytes"],
-            MAX_SERIALIZED_OUTPUT_BYTES
-        );
-        let suggested = &continuation["suggested_call"];
+        let suggested = &model.output["suggested_call"];
         assert_eq!(
             suggested["arguments"]["max_result_bytes"],
             MAX_SERIALIZED_OUTPUT_BYTES
@@ -1266,7 +1237,7 @@ mod tests {
         let mut model = ToolResult::ok(output);
         add_actionable_read_continuations(&projection, &mut model);
         assert!(
-            model.output.get("continuation").is_none(),
+            model.output.get("suggested_call").is_none(),
             "a hard-cap zero-progress replay is not actionable: {}",
             model.output
         );
@@ -1462,6 +1433,7 @@ mod tests {
                 path: "src/0.rs".to_string(),
                 start_line: Some(11),
                 limit: Some(1),
+                expected_read_revision: None,
             }],
             with_line_numbers: None,
             max_result_bytes: None,
@@ -1568,6 +1540,7 @@ mod tests {
                     path: "src/lib.rs".to_string(),
                     start_line: None,
                     limit: None,
+                    expected_read_revision: None,
                 }],
                 session_id: None,
                 with_line_numbers: None,

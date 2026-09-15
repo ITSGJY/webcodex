@@ -405,6 +405,22 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     return value;
   }
 
+  function acceptWaitReference(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || !WAIT_ID.test(value.wait_id || "") || !WAIT_STATES.has(value.state)
+      || (waitId && waitId !== value.wait_id)) {
+      teardown();
+      el("binding").textContent = "Unavailable";
+      el("status").textContent = "Invalid or conflicting Wait identity";
+      return false;
+    }
+    // The model result supplies only a selector. The existing App-only poll
+    // validates the durable target and revision before displaying Wait state.
+    // Delayed initial results cannot replace a newer authoritative observation.
+    waitId = value.wait_id;
+    return true;
+  }
+
   function acceptWaitProjection(value) {
     const wait = validWaitProjection(value);
     if (!wait || (waitId && waitId !== wait.wait_id)
@@ -837,7 +853,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     if (!projection || !acceptIdentity(projection)) return;
     const output = outputOf(result);
     if (output && Object.prototype.hasOwnProperty.call(output, "agent_wait")
-      && !acceptWaitProjection(output.agent_wait)) return;
+      && !acceptWaitReference(output.agent_wait)) return;
     // A delayed initial result must not overwrite newer bind/heartbeat state.
     if (!bindingStarted && bindAttempts === 0) renderWithWait(projection);
     void maybeStartBinding();

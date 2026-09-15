@@ -207,72 +207,46 @@ fn apply_patch_file_summary_schema() -> Value {
     })
 }
 
-fn edit_conflict_recovery_schema() -> Value {
+fn edit_candidate_range_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "schema_version": {"type": "integer", "const": 1},
-            "conflict_kind": {"type": "string", "enum": [
-                "multiple_matches", "match_not_found", "occurrence_out_of_range",
-                "occurrence_outside_line_scope", "overlapping_edits", "sha256_mismatch"
-            ]},
-            "recovery_action": {"type": "string", "enum": [
-                "select_occurrence_or_refine_match", "reread_or_refine_match",
-                "choose_valid_occurrence_or_refine_match", "narrow_line_scope_or_select_occurrence",
-                "adjust_line_scope_or_refine_match", "align_occurrence_with_line_scope",
-                "refine_edit_batch", "reread_file"
-            ]},
-            "occurrence_selector_supported": {"type": "boolean"},
-            "direct_retry_safe": {
-                "type": "boolean",
-                "description": "True only when a corrected request may be retried against the same observed expected_sha256 without rereading. It never authorizes automatic replay of the rejected payload."
-            },
-            "reread_required": {
-                "type": "boolean",
-                "description": "True when the caller must reread the affected file before another write attempt."
-            },
-            "expected_sha256": {
-                "type": "string",
-                "pattern": "^[a-f0-9]{64}$",
-                "description": "Caller-provided expected sha256 on a sha256 mismatch; hash only, never file content."
-            },
-            "current_sha256": {
-                "type": "string",
-                "pattern": "^[a-f0-9]{64}$",
-                "description": "Current observed file sha256 on a sha256 mismatch; hash only, never file content."
-            },
-            "match_count": {"type": "integer", "minimum": 0},
-            "requested_occurrence": {"type": "integer", "minimum": 1},
-            "line_scope": {
+            "occurrence": {"type": "integer", "minimum": 1},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1}
+        },
+        "required": ["start_line", "end_line"]
+    })
+}
+
+fn read_files_recovery_call_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "tool": {"type": "string", "const": "read_files"},
+            "arguments": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1}
+                    "project": {"type": "string", "minLength": 1},
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {"path": {"type": "string", "minLength": 1}},
+                            "required": ["path"]
+                        }
+                    }
                 },
-                "required": ["start_line", "end_line"]
-            },
-            "line_scope_match_count": {"type": "integer", "minimum": 0},
-            "candidate_ranges": {
-                "type": "array", "maxItems": 8,
-                "items": {
-                    "type": "object", "additionalProperties": false,
-                    "properties": {
-                        "occurrence": {"type": "integer", "minimum": 1},
-                        "start_line": {"type": "integer", "minimum": 1},
-                        "end_line": {"type": "integer", "minimum": 1}
-                    },
-                    "required": ["occurrence", "start_line", "end_line"]
-                }
-            },
-            "candidates_truncated": {"type": "boolean"},
-            "conflicting_edit_indices": {
-                "type": "array", "maxItems": 2,
-                "items": {"type": "integer", "minimum": 0, "maximum": 19}
+                "required": ["project", "items"]
             }
         },
-        "required": ["schema_version", "conflict_kind", "recovery_action", "occurrence_selector_supported"]
+        "required": ["tool", "arguments"]
     })
 }
 
@@ -305,7 +279,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "overwritten",
-                schema_type("boolean", "True when the request successfully targeted an existing file with its exact sha256 guard."),
+                schema_type("boolean", "True when the request successfully targeted an existing file with expected_read_revision resolved to the Runner's exact SHA guard."),
             ),
             (
                 "bytes_written",
@@ -313,7 +287,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "sha256",
-                nullable_schema("string", "sha256 of the final file, current file on sha guard mismatch, or null when unavailable."),
+                nullable_schema("string", "Informational sha256 of the final file when available; stale guarded-write conflicts are projected through read revisions instead of exposing Runner SHA recovery truth."),
             ),
             (
                 "changed",
@@ -336,16 +310,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "not_started or outcome_unknown for delivery-boundary failures."),
             ),
             (
-                "recovery_action",
-                nullable_schema("string", "Bounded next action; outcome_unknown requires workspace inspection before another write."),
-            ),
-            (
-                "retry_guidance",
-                schema_type("string", "Bounded correction guidance for a deterministic preflight rejection."),
-            ),
-            (
-                "error",
-                schema_type("string", "Agent-side whole-file write rejection message, when unsuccessful."),
+                "recovery",
+                read_files_recovery_call_schema(),
             ),
         ])),
         "apply_patch" => Some(wrapped_output_schema(vec![
@@ -421,10 +387,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "not_started or outcome_unknown for delivery-boundary failures."),
             ),
             (
-                "recovery_action",
-                nullable_schema("string", "Bounded next action; outcome_unknown requires workspace inspection before another write."),
-            ),
-            (
                 "rollback_complete",
                 nullable_schema("boolean", "Whether a failed transactional apply fully restored every prior change; false makes the final workspace state uncertain."),
             ),
@@ -445,12 +407,24 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "Project-relative failed path when known."),
             ),
             (
-                "retry_guidance",
-                schema_type("string", "Bounded recovery guidance for a deterministic no-mutation rejection."),
+                "match_count",
+                schema_type("integer", "Exact-match count reported for a deterministic text conflict when useful."),
             ),
             (
-                "conflict_recovery",
-                edit_conflict_recovery_schema(),
+                "candidate_ranges",
+                array_schema(edit_candidate_range_schema(), "Bounded candidate source ranges. occurrence is included only when the current read revision makes positional retry safe."),
+            ),
+            (
+                "candidates_truncated",
+                schema_type("boolean", "True when additional exact-match candidates exist beyond candidate_ranges."),
+            ),
+            (
+                "conflicting_edit_indices",
+                array_schema(schema_type("integer", "Zero-based edit index participating in an overlap conflict."), "The edit indices whose planned ranges overlap."),
+            ),
+            (
+                "recovery",
+                read_files_recovery_call_schema(),
             ),
         ])),
         _ => None,

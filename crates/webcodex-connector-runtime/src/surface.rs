@@ -107,7 +107,7 @@ pub fn capability_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "files_read",
-            "Read one small, coherent batch of project files for an active task. Every result includes the complete-file sha256 required by edits_apply, even for a line range.",
+            "Read one small, coherent batch of project files for an active task. Successful reads expose read_revision for the exact full-file snapshot; use that model-facing handle for guarded edits. sha256 remains informational.",
             json!({
                 "type": "object",
                 "properties": {
@@ -207,7 +207,7 @@ pub fn capability_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "edits_apply",
-            "Transactionally apply up to 16 edit/create/delete/rename file changes. Existing files require sha256 values returned by files_read; the full batch is preflighted before mutation. Reuse operation_id only for an exact retry.",
+            "Transactionally apply up to 16 edit/create/delete/rename file changes. Delete/rename require expected_read_revision from files_read; globally unique local exact edits may omit it. The full batch is preflighted before mutation. Reuse operation_id only for an exact retry.",
             json!({
                 "type": "object",
                 "properties": {
@@ -228,7 +228,7 @@ pub fn capability_specs() -> Vec<ToolSpec> {
                                 "path": path_schema(),
                                 "to_path": path_schema(),
                                 "content": { "type": "string" },
-                                "expected_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                                "expected_read_revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_u64 },
                                 "edits": {
                                     "type": "array", "minItems": 1, "maxItems": 20,
                                     "items": {
@@ -526,6 +526,18 @@ mod tests {
             start.input_schema["properties"]["mode"]["default"],
             "normal"
         );
+        let edits = specs
+            .iter()
+            .find(|spec| spec.name == "edits_apply")
+            .unwrap();
+        let change = &edits.input_schema["properties"]["changes"]["items"];
+        assert_eq!(
+            change["properties"]["expected_read_revision"]["type"],
+            "integer"
+        );
+        assert!(change["properties"].get("expected_sha256").is_none());
+        let files_read = specs.iter().find(|spec| spec.name == "files_read").unwrap();
+        assert!(files_read.description.contains("read_revision"));
         for spec in specs {
             assert_eq!(
                 spec.input_schema["additionalProperties"], false,

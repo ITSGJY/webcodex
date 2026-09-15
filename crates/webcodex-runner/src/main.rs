@@ -1957,6 +1957,10 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // This binary enforces ApplyTextEditInput.occurrence exactly. Older binaries
     // omit this additive effect-semantics capability and must not receive selectors.
     capabilities.apply_text_edit_occurrence = true;
+    // Unique exact local edits may be preflighted against current content
+    // without a historical whole-file SHA. The transactional source-SHA fence
+    // before mutation remains mandatory.
+    capabilities.apply_text_edit_local_guard_without_sha = true;
     // Line scopes are an additive rolling-upgrade fence: advertise only because
     // this binary resolves full-match containment before any mutation.
     capabilities.apply_text_edit_line_scope = true;

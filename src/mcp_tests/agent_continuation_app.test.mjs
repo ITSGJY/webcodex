@@ -96,12 +96,16 @@ test("Agent Wait card tracks waiting -> triggered -> resuming -> resumed without
     idempotency_key: "wait-card",
   });
   const quiet = { ...projection, wake: null, queued_delivery_count: 0 };
-  view.toolResult({ agent_wait: waitingWait, agent_continuation: quiet });
+  view.toolResult({ agent_wait: { wait_id: waitId, state: "waiting" }, agent_continuation: quiet });
   await view.reply(view.calls("agent_continuation_bind")[0], toolResult({ agent_continuation: quiet }));
+  assert.notEqual(view.nodes.waitSummary?.hidden, false, "sparse model reference has no revision or target proof");
+  await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: quiet }));
+  await view.reply(view.calls("agent_wait_state").at(-1), toolResult({ agent_wait: waitingWait }));
   assert.equal(view.nodes.waitSummary.hidden, false);
   assert.equal(view.nodes.waitState.textContent, "Waiting");
   assert.equal(view.nodes.waitMatches.textContent, "0");
   assert.equal(view.nodes.status.textContent, "Waiting for selected event");
+  await view.fireTimers(3000);
 
   const triggeredWake = {
     ...wake,
@@ -137,6 +141,8 @@ test("Agent Wait card tracks waiting -> triggered -> resuming -> resumed without
   assert.equal(view.nodes.waitState.textContent, "Triggered");
   assert.equal(view.nodes.waitMatches.textContent, "1");
   assert.equal(view.nodes.status.textContent, "Triggered · resuming…");
+  view.toolResult({ agent_wait: { wait_id: waitId, state: "waiting" }, agent_continuation: quiet });
+  assert.equal(view.nodes.waitState.textContent, "Triggered", "delayed sparse result cannot regress durable state");
 
   await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake }));
   await view.reply(view.calls("agent_continuation_wake_prepare").at(-1), prepared());
@@ -169,7 +175,7 @@ test("Agent Wait card never filters a competing non-Wait Agent Wake", async () =
   view.toolInput({ ...input, events: [{ kind: "agent_task_terminal", task_id: waitTaskA }], idempotency_key: "wait-competition" });
   const quiet = { ...projection, wake: null, queued_delivery_count: 0 };
   const oneSourceWait = { ...waitingWait, source_count: 1, sources: waitingWait.sources.slice(0, 1) };
-  view.toolResult({ agent_wait: oneSourceWait, agent_continuation: quiet });
+  view.toolResult({ agent_wait: { wait_id: waitId, state: "waiting" }, agent_continuation: quiet });
   await view.reply(view.calls("agent_continuation_bind")[0], toolResult({ agent_continuation: quiet }));
 
   const inboxWake = { ...wake, state: "pending", revision: 1 };
@@ -1242,3 +1248,20 @@ for (const stage of ["state", "acquire", "finish"]) {
     assert.equal(second.nodes.binding.textContent, "Connected");
   });
 }
+
+test("Agent Wait sparse reference still requires the exact durable target on App refresh", async () => {
+  const view = app("mcp_agent_continuation_app.html");
+  await view.initialize();
+  view.toolInput(input);
+  const quiet = { ...projection, wake: null, queued_delivery_count: 0 };
+  view.toolResult({ agent_wait: { wait_id: waitId, state: "waiting" }, agent_continuation: quiet });
+  await view.reply(view.calls("agent_continuation_bind")[0], toolResult({ agent_continuation: quiet }));
+  await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: quiet }));
+  await view.reply(view.calls("agent_wait_state").at(-1), toolResult({ agent_wait: {
+    ...waitingWait, target_agent_id: `wc_dagent_${"a".repeat(32)}`,
+  } }));
+  assert.equal(view.nodes.binding.textContent, "Unavailable");
+  assert.equal(view.nodes.status.textContent, "Invalid or conflicting Wait identity");
+  assert.notEqual(view.nodes.waitSummary?.hidden, false);
+  assert.equal(hostMessages(view).length, 0);
+});

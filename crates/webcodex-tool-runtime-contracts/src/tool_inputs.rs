@@ -75,12 +75,27 @@ pub fn is_checkpoint_validation_status(value: &str) -> bool {
     CHECKPOINT_VALIDATION_STATUS_VALUES.contains(&value)
 }
 
-// The `apply_text_edits` wire types are shared verbatim with the Runner binary,
-// so their canonical ownership stays in `webcodex-core`; this crate only
-// re-exports them as part of the Tool Runtime call contract.
+// Exact edit primitives and kinds remain shared with the Runner wire contract,
+// but the model-facing file-change DTO intentionally differs: models carry a
+// short read revision while ToolRuntime translates it back to the wire SHA.
 pub use webcodex_core::apply_edits_shared::{
-    ApplyFileChangeInput, ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind,
+    ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind,
 };
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyFileChangeInput {
+    pub kind: ApplyFileChangeKind,
+    pub path: String,
+    #[serde(default)]
+    pub to_path: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub edits: Vec<ApplyTextEditInput>,
+    #[serde(default)]
+    pub expected_read_revision: Option<u64>,
+}
 
 #[cfg(feature = "workspace-checkpoints")]
 #[derive(Debug, Clone, Deserialize, Serialize)]

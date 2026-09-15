@@ -6,6 +6,17 @@ pub(crate) const MAX_WRITE_CONTENT_BYTES: usize = 256 * 1024; // 256 KiB
 /// agent enforces a per-file cap instead), so it stays local.
 pub(crate) const MAX_APPLY_FILE_CHANGES_BYTES: usize = 1024 * 1024;
 
+fn compact_model_edit_surface(tool_name: &str) -> bool {
+    matches!(tool_name, "apply_text_edits" | "write_project_file")
+}
+
+fn read_files_recovery(project: &str, path: &str) -> Value {
+    json!({
+        "tool": "read_files",
+        "arguments": {"project": project, "items": [{"path": path}]}
+    })
+}
+
 fn recoverable_write_rejection(reason: impl AsRef<str>) -> String {
     format!(
         "Rejected before write: {}.\nNo files were modified.\nRetry guidance: read the file again to refresh line numbers/context, then retry with updated guards.",
@@ -14,19 +25,22 @@ fn recoverable_write_rejection(reason: impl AsRef<str>) -> String {
 }
 
 fn structured_edit_not_started_result(tool_name: &str, reason: impl AsRef<str>) -> ToolResult {
+    let mut output = json!({
+        "execution_state": "not_started",
+        "state_changed": false,
+        "error_kind": "not_started",
+        "failure_kind": "not_started",
+        "tool_failure": true,
+    });
+    if !compact_model_edit_surface(tool_name) {
+        output["recovery_action"] = json!("retry_same_after_runner_recovery");
+    }
     ToolResult::err_with_output(
         format!(
-            "{tool_name} was not dispatched: {}. No files were modified by this request. Restore Runner availability, then retry with the same guards.",
+            "{tool_name} was not dispatched: {}. No files were modified by this request.",
             reason.as_ref()
         ),
-        json!({
-            "execution_state": "not_started",
-            "state_changed": false,
-            "error_kind": "not_started",
-            "failure_kind": "not_started",
-            "tool_failure": true,
-            "recovery_action": "retry_same_after_runner_recovery",
-        }),
+        output,
     )
     .with_recovery(crate::tool_runtime::RecoveryKind::RetrySame)
 }
@@ -62,10 +76,12 @@ fn structured_edit_outcome_unknown_result(
     fields.insert("error_kind".to_string(), json!("outcome_unknown"));
     fields.insert("failure_kind".to_string(), json!("outcome_unknown"));
     fields.insert("tool_failure".to_string(), json!(true));
-    fields.insert(
-        "recovery_action".to_string(),
-        json!("inspect_workspace_before_retry"),
-    );
+    if !compact_model_edit_surface(tool_name) {
+        fields.insert(
+            "recovery_action".to_string(),
+            json!("inspect_workspace_before_retry"),
+        );
+    }
     ToolResult::err_with_output(
         format!(
             "{tool_name} outcome is unknown: {}. The Runner may already have changed files. Inspect current workspace state before issuing another write.",
@@ -169,6 +185,76 @@ fn write_project_file_preflight_rejection(
     .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
 }
 
+fn read_revision_rejection(
+    project: &str,
+    path: &str,
+    error: ReadRevisionLookupError,
+) -> ToolResult {
+    let (error_kind, detail) = match error {
+        ReadRevisionLookupError::Unknown => (
+            "unknown_read_revision",
+            "the read revision is unknown, expired, evicted, or belongs to a prior Server runtime",
+        ),
+        ReadRevisionLookupError::ProjectMismatch => (
+            "read_revision_project_mismatch",
+            "the read revision belongs to a different Project",
+        ),
+        ReadRevisionLookupError::PathMismatch => (
+            "read_revision_path_mismatch",
+            "the read revision belongs to a different project-relative path",
+        ),
+        ReadRevisionLookupError::OwnerMismatch => (
+            "read_revision_owner_mismatch",
+            "the read revision belongs to a different Runner process or Project placement",
+        ),
+    };
+    ToolResult::err_with_output(
+        format!("Rejected before write: {detail}. No files were modified."),
+        json!({
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error_kind": error_kind,
+            "path": path,
+            "recovery": read_files_recovery(project, path),
+        }),
+    )
+    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
+}
+
+fn read_revision_target(
+    resolved: &ResolvedProject,
+    path: &str,
+    runner_instance_id: &str,
+) -> ReadRevisionTarget {
+    ReadRevisionTarget {
+        project_id: resolved.resolved_id.clone(),
+        path: path.to_string(),
+        client_id: resolved.config.client_id.clone(),
+        runner_instance_id: runner_instance_id.to_string(),
+        project_root: resolved.config.path.clone(),
+        root_fingerprint: resolved.root_fingerprint.clone(),
+    }
+}
+
+fn apply_text_edit_local_guard_capability_rejection(reason: impl AsRef<str>) -> ToolResult {
+    let reason = reason.as_ref();
+    ToolResult::err_with_output(
+        format!(
+            "Rejected before write: {reason}. No files were modified. Retry guidance: this Runner generation requires a read revision for local guarded edits; reread the current file and retry with expected_read_revision."
+        ),
+        json!({
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error_kind": "agent_capability_unavailable",
+            "failure_kind": "capability_unavailable",
+            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA
+        }),
+    )
+    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
+}
+
 fn apply_text_edit_occurrence_capability_rejection(reason: impl AsRef<str>) -> ToolResult {
     let reason = reason.as_ref();
     ToolResult::err_with_output(
@@ -179,8 +265,7 @@ fn apply_text_edit_occurrence_capability_rejection(reason: impl AsRef<str>) -> T
             "state_changed": false,
             "error_kind": "agent_capability_unavailable",
             "failure_kind": "capability_unavailable",
-            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
-            "retry_guidance": "reconnect the Runner or refine the edit to a unique exact match without occurrence"
+            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE
         }),
     )
 }
@@ -195,8 +280,7 @@ fn apply_text_edit_line_scope_capability_rejection(reason: impl AsRef<str>) -> T
             "state_changed": false,
             "error_kind": "agent_capability_unavailable",
             "failure_kind": "capability_unavailable",
-            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
-            "retry_guidance": "reconnect a Runner with apply_text_edit_line_scope support; never silently downgrade a scoped edit to an unscoped edit"
+            "capability": crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE
         }),
     )
 }
@@ -384,19 +468,29 @@ fn validate_apply_file_change(
     index: usize,
     change: &ApplyFileChangeInput,
 ) -> Result<(), ApplyTextEditsPreflightValidationError> {
-    let expected_hash = || -> Result<(), ApplyTextEditsPreflightValidationError> {
-        match change.expected_sha256.as_deref() {
-            Some(hash) if is_hex_sha256(hash) => Ok(()),
-            _ => Err(format!(
-                "change {index} ({}): expected_sha256 is required and must be 64 lowercase hexadecimal characters",
+    let valid_revision = |required: bool| -> Result<(), ApplyTextEditsPreflightValidationError> {
+        match change.expected_read_revision {
+            Some(revision) if (1..=MAX_JSON_SAFE_INTEGER).contains(&revision) => Ok(()),
+            Some(_) => Err(format!(
+                "change {index} ({}): expected_read_revision must be a positive JSON-safe integer",
                 change.kind.as_str()
             )
             .into()),
+            None if required => Err(format!(
+                "change {index} ({}): expected_read_revision is required",
+                change.kind.as_str()
+            )
+            .into()),
+            None => Ok(()),
         }
     };
     match change.kind {
         ApplyFileChangeKind::Edit => {
-            expected_hash()?;
+            let positional = change
+                .edits
+                .iter()
+                .any(|edit| edit.occurrence.is_some() || edit.line_scope.is_some());
+            valid_revision(positional)?;
             if change.to_path.is_some() || change.content.is_some() {
                 return Err(
                     format!("change {index} (edit): to_path and content are not allowed").into(),
@@ -419,11 +513,11 @@ fn validate_apply_file_change(
         }
         ApplyFileChangeKind::Create => {
             if change.to_path.is_some()
-                || change.expected_sha256.is_some()
+                || change.expected_read_revision.is_some()
                 || !change.edits.is_empty()
             {
                 return Err(format!(
-                    "change {index} (create): to_path, expected_sha256, and edits are not allowed"
+                    "change {index} (create): to_path, expected_read_revision, and edits are not allowed"
                 )
                 .into());
             }
@@ -438,7 +532,7 @@ fn validate_apply_file_change(
             }
         }
         ApplyFileChangeKind::Delete => {
-            expected_hash()?;
+            valid_revision(true)?;
             if change.to_path.is_some() || change.content.is_some() || !change.edits.is_empty() {
                 return Err(format!(
                     "change {index} (delete): to_path, content, and edits are not allowed"
@@ -447,7 +541,7 @@ fn validate_apply_file_change(
             }
         }
         ApplyFileChangeKind::Rename => {
-            expected_hash()?;
+            valid_revision(true)?;
             let to_path = change
                 .to_path
                 .as_deref()
@@ -1513,16 +1607,191 @@ fn apply_patch_agent_stdout_result(
     )
 }
 
+fn sanitize_apply_text_edits_model_recovery(
+    mut result: ToolResult,
+    project: &str,
+    changes: &[ApplyFileChangeInput],
+) -> ToolResult {
+    if result.success {
+        return result;
+    }
+    let change_index = result
+        .output
+        .get("change_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let change = change_index.and_then(|index| changes.get(index));
+    let error_kind = result
+        .output
+        .get("error_kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let raw_conflict = result
+        .output
+        .as_object_mut()
+        .and_then(|output| output.remove("conflict_recovery"));
+    if let Some(output) = result.output.as_object_mut() {
+        for key in [
+            "retry_guidance",
+            "recovery_action",
+            "expected_read_revision",
+            "reread_required",
+            "suggested_call",
+            "error",
+        ] {
+            output.remove(key);
+        }
+    }
+
+    if error_kind == "sha256_conflict" {
+        result.output["error_kind"] = json!("stale_file_revision");
+        if let Some(change) = change {
+            result.output["path"] = json!(change.path);
+            result.output["recovery"] = read_files_recovery(project, &change.path);
+        }
+        result.error = Some(
+            "Rejected transactional file batch: the source changed before mutation. No files were modified."
+                .to_string(),
+        );
+        return result;
+    }
+
+    if error_kind != "edit_conflict" {
+        return result;
+    }
+    let Some(raw_conflict) = raw_conflict.as_ref().and_then(Value::as_object) else {
+        return result;
+    };
+    let Some(conflict_kind) = raw_conflict.get("conflict_kind").and_then(Value::as_str) else {
+        return result;
+    };
+    let conflict_kind = match conflict_kind {
+        "multiple_matches"
+        | "match_not_found"
+        | "occurrence_out_of_range"
+        | "occurrence_outside_line_scope"
+        | "overlapping_edits" => conflict_kind,
+        _ => return result,
+    };
+    result.output["error_kind"] = json!(conflict_kind);
+    if let Some(match_count) = raw_conflict.get("match_count").and_then(Value::as_u64) {
+        result.output["match_count"] = json!(match_count);
+    }
+    if let Some(truncated) = raw_conflict
+        .get("candidates_truncated")
+        .and_then(Value::as_bool)
+    {
+        result.output["candidates_truncated"] = json!(truncated);
+    }
+    if let Some(indices) = raw_conflict
+        .get("conflicting_edit_indices")
+        .and_then(Value::as_array)
+    {
+        result.output["conflicting_edit_indices"] = json!(indices);
+    }
+
+    let guarded = change.is_some_and(|change| change.expected_read_revision.is_some());
+    if let Some(candidates) = raw_conflict
+        .get("candidate_ranges")
+        .and_then(Value::as_array)
+    {
+        let candidates = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let start_line = candidate.get("start_line")?.as_u64()?;
+                let end_line = candidate.get("end_line")?.as_u64()?;
+                if guarded {
+                    Some(json!({
+                        "occurrence": candidate.get("occurrence")?.as_u64()?,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                    }))
+                } else {
+                    Some(json!({"start_line": start_line, "end_line": end_line}))
+                }
+            })
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            result.output["candidate_ranges"] = json!(candidates);
+        }
+    }
+
+    if !guarded && conflict_kind != "overlapping_edits" {
+        if let Some(change) = change {
+            result.output["recovery"] = read_files_recovery(project, &change.path);
+        }
+    }
+    result.error = Some(
+        match conflict_kind {
+            "multiple_matches" => "Rejected transactional file batch: the exact target matched multiple locations. No files were modified.",
+            "match_not_found" => "Rejected transactional file batch: the exact target was not found. No files were modified.",
+            "occurrence_out_of_range" => "Rejected transactional file batch: the requested occurrence is outside the exact-match set. No files were modified.",
+            "occurrence_outside_line_scope" => "Rejected transactional file batch: the requested occurrence is outside line_scope. No files were modified.",
+            "overlapping_edits" => "Rejected transactional file batch: planned exact edit ranges overlap. No files were modified.",
+            _ => unreachable!(),
+        }
+        .to_string(),
+    );
+    result
+}
+
+fn sanitize_write_project_file_model_recovery(
+    mut result: ToolResult,
+    project: &str,
+    path: &str,
+) -> ToolResult {
+    if result.success {
+        return result;
+    }
+    let sha_mismatch = result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("expected_sha256 mismatch"));
+    if let Some(output) = result.output.as_object_mut() {
+        for key in [
+            "retry_guidance",
+            "recovery_action",
+            "expected_read_revision",
+            "reread_required",
+            "suggested_call",
+            "error",
+        ] {
+            output.remove(key);
+        }
+    }
+    if !sha_mismatch {
+        return result;
+    }
+    result
+        .output
+        .as_object_mut()
+        .map(|output| output.remove("sha256"));
+    result.output["error_kind"] = json!("stale_file_revision");
+    result.output["path"] = json!(path);
+    result.output["recovery"] = read_files_recovery(project, path);
+    result.error = Some(format!(
+        "Rejected whole-file replacement: the source for '{path}' changed before mutation. No file was overwritten."
+    ));
+    result
+}
+
 fn apply_text_edits_agent_stdout_result(
     stdout: &str,
     expected_change_count: usize,
     expected_dry_run: bool,
+    project: &str,
+    changes: &[ApplyFileChangeInput],
 ) -> ToolResult {
-    transactional_edit_agent_stdout_result(
-        "apply_text_edits",
-        stdout,
-        expected_change_count,
-        expected_dry_run,
+    sanitize_apply_text_edits_model_recovery(
+        transactional_edit_agent_stdout_result(
+            "apply_text_edits",
+            stdout,
+            expected_change_count,
+            expected_dry_run,
+        ),
+        project,
+        changes,
     )
 }
 
@@ -1578,6 +1847,70 @@ fn write_project_file_agent_stdout_result(stdout: &str) -> ToolResult {
         );
     }
     ToolResult::ok(obj)
+}
+
+fn compact_write_project_file_preflight_rejection(
+    detail: impl Into<String>,
+    error_kind: &'static str,
+) -> ToolResult {
+    let detail = detail.into();
+    ToolResult::err_with_output(
+        format!("Rejected before write: {detail}. No files were modified."),
+        json!({
+            "changed": false,
+            "state_changed": false,
+            "execution_state": "not_started",
+            "error_kind": error_kind,
+        }),
+    )
+    .with_recovery(crate::tool_runtime::RecoveryKind::FixInput)
+}
+
+fn compact_apply_text_edits_preflight_rejection(
+    message: impl Into<String>,
+    error_kind: &'static str,
+    change_index: Option<usize>,
+    edit_index: Option<usize>,
+    kind: Option<&str>,
+    path: Option<&str>,
+) -> ToolResult {
+    let detail = message.into();
+    let mut output = json!({
+        "state_changed": false,
+        "error_kind": error_kind,
+    });
+    if let Some(change_index) = change_index {
+        output["change_index"] = json!(change_index);
+    }
+    if let Some(edit_index) = edit_index {
+        output["edit_index"] = json!(edit_index);
+    }
+    if let Some(kind) = kind {
+        output["kind"] = json!(kind);
+    }
+    if let Some(path) = path {
+        output["path"] = json!(path);
+    }
+    ToolResult::err_with_output(
+        format!("Rejected before write: {detail}. No files were modified."),
+        output,
+    )
+}
+
+fn compact_apply_text_edits_path_policy_rejection(
+    change_index: usize,
+    kind: &str,
+    path: &str,
+    message: String,
+) -> ToolResult {
+    let mut result = super::permissions::edit_path_policy_rejected_result(path, message);
+    if let Some(output) = result.output.as_object_mut() {
+        output.remove("path");
+        output.remove("error");
+    }
+    result.output["change_index"] = json!(change_index);
+    result.output["kind"] = json!(kind);
+    result
 }
 
 fn apply_text_edits_preflight_rejection(
@@ -2101,60 +2434,82 @@ impl ToolRuntime {
         path: String,
         content: String,
         overwrite: Option<bool>,
-        expected_sha256: Option<String>,
+        expected_read_revision: Option<u64>,
     ) -> ToolResult {
-        // ---- Input validation (before project resolution) ----
         if let Err(e) = validate_edit_file_path(&path) {
             return super::permissions::edit_path_policy_rejected_result(&path, e);
         }
         if content.contains('\0') {
-            return write_project_file_preflight_rejection(
+            return compact_write_project_file_preflight_rejection(
                 "content cannot contain NUL bytes",
                 "invalid_content",
-                "remove the NUL byte and retry",
             );
         }
         if content.len() > MAX_WRITE_CONTENT_BYTES {
-            return write_project_file_preflight_rejection(
+            return compact_write_project_file_preflight_rejection(
                 format!("content exceeds {MAX_WRITE_CONTENT_BYTES} bytes"),
                 "content_too_large",
-                "use apply_text_edits for a smaller local change or reduce the full rewrite",
             );
         }
         let overwrite = overwrite.unwrap_or(false);
-        if let Some(hash) = expected_sha256.as_deref() {
-            if !is_hex_sha256(hash) {
-                return write_project_file_preflight_rejection(
-                    "expected_sha256 must be a lowercase 64-character hex digest",
-                    "invalid_expected_sha256",
-                    "reread the file and provide its exact current sha256",
-                );
-            }
+        if expected_read_revision
+            .is_some_and(|revision| !(1..=MAX_JSON_SAFE_INTEGER).contains(&revision))
+        {
+            return compact_write_project_file_preflight_rejection(
+                "expected_read_revision must be a positive JSON-safe integer",
+                "invalid_expected_read_revision",
+            );
         }
-        match (overwrite, expected_sha256.is_some()) {
+        match (overwrite, expected_read_revision.is_some()) {
             (true, false) => {
-                return write_project_file_preflight_rejection(
-                    "overwrite=true requires expected_sha256",
-                    "missing_expected_sha256",
-                    "reread the existing file and retry with its exact current sha256",
+                return compact_write_project_file_preflight_rejection(
+                    "overwrite=true requires expected_read_revision",
+                    "missing_expected_read_revision",
                 )
             }
             (false, true) => {
-                return write_project_file_preflight_rejection(
-                    "expected_sha256 is allowed only when overwrite=true",
-                    "unexpected_expected_sha256",
-                    "omit expected_sha256 for a new-file create, or set overwrite=true for an existing-file rewrite",
+                return compact_write_project_file_preflight_rejection(
+                    "expected_read_revision is allowed only when overwrite=true",
+                    "unexpected_expected_read_revision",
                 )
             }
             _ => {}
         }
 
-        // ---- Project resolution (Runner-registered only) ----
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
+        let resolved = match self.resolve_project_input(&project).await {
+            Ok(resolved) => resolved,
+            Err(error) => return ToolResult::err(error),
         };
-        let client_id = proj.client_id.clone();
+        let Some(runner) = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await
+        else {
+            return structured_edit_not_started_result(
+                "write_project_file",
+                "the resolved Runner became unavailable before mutation admission",
+            );
+        };
+        let Some(runner_project_id) =
+            crate::tool_runtime::runner_local_project_id(&resolved.resolved_id)
+        else {
+            return structured_edit_not_started_result(
+                "write_project_file",
+                "the resolved Project identity could not be bound to a Runner-local project id",
+            );
+        };
+        let expected_sha256 = match expected_read_revision {
+            Some(revision) => {
+                let target = read_revision_target(&resolved, &path, &runner.runner_instance_id);
+                match self.read_revisions.resolve(revision, &target) {
+                    Ok(sha256) => Some(sha256),
+                    Err(error) => {
+                        return read_revision_rejection(&resolved.resolved_id, &path, error)
+                    }
+                }
+            }
+            None => None,
+        };
 
         let payload = json!({
             "path": path.clone(),
@@ -2163,31 +2518,48 @@ impl ToolRuntime {
             "expected_sha256": expected_sha256,
         });
         let wait_timeout = 60_u64;
+        let request = ShellFileOpRequest {
+            op: "write_project_file".to_string(),
+            client_id: resolved.config.client_id.clone(),
+            path: path.clone(),
+            cwd: Some(resolved.config.path.clone()),
+            content: Some(payload.to_string()),
+            max_bytes: None,
+            old_text: None,
+            pattern: None,
+            expected_sha256: None,
+            expected_prefix: None,
+            start_line: None,
+            end_line: None,
+            line: None,
+            create_dirs: false,
+            wait_timeout_secs: wait_timeout,
+        };
         let (request_id, rx) = match self
             .runner_registry
-            .enqueue_file_op(
-                ShellFileOpRequest {
-                    op: "write_project_file".to_string(),
-                    client_id,
-                    path: path.clone(),
-                    cwd: Some(proj.path.clone()),
-                    content: Some(payload.to_string()),
-                    max_bytes: None,
-                    old_text: None,
-                    pattern: None,
-                    expected_sha256: None,
-                    expected_prefix: None,
-                    start_line: None,
-                    end_line: None,
-                    line: None,
-                    create_dirs: false,
-                    wait_timeout_secs: wait_timeout,
-                },
+            .enqueue_project_file_mutation(
+                request,
+                runner_project_id,
+                &resolved.config.path,
+                &runner.runner_instance_id,
                 "tool_runtime".to_string(),
             )
             .await
         {
             Ok(request) => request,
+            Err(error) if error.starts_with("stale_runner:") => {
+                if expected_read_revision.is_some() {
+                    return read_revision_rejection(
+                        &resolved.resolved_id,
+                        &path,
+                        ReadRevisionLookupError::OwnerMismatch,
+                    );
+                }
+                return structured_edit_not_started_result(
+                    "write_project_file",
+                    "the exact Runner changed before the new-file create could be dispatched; retry after resolving the current Project owner",
+                );
+            }
             Err(_) => {
                 return structured_edit_not_started_result(
                     "write_project_file",
@@ -2207,7 +2579,11 @@ impl ToolRuntime {
             Ok(response) => response,
             Err(result) => return result,
         };
-        write_project_file_agent_stdout_result(&response.stdout.unwrap_or_default())
+        sanitize_write_project_file_model_recovery(
+            write_project_file_agent_stdout_result(&response.stdout.unwrap_or_default()),
+            &resolved.resolved_id,
+            &path,
+        )
     }
 
     pub(crate) async fn apply_patch(
@@ -2402,18 +2778,17 @@ impl ToolRuntime {
         dry_run: Option<bool>,
     ) -> ToolResult {
         if changes.is_empty() {
-            return apply_text_edits_preflight_rejection(
+            return compact_apply_text_edits_preflight_rejection(
                 "changes must contain at least one file change",
                 "empty_batch",
                 None,
                 None,
                 None,
                 None,
-                "add at least one valid file change and retry",
             );
         }
         if changes.len() > MAX_APPLY_FILE_CHANGES {
-            return apply_text_edits_preflight_rejection(
+            return compact_apply_text_edits_preflight_rejection(
                 format!(
                     "too many file changes; maximum is {}",
                     MAX_APPLY_FILE_CHANGES
@@ -2423,13 +2798,12 @@ impl ToolRuntime {
                 None,
                 None,
                 None,
-                "reduce the batch to the supported file-change limit and retry",
             );
         }
         let mut touched_paths = HashSet::new();
         for (change_index, change) in changes.iter().enumerate() {
             if let Err(error) = validate_edit_file_path(&change.path) {
-                return apply_text_edits_path_policy_rejection(
+                return compact_apply_text_edits_path_policy_rejection(
                     change_index,
                     change.kind.as_str(),
                     &change.path,
@@ -2437,7 +2811,7 @@ impl ToolRuntime {
                 );
             }
             if !touched_paths.insert(change.path.as_str()) {
-                return apply_text_edits_preflight_rejection(
+                return compact_apply_text_edits_preflight_rejection(
                     format!(
                         "change {change_index} reuses path '{}'; each source/destination path may appear only once",
                         change.path
@@ -2447,12 +2821,11 @@ impl ToolRuntime {
                     None,
                     Some(change.kind.as_str()),
                     Some(&change.path),
-                    "correct the duplicate source/destination path and retry the whole batch",
                 );
             }
             if let Some(to_path) = change.to_path.as_deref() {
                 if let Err(error) = validate_edit_file_path(to_path) {
-                    return apply_text_edits_path_policy_rejection(
+                    return compact_apply_text_edits_path_policy_rejection(
                         change_index,
                         change.kind.as_str(),
                         to_path,
@@ -2460,7 +2833,7 @@ impl ToolRuntime {
                     );
                 }
                 if !touched_paths.insert(to_path) {
-                    return apply_text_edits_preflight_rejection(
+                    return compact_apply_text_edits_preflight_rejection(
                         format!(
                             "change {change_index} reuses destination path '{to_path}'; each source/destination path may appear only once"
                         ),
@@ -2469,7 +2842,6 @@ impl ToolRuntime {
                         None,
                         Some(change.kind.as_str()),
                         Some(to_path),
-                        "correct the duplicate source/destination path and retry the whole batch",
                     );
                 }
             }
@@ -2479,7 +2851,7 @@ impl ToolRuntime {
                     .and_then(|edit_index| change.edits.get(edit_index))
                     .map(|edit| edit.kind.as_str())
                     .unwrap_or_else(|| change.kind.as_str());
-                return apply_text_edits_preflight_rejection(
+                return compact_apply_text_edits_preflight_rejection(
                     validation_error.message,
                     if validation_error.edit_index.is_some() {
                         "invalid_edit"
@@ -2490,30 +2862,76 @@ impl ToolRuntime {
                     validation_error.edit_index,
                     Some(failed_kind),
                     Some(&change.path),
-                    "correct the rejected change or edit and retry the whole batch",
                 );
             }
         }
-        let requires_occurrence_capability = changes
-            .iter()
-            .flat_map(|change| change.edits.iter())
-            .any(|edit| edit.occurrence.is_some());
-        let requires_line_scope_capability = changes
-            .iter()
-            .flat_map(|change| change.edits.iter())
-            .any(|edit| edit.line_scope.is_some());
+
+        let resolved = match self.resolve_project_input(&project).await {
+            Ok(resolved) => resolved,
+            Err(error) => return ToolResult::err(error),
+        };
+        let Some(runner) = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await
+        else {
+            return structured_edit_not_started_result(
+                "apply_text_edits",
+                "the resolved Runner became unavailable before mutation admission",
+            );
+        };
+        let Some(runner_project_id) =
+            crate::tool_runtime::runner_local_project_id(&resolved.resolved_id)
+        else {
+            return structured_edit_not_started_result(
+                "apply_text_edits",
+                "the resolved Project identity could not be bound to a Runner-local project id",
+            );
+        };
+
+        // Resolve every strong model-facing guard before request construction.
+        // Any invalid/stale/mismatched revision rejects the entire batch without
+        // dispatch, preserving transactionality across mixed guarded/unguarded changes.
+        let mut wire_changes = Vec::with_capacity(changes.len());
+        for change in &changes {
+            let expected_sha256 = match change.expected_read_revision {
+                Some(revision) => {
+                    let target =
+                        read_revision_target(&resolved, &change.path, &runner.runner_instance_id);
+                    match self.read_revisions.resolve(revision, &target) {
+                        Ok(sha256) => Some(sha256),
+                        Err(error) => {
+                            return read_revision_rejection(
+                                &resolved.resolved_id,
+                                &change.path,
+                                error,
+                            )
+                        }
+                    }
+                }
+                None => None,
+            };
+            wire_changes.push(crate::apply_edits_shared::ApplyFileChangeInput {
+                kind: change.kind,
+                path: change.path.clone(),
+                to_path: change.to_path.clone(),
+                content: change.content.clone(),
+                edits: change.edits.clone(),
+                expected_sha256,
+            });
+        }
 
         let expected_change_count = changes.len();
         let expected_dry_run = dry_run.unwrap_or(false);
         let payload = json!({
-            "changes": changes,
+            "changes": wire_changes,
             "dry_run": expected_dry_run,
             "recovery_metadata_version": 1,
         });
         let serialized = match serde_json::to_string(&payload) {
             Ok(serialized) if serialized.len() <= MAX_APPLY_FILE_CHANGES_BYTES => serialized,
             Ok(_) => {
-                return apply_text_edits_preflight_rejection(
+                return compact_apply_text_edits_preflight_rejection(
                     format!(
                         "serialized file changes exceed {} bytes",
                         MAX_APPLY_FILE_CHANGES_BYTES
@@ -2523,27 +2941,19 @@ impl ToolRuntime {
                     None,
                     None,
                     None,
-                    "reduce the batch payload size and retry",
                 )
             }
             Err(error) => {
-                return apply_text_edits_preflight_rejection(
+                return compact_apply_text_edits_preflight_rejection(
                     format!("failed to serialize file changes payload: {error}"),
                     "serialization_failed",
                     None,
                     None,
                     None,
                     None,
-                    "correct the request payload and retry",
                 )
             }
         };
-
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
-        };
-        let client_id = proj.client_id.clone();
 
         let wait_timeout = 60_u64;
         let routing_path = changes
@@ -2552,9 +2962,9 @@ impl ToolRuntime {
             .expect("non-empty changes validated above");
         let request = ShellFileOpRequest {
             op: "apply_text_edits".to_string(),
-            client_id,
+            client_id: resolved.config.client_id.clone(),
             path: routing_path,
-            cwd: Some(proj.path.clone()),
+            cwd: Some(resolved.config.path.clone()),
             content: Some(serialized),
             max_bytes: None,
             old_text: None,
@@ -2567,40 +2977,58 @@ impl ToolRuntime {
             create_dirs: false,
             wait_timeout_secs: wait_timeout,
         };
-        let enqueue_result = if requires_line_scope_capability {
-            self.runner_registry
-                .enqueue_apply_text_edits_with_line_scope(
-                    request,
-                    "tool_runtime".to_string(),
-                    requires_occurrence_capability,
-                )
-                .await
-        } else if requires_occurrence_capability {
-            self.runner_registry
-                .enqueue_apply_text_edits_with_occurrence(request, "tool_runtime".to_string())
-                .await
-        } else {
-            self.runner_registry
-                .enqueue_file_op(request, "tool_runtime".to_string())
-                .await
-        };
+        let enqueue_result = self
+            .runner_registry
+            .enqueue_project_file_mutation(
+                request,
+                runner_project_id,
+                &resolved.config.path,
+                &runner.runner_instance_id,
+                "tool_runtime".to_string(),
+            )
+            .await;
         let (request_id, rx) = match enqueue_result {
-            Ok(r) => r,
-            Err(e)
-                if e.starts_with("capability_unavailable:")
-                    && e.contains(
+            Ok(request) => request,
+            Err(error)
+                if error.starts_with("capability_unavailable:")
+                    && error.contains(
+                        crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA,
+                    ) =>
+            {
+                return apply_text_edit_local_guard_capability_rejection(error)
+            }
+            Err(error)
+                if error.starts_with("capability_unavailable:")
+                    && error.contains(
                         crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
                     ) =>
             {
-                return apply_text_edit_line_scope_capability_rejection(e)
+                return apply_text_edit_line_scope_capability_rejection(error)
             }
-            Err(e)
-                if e.starts_with("capability_unavailable:")
-                    && e.contains(
+            Err(error)
+                if error.starts_with("capability_unavailable:")
+                    && error.contains(
                         crate::runner_protocol::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
                     ) =>
             {
-                return apply_text_edit_occurrence_capability_rejection(e)
+                return apply_text_edit_occurrence_capability_rejection(error)
+            }
+            Err(error) if error.starts_with("stale_runner:") => {
+                if let Some(path) = changes.iter().find_map(|change| {
+                    change
+                        .expected_read_revision
+                        .map(|_| change.path.as_str())
+                }) {
+                    return read_revision_rejection(
+                        &resolved.resolved_id,
+                        path,
+                        ReadRevisionLookupError::OwnerMismatch,
+                    );
+                }
+                return structured_edit_not_started_result(
+                    "apply_text_edits",
+                    "the exact Runner changed before the local edit could be dispatched; reread before retrying",
+                );
             }
             Err(_) => {
                 return structured_edit_not_started_result(
@@ -2625,6 +3053,8 @@ impl ToolRuntime {
             &response.stdout.unwrap_or_default(),
             expected_change_count,
             expected_dry_run,
+            &resolved.resolved_id,
+            &changes,
         )
     }
 }
@@ -3700,7 +4130,7 @@ mod tests {
 
     #[test]
     fn apply_text_edits_path_policy_recovery_omits_untrusted_path_metadata() {
-        let result = apply_text_edits_path_policy_rejection(
+        let result = compact_apply_text_edits_path_policy_rejection(
             2,
             "edit",
             "/private/secret.txt",
@@ -3725,6 +4155,8 @@ mod tests {
             r#"{"changed":true,"state_changed":false,"rollback_complete":false,"retry_guidance":"retry directly","conflict_recovery":{"schema_version":1,"conflict_kind":"multiple_matches","occurrence_selector_supported":true,"direct_retry_safe":true,"reread_required":false,"recovery_action":"select_occurrence_or_refine_match"},"error":"rollback failed"}"#,
             1,
             false,
+            "agent:test:demo",
+            &[],
         );
 
         assert!(!result.success);

@@ -14,6 +14,10 @@ fn apply_text_edits_schema_accepts(schema: &Value, value: &Value) -> bool {
     test_support::validate_schema_instance(value, schema).is_ok()
 }
 
+fn schema_accepts(schema: &Value, value: &Value) -> bool {
+    test_support::validate_schema_instance(value, schema).is_ok()
+}
+
 #[test]
 fn apply_text_edits_input_schema_encodes_file_and_edit_kind_contracts() {
     let specs = registered_tool_specs();
@@ -30,18 +34,23 @@ fn apply_text_edits_input_schema_encodes_file_and_edit_kind_contracts() {
     let create = variant_for_kind(&changes["items"], "create");
     let delete = variant_for_kind(&changes["items"], "delete");
     let rename = variant_for_kind(&changes["items"], "rename");
-    assert_eq!(
-        edit["required"],
-        json!(["kind", "path", "expected_sha256", "edits"])
-    );
+    assert_eq!(edit["required"], json!(["kind", "path", "edits"]));
     assert_eq!(create["required"], json!(["kind", "path", "content"]));
     assert_eq!(
         delete["required"],
-        json!(["kind", "path", "expected_sha256"])
+        json!(["kind", "path", "expected_read_revision"])
     );
     assert_eq!(
         rename["required"],
-        json!(["kind", "path", "to_path", "expected_sha256"])
+        json!(["kind", "path", "to_path", "expected_read_revision"])
+    );
+    assert_eq!(
+        edit["properties"]["expected_read_revision"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        edit["properties"]["expected_read_revision"]["maximum"],
+        9007199254740991_u64
     );
     for variant in [edit, create, delete, rename] {
         assert_eq!(variant["additionalProperties"], false);
@@ -92,21 +101,17 @@ fn apply_text_edits_input_schema_encodes_file_and_edit_kind_contracts() {
             .contains("global source-order"));
     }
 
-    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let revision = 3817291045227_u64;
     let valid = [
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact","old_text":"old"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"delete_exact","old_text":"old"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_before","anchor_text":"anchor","new_text":"new"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_after","anchor_text":"anchor","new_text":"new"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_before","anchor_text":"anchor","new_text":""}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_after","anchor_text":"anchor","new_text":""}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact","old_text":"old","line_scope":{"start_line":10,"end_line":20}}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"delete_exact","old_text":"old","line_scope":{"start_line":10,"end_line":20}}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_before","anchor_text":"anchor","new_text":"new","line_scope":{"start_line":10,"end_line":20}}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_after","anchor_text":"anchor","new_text":"new","occurrence":2,"line_scope":{"start_line":10,"end_line":20}}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"replace_exact","old_text":"old"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"delete_exact","old_text":"old"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"insert_before","anchor_text":"anchor","new_text":"new"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_read_revision":revision,"edits":[{"kind":"replace_exact","old_text":"old"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_read_revision":revision,"edits":[{"kind":"replace_exact","old_text":"old","line_scope":{"start_line":10,"end_line":20}}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_read_revision":revision,"edits":[{"kind":"insert_after","anchor_text":"anchor","new_text":"new","occurrence":2}]}]}),
         json!({"project":"demo","changes":[{"kind":"create","path":"new.txt","content":""}]}),
-        json!({"project":"demo","changes":[{"kind":"delete","path":"old.txt","expected_sha256":hash}]}),
-        json!({"project":"demo","changes":[{"kind":"rename","path":"old.txt","to_path":"new.txt","expected_sha256":hash}]}),
+        json!({"project":"demo","changes":[{"kind":"delete","path":"old.txt","expected_read_revision":revision}]}),
+        json!({"project":"demo","changes":[{"kind":"rename","path":"old.txt","to_path":"new.txt","expected_read_revision":revision}]}),
     ];
     for value in valid {
         assert!(
@@ -116,24 +121,62 @@ fn apply_text_edits_input_schema_encodes_file_and_edit_kind_contracts() {
     }
 
     let invalid = [
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact","old_text":"old","anchor_text":"anchor"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"delete_exact","old_text":"old","new_text":"x"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_before","old_text":"old","anchor_text":"anchor","new_text":"x"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"insert_after","anchor_text":"anchor"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact","old_text":"old","line_scope":{"start_line":0,"end_line":2}}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact","old_text":"old","line_scope":{"end_line":2}}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact","old_text":"old","line_scope":{"start_line":1}}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_sha256":hash,"edits":[{"kind":"replace_exact","old_text":"old","line_scope":{"start_line":1,"end_line":2,"nearest":true}}]}]}),
-        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"delete_exact","old_text":"old"}]}]}),
-        json!({"project":"demo","changes":[{"kind":"create","path":"new.txt","content":"x","expected_sha256":hash}]}),
-        json!({"project":"demo","changes":[{"kind":"delete","path":"old.txt","expected_sha256":hash,"content":"x"}]}),
-        json!({"project":"demo","changes":[{"kind":"rename","path":"old.txt","to_path":"new.txt","expected_sha256":hash,"edits":[]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"replace_exact","old_text":"old","anchor_text":"anchor"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"replace_exact"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"delete_exact","old_text":"old","new_text":"x"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"insert_after","anchor_text":"anchor"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"replace_exact","old_text":"old","line_scope":{"start_line":10,"end_line":20}}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","edits":[{"kind":"replace_exact","old_text":"old","occurrence":2}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_read_revision":0,"edits":[{"kind":"replace_exact","old_text":"old"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"edit","path":"a.rs","expected_read_revision":9007199254740992_u64,"edits":[{"kind":"replace_exact","old_text":"old"}]}]}),
+        json!({"project":"demo","changes":[{"kind":"create","path":"new.txt","content":"x","expected_read_revision":revision}]}),
+        json!({"project":"demo","changes":[{"kind":"delete","path":"old.txt"}]}),
+        json!({"project":"demo","changes":[{"kind":"rename","path":"old.txt","to_path":"new.txt"}]}),
     ];
     for value in invalid {
         assert!(
             !apply_text_edits_schema_accepts(schema, &value),
             "invalid apply_text_edits shape accepted: {value}"
+        );
+    }
+}
+
+#[test]
+fn write_project_file_schema_uses_read_revision_for_whole_file_replacement() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "write_project_file").input_schema;
+    let revision = 3817291045227_u64;
+
+    assert_eq!(
+        schema["properties"]["expected_read_revision"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        schema["properties"]["expected_read_revision"]["maximum"],
+        9007199254740991_u64
+    );
+    assert!(schema["properties"].get("expected_sha256").is_none());
+
+    for value in [
+        json!({"project":"demo","path":"new.rs","content":"fn main() {}"}),
+        json!({"project":"demo","path":"existing.rs","content":"fn main() {}","overwrite":true,"expected_read_revision":revision}),
+    ] {
+        assert!(
+            schema_accepts(schema, &value),
+            "valid write shape rejected: {value}"
+        );
+    }
+    for value in [
+        json!({"project":"demo","path":"existing.rs","content":"x","overwrite":true}),
+        json!({"project":"demo","path":"existing.rs","content":"x","expected_read_revision":revision}),
+        json!({"project":"demo","path":"existing.rs","content":"x","overwrite":false,"expected_read_revision":revision}),
+        json!({"project":"demo","path":"existing.rs","content":"x","overwrite":true,"expected_read_revision":0}),
+        json!({"project":"demo","path":"existing.rs","content":"x","overwrite":true,"expected_read_revision":9007199254740992_u64}),
+        json!({"project":"demo","path":"existing.rs","content":"x","overwrite":true,"expected_sha256":"a".repeat(64)}),
+    ] {
+        assert!(
+            !schema_accepts(schema, &value),
+            "invalid write shape accepted: {value}"
         );
     }
 }

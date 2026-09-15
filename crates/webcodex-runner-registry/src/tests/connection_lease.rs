@@ -646,6 +646,8 @@ async fn late_result_on_stale_connection_is_accepted_without_refreshing_liveness
                 exit_code: Some(0),
                 stdout: Some("hi".to_string()),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             }

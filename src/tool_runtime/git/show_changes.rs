@@ -2146,10 +2146,6 @@ fn set_show_changes_verdict(output: &mut Value) {
         let hunk_line_truncated = diff_truncation_reasons
             .iter()
             .any(|reason| *reason == "diff_hunk_line_limit");
-        let current_hunk_omitted = hunk_line_truncated
-            || diff_truncation_reasons
-                .iter()
-                .any(|reason| *reason == "diff_hunk_byte_budget");
         // show_changes currently reports line truncation at the aggregate diff
         // level, not as authoritative per-hunk provenance. Keep whole-worktree
         // scope rather than guessing which returned path owns the omitted lines.
@@ -2163,12 +2159,6 @@ fn set_show_changes_verdict(output: &mut Value) {
             .get("project")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let recovery_kind = match (page_truncated, current_hunk_omitted) {
-            (true, true) => "mixed",
-            (true, false) => "page",
-            (false, true) => "hunk_lines",
-            (false, false) => unreachable!("truncated show_changes diff needs a recovery kind"),
-        };
         let canonical_recovery_call = SuggestedToolCall::new(
             "git_diff_hunks",
             json!({
@@ -2182,19 +2172,7 @@ fn set_show_changes_verdict(output: &mut Value) {
         )
         .to_value();
         output["diff_review_handoff"] = json!({
-            "scope": "worktree",
-            "reason": "show_changes_diff_truncated",
-            "truncation_reasons": diff_truncation_reasons,
-            "recovery": {
-                "kind": recovery_kind,
-                "tool": canonical_recovery_call["tool"].clone(),
-                "arguments": canonical_recovery_call["arguments"].clone(),
-                "safe_continuation_for_omitted_lines": if current_hunk_omitted {
-                    Value::Bool(false)
-                } else {
-                    Value::Null
-                },
-            },
+            "next_call": canonical_recovery_call,
         });
         push_unique_reason(&mut warning_reasons, "truncated_by_limit");
         push_unique_action(
@@ -2204,13 +2182,13 @@ fn set_show_changes_verdict(output: &mut Value) {
         if page_truncated {
             push_unique_action(
                 &mut actions,
-                "follow git_diff_hunks.next_continuation while has_more=true",
+                "follow git_diff_hunks recovery.later_hunks.next_call while has_more=true",
             );
         }
         if hunk_line_truncated {
             push_unique_action(
                 &mut actions,
-                "follow git_diff_hunks recovery.omitted_lines.next_call; after the fresh handoff observation it may use bounded refinement or an exact hunk-fragment continuation",
+                "follow git_diff_hunks recovery.current_hunk.next_call; after the fresh handoff observation it may use bounded refinement or an exact hunk-fragment continuation",
             );
         }
     } else if let Some(object) = output.as_object_mut() {

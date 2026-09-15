@@ -378,6 +378,8 @@ async fn complete_mcp_import_save(
                 .to_string(),
             ),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -427,6 +429,8 @@ async fn complete_mcp_import_save(
                             .to_string(),
                         ),
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })
@@ -457,6 +461,8 @@ async fn complete_mcp_import_save(
                             .to_string(),
                         ),
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })
@@ -521,6 +527,8 @@ async fn complete_mcp_import_until_abort(
                 .to_string(),
             ),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -568,6 +576,8 @@ async fn complete_mcp_import_until_abort(
                             .to_string(),
                         ),
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })
@@ -594,6 +604,8 @@ async fn complete_mcp_import_until_abort(
                             .to_string(),
                         ),
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error: None,
                     })

@@ -393,6 +393,8 @@ async fn dispatched_shared_capture_wait_timeout_reports_outcome_unknown_without_
             exit_code: Some(0),
             stdout: Some("late result".to_string()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(3_000),
             error: None,
         })

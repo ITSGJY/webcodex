@@ -108,7 +108,7 @@ fn instruction_source<'a>(output: &'a Value, path: &str) -> &'a Value {
 fn assert_builtin_workflow(output: &Value) {
     let workflow = &output["workflow"];
     assert_eq!(workflow["contract"], "webcodex.coding_workflow");
-    assert_eq!(workflow["version"], 9);
+    assert_eq!(workflow["version"], 10);
     assert_eq!(workflow["authority"], "model_guidance_only");
     assert!(workflow["role_selection"]
         .as_str()
@@ -174,6 +174,11 @@ fn assert_builtin_workflow(output: &Value) {
     for phrase in [
         "cargo_fmt(check=false)",
         "instead of reproducing rustfmt edits manually",
+        "highest expected correctness and reliability",
+        "bounded deterministic Python transformation through run_shell",
+        "first-class option",
+        "do not bypass permission/path policy",
+        "Always inspect the resulting diff and validate final source",
         "independent read-only inspection",
         "short sync_wait_secs",
         "same-execution Job handoff",
@@ -825,6 +830,7 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
                 path: "src/restart.rs".to_string(),
                 start_line: None,
                 limit: None,
+                expected_read_revision: None,
             }],
             session_id: Some(session_id.clone()),
             with_line_numbers: None,

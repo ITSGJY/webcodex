@@ -758,27 +758,27 @@ fn edit_conflict_retry_guidance(recovery: Option<&serde_json::Value>) -> &'stati
         .and_then(serde_json::Value::as_str)
     {
         Some("select_occurrence_or_refine_match") => {
-            "choose an advertised occurrence or refine the exact match; reuse the same expected_sha256 unless you reread or observe a changed file."
+            "choose an advertised occurrence only with the caller's still-valid snapshot guard, or refine the exact target so it is globally unique."
         }
         Some("choose_valid_occurrence_or_refine_match") => {
-            "choose a valid advertised occurrence or refine the exact match; reuse the same expected_sha256 unless you reread or observe a changed file."
+            "choose a valid advertised occurrence only with the caller's still-valid snapshot guard, or refine the exact target so it is globally unique."
         }
         Some("narrow_line_scope_or_select_occurrence") => {
-            "narrow line_scope or choose an advertised global occurrence that is fully contained by it; reuse the same expected_sha256 unless the file changed."
+            "narrow line_scope or choose an advertised global occurrence only with the caller's still-valid snapshot guard."
         }
         Some("adjust_line_scope_or_refine_match") => {
-            "adjust line_scope or refine the exact match; reuse the same expected_sha256 unless the file changed."
+            "adjust line_scope with a still-valid snapshot guard, or refine the exact target so positional selection is unnecessary."
         }
         Some("align_occurrence_with_line_scope") => {
-            "use the intended global occurrence with a line_scope that fully contains it, or correct either fence; reuse the same expected_sha256 unless the file changed."
+            "use the intended global occurrence with a line_scope that fully contains it and a still-valid snapshot guard, or refine the exact target."
         }
         Some("reread_or_refine_match") => {
-            "for model-generated contextual changes, prefer apply_patch; otherwise reread this file or refine the exact match, then retry apply_text_edits with the newly observed expected_sha256."
+            "reread or refine the exact target; for repetitive or programmatic rewrites, a bounded deterministic transformation may be clearer than positional text selection."
         }
         Some("refine_edit_batch") => {
-            "refine the edit batch so exact edit ranges no longer overlap; reuse the same expected_sha256 unless you reread or observe a changed file."
+            "refine the edit batch so exact edit ranges no longer overlap; preserve any caller-provided snapshot guard when positional selection remains necessary."
         }
-        _ => "read this file again and use an exact unique anchor.",
+        _ => "reread this file or use a stronger globally unique exact target.",
     }
 }
 
@@ -1876,7 +1876,22 @@ pub(crate) fn handle_apply_text_edits_file_request(
                         )
                     }
                 };
-                if change.expected_sha256.as_deref() != Some(old_sha256.as_str()) {
+                let whole_file_guard_required = !matches!(change.kind, ApplyFileChangeKind::Edit);
+                if whole_file_guard_required && change.expected_sha256.is_none() {
+                    return batch_error(
+                        Some(index),
+                        Some(change.kind.as_str()),
+                        Some(&change.path),
+                        "missing_sha256_guard",
+                        "whole-file delete/rename requires an expected_sha256 wire guard",
+                        start,
+                    );
+                }
+                if change
+                    .expected_sha256
+                    .as_deref()
+                    .is_some_and(|expected| expected != old_sha256)
+                {
                     let mut result = serde_json::json!({
                         "changed": false,
                         "error_kind": "sha256_conflict",
@@ -1884,9 +1899,7 @@ pub(crate) fn handle_apply_text_edits_file_request(
                         "change_index": index,
                         "kind": change.kind.as_str(),
                         "path": change.path,
-                        "error": format!(
-                            "Rejected transactional file batch: expected_sha256 does not match current sha256 {old_sha256}. No files were modified. Retry guidance: refresh file hashes/content, correct the failing change, and retry the whole batch."
-                        ),
+                        "error": "Rejected transactional file batch: the guarded full-file snapshot no longer matches current content. No files were modified. Retry guidance: reread the file and retry with a refreshed guard.",
                     });
                     if payload.recovery_metadata_version == Some(1) {
                         result["conflict_recovery"] = sha256_conflict_recovery(
@@ -1894,7 +1907,7 @@ pub(crate) fn handle_apply_text_edits_file_request(
                             &old_sha256,
                         );
                         result["retry_guidance"] = serde_json::json!(
-                            "reread the file to obtain current content and sha256, then retry the whole batch with refreshed guards"
+                            "reread the file to refresh the guarded snapshot, then retry the whole batch"
                         );
                     }
                     return line_edit_stdout(result, start);
@@ -2078,6 +2091,43 @@ mod write_project_file_effect_tests {
         assert_eq!(output["created"], false);
         assert_eq!(output["changed"], false);
         assert_eq!(output["state_changed"], false);
+    }
+
+    #[test]
+    fn planned_local_edit_rejects_preflight_to_mutation_race() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.txt");
+        let original = "target\nunrelated=old\n";
+        std::fs::write(&target, original).unwrap();
+        let old_sha256 = sha256_hex_bytes(original.as_bytes());
+        let permissions = std::fs::metadata(&target).unwrap().permissions();
+        let plan = PlannedFileChange {
+            index: 0,
+            kind: ApplyFileChangeKind::Edit,
+            path: "target.txt".to_string(),
+            to_path: None,
+            resolved: target.clone(),
+            resolved_to: None,
+            original: Some(original.to_string()),
+            replacement: Some("TARGET\nunrelated=old\n".to_string()),
+            permissions: Some(permissions),
+            old_sha256: Some(old_sha256),
+            new_sha256: Some(sha256_hex_bytes(b"TARGET\nunrelated=old\n")),
+            edit_summaries: Vec::new(),
+            would_change: true,
+        };
+
+        // This occurs after preflight produced the plan but before mutation.
+        std::fs::write(&target, "target\nunrelated=concurrent\n").unwrap();
+        let failure = apply_change(&plan).expect_err("race must fail closed");
+        assert!(failure
+            .message
+            .contains("source changed after batch preflight"));
+        assert!(failure.rollback_complete);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "target\nunrelated=concurrent\n"
+        );
     }
 
     #[test]

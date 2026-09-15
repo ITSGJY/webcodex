@@ -47,6 +47,7 @@ async fn read_agent_file_for_session(
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: session_id,
                         with_line_numbers: None,
@@ -101,6 +102,7 @@ async fn read_files_with_session_id_records_event_without_content() {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: Some(session_id),
                         with_line_numbers: Some(true),
@@ -173,6 +175,7 @@ async fn read_files_without_session_id_omits_session_telemetry() {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -733,7 +736,7 @@ async fn closed_session_blocks_write_tools_and_message_post() {
             content: "blocked".to_string(),
             session_id: Some(session.session_id.clone()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         })
         .await;
     assert!(!write.success);

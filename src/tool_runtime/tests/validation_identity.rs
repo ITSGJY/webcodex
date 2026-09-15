@@ -147,7 +147,8 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
         .unwrap();
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert!(handoff.output.get("promoted_to_job").is_none());
+    assert_eq!(handoff.output["continuation"]["tool"], "observe_jobs");
     assert_eq!(handoff.output["job_id"], job_id);
 
     runtime

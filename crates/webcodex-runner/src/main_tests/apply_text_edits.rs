@@ -104,6 +104,123 @@ fn file_apply_text_edits_applies_multi_file_transaction() {
 }
 
 #[test]
+fn file_apply_text_edits_unique_local_edit_without_sha_uses_current_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let file = tmp.path().join("target.txt");
+    std::fs::write(&file, "target\nunrelated=old\n").unwrap();
+
+    // Simulate an unrelated same-file change after the model's historical read.
+    std::fs::write(&file, "target\nunrelated=current\n").unwrap();
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({
+                "changes": [{
+                    "kind": "edit",
+                    "path": "target.txt",
+                    "edits": [{"kind":"replace_exact","old_text":"target","new_text":"TARGET"}]
+                }]
+            }),
+        ),
+    ));
+
+    assert_eq!(out["changed"], true);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "TARGET\nunrelated=current\n"
+    );
+}
+
+#[test]
+fn file_apply_text_edits_local_edit_without_sha_rejects_changed_or_ambiguous_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let file = tmp.path().join("target.txt");
+
+    std::fs::write(&file, "target=current\nunrelated=current\n").unwrap();
+    let missing = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({
+                "recovery_metadata_version": 1,
+                "changes": [{
+                    "kind": "edit",
+                    "path": "target.txt",
+                    "edits": [{"kind":"replace_exact","old_text":"target=old","new_text":"target=MODEL"}]
+                }]
+            }),
+        ),
+    ));
+    assert_eq!(missing["error_kind"], "edit_conflict");
+    assert_eq!(
+        missing["conflict_recovery"]["conflict_kind"],
+        "match_not_found"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "target=current\nunrelated=current\n"
+    );
+
+    std::fs::write(&file, "target\nother\ntarget\n").unwrap();
+    let ambiguous = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({
+                "recovery_metadata_version": 1,
+                "changes": [{
+                    "kind": "edit",
+                    "path": "target.txt",
+                    "edits": [{"kind":"replace_exact","old_text":"target","new_text":"TARGET"}]
+                }]
+            }),
+        ),
+    ));
+    assert_eq!(ambiguous["error_kind"], "edit_conflict");
+    assert_eq!(
+        ambiguous["conflict_recovery"]["conflict_kind"],
+        "multiple_matches"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "target\nother\ntarget\n"
+    );
+}
+
+#[test]
+fn file_apply_text_edits_delete_and_rename_still_require_wire_sha_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::write(tmp.path().join("delete.txt"), "delete me\n").unwrap();
+    std::fs::write(tmp.path().join("rename.txt"), "rename me\n").unwrap();
+
+    for changes in [
+        serde_json::json!([{"kind":"delete","path":"delete.txt"}]),
+        serde_json::json!([{"kind":"rename","path":"rename.txt","to_path":"renamed.txt"}]),
+    ] {
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                tmp.path(),
+                "delete.txt",
+                serde_json::json!({"changes": changes}),
+            ),
+        ));
+        assert_eq!(out["error_kind"], "missing_sha256_guard");
+        assert_eq!(out["state_changed"], false);
+    }
+    assert!(tmp.path().join("delete.txt").exists());
+    assert!(tmp.path().join("rename.txt").exists());
+    assert!(!tmp.path().join("renamed.txt").exists());
+}
+
+#[test]
 fn file_apply_text_edits_hash_conflict_keeps_every_file_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -377,7 +494,8 @@ fn file_apply_text_edits_expected_file_sha256_mismatch_without_write() {
         ),
     ));
     let err = out["error"].as_str().unwrap();
-    assert!(err.contains("expected_sha256 does not match"));
+    assert_eq!(out["error_kind"], "sha256_conflict");
+    assert_eq!(out["state_changed"], false);
     assert!(err.contains("No files were modified"));
     assert_eq!(out["changed"], false);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha\n");
@@ -608,7 +726,7 @@ fn file_apply_text_edits_structured_multiple_match_recovery_is_bounded() {
     assert_eq!(recovery["candidates_truncated"], true);
     let error = out["error"].as_str().unwrap();
     assert!(error.contains("choose an advertised occurrence"));
-    assert!(error.contains("reuse the same expected_sha256"));
+    assert!(error.contains("still-valid snapshot guard"));
     assert!(!error.contains("read this file again"));
     let serialized = serde_json::to_string(&out).unwrap();
     assert!(!serialized.contains("x\\n"));
@@ -647,10 +765,10 @@ fn file_apply_text_edits_structured_not_found_disables_selector() {
     assert_eq!(recovery["direct_retry_safe"], false);
     assert_eq!(recovery["reread_required"], true);
     assert_eq!(recovery["recovery_action"], "reread_or_refine_match");
-    assert!(out["retry_guidance"]
-        .as_str()
-        .unwrap()
-        .contains("prefer apply_patch"));
+    let retry_guidance = out["retry_guidance"].as_str().unwrap();
+    assert!(retry_guidance.contains("reread or refine the exact target"));
+    assert!(retry_guidance.contains("bounded deterministic transformation"));
+    assert!(!retry_guidance.contains("prefer apply_patch"));
     assert_eq!(recovery["candidate_ranges"].as_array().unwrap().len(), 0);
     assert!(!serde_json::to_string(recovery)
         .unwrap()

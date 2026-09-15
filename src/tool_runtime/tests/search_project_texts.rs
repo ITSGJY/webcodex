@@ -410,14 +410,7 @@ fn search_project_text_model_projection_compacts_files_count_and_guides_truncati
     assert_eq!(truncated_sparse.output["result_mode"], "matches");
     assert_eq!(truncated_sparse.output["truncated"], true);
     assert_eq!(truncated_sparse.output["truncation_reason"], "limit");
-    assert_eq!(
-        truncated_sparse.output["continuation"]["kind"],
-        "refine_query"
-    );
-    assert_eq!(
-        truncated_sparse.output["continuation"]["safe_cursor"],
-        false
-    );
+    assert!(truncated_sparse.output.get("continuation").is_none());
     assert!(truncated_sparse.output.get("next_index").is_none());
     assert!(truncated_sparse.output.get("match_offset").is_none());
     assert!(truncated_sparse.output.get("next_match").is_none());
@@ -1467,6 +1460,8 @@ async fn search_project_texts_retry_uses_only_remaining_absolute_deadline() {
             exit_code: Some(0),
             stdout: Some(search_stdout("matches", "src/late.rs", "late")),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(200),
             error: None,
         })
@@ -2081,6 +2076,8 @@ async fn search_project_texts_deadline_preserves_fast_result_and_cancels_unfinis
                 exit_code: Some(0),
                 stdout: Some(search_stdout("matches", "src/late.rs", "late")),
                 stderr: Some(String::new()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(200),
                 error: None,
             })

@@ -1,6 +1,7 @@
 use super::jobs::{
-    assert_active_instance_locked, observe_job_terminal, replace_log_limited, request_preview,
-    retain_ordinary_result_stream, retain_result_stream_to,
+    assert_active_instance_locked, combine_result_stream_truncation, observe_job_terminal,
+    replace_log_limited, request_preview, retain_ordinary_result_stream_with_evidence,
+    retain_result_stream_to_with_evidence,
 };
 use super::requests::{remove_pending_request_locked, take_pending_request_locked};
 use super::state::JobLifecycleState;
@@ -17,7 +18,7 @@ use webcodex_core::plugin::{
     validate_response_for_request as validate_plugin_gateway_response, PluginDispatchState,
     PluginGatewayResponse,
 };
-use webcodex_core::runner_operation::{RunnerJobOperation, RunnerOperation};
+use webcodex_core::runner_operation::{RunnerFileOperation, RunnerJobOperation, RunnerOperation};
 use webcodex_core::runner_protocol::{
     RunnerPersistentShellResultRequest, RunnerPollRequest, RunnerRequest, RunnerResultPayload,
     ShellCommandExecutionState, ShellRunResponse,
@@ -147,6 +148,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(format!("{code}: {message}")),
                         request_dispatched: Some(false),
@@ -209,6 +212,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(format!("{code}: {message}")),
                         request_dispatched: Some(false),
@@ -297,6 +302,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(error.clone()),
                         request_dispatched: Some(false),
@@ -376,6 +383,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(message.clone()),
                         request_dispatched: Some(false),
@@ -447,6 +456,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(error),
                         request_dispatched: Some(false),
@@ -514,24 +525,45 @@ impl RunnerRegistry {
                     pending.expected_project_cwd.as_deref(),
                 ) {
                     (Some(project_id), Some(project_cwd)) => match inner.runners.get(&body.client_id) {
+                        Some(runner)
+                            if pending
+                                .expected_project_runner_instance_id
+                                .as_deref()
+                                .is_some_and(|expected| runner.runner_instance_id != expected) =>
+                        {
+                            Some(
+                                "stale_runner: target Runner changed before project file dispatch"
+                                    .to_string(),
+                            )
+                        }
                         Some(runner) if runner.owner != pending.expected_runner_owner => Some(
                             "stale_authority: target Runner owner changed before dispatch".to_string(),
                         ),
-                        Some(runner)
-                            if !runner.runner_features.supports(RunnerFeature::FileWrite) =>
-                        {
-                            Some(
-                            "stale_authority: target Runner no longer advertises file_write before dispatch"
-                                .to_string(),
-                            )
-                        }
-                        Some(runner)
-                            if runner.projects.iter().any(|project| {
+                        Some(runner) => {
+                            let required_feature = match &pending.operation {
+                                RunnerOperation::File(RunnerFileOperation::Read(_)) => {
+                                    RunnerFeature::FileRead
+                                }
+                                _ => RunnerFeature::FileWrite,
+                            };
+                            if !runner.runner_features.supports(required_feature) {
+                                Some(format!(
+                                    "stale_authority: target Runner no longer advertises {} before dispatch",
+                                    required_feature.as_wire_name()
+                                ))
+                            } else if runner.projects.iter().any(|project| {
                                 !project.disabled
                                     && project.id == project_id
                                     && project.path == project_cwd
-                            }) => None,
-                        Some(_) | None => Some(format!(
+                            }) {
+                                None
+                            } else {
+                                Some(format!(
+                                    "stale_project: target project {project_id} is no longer registered at the resolved path"
+                                ))
+                            }
+                        }
+                        None => Some(format!(
                             "stale_project: target project {project_id} is no longer registered at the resolved path"
                         )),
                     },
@@ -555,6 +587,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(error),
                         request_dispatched: Some(false),
@@ -811,15 +845,21 @@ impl RunnerRegistry {
         // independently without silently constraining the other first.
         let raw_stdout = body.stdout;
         let raw_stderr = body.stderr;
-        let stdout = if pending.operation.is_large_native_image_request() {
-            retain_result_stream_to(
+        let (stdout, server_stdout_truncated) = if pending.operation.is_large_native_image_request()
+        {
+            retain_result_stream_to_with_evidence(
                 raw_stdout.clone(),
                 webcodex_core::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES,
             )
         } else {
-            retain_ordinary_result_stream(raw_stdout.clone())
+            retain_ordinary_result_stream_with_evidence(raw_stdout.clone())
         };
-        let stderr = retain_ordinary_result_stream(raw_stderr.clone());
+        let (stderr, server_stderr_truncated) =
+            retain_ordinary_result_stream_with_evidence(raw_stderr.clone());
+        let stdout_truncated =
+            combine_result_stream_truncation(body.stdout_truncated, server_stdout_truncated);
+        let stderr_truncated =
+            combine_result_stream_truncation(body.stderr_truncated, server_stderr_truncated);
         let success = matches!(
             command_execution_state,
             None | Some(ShellCommandExecutionState::Completed)
@@ -855,6 +895,8 @@ impl RunnerRegistry {
             exit_code: body.exit_code,
             stdout,
             stderr,
+            stdout_truncated,
+            stderr_truncated,
             duration_ms: body.duration_ms,
             error,
             request_dispatched: Some(pending.dispatched),

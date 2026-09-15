@@ -355,7 +355,6 @@ fn sparse_success_item(item: &Value) -> Option<Value> {
     sparse.insert("changed".to_string(), json!(changed));
     sparse.insert("log_delta_status".to_string(), json!(log_delta_status));
     sparse.insert("observation_token".to_string(), json!(observation_token));
-    copy_present(observation, &mut sparse, "continuation_semantics");
 
     for key in [
         "exit_code",

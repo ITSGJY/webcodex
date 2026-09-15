@@ -354,6 +354,35 @@ fn phase_f_bounded_raw_tail_aligns_complete_utf8_before_windows_decode() {
 }
 
 #[test]
+fn synchronous_shell_capture_preserves_typed_truncation_evidence() {
+    let max = 32;
+    for stream in ["stdout", "stderr"] {
+        let captured =
+            read_bounded_pipe_tail(std::io::Cursor::new(vec![b'x'; max * 8]), max, stream).unwrap();
+        let (text, truncated) = captured.normalize_with_truncation(max);
+        assert!(captured.raw_truncated, "{stream}");
+        assert!(truncated, "{stream}");
+        assert!(text.len() <= max, "{stream}: {}", text.len());
+    }
+
+    let small = read_bounded_pipe_tail(std::io::Cursor::new(b"small"), max, "stdout").unwrap();
+    let (text, truncated) = small.normalize_with_truncation(max);
+    assert_eq!(text, "small");
+    assert!(!small.raw_truncated);
+    assert!(!truncated);
+
+    let captured_without_raw_loss =
+        read_bounded_pipe_tail(std::io::Cursor::new(vec![b'y'; max * 2]), max * 4, "stdout")
+            .unwrap();
+    assert!(!captured_without_raw_loss.raw_truncated);
+    let (_, truncated) = captured_without_raw_loss.normalize_with_truncation(max);
+    assert!(
+        truncated,
+        "presentation normalization truncation is also typed evidence"
+    );
+}
+
+#[test]
 fn phase_f_bounded_raw_tail_restores_utf8_bom_after_scalar_alignment() {
     let text = "中🙂".repeat(64);
     let mut bytes = vec![0xEF, 0xBB, 0xBF];

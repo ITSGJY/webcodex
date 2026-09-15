@@ -1957,6 +1957,8 @@ async fn complete_result_app_show_changes(
             exit_code: Some(0),
             stdout: Some(stdout),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })

@@ -12,6 +12,9 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "ordinary coding/review",
         "omit session_id",
         "fresh workflow session",
+        "does not imply a fresh model context",
+        "fresh or uncertain model context",
+        "re-observes instruction files",
         "exact resume",
         "active accessible session",
         "never guesses prior session",
@@ -39,16 +42,14 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     for phrase in [
         "adaptive runtime preferred batch-capable inspect tool",
         "only one known range",
-        "read_range",
-        "batch_items",
-        "next_index",
-        "not a read_files input",
-        "increase_result_budget",
         "no fake continuation",
-        "complete a current partial item",
         "512 kib",
         "exact resolved project",
         "business session_id",
+        "read_revision",
+        "single output-level suggested_call",
+        "continued ranges are fenced",
+        "runtime rejects a continuation",
     ] {
         assert!(
             read_files_desc.contains(phrase),
@@ -192,11 +193,10 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "512 kib",
         "final model-facing",
         "next complete-line fragment",
-        "parser-ready suggested_call",
-        "next_continuation",
-        "recovery.continuation",
+        "parser-ready next_call",
+        "recovery.later_hunks.next_call",
         "later-record only",
-        "recovery.omitted_lines",
+        "recovery.current_hunk.next_call",
         "bounded refinement",
         "exact hunk-fragment token",
     ] {
@@ -230,31 +230,22 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    // Contextual patch remains a guarded alternative, not a line-count heuristic.
+    // Patch input remains available without becoming the default recovery path.
     let apply_patch_desc = desc("apply_patch");
     for phrase in [
-        "contextual patch path",
-        "guarded exact edits",
-        "line count alone is not a reason to patch",
-        "contextual or multi-hunk form is clearer",
+        "naturally patch-shaped",
+        "genuinely the clearest reliable representation",
+        "not the default recovery",
         "stable unique context",
         "function/impl/type/test/module",
-        "not repeated lines/short fragments",
         "transactional",
-        "sha rechecks",
         "rollback",
         "dry_run",
-        "matching_mode=unique default",
+        "matching_mode=unique",
         "matching_mode_rejected",
-        "never weaken guard",
-        "switch to first_match",
-        "use apply_text_edits if easy",
-        "bounded read_files recovery",
-        "context_mismatch",
-        "regenerate from current source",
-        "matching_mode=exact_unique",
-        "stale-context/concurrency fence",
-        "first_match is compatibility, not recovery",
+        "weakening the guard",
+        "first_match",
+        "preserve unique/exact_unique",
         "outcome_unknown",
     ] {
         assert!(
@@ -262,44 +253,44 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "apply_patch description should mention {phrase}: {apply_patch_desc}"
         );
     }
-    assert!(!apply_patch_desc.contains("retry with matching_mode=first_match"));
+    assert!(!apply_patch_desc.contains("prefer apply_patch"));
 
-    // Default read-paired guarded edit path.
     let apply_text_edits_desc = desc("apply_text_edits");
     for phrase in [
-        "canonical default guarded edit path",
-        "after read_files",
-        "current worktree",
-        "ordinary model-generated changes",
-        "many changed lines alone are not a reason to choose apply_patch",
-        "transactional",
-        "sha-guarded",
-        "expected_sha256",
-        "unique by default",
-        "occurrence",
-        "line_scope",
-        "transactional multi-file edits",
-        "use apply_patch only when",
-        "contextual",
-        "large multi-hunk",
-        "external raw diff",
+        "transactional structured option",
+        "small/local exact edits",
+        "globally unique",
+        "may omit expected_read_revision",
+        "occurrence or line_scope",
+        "requires expected_read_revision",
+        "stronger whole-file stale-context fence",
+        "model input never needs a digest",
+        "preflighted transactionally",
+        "conflicts fail closed",
+        "rechecks planned source content before mutation",
+        "expected correctness and reliability",
+        "minimal error facts",
+        "one parser-ready read_files recovery call",
+        "inspect the resulting diff",
+        "validate the final source",
     ] {
         assert!(
             apply_text_edits_desc.contains(phrase),
             "apply_text_edits description should mention {phrase}: {apply_text_edits_desc}"
         );
     }
+    assert!(!apply_text_edits_desc.contains("canonical default guarded edit path"));
+    assert!(!apply_text_edits_desc.contains("expected_sha256"));
+    assert!(!apply_text_edits_desc.contains("prefer apply_patch"));
 
-    // Raw/external unified-diff path owns its own preflight and recovery semantics.
     let unified_diff_desc = desc("apply_unified_diff");
     for phrase in [
         "external raw unified-diff mutation path",
         "input is already a standard unified diff",
-        "ordinary model-generated edits",
-        "read_files followed by apply_text_edits",
-        "contextual or large patch-shaped changes use apply_patch",
+        "clearest reliable mutation",
         "bounded preflight",
         "never needs a separate validation call",
+        "rather than converting model-generated work into unified diff by default",
     ] {
         assert!(
             unified_diff_desc.contains(phrase),
@@ -307,26 +298,26 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    // Whole-file write is not the ordinary local-edit default.
     let write_file_desc = desc("write_project_file");
     for phrase in [
-        "create new files",
-        "whole-file rewrites",
-        "ordinary model-generated changes",
-        "after read_files",
-        "prefer apply_text_edits",
-        "returned current sha",
-        "use apply_patch only when",
-        "not merely because many lines change",
-        "contextual or multi-hunk patch form",
-        "inspect current content",
-        "expected_sha256",
+        "create a new file",
+        "intentional whole-file replacement",
+        "expected_read_revision",
+        "model-facing snapshot handle",
+        "model does not copy a digest",
+        "minimal error facts",
+        "one parser-ready read_files recovery call",
+        "clearest reliable mutation",
+        "inspect the resulting diff",
+        "validate the final source",
     ] {
         assert!(
             write_file_desc.contains(phrase),
             "write_project_file description should mention {phrase}: {write_file_desc}"
         );
     }
+    assert!(!write_file_desc.contains("expected_sha256"));
+    assert!(!write_file_desc.contains("prefer apply_text_edits"));
 
     // The legacy single-purpose edit tools (replace_line_range, insert_at_line,
     // delete_line_range, replace_in_file, replace_exact_block,
@@ -372,7 +363,13 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "run_process preferred for one native executable with literal argv",
         "independent effects or failure/permission boundaries",
         "validation, commit, push, deploy, or restart",
-        "run_script for program-like loops",
+        "bounded deterministic python heredoc",
+        "first-class programmatic source-transformation path",
+        "do not use it to bypass project/path/permission policy",
+        "avoid network unless the task requires and authorizes it",
+        "inspect the diff and validate the final source",
+        "run_script does not imply python support",
+        "run_script for its supported program-like script languages",
         "same-process cwd/env/export/function/umask state",
         "one named ssh resource",
         "runner-owned",
@@ -663,7 +660,7 @@ fn call_hierarchy_schema_keeps_traversal_strict_and_result_budget_clamped() {
 }
 
 #[test]
-fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
+fn edit_tool_surface_keeps_mutation_options_visible_and_schemas_stable() {
     let specs = registered_tool_specs();
     let names: std::collections::BTreeSet<&str> =
         specs.iter().map(|spec| spec.name.as_str()).collect();
@@ -723,14 +720,11 @@ fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
         "legacy strict_matching must not remain model-facing"
     );
     let patch_spec = spec_named(&specs, "apply_patch");
-    assert!(patch_spec.description.contains("preserves requested guard"));
-    assert!(patch_spec.description.contains("unique stays unique"));
+    assert!(patch_spec.description.contains("naturally patch-shaped"));
     assert!(patch_spec
         .description
-        .contains("exact_unique stays exact_unique"));
-    assert!(patch_spec
-        .description
-        .contains("never relax the stale-context/concurrency fence"));
+        .contains("preserve unique/exact_unique"));
+    assert!(patch_spec.description.contains("not the default recovery"));
     let patch_output = &patch_spec.output_schema["properties"]["output"]["properties"];
     assert!(
         patch_output.get("match_diagnostic").is_some(),
@@ -818,9 +812,9 @@ fn edit_tool_surface_keeps_canonical_tools_visible_and_schemas_stable() {
             "apply_patch edit summary must expose {field}"
         );
     }
-    assert!(patch_spec.description.contains("multiple chunks"));
-    assert!(patch_spec.description.contains("duplicate file operations"));
-    assert!(patch_spec.description.contains("never relax"));
+    assert!(patch_spec.description.contains("Transactional"));
+    assert!(patch_spec.description.contains("matching_mode_rejected"));
+    assert!(patch_spec.description.contains("weakening the guard"));
     let unified_diff = &spec_named(&specs, "apply_unified_diff").input_schema["properties"];
     for field in ["project", "diff", "deny_sensitive_paths"] {
         assert!(

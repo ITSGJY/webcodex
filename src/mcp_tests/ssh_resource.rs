@@ -80,6 +80,8 @@ async fn complete_response(
                 exit_code: Some(0),
                 stdout: Some(serde_json::to_string(&response).unwrap()),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             },

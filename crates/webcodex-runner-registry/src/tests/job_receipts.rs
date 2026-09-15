@@ -384,6 +384,8 @@ async fn receipts_polling_completion_preserves_full_server_bounded_streams() {
         exit_code: Some(0),
         stdout: Some("stdout\n".repeat(100_000)),
         stderr: Some("stderr\n".repeat(100_000)),
+        stdout_truncated: false,
+        stderr_truncated: false,
         duration_ms: Some(20),
         error: None,
     })

@@ -162,6 +162,8 @@ async fn complete_script_lifecycle(
                 exit_code,
                 stdout: Some(stdout.to_string()),
                 stderr: Some(stderr.to_string()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(9),
                 error: error.map(str::to_string),
             },
@@ -568,7 +570,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     .await;
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert!(handoff.output.get("promoted_to_job").is_none());
     assert_observe_job_continuation(&handoff.output);
     assert_eq!(handoff.output["execution_state"], "running");
     let job_id = handoff.output["job_id"].as_str().unwrap();
@@ -764,7 +766,7 @@ async fn typescript_slow_handoff_keeps_one_execution_and_safe_durable_metadata()
 
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    assert!(handoff.output.get("promoted_to_job").is_none());
     assert_observe_job_continuation(&handoff.output);
     assert_eq!(handoff.output["execution_state"], "running");
     let job_id = handoff.output["job_id"].as_str().unwrap();

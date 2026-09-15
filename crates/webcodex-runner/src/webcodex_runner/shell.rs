@@ -4,7 +4,7 @@ use super::config::{
 };
 use super::output::{CommandResult, ShellCommandResult};
 use super::output_text::{
-    append_bounded_text, normalize_captured_output_text, normalize_output_text,
+    append_bounded_text, normalize_captured_output_text_with_truncation, normalize_output_text,
     CapturedOutputEncoding, FullStreamUtf8Validity, LeadingBom, OutputTextSource,
 };
 use super::projects::find_project_shell_context;
@@ -1463,8 +1463,8 @@ struct BoundedPipeTail {
 }
 
 impl BoundedPipeTail {
-    fn normalize(&self, max_output_bytes: usize) -> String {
-        normalize_captured_output_text(
+    fn normalize_with_truncation(&self, max_output_bytes: usize) -> (String, bool) {
+        normalize_captured_output_text_with_truncation(
             &self.bytes,
             self.raw_truncated,
             max_output_bytes,
@@ -2831,19 +2831,23 @@ fn execute_configured_command(
             let duration_ms = start.elapsed().as_millis() as u64;
             return match terminate_and_collect_pipes(child, drains) {
                 Ok((_status, stdout, stderr)) => {
-                    let mut stderr = stderr.normalize(policy.max_output_bytes);
-                    append_bounded_text(
+                    let (stdout, stdout_truncated) =
+                        stdout.normalize_with_truncation(policy.max_output_bytes);
+                    let (mut stderr, mut stderr_truncated) =
+                        stderr.normalize_with_truncation(policy.max_output_bytes);
+                    stderr_truncated |= append_bounded_text(
                         &mut stderr,
                         "job stopped by request",
                         policy.max_output_bytes,
                     );
                     ShellCommandResult::completed(CommandResult {
                         exit_code: Some(-1),
-                        stdout: Some(stdout.normalize(policy.max_output_bytes)),
+                        stdout: Some(stdout),
                         stderr: Some(stderr),
                         duration_ms: Some(duration_ms),
                         error: Some("job stopped".to_string()),
                     })
+                    .with_stream_truncation(stdout_truncated, stderr_truncated)
                 }
                 Err(e) => ShellCommandResult::outcome_unknown(CommandResult {
                     exit_code: Some(-1),
@@ -2861,19 +2865,23 @@ fn execute_configured_command(
                     let duration_ms = start.elapsed().as_millis() as u64;
                     return match terminate_and_collect_pipes(child, drains) {
                         Ok((_status, stdout, stderr)) => {
-                            let mut stderr = stderr.normalize(policy.max_output_bytes);
-                            append_bounded_text(
+                            let (stdout, stdout_truncated) =
+                                stdout.normalize_with_truncation(policy.max_output_bytes);
+                            let (mut stderr, mut stderr_truncated) =
+                                stderr.normalize_with_truncation(policy.max_output_bytes);
+                            stderr_truncated |= append_bounded_text(
                                 &mut stderr,
                                 &format!("command timed out after {} seconds", timeout_secs),
                                 policy.max_output_bytes,
                             );
                             ShellCommandResult::timed_out(CommandResult {
                                 exit_code: Some(-1),
-                                stdout: Some(stdout.normalize(policy.max_output_bytes)),
+                                stdout: Some(stdout),
                                 stderr: Some(stderr),
                                 duration_ms: Some(duration_ms),
                                 error: Some("command timed out".to_string()),
                             })
+                            .with_stream_truncation(stdout_truncated, stderr_truncated)
                         }
                         Err(e) => ShellCommandResult::outcome_unknown(CommandResult {
                             exit_code: Some(-1),
@@ -2918,13 +2926,20 @@ fn execute_configured_command(
         });
     }
     match terminate_and_collect_pipes(child, drains) {
-        Ok((status, stdout, stderr)) => ShellCommandResult::completed(CommandResult {
-            exit_code: Some(status.code().unwrap_or(-1)),
-            stdout: Some(stdout.normalize(policy.max_output_bytes)),
-            stderr: Some(stderr.normalize(policy.max_output_bytes)),
-            duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: None,
-        }),
+        Ok((status, stdout, stderr)) => {
+            let (stdout, stdout_truncated) =
+                stdout.normalize_with_truncation(policy.max_output_bytes);
+            let (stderr, stderr_truncated) =
+                stderr.normalize_with_truncation(policy.max_output_bytes);
+            ShellCommandResult::completed(CommandResult {
+                exit_code: Some(status.code().unwrap_or(-1)),
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: None,
+            })
+            .with_stream_truncation(stdout_truncated, stderr_truncated)
+        }
         Err(e) => spawned_output_failure(start, e),
     }
 }

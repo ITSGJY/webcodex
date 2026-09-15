@@ -2,7 +2,9 @@
 
 use super::super::*;
 use super::support::*;
-use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
+use crate::runner_protocol::{
+    RunnerCapabilities, RunnerPollRequest, RunnerRegisterRequest, RunnerResultRequest,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -12,7 +14,141 @@ fn item(path: &str, start_line: Option<usize>, limit: Option<usize>) -> ReadFile
         path: path.to_string(),
         start_line,
         limit,
+        expected_read_revision: None,
     }
+}
+
+fn fenced_item(
+    path: &str,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+    expected_read_revision: u64,
+) -> ReadFilesItem {
+    ReadFilesItem {
+        path: path.to_string(),
+        start_line,
+        limit,
+        expected_read_revision: Some(expected_read_revision),
+    }
+}
+
+async fn read_revision_for(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: &str,
+    path: &str,
+    content: &str,
+) -> u64 {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.to_string();
+        let path = path.to_string();
+        async move {
+            runtime
+                .read_files(project, vec![item(&path, Some(1), Some(1))], None)
+                .await
+        }
+    });
+    let request = next_read_request(runtime, client_id).await;
+    assert_eq!(request.path.as_deref(), Some(path));
+    complete_read(runtime, client_id, &request, content).await;
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    result.output["items"][0]["output"]["read_revision"]
+        .as_u64()
+        .expect("successful read must expose read_revision")
+}
+
+async fn assert_no_pending_read(runtime: &ToolRuntime, client_id: &str, runner_instance_id: &str) {
+    let pending = runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: client_id.to_string(),
+            runner_instance_id: runner_instance_id.to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        pending.is_none(),
+        "stale read must fail before Runner dispatch"
+    );
+}
+
+fn assert_stale_read_item(result: &ToolResult, index: usize, path: &str) {
+    assert!(
+        result.success,
+        "item failure must not fail the batch transport"
+    );
+    let item = &result.output["items"][index];
+    assert_eq!(item["success"], false);
+    assert_eq!(item["path"], path);
+    assert_eq!(item["output"]["error_kind"], "read_file_failed");
+    assert_eq!(item["output"]["reason_code"], "stale_read_revision");
+    assert_eq!(item["output"]["path"], path);
+    assert_eq!(item["output"]["state_changed"], false);
+    for field in [
+        "expected_read_revision",
+        "actual_read_revision",
+        "sha256",
+        "text",
+        "mismatch_kind",
+        "safe_retry",
+        "snapshot_stable",
+    ] {
+        assert!(item["output"].get(field).is_none(), "{item}");
+    }
+}
+
+async fn replace_runner_project_at_path(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    runner_instance_id: &str,
+    project_id: &str,
+    root: &std::path::Path,
+) {
+    runtime
+        .runner_registry
+        .register(crate::test_support::current_runner_registration(
+            RunnerRegisterRequest {
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                client_id: client_id.to_string(),
+                runner_instance_id: runner_instance_id.to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: None,
+                owner: None,
+                hostname: None,
+                host_context: None,
+                capabilities: RunnerCapabilities {
+                    shell: true,
+                    git: true,
+                    file_read: true,
+                    file_write: true,
+                    internal_posix_script: true,
+                    ..Default::default()
+                },
+                policy: None,
+            },
+        ))
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        runner_instance_id,
+        vec![named_registered_project(
+            client_id,
+            project_id,
+            project_id,
+            &root.to_string_lossy(),
+            1,
+        )],
+    )
+    .await;
 }
 
 async fn next_read_request(
@@ -92,6 +228,38 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
         "items": [{"path": "a.rs"}],
         "max_result_bytes": "65536"
     })));
+    for revision in [1_u64, 9_007_199_254_740_991] {
+        assert!(validates(&json!({
+            "project": "demo",
+            "items": [{"path": "a.rs", "expected_read_revision": revision}]
+        })));
+        let parsed = ToolCall::from_tool_name(
+            "read_files",
+            json!({
+                "project": "demo",
+                "items": [{"path": "a.rs", "expected_read_revision": revision}]
+            }),
+        )
+        .expect("valid expected_read_revision must parse");
+        assert!(matches!(
+            parsed,
+            ToolCall::ReadFiles { items, .. }
+                if items[0].expected_read_revision == Some(revision)
+        ));
+    }
+    for invalid_revision in [
+        json!(0),
+        json!(9_007_199_254_740_992_u64),
+        json!("1"),
+        Value::Null,
+    ] {
+        let value = json!({
+            "project": "demo",
+            "items": [{"path": "a.rs", "expected_read_revision": invalid_revision}]
+        });
+        assert!(!validates(&value));
+        assert!(ToolCall::from_tool_name("read_files", value).is_err());
+    }
     assert!(!validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs", "unexpected": true}]
@@ -201,10 +369,82 @@ async fn read_files_returns_ordered_normalized_successes_after_out_of_order_comp
     assert_eq!(result.output["output_truncated"], false);
     assert!(result.output["next_index"].is_null());
 
+    let mut result = result;
+    let projection =
+        super::super::dispatch::ModelFacingProjectionPlan::capture(&ToolCall::ReadFiles {
+            project: runtime_project,
+            items: vec![
+                item("src/lib.rs", Some(2), Some(2)),
+                item("src/main.rs", None, Some(1)),
+            ],
+            session_id: None,
+            with_line_numbers: Some(true),
+            max_result_bytes: None,
+        });
+    projection.project(&mut result);
+    assert_eq!(
+        result.output["suggested_call"]["arguments"]["items"][0]["start_line"],
+        4
+    );
     let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
         .unwrap();
+}
+
+#[tokio::test]
+async fn read_files_reuses_read_revision_for_same_full_file_snapshot_across_ranges() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "read-revision-reuse";
+    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let content = "one\ntwo\nthree\nfour\n";
+
+    let first = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .read_files(
+                    "demo".to_string(),
+                    vec![item("src/lib.rs", Some(1), Some(2))],
+                    Some(false),
+                )
+                .await
+        }
+    });
+    let first_request = next_read_request(&runtime, client_id).await;
+    complete_read(&runtime, client_id, &first_request, content).await;
+    let first = first.await.unwrap();
+    assert!(first.success, "{:?}", first.error);
+    let first_revision = first.output["items"][0]["output"]["read_revision"]
+        .as_u64()
+        .expect("first read revision");
+
+    let second = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .read_files(
+                    "demo".to_string(),
+                    vec![item("src/lib.rs", Some(3), Some(2))],
+                    Some(false),
+                )
+                .await
+        }
+    });
+    let second_request = next_read_request(&runtime, client_id).await;
+    complete_read(&runtime, client_id, &second_request, content).await;
+    let second = second.await.unwrap();
+    assert!(second.success, "{:?}", second.error);
+    let second_revision = second.output["items"][0]["output"]["read_revision"]
+        .as_u64()
+        .expect("second read revision");
+
+    assert_eq!(first_revision, second_revision);
+    assert_eq!(
+        first.output["items"][0]["output"]["sha256"],
+        second.output["items"][0]["output"]["sha256"]
+    );
 }
 
 #[tokio::test]
@@ -234,6 +474,7 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
                             path: "src/lib.rs".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: Some(session_id),
                         with_line_numbers: None,
@@ -253,10 +494,8 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
     let item = &result.output["items"][0];
     assert_eq!(item["output"]["text"], "one\ntwo");
     assert_eq!(item["path"], "src/lib.rs");
-    assert_eq!(
-        item["output"]["sha256"],
-        format!("{:x}", Sha256::digest(content.as_bytes()))
-    );
+    assert!(item["output"].get("sha256").is_none());
+    assert!(item["output"]["read_revision"].as_u64().is_some());
     assert_eq!(item["output"]["total_lines"], 2);
     for omitted in [
         "format",
@@ -334,6 +573,7 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
                             path: "src/lib.rs".to_string(),
                             start_line: Some(2),
                             limit: Some(1),
+                            expected_read_revision: None,
                         }],
                         session_id: Some(session_id),
                         with_line_numbers: None,
@@ -359,36 +599,29 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
     assert_eq!(item["output"]["returned_lines"], 1);
     assert_eq!(item["output"]["end_line"], 2);
     assert_eq!(item["output"]["has_more"], true);
-    assert_eq!(item["output"]["next_start_line"], 3);
-    let continuation = &item["continuation"];
-    assert_eq!(continuation["kind"], "read_range");
-    assert_eq!(continuation["safe_cursor"], true);
-    assert_eq!(continuation["snapshot_stable"], false);
-    assert_eq!(continuation["continuation_semantics"]["kind"], "page");
     assert_eq!(
-        continuation["continuation_semantics"]["carrier"],
-        "position"
+        result.output["suggested_call"]["arguments"]["items"][0]["start_line"],
+        3
     );
-    assert_eq!(
-        continuation["source_sha256"],
-        format!("{:x}", Sha256::digest(content.as_bytes()))
-    );
-    assert_eq!(continuation["suggested_call"]["tool"], "read_files");
-    assert_eq!(
-        continuation["suggested_call"]["arguments"]["session_id"],
-        session_id
-    );
+    let suggested = &result.output["suggested_call"];
+    let read_revision = item["output"]["read_revision"]
+        .as_u64()
+        .expect("successful read must expose read_revision");
+    assert!(item["output"].get("sha256").is_none());
+    assert!((1..=9_007_199_254_740_991).contains(&read_revision));
+    assert_eq!(suggested["tool"], "read_files");
+    assert_eq!(suggested["arguments"]["session_id"], session_id);
     let next_call = ToolCall::from_tool_name(
-        continuation["suggested_call"]["tool"].as_str().unwrap(),
-        continuation["suggested_call"]["arguments"].clone(),
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
     )
     .expect("read_files continuation suggested_call must parse");
     assert!(matches!(
-        next_call,
+        &next_call,
         ToolCall::ReadFiles {
-            project: ref next_project,
-            ref items,
-            session_id: Some(ref next_session_id),
+            project: next_project,
+            items,
+            session_id: Some(next_session_id),
             with_line_numbers: None,
             max_result_bytes: None,
         } if next_project == &project
@@ -396,8 +629,24 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
             && items[0].path == "src/lib.rs"
             && items[0].start_line == Some(3)
             && items[0].limit == Some(1)
+            && items[0].expected_read_revision == Some(read_revision)
             && next_session_id == &session_id
     ));
+
+    let second = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move { runtime.dispatch_with_auth(next_call, Some(&auth)).await }
+    });
+    let second_request = next_read_request(&runtime, client_id).await;
+    assert_eq!(second_request.start_line, Some(3));
+    complete_read(&runtime, client_id, &second_request, content).await;
+    let second = second.await.unwrap();
+    assert!(second.success, "{:?}", second.error);
+    let second_item = &second.output["items"][0];
+    assert_eq!(second_item["success"], true);
+    assert_eq!(second_item["output"]["text"], "three");
+    assert_eq!(second_item["output"]["read_revision"], read_revision);
 
     let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
@@ -408,7 +657,7 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
 }
 
 #[tokio::test]
-async fn read_files_continuation_is_positional_not_snapshot_stable() {
+async fn read_files_continuation_rejects_changed_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-source-change";
@@ -429,6 +678,7 @@ async fn read_files_continuation_is_positional_not_snapshot_stable() {
                             path: "src/lib.rs".to_string(),
                             start_line: Some(1),
                             limit: Some(1),
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -443,17 +693,24 @@ async fn read_files_continuation_is_positional_not_snapshot_stable() {
     complete_read(&runtime, client_id, &request, first_content).await;
     let first = first.await.unwrap();
     let first_item = &first.output["items"][0];
-    let first_sha = first_item["output"]["sha256"].as_str().unwrap().to_string();
-    let suggested = &first_item["continuation"]["suggested_call"];
+    let first_revision = first_item["output"]["read_revision"]
+        .as_u64()
+        .expect("first read revision");
+    let suggested = &first.output["suggested_call"];
     let next_call = ToolCall::from_tool_name(
         suggested["tool"].as_str().unwrap(),
         suggested["arguments"].clone(),
     )
-    .expect("positional continuation must parse");
+    .expect("snapshot-fenced continuation must parse");
+    assert!(matches!(
+        &next_call,
+        ToolCall::ReadFiles { items, .. }
+            if items[0].expected_read_revision == Some(first_revision)
+    ));
 
-    // Insert a line before the cursor between calls. The next read is still a
-    // deterministic absolute line read, but it is intentionally not frozen to
-    // the first file snapshot.
+    // Insert a line before the cursor between calls. The range request still
+    // reaches the exact Runner, but Runtime must reject its changed full-file
+    // snapshot rather than expose shifted continuation content.
     let changed_content = "zero\none\ntwo\nthree";
     let second = tokio::spawn({
         let runtime = runtime.clone();
@@ -464,12 +721,156 @@ async fn read_files_continuation_is_positional_not_snapshot_stable() {
     assert_eq!(request.start_line, Some(2));
     complete_read(&runtime, client_id, &request, changed_content).await;
     let second = second.await.unwrap();
-    assert!(second.success, "{:?}", second.error);
+    assert!(second.success, "batch transport should remain successful");
     let second_item = &second.output["items"][0];
-    assert_eq!(second_item["output"]["text"], "one");
-    assert_ne!(second_item["output"]["sha256"], first_sha);
-    assert_eq!(first_item["continuation"]["source_sha256"], first_sha);
-    assert_eq!(first_item["continuation"]["snapshot_stable"], false);
+    assert_eq!(second_item["success"], false);
+    assert_eq!(second_item["output"]["error_kind"], "read_file_failed");
+    assert_eq!(second_item["output"]["reason_code"], "stale_read_revision");
+    assert_eq!(second_item["output"]["path"], "src/lib.rs");
+    assert_eq!(second_item["output"]["state_changed"], false);
+    for field in ["text", "read_revision", "sha256", "actual_read_revision"] {
+        assert!(second_item["output"].get(field).is_none(), "{second_item}");
+    }
+    assert!(second.output.get("suggested_call").is_none());
+}
+
+#[tokio::test]
+async fn read_files_rejects_revision_from_previous_runtime_before_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let client_id = "read-restart-revision";
+    let runtime_a = ToolRuntime::new_for_tests();
+    let project_a =
+        register_runner_project_at_path(&runtime_a, client_id, "demo", root.path()).await;
+    let revision = read_revision_for(
+        &runtime_a,
+        client_id,
+        &project_a,
+        "src/lib.rs",
+        "one\ntwo\n",
+    )
+    .await;
+
+    let runtime_b = ToolRuntime::new_for_tests();
+    let project_b =
+        register_runner_project_at_path(&runtime_b, client_id, "demo", root.path()).await;
+    let result = runtime_b
+        .read_files(
+            project_b,
+            vec![fenced_item("src/lib.rs", Some(2), Some(1), revision)],
+            None,
+        )
+        .await;
+    assert_stale_read_item(&result, 0, "src/lib.rs");
+    assert_no_pending_read(&runtime_b, client_id, "inst").await;
+}
+
+#[tokio::test]
+async fn read_files_rejects_revision_for_wrong_path_before_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "read-wrong-path-revision";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let revision = read_revision_for(&runtime, client_id, &project, "src/a.rs", "one\ntwo\n").await;
+
+    let result = runtime
+        .read_files(
+            project,
+            vec![fenced_item("src/b.rs", Some(2), Some(1), revision)],
+            None,
+        )
+        .await;
+    assert_stale_read_item(&result, 0, "src/b.rs");
+    assert_no_pending_read(&runtime, client_id, "inst").await;
+}
+
+#[tokio::test]
+async fn read_files_rejects_revision_for_wrong_project_before_dispatch() {
+    let root_a = tempfile::tempdir().unwrap();
+    let root_b = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let project_a =
+        register_runner_project_at_path(&runtime, "read-project-a", "demo-a", root_a.path()).await;
+    let project_b =
+        register_runner_project_at_path(&runtime, "read-project-b", "demo-b", root_b.path()).await;
+    let revision = read_revision_for(
+        &runtime,
+        "read-project-a",
+        &project_a,
+        "src/lib.rs",
+        "one\ntwo\n",
+    )
+    .await;
+
+    let result = runtime
+        .read_files(
+            project_b,
+            vec![fenced_item("src/lib.rs", Some(2), Some(1), revision)],
+            None,
+        )
+        .await;
+    assert_stale_read_item(&result, 0, "src/lib.rs");
+    assert_no_pending_read(&runtime, "read-project-b", "inst").await;
+}
+
+#[tokio::test]
+async fn read_files_rejects_revision_after_runner_replacement_before_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "read-runner-replacement";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let revision =
+        read_revision_for(&runtime, client_id, &project, "src/lib.rs", "one\ntwo\n").await;
+
+    runtime
+        .runner_registry
+        .set_last_seen_for_test(client_id, chrono::Utc::now().timestamp() - 120)
+        .await;
+    replace_runner_project_at_path(&runtime, client_id, "inst-b", "demo", root.path()).await;
+
+    let result = runtime
+        .read_files(
+            project,
+            vec![fenced_item("src/lib.rs", Some(2), Some(1), revision)],
+            None,
+        )
+        .await;
+    assert_stale_read_item(&result, 0, "src/lib.rs");
+    assert_no_pending_read(&runtime, client_id, "inst-b").await;
+}
+
+#[tokio::test]
+async fn read_files_stale_revision_isolated_from_normal_batch_item() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "read-stale-batch-isolation";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let revision = read_revision_for(&runtime, client_id, &project, "src/a.rs", "one\ntwo\n").await;
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .read_files(
+                    project,
+                    vec![
+                        fenced_item("src/stale.rs", Some(2), Some(1), revision),
+                        item("src/good.rs", None, None),
+                    ],
+                    None,
+                )
+                .await
+        }
+    });
+    let request = next_read_request(&runtime, client_id).await;
+    assert_eq!(request.path.as_deref(), Some("src/good.rs"));
+    complete_read(&runtime, client_id, &request, "ok\n").await;
+    let result = task.await.unwrap();
+
+    assert_stale_read_item(&result, 0, "src/stale.rs");
+    assert_eq!(result.output["items"][1]["success"], true);
+    assert_eq!(result.output["items"][1]["output"]["text"], "ok");
+    assert_no_pending_read(&runtime, client_id, "inst").await;
 }
 
 #[tokio::test]
@@ -494,6 +895,7 @@ async fn read_file_dispatch_complete_explicit_range_keeps_full_range_metadata() 
                             path: "src/lib.rs".to_string(),
                             start_line: Some(1),
                             limit: Some(2),
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -597,7 +999,8 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
         assert!(item["error"].is_null());
         assert_eq!(item["output"]["format"], "numbered");
         assert!(item["output"].get("path").is_none());
-        assert!(item["output"]["sha256"].as_str().is_some());
+        assert!(item["output"].get("sha256").is_none());
+        assert!(item["output"]["read_revision"].as_u64().is_some());
         assert_eq!(item["output"]["total_lines"], 1);
         for omitted in [
             "start_line",
@@ -627,7 +1030,7 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
 }
 
 #[tokio::test]
-async fn read_files_partial_item_has_actionable_item_continuation() {
+async fn read_files_partial_item_has_one_invocation_follow_up() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-batch-item-continuation";
@@ -677,12 +1080,12 @@ async fn read_files_partial_item_has_actionable_item_continuation() {
     assert_eq!(result.output["output_truncated"], false);
     assert!(result.output.get("continuation").is_none());
     let items = result.output["items"].as_array().unwrap();
-    let continuation = &items[0]["continuation"];
-    assert_eq!(continuation["kind"], "read_range");
-    assert_eq!(continuation["safe_cursor"], true);
-    assert_eq!(continuation["snapshot_stable"], false);
-    let suggested = &continuation["suggested_call"];
+    let suggested = &result.output["suggested_call"];
     assert_eq!(suggested["arguments"]["session_id"], session_id);
+    assert_eq!(
+        suggested["arguments"]["items"][0]["expected_read_revision"],
+        items[0]["output"]["read_revision"]
+    );
     let next_call = ToolCall::from_tool_name(
         suggested["tool"].as_str().unwrap(),
         suggested["arguments"].clone(),
@@ -816,9 +1219,11 @@ async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
     assert_eq!(items[0]["path"], "good.txt");
     assert_eq!(items[0]["output"]["text"], "ok");
     assert_eq!(items[0]["output"]["has_more"], true);
-    assert_eq!(items[0]["output"]["next_start_line"], 2);
-    assert_eq!(items[0]["continuation"]["kind"], "read_range");
-    let suggested = &items[0]["continuation"]["suggested_call"];
+    assert_eq!(
+        result.output["suggested_call"]["arguments"]["items"][0]["start_line"],
+        2
+    );
+    let suggested = &result.output["suggested_call"];
     ToolCall::from_tool_name(
         suggested["tool"].as_str().unwrap(),
         suggested["arguments"].clone(),
@@ -1010,6 +1415,8 @@ async fn read_files_deadline_preserves_completed_results_and_cancels_unfinished_
                 exit_code: Some(0),
                 stdout: Some(canonical_agent_file_read_output("late\n", 1)),
                 stderr: Some(String::new()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(100),
                 error: None,
             })
@@ -1212,6 +1619,10 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
     assert!(result.output.get("session_context_revision").is_none());
     assert!(result.output.get("session_continuity").is_none());
     assert!(result.output.get("session_recovery").is_none());
+    assert_eq!(
+        runtime.sessions.context_revision(&session.session_id),
+        Some(0)
+    );
     for omitted in [
         "project",
         "requested_count",
@@ -1295,9 +1706,9 @@ async fn read_files_outer_recorder_observes_canonical_batch_before_primary_proje
     assert_eq!(result.output["output_truncated"], true);
     assert_eq!(result.output["truncation_reason"], "batch_response_budget");
     assert_eq!(result.output["returned_count"], 1);
-    assert_eq!(result.output["next_index"], 1);
+    assert!(result.output.get("next_index").is_none());
     assert_eq!(
-        result.output["continuation"]["suggested_call"]["arguments"]["session_id"],
+        result.output["suggested_call"]["arguments"]["session_id"],
         business_session.session_id,
         "model continuation must preserve the concrete business Session rather than inherit the outer recorder"
     );
@@ -1597,9 +2008,14 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
     assert_eq!(result.output["output_truncated"], true);
     assert_eq!(result.output["truncation_reason"], "hard_result_cap");
     let returned_count = result.output["returned_count"].as_u64().unwrap();
-    let next_index = result.output["next_index"].as_u64().unwrap();
     assert!(returned_count < 4);
-    assert_eq!(next_index, returned_count);
+    assert_eq!(
+        result.output["suggested_call"]["arguments"]["items"]
+            .as_array()
+            .unwrap()
+            .len() as u64,
+        4 - returned_count
+    );
     let serialized_len = serde_json::to_vec(&result).unwrap().len();
     assert!(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,

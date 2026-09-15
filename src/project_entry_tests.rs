@@ -578,6 +578,8 @@ async fn complete_project_agent_request(
             exit_code: Some(exit_code),
             stdout: Some(stdout),
             stderr: Some(stderr),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })

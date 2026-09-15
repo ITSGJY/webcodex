@@ -280,12 +280,25 @@ struct RuntimeConsoleOverview {
     projects: Vec<RuntimeConsoleProject>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeConsoleWindowVisibilityScope {
+    Global,
+    Principal,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RuntimeConsoleWindowVisibility {
+    pub scope: RuntimeConsoleWindowVisibilityScope,
+}
+
 #[derive(Debug, Serialize)]
 struct RuntimeConsoleWindows {
     windows: Vec<RuntimeConsoleWindowSummary>,
     returned: usize,
     total: usize,
     truncated: bool,
+    visibility: RuntimeConsoleWindowVisibility,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,6 +332,7 @@ struct RuntimeConsoleWindowDetail {
     activity: Vec<RuntimeConsoleWindowActivity>,
     activity_returned: usize,
     activity_truncated: bool,
+    visibility: RuntimeConsoleWindowVisibility,
 }
 
 #[derive(Debug, Serialize)]
@@ -1853,11 +1867,19 @@ async fn windows_for_auth(
             .then_with(|| left.client_window_key.cmp(&right.client_window_key))
     });
     window_rows.truncate(limit);
+    let visibility = RuntimeConsoleWindowVisibility {
+        scope: if auth.is_admin_caller() {
+            RuntimeConsoleWindowVisibilityScope::Global
+        } else {
+            RuntimeConsoleWindowVisibilityScope::Principal
+        },
+    };
     Ok(RuntimeConsoleWindows {
         returned: window_rows.len(),
         truncated: source_truncated || total > window_rows.len(),
         total,
         windows: window_rows,
+        visibility,
     })
 }
 
@@ -2034,6 +2056,13 @@ async fn window_for_auth(
         activity_returned: activity.len(),
         activity_truncated,
         activity,
+        visibility: RuntimeConsoleWindowVisibility {
+            scope: if auth.is_admin_caller() {
+                RuntimeConsoleWindowVisibilityScope::Global
+            } else {
+                RuntimeConsoleWindowVisibilityScope::Principal
+            },
+        },
     })
 }
 
@@ -4333,6 +4362,10 @@ mod tests {
             visible_keys,
             std::collections::BTreeSet::from([window_a.as_str(), diagnostic_key.as_str()])
         );
+        assert_eq!(
+            visible.visibility.scope,
+            RuntimeConsoleWindowVisibilityScope::Principal
+        );
         let serialized = serde_json::to_string(&visible).unwrap();
         assert!(!serialized.contains(&window_b));
         assert!(!serialized.contains(&revoked_project_window));
@@ -4341,6 +4374,7 @@ mod tests {
         assert!(!serialized.contains(&transport_key));
         assert!(serialized.contains(&diagnostic_key));
         assert!(!serialized.contains(project_b));
+        assert!(serialized.contains("\"scope\":\"principal\""));
 
         let own = window_for_auth(
             &runtime,
@@ -4355,6 +4389,10 @@ mod tests {
         .unwrap();
         assert_eq!(own.client_window_key, window_a);
         assert_eq!(own.last_seen_at_ms, 1_001);
+        assert_eq!(
+            own.visibility.scope,
+            RuntimeConsoleWindowVisibilityScope::Principal
+        );
 
         for hidden_key in [
             &window_b,
@@ -4383,6 +4421,12 @@ mod tests {
         let global = windows_for_auth(&runtime, &admin, Some(20), None)
             .await
             .unwrap();
+        assert_eq!(
+            global.visibility.scope,
+            RuntimeConsoleWindowVisibilityScope::Global
+        );
+        let global_serialized = serde_json::to_string(&global).unwrap();
+        assert!(global_serialized.contains("\"scope\":\"global\""));
         let keys = global
             .windows
             .iter()
@@ -4400,6 +4444,35 @@ mod tests {
                 diagnostic_key.as_str(),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn window_visibility_scope_distinguishes_global_and_principal_without_leaking_identity() {
+        let (_tmp, _db, runtime) = test_runtime_with_window_db();
+        let admin = test_bootstrap_auth();
+        let ordinary = crate::auth::shared_key_context("window-vis-test");
+
+        let admin_list = windows_for_auth(&runtime, &admin, Some(10), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            admin_list.visibility.scope,
+            RuntimeConsoleWindowVisibilityScope::Global
+        );
+        let admin_json = serde_json::to_string(&admin_list).unwrap();
+        assert!(admin_json.contains("\"visibility\":{\"scope\":\"global\"}"));
+        assert!(!admin_json.contains("bootstrap"));
+
+        let ordinary_list = windows_for_auth(&runtime, &ordinary, Some(10), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ordinary_list.visibility.scope,
+            RuntimeConsoleWindowVisibilityScope::Principal
+        );
+        let ordinary_json = serde_json::to_string(&ordinary_list).unwrap();
+        assert!(ordinary_json.contains("\"visibility\":{\"scope\":\"principal\"}"));
+        assert!(!ordinary_json.contains("window-vis-test"));
     }
 
     #[tokio::test]
