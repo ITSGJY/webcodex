@@ -806,10 +806,8 @@ fn git_diff_hunks_recovery_value(
         && max_hunk_lines < MAX_MAX_HUNK_LINES
         && omitted_lines_recovery_proven
         && exact_single_hunk_recovery;
-    let fragment_recoverable = omitted_lines_present
-        && hunk_line_limit
-        && !refinement_recoverable
-        && hunk_fragment_continuation.is_some();
+    let fragment_recoverable =
+        omitted_lines_present && !refinement_recoverable && hunk_fragment_continuation.is_some();
     let omitted_lines_reason = if !omitted_lines_present {
         Value::Null
     } else if refinement_recoverable {
@@ -1073,26 +1071,32 @@ if [ "$pre_hash_exit" -eq 0 ] && [ "$pre_diff_exit" -eq 0 ] && [ "$stale" -eq 0 
 function reset_record() {
   record_kind=""; record_buf=""; record_bytes=0; record_byte_trunc=0; record_unreturnable=0;
   hunk_line_count=0; hunk_full_bytes=0; hunk_header_bytes=0; hunk_line_trunc=0;
-  fragment_emitted_lines=0; next_fragment_lines=0; next_fragment_bytes=0;
+  fragment_emitted_lines=0; first_omitted_line=-1; first_omitted_line_bytes=0;
 }
-function append_record(line,    line_bytes) {
-  if (stopped) return;
+function available_record_bytes(    available) {
+  available=page_budget-page_bytes;
+  if (record_kind=="hunk" && !current_file_context_emitted) available-=file_ctx_bytes;
+  return (available>0 ? available : 0);
+}
+function append_record(line,    line_bytes, available) {
+  if (stopped || record_byte_trunc) return 0;
   line_bytes=length(line)+1;
-  if (record_bytes==0 && line_bytes>page_budget) {
-    record_unreturnable=1; record_byte_trunc=1; return;
+  available=available_record_bytes();
+  if (record_bytes==0 && line_bytes>available) {
+    record_unreturnable=1; record_byte_trunc=1; return 0;
   }
-  if (record_bytes+line_bytes<=page_budget) {
-    record_buf=record_buf line "\n"; record_bytes+=line_bytes;
-  } else {
-    record_byte_trunc=1;
+  if (record_bytes+line_bytes<=available) {
+    record_buf=record_buf line "\n"; record_bytes+=line_bytes; return 1;
+  }
+  record_byte_trunc=1;
+  return 0;
+}
+function note_first_omitted_line(line_position, line_bytes) {
+  if (first_omitted_line<0) {
+    first_omitted_line=line_position; first_omitted_line_bytes=line_bytes;
   }
 }
-function note_next_fragment_line(line_bytes) {
-  if (fragment_capacity>0 && next_fragment_lines<fragment_capacity) {
-    next_fragment_bytes+=line_bytes; next_fragment_lines++;
-  }
-}
-function append_hunk_line(line,    line_bytes, line_position) {
+function append_hunk_line(line,    line_bytes, line_position, appended) {
   line_bytes=length(line)+1;
   line_position=hunk_line_count;
   hunk_full_bytes+=line_bytes;
@@ -1103,14 +1107,17 @@ function append_hunk_line(line,    line_bytes, line_position) {
     } else if (line_position<fragment_line_position) {
       # Replay-drain prior complete lines without returning them.
     } else if (fragment_emitted_lines<fragment_capacity) {
-      append_record(line); fragment_emitted_lines++;
+      appended=append_record(line);
+      if (appended) fragment_emitted_lines++;
+      else note_first_omitted_line(line_position, line_bytes);
     } else {
-      hunk_line_trunc=1; note_next_fragment_line(line_bytes);
+      hunk_line_trunc=1; note_first_omitted_line(line_position, line_bytes);
     }
   } else if (hunk_line_count<max_hunk_lines) {
-    append_record(line);
+    appended=append_record(line);
+    if (!appended) note_first_omitted_line(line_position, line_bytes);
   } else {
-    hunk_line_trunc=1; note_next_fragment_line(line_bytes);
+    hunk_line_trunc=1; note_first_omitted_line(line_position, line_bytes);
   }
   hunk_line_count++;
 }
@@ -1123,7 +1130,7 @@ function note_line_ceiling_hunk(idx) {
 function note_line_recoverable_hunk(idx) {
   if (line_recoverable_hunks=="") line_recoverable_hunks=idx; else line_recoverable_hunks=line_recoverable_hunks "," idx;
 }
-function flush_record(    need_context, combined_bytes, context_truncated, hunk_index, line_ceiling_fit, line_recovery_safe, candidate_line, candidate_safe) {
+function flush_record(    need_context, combined_bytes, context_truncated, hunk_index, line_ceiling_fit, line_recovery_safe, candidate_line, candidate_safe, byte_fragment_progress, byte_fragment_safe) {
   if (record_kind=="") return;
   if (record_kind=="file") {
     file_ctx=record_buf; file_ctx_bytes=record_bytes; file_ctx_truncated=record_byte_trunc;
@@ -1141,11 +1148,17 @@ function flush_record(    need_context, combined_bytes, context_truncated, hunk_
     page_hunk_limit=1; has_more=1; stopped=1; reset_record(); return;
   }
   need_context=(record_kind=="hunk" && !current_file_context_emitted);
+  context_truncated=0;
+  candidate_line=first_omitted_line;
+  byte_fragment_progress=(fragment_mode && record_index==start_position ? fragment_emitted_lines>0 : candidate_line>1 && record_bytes>hunk_header_bytes);
+  byte_fragment_safe=(record_kind=="hunk" && record_byte_trunc && record_index==start_position && byte_fragment_progress && candidate_line>0 && first_omitted_line_bytes>0 && !file_ctx_truncated && fragment_capacity>0 && file_ctx_bytes+hunk_header_bytes+first_omitted_line_bytes<=page_budget);
+  if (record_byte_trunc && (record_kind!="hunk" || record_index!=start_position || !byte_fragment_safe)) {
+    page_byte_budget=1; has_more=1; stopped=1; reset_record(); return;
+  }
   combined_bytes=record_bytes + (need_context ? file_ctx_bytes : 0);
   if (page_bytes+combined_bytes>page_budget) {
     page_byte_budget=1; has_more=1; stopped=1; reset_record(); return;
   }
-  context_truncated=0;
   if (need_context) {
     if (file_ctx_bytes>0) { printf "%s", file_ctx; page_bytes+=file_ctx_bytes; }
     current_file_context_emitted=1;
@@ -1173,8 +1186,7 @@ function flush_record(    need_context, combined_bytes, context_truncated, hunk_
       note_line_ceiling_hunk(hunk_index);
     line_recovery_safe=(hunk_line_trunc && !record_byte_trunc && line_ceiling_fit && !file_ctx_truncated && file_ctx_bytes+hunk_full_bytes<=page_budget);
     if (line_recovery_safe) note_line_recoverable_hunk(hunk_index);
-    candidate_line=(fragment_mode && record_index==start_position ? fragment_line_position+fragment_emitted_lines : max_hunk_lines);
-    candidate_safe=(hunk_line_trunc && !record_byte_trunc && !context_truncated && !file_ctx_truncated && fragment_capacity>0 && next_fragment_lines>0 && candidate_line>0 && file_ctx_bytes+hunk_header_bytes+next_fragment_bytes<=page_budget);
+    candidate_safe=((hunk_line_trunc || record_byte_trunc) && !context_truncated && !file_ctx_truncated && fragment_capacity>0 && candidate_line>0 && first_omitted_line_bytes>0 && file_ctx_bytes+hunk_header_bytes+first_omitted_line_bytes<=page_budget);
     if (candidate_safe) {
       fragment_candidate_safe=1;
       fragment_candidate_record=record_index;
@@ -1182,7 +1194,7 @@ function flush_record(    need_context, combined_bytes, context_truncated, hunk_
     }
     if (hunk_line_trunc) hunk_line_limit=1;
     if (record_byte_trunc) page_byte_budget=1;
-    if (hunk_line_trunc || (fragment_mode && record_index==start_position)) stopped=1;
+    if (hunk_line_trunc || record_byte_trunc || (fragment_mode && record_index==start_position)) stopped=1;
   }
   if (record_byte_trunc || context_truncated) stopped=1;
   reset_record();
@@ -2048,14 +2060,13 @@ impl ToolRuntime {
                     || wire.fragment_invalid
                     || wire.fragment_progress_lines == 0
                     || wire.returned_hunks != 1
-                    || wire.page_byte_budget
                     || wire.next_position != start_position.saturating_add(1)))
             || (!fragment_requested
                 && (wire.fragment_found
                     || wire.fragment_invalid
                     || wire.fragment_progress_lines != 0))
             || (wire.fragment_candidate_safe
-                && (!wire.hunk_line_limit
+                && (!(wire.hunk_line_limit || wire.page_byte_budget)
                     || wire.fragment_candidate_record == 0
                     || wire.fragment_candidate_line == 0
                     || wire.returned_hunks == 0

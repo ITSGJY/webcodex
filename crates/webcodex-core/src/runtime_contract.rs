@@ -13,10 +13,13 @@ pub const FILE_READ_MAX_LIMIT: usize = 2000;
 /// Raw producer-page budget for `git_diff_hunks`, independent of the final
 /// serialized model-facing result ceiling.
 pub const MIN_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 16 * 1024;
-pub const DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 64 * 1024;
 /// Keep producer stdout comfortably below the ordinary 256 KiB per-stream
 /// Runner result-retention default, leaving headroom for framing and metadata.
 pub const MAX_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 192 * 1024;
+/// Broad review should use the full safe producer page by default. Smaller pages
+/// only add Runner round-trips and repeat the same Git source scan; callers can
+/// still request a tighter page explicitly when useful.
+pub const DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES: usize = MAX_GIT_DIFF_HUNKS_PAGE_BYTES;
 pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 192;
 pub const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
 pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
