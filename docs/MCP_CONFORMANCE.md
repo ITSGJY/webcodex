@@ -8,10 +8,12 @@ checks that actually ran; it is not a blanket "MCP compliant" badge.
 ## Pinned referee and profiles
 
 `scripts/mcp_conformance.sh` pins the upstream referee to the immutable commit in
-`tests/fixtures/mcp/conformance/baseline.json`. The script rejects any checkout at
-a different commit and installs dependencies from that checkout's lockfile before
-building it. Updating the pin is therefore a reviewed test-contract change, not a
-floating dependency update.
+`tests/fixtures/mcp/conformance/baseline.json`. The script rejects an external
+checkout at a different commit, archives the pinned Git object into a fresh
+script-owned build directory, and runs `npm ci` plus the referee build from that
+archive every time. Existing `dist/` output and working-tree modifications are
+therefore never trusted as pinned evidence. Updating the pin is a reviewed
+test-contract change, not a floating dependency update.
 
 The ordinary baseline runs two dated server profiles independently:
 
@@ -36,9 +38,14 @@ WEBCODEX_MCP_CONFORMANCE_HARNESS_DIR=/path/to/conformance \
   bash scripts/mcp_conformance.sh 2026-07-28
 ```
 
-The supplied checkout must resolve to the exact pinned commit. Reports are written
-to `target/mcp-conformance/reports` by default. CI uploads that directory even
-when the gate fails so the raw evidence remains inspectable.
+The supplied checkout must resolve to the exact pinned commit. A checkout supplied
+through `WEBCODEX_MCP_CONFORMANCE_HARNESS_DIR` is read-only from this script's
+perspective: invalid or mismatched checkouts are rejected rather than deleted or
+rewritten, and local working-tree changes are ignored by the pinned `git archive`.
+Reports are written to `target/mcp-conformance/reports` by default. An explicitly
+supplied report directory must be empty or carry the WebCodex ownership marker
+before old profile output is removed. CI uploads the report directory even when
+the gate fails so the raw evidence remains inspectable.
 
 ## What is exercised
 
@@ -67,11 +74,17 @@ required server-scenario list and the reviewed baseline.
 
 Every `FAILURE`, `WARNING`, or `SKIPPED` check from a **scored required**
 scenario must have an exact `<scenario>, <check_id>` classification in
-`tests/fixtures/mcp/conformance/baseline.json`. Whole-scenario wildcards are
-rejected because they can hide a newly failing check behind an unrelated known
-failure. The referee's `not_scored` server scenarios are still required to run
-and are retained as informational evidence, but their verdicts do not affect the
-gate and do not consume expected-failure classifications. Supported scored
+`tests/fixtures/mcp/conformance/baseline.json`. Each classification also pins the
+observed status and a SHA-256 fingerprint of the stable failure evidence
+(`errorMessage`, then structured details/metadata, falling back to the check's
+name/description). If the same check ID starts failing for a different reason or
+with a different severity, the gate requires review instead of reusing the old
+classification. Whole-scenario wildcards are rejected.
+
+The referee's `not_scored` server scenarios are still required to run and are
+retained as informational protocol evidence. Their protocol verdicts do not
+consume expected-failure classifications, but infrastructure failures such as a
+scenario timeout or connection failure remain gate-blocking. Supported scored
 classifications are:
 
 | Classification | Meaning |
@@ -85,16 +98,22 @@ classifications are:
 The gate also fails when:
 
 - no applicable `SUCCESS`/`FAILURE`/`WARNING` checks were emitted;
+- an individual required scenario emits no verdict (for example an empty or
+  INFO-only report);
 - a scored or `not_scored` scenario report expected by the frozen requirements is
   missing, duplicated, or an unknown scenario is unexpectedly present;
+- a check contains an unknown status;
 - a new non-success check in a scored required scenario has no exact classification;
-- a classified check is no longer emitted or now passes, making its baseline
-  entry stale;
-- an inconclusive infrastructure result is present.
+- a classified check changes status/evidence, disappears, or now passes;
+- the referee exits abnormally, its exit code disagrees with the scored FAILURE
+  set, or any scored/not-scored scenario reports a timeout, connection failure,
+  or other recognized infrastructure error;
+- an explicitly classified inconclusive infrastructure result is present.
 
-This is intentionally stricter than trusting the referee process exit code. A
-zero exit can coexist with skipped/unscored coverage, and an expected-failure run
-can intentionally tolerate known protocol defects.
+For the pinned referee, exit `0` means no scored FAILURE and exit `1` means at
+least one scored FAILURE; other exit codes are treated as runner/infrastructure
+failures. This is stricter than trusting the process exit code alone because the
+raw reports still need complete coverage and reviewed classifications.
 
 The report gate's own regression suite is dependency-free:
 
@@ -102,9 +121,10 @@ The report gate's own regression suite is dependency-free:
 python3 scripts/tests/test_mcp_conformance_report.py
 ```
 
-It covers all-skipped scored output, missing scored/informational scenarios,
-harness errors, new scored failures, informational non-success reporting, stale
-classifications, and rejection of broad masks.
+It covers all-skipped output, missing/empty/INFO-only scenarios, unknown statuses,
+abnormal referee exits, scored and not-scored infrastructure failures, changed
+status/evidence for an existing check ID, new scored failures, informational
+non-success reporting, stale classifications, and rejection of broad masks.
 
 ## Raw evidence and review policy
 
@@ -118,8 +138,12 @@ Each profile retains:
 - the coverage-aware WebCodex summary.
 
 Baseline updates should be narrow. Add a classification only after reproducing
-and understanding the exact check. Remove it as soon as that check passes. Do not
-replace multiple check IDs with a scenario-wide exception.
+and understanding the exact check, then record its observed status and evidence
+fingerprint. A changed fingerprint is a review prompt, not something to refresh
+mechanically. Remove the entry as soon as the check passes. Do not replace
+multiple check IDs with a scenario-wide exception. The SEP-2164 `data.uri`
+finding is kept as an advisory SHOULD/WARNING rather than described as a MUST
+violation.
 
 This baseline deliberately records two already-demonstrated 2026 result-shape findings
 without fixing production behavior: streamed artifact `resources/read` omits the

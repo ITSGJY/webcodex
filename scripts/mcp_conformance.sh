@@ -17,9 +17,27 @@ print(commit)
 PY
 )"
 WORK_ROOT="${WEBCODEX_MCP_CONFORMANCE_WORK_ROOT:-target/mcp-conformance}"
-HARNESS_DIR="${WEBCODEX_MCP_CONFORMANCE_HARNESS_DIR:-$WORK_ROOT/harness}"
-REPORT_ROOT="${WEBCODEX_MCP_CONFORMANCE_REPORT_ROOT:-$WORK_ROOT/reports}"
+HARNESS_DIR_EXTERNAL=0
+if [ "${WEBCODEX_MCP_CONFORMANCE_HARNESS_DIR+x}" = x ]; then
+  HARNESS_DIR="${WEBCODEX_MCP_CONFORMANCE_HARNESS_DIR}"
+  HARNESS_DIR_EXTERNAL=1
+else
+  HARNESS_DIR="$WORK_ROOT/harness"
+fi
+REPORT_ROOT_EXTERNAL=0
+if [ "${WEBCODEX_MCP_CONFORMANCE_REPORT_ROOT+x}" = x ]; then
+  REPORT_ROOT="${WEBCODEX_MCP_CONFORMANCE_REPORT_ROOT}"
+  REPORT_ROOT_EXTERNAL=1
+else
+  REPORT_ROOT="$WORK_ROOT/reports"
+fi
 PROFILES=("$@")
+HARNESS_OWNER_MARKER=".webcodex-mcp-conformance-harness"
+REPORT_OWNER_MARKER=".webcodex-mcp-conformance-reports"
+harness_build_dir=""
+fixture_dir=""
+fixture_pid=""
+cleanup_started=0
 
 if [ "$#" -eq 0 ]; then
   PROFILES=("2026-07-28" "2025-11-25")
@@ -31,33 +49,130 @@ for profile in "${PROFILES[@]}"; do
   esac
 done
 
-mkdir -p "$WORK_ROOT" "$REPORT_ROOT"
+if [ -z "$WORK_ROOT" ] || [ -z "$HARNESS_DIR" ] || [ -z "$REPORT_ROOT" ]; then
+  echo "MCP conformance work, harness, and report paths must be non-empty" >&2
+  exit 2
+fi
+mkdir -p "$WORK_ROOT"
 
-prepare_harness() {
-  if [ ! -d "$HARNESS_DIR/.git" ]; then
-    rm -rf "$HARNESS_DIR"
+stop_fixture() {
+  [ -n "$fixture_pid" ] || return 0
+  touch "$fixture_dir/stop" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$fixture_pid" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+  if kill -0 "$fixture_pid" 2>/dev/null; then
+    kill "$fixture_pid" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$fixture_pid" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+  if kill -0 "$fixture_pid" 2>/dev/null; then
+    kill -KILL "$fixture_pid" 2>/dev/null || true
+  fi
+  wait "$fixture_pid" 2>/dev/null || true
+  fixture_pid=""
+}
+
+cleanup() {
+  [ "$cleanup_started" -eq 0 ] || return 0
+  cleanup_started=1
+  stop_fixture
+  if [ -n "$fixture_dir" ]; then
+    rm -rf "$fixture_dir"
+  fi
+  if [ -n "$harness_build_dir" ]; then
+    rm -rf "$harness_build_dir"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+is_git_worktree() {
+  git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+prepare_harness_source() {
+  if [ "$HARNESS_DIR_EXTERNAL" -eq 1 ]; then
+    if ! is_git_worktree "$HARNESS_DIR"; then
+      echo "WEBCODEX_MCP_CONFORMANCE_HARNESS_DIR must name an existing Git worktree; refusing to modify it: $HARNESS_DIR" >&2
+      exit 2
+    fi
+  elif [ ! -e "$HARNESS_DIR" ]; then
     mkdir -p "$HARNESS_DIR"
+    touch "$HARNESS_DIR/$HARNESS_OWNER_MARKER"
     git -C "$HARNESS_DIR" init -q
     git -C "$HARNESS_DIR" remote add origin https://github.com/modelcontextprotocol/conformance.git
+  elif ! is_git_worktree "$HARNESS_DIR"; then
+    echo "default harness path exists but is not a Git worktree; refusing to remove it: $HARNESS_DIR" >&2
+    exit 2
+  elif [ ! -f "$HARNESS_DIR/$HARNESS_OWNER_MARKER" ]; then
+    origin_url="$(git -C "$HARNESS_DIR" remote get-url origin 2>/dev/null || true)"
+    case "$origin_url" in
+      https://github.com/modelcontextprotocol/conformance.git|https://github.com/modelcontextprotocol/conformance)
+        touch "$HARNESS_DIR/$HARNESS_OWNER_MARKER"
+        ;;
+      *)
+        echo "default harness checkout is not WebCodex-owned and has an unexpected origin; refusing to modify it" >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  actual="$(git -C "$HARNESS_DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [ "$actual" != "$HARNESS_COMMIT" ]; then
+    if [ "$HARNESS_DIR_EXTERNAL" -eq 1 ]; then
+      echo "MCP conformance harness must be exactly $HARNESS_COMMIT, got ${actual:-unresolved}; external checkout is never modified" >&2
+      exit 2
+    fi
     GIT_TERMINAL_PROMPT=0 git -C "$HARNESS_DIR" fetch -q --depth 1 origin "$HARNESS_COMMIT"
     git -C "$HARNESS_DIR" checkout -q --detach FETCH_HEAD
+    actual="$(git -C "$HARNESS_DIR" rev-parse HEAD)"
   fi
-  actual="$(git -C "$HARNESS_DIR" rev-parse HEAD)"
   if [ "$actual" != "$HARNESS_COMMIT" ]; then
     echo "MCP conformance harness must be exactly $HARNESS_COMMIT, got $actual" >&2
     exit 2
   fi
-  if [ ! -f "$HARNESS_DIR/package-lock.json" ]; then
+}
+
+prepare_report_root() {
+  if [ -e "$REPORT_ROOT" ] && [ ! -d "$REPORT_ROOT" ]; then
+    echo "MCP conformance report root is not a directory: $REPORT_ROOT" >&2
+    exit 2
+  fi
+  mkdir -p "$REPORT_ROOT"
+  if [ "$REPORT_ROOT_EXTERNAL" -eq 1 ] && [ ! -f "$REPORT_ROOT/$REPORT_OWNER_MARKER" ]; then
+    if find "$REPORT_ROOT" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+      echo "external MCP report root is non-empty and not WebCodex-owned; refusing to delete its contents: $REPORT_ROOT" >&2
+      exit 2
+    fi
+  fi
+  touch "$REPORT_ROOT/$REPORT_OWNER_MARKER"
+  rm -rf "$REPORT_ROOT/2026-07-28" "$REPORT_ROOT/2025-11-25"
+  rm -f "$REPORT_ROOT/fixture.log"
+}
+
+prepare_harness_build() {
+  harness_build_dir="$(mktemp -d "$WORK_ROOT/harness-build.XXXXXX")"
+  git -C "$HARNESS_DIR" archive "$HARNESS_COMMIT" | tar -x -C "$harness_build_dir"
+  if [ ! -f "$harness_build_dir/package-lock.json" ]; then
     echo "pinned harness has no package-lock.json" >&2
     exit 2
   fi
-  if [ ! -f "$HARNESS_DIR/dist/index.js" ]; then
-    npm --prefix "$HARNESS_DIR" ci --ignore-scripts --no-audit --no-fund
-    npm --prefix "$HARNESS_DIR" run build
+  npm --prefix "$harness_build_dir" ci --ignore-scripts --no-audit --no-fund
+  npm --prefix "$harness_build_dir" run build
+  if [ ! -f "$harness_build_dir/dist/index.js" ]; then
+    echo "pinned harness build did not produce dist/index.js" >&2
+    exit 2
   fi
 }
 
-prepare_harness
+prepare_harness_source
+prepare_report_root
+prepare_harness_build
 python3 scripts/tests/test_mcp_conformance_report.py
 
 # Compile before starting the bounded readiness clock. A cold WebCodex test build
@@ -69,25 +184,6 @@ fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/webcodex-mcp-conformance.XXXXXX")"
 url_file="$fixture_dir/url"
 stop_file="$fixture_dir/stop"
 fixture_log="$REPORT_ROOT/fixture.log"
-fixture_pid=""
-cleanup() {
-  touch "$stop_file" 2>/dev/null || true
-  if [ -n "$fixture_pid" ]; then
-    for _ in $(seq 1 50); do
-      if ! kill -0 "$fixture_pid" 2>/dev/null; then break; fi
-      sleep 0.1
-    done
-    if kill -0 "$fixture_pid" 2>/dev/null; then
-      kill "$fixture_pid" 2>/dev/null || true
-    fi
-    wait "$fixture_pid" 2>/dev/null || true
-  fi
-  rm -rf "$fixture_dir"
-}
-trap cleanup EXIT INT TERM
-
-rm -rf "$REPORT_ROOT"
-mkdir -p "$REPORT_ROOT"
 WEBCODEX_MCP_CONFORMANCE_URL_FILE="$url_file" \
 WEBCODEX_MCP_CONFORMANCE_STOP_FILE="$stop_file" \
   cargo test --locked -p webcodex --lib mcp_conformance_fixture_server -- --ignored --nocapture \
@@ -122,7 +218,7 @@ for profile in "${PROFILES[@]}"; do
   mkdir -p "$raw"
   log="$profile_root/harness.log"
   set +e
-  node "$HARNESS_DIR/dist/index.js" server \
+  node "$harness_build_dir/dist/index.js" server \
     --url "$fixture_url" \
     --requirements "$profile" \
     --output-dir "$raw" \
@@ -132,7 +228,7 @@ for profile in "${PROFILES[@]}"; do
   set -e
 
   metadata="$profile_root/metadata.json"
-  python3 - "$HARNESS_DIR/requirements/$profile.yaml" "$metadata" "$profile" \
+  python3 - "$harness_build_dir/requirements/$profile.yaml" "$metadata" "$profile" \
     "$server_sha" "$HARNESS_COMMIT" "$harness_exit" <<'PY'
 import json
 import pathlib

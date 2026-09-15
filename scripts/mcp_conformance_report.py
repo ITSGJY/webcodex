@@ -12,6 +12,7 @@ coverage or compliance.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -27,9 +28,26 @@ CLASSIFICATIONS = {
     "harness_limitation_pending",
     "inconclusive_infrastructure",
 }
+VALID_STATUSES = {"SUCCESS", "FAILURE", "WARNING", "SKIPPED", "INFO"}
 NON_SUCCESS_STATUSES = {"FAILURE", "WARNING", "SKIPPED"}
 APPLICABLE_STATUSES = {"SUCCESS", "FAILURE", "WARNING"}
+VERDICT_STATUSES = {"SUCCESS", "FAILURE", "WARNING", "SKIPPED"}
 SCENARIO_DIR_RE = re.compile(r"^server-(.+)-\d{4}-\d{2}-\d{2}T.*Z$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+INFRASTRUCTURE_ERROR_MARKERS = (
+    "econnrefused",
+    "connection refused",
+    "econnreset",
+    "connection reset",
+    "enotfound",
+    "fetch failed",
+    "failed to fetch",
+    "network error",
+    "socket hang up",
+    "did not complete within",
+    "timed out",
+    "connect timeout",
+)
 
 
 class GateError(RuntimeError):
@@ -40,6 +58,8 @@ class GateError(RuntimeError):
 class Classification:
     scenario: str
     check_id: str
+    expected_status: str
+    evidence_sha256: str
     classification: str
     reason: str
     evidence: str
@@ -47,6 +67,44 @@ class Classification:
     @property
     def key(self) -> tuple[str, str]:
         return (self.scenario, self.check_id)
+
+
+def check_evidence_sha256(check: dict[str, Any]) -> str:
+    """Hash stable failure evidence while excluding timestamps and verbose logs."""
+
+    error_message = check.get("errorMessage")
+    if isinstance(error_message, str) and error_message:
+        payload: dict[str, Any] = {"errorMessage": error_message}
+    elif "details" in check:
+        payload = {"details": check.get("details")}
+    elif "metadata" in check:
+        payload = {"metadata": check.get("metadata")}
+    else:
+        payload = {
+            "name": check.get("name"),
+            "description": check.get("description"),
+        }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _infrastructure_reason(check: dict[str, Any]) -> str | None:
+    if check.get("id") == "scenario-timeout":
+        return "referee scenario timeout"
+    if check.get("description") == "Failed to run scenario":
+        return "referee failed to run scenario"
+    error_message = check.get("errorMessage")
+    if isinstance(error_message, str):
+        lowered = error_message.lower()
+        for marker in INFRASTRUCTURE_ERROR_MARKERS:
+            if marker in lowered:
+                return f"network/timeout error marker {marker!r}"
+    return None
 
 
 def _load_json(path: Path) -> Any:
@@ -87,6 +145,8 @@ def load_reports(report_root: Path) -> dict[str, list[dict[str, Any]]]:
                 raise GateError(f"{checks_path}[{index}] has no non-empty check id")
             if not isinstance(status, str) or not status:
                 raise GateError(f"{checks_path}[{index}] has no non-empty status")
+            if status not in VALID_STATUSES:
+                raise GateError(f"{checks_path}[{index}] has unknown status {status!r}")
             checks.append(check)
         reports[scenario] = checks
     return reports
@@ -94,8 +154,8 @@ def load_reports(report_root: Path) -> dict[str, list[dict[str, Any]]]:
 
 def load_classifications(baseline_path: Path, profile: str) -> dict[tuple[str, str], Classification]:
     baseline = _load_json(baseline_path)
-    if not isinstance(baseline, dict) or baseline.get("schema_version") != 1:
-        raise GateError("baseline must be an object with schema_version=1")
+    if not isinstance(baseline, dict) or baseline.get("schema_version") != 2:
+        raise GateError("baseline must be an object with schema_version=2")
     profiles = baseline.get("profiles")
     if not isinstance(profiles, dict) or profile not in profiles:
         raise GateError(f"baseline has no profile {profile!r}")
@@ -112,6 +172,8 @@ def load_classifications(baseline_path: Path, profile: str) -> dict[tuple[str, s
             raise GateError(f"classification #{index + 1} must be an object")
         scenario = raw.get("scenario")
         check_id = raw.get("check_id")
+        expected_status = raw.get("expected_status")
+        evidence_sha256 = raw.get("evidence_sha256")
         kind = raw.get("classification")
         reason = raw.get("reason")
         evidence = raw.get("evidence")
@@ -123,6 +185,15 @@ def load_classifications(baseline_path: Path, profile: str) -> dict[tuple[str, s
             raise GateError(
                 f"classification {scenario!r} must name one exact check_id; broad scenario masks are forbidden"
             )
+        if expected_status not in NON_SUCCESS_STATUSES:
+            raise GateError(
+                f"classification {scenario}:{check_id} needs expected_status in "
+                f"{sorted(NON_SUCCESS_STATUSES)}, got {expected_status!r}"
+            )
+        if not isinstance(evidence_sha256, str) or not SHA256_RE.fullmatch(evidence_sha256):
+            raise GateError(
+                f"classification {scenario}:{check_id} needs a lowercase 64-hex evidence_sha256"
+            )
         if kind not in CLASSIFICATIONS:
             raise GateError(
                 f"classification {scenario}:{check_id} has unsupported kind {kind!r}"
@@ -131,7 +202,15 @@ def load_classifications(baseline_path: Path, profile: str) -> dict[tuple[str, s
             raise GateError(f"classification {scenario}:{check_id} needs a reason")
         if not isinstance(evidence, str) or not evidence.strip():
             raise GateError(f"classification {scenario}:{check_id} needs evidence")
-        entry = Classification(scenario, check_id, kind, reason.strip(), evidence.strip())
+        entry = Classification(
+            scenario,
+            check_id,
+            expected_status,
+            evidence_sha256,
+            kind,
+            reason.strip(),
+            evidence.strip(),
+        )
         if entry.key in entries:
             raise GateError(f"duplicate classification for {scenario}:{check_id}")
         entries[entry.key] = entry
@@ -151,6 +230,9 @@ def evaluate_reports(
         raise GateError(
             f"metadata profile {metadata.get('profile')!r} does not match requested {profile!r}"
         )
+    harness_exit_code = metadata.get("harness_exit_code")
+    if isinstance(harness_exit_code, bool) or not isinstance(harness_exit_code, int):
+        raise GateError("metadata harness_exit_code must be an integer")
     required = metadata.get("required_scenarios")
     if not isinstance(required, list) or not required or not all(isinstance(item, str) and item for item in required):
         raise GateError("metadata required_scenarios must be a non-empty string array")
@@ -211,13 +293,25 @@ def evaluate_reports(
     expected: list[dict[str, str]] = []
     informational_non_success: list[dict[str, str]] = []
     inconclusive: list[str] = []
+    evidence_mismatches: list[str] = []
+    infrastructure_failures: list[str] = []
+    baseline_observations: list[dict[str, str]] = []
 
     for scenario, checks in sorted(reports.items()):
         scored = scenario in required_set
+        if scored and not any(check["status"] in VERDICT_STATUSES for check in checks):
+            problems.append(f"required scenario {scenario!r} emitted no verdict checks")
+        if not scored and not checks:
+            problems.append(f"not-scored scenario {scenario!r} emitted an empty report")
         for check in checks:
             check_id = check["id"]
             status = check["status"]
             key = (scenario, check_id)
+            infra_reason = _infrastructure_reason(check)
+            if infra_reason is not None and status in NON_SUCCESS_STATUSES:
+                infrastructure_failures.append(
+                    f"{scenario}:{check_id} [{status}] ({infra_reason})"
+                )
             if not scored:
                 informational_statuses[status] += 1
                 if scenario in not_scored and status in NON_SUCCESS_STATUSES:
@@ -238,14 +332,35 @@ def evaluate_reports(
             if status in NON_SUCCESS_STATUSES:
                 entry = classifications.get(key)
                 label = f"{scenario}:{check_id} [{status}]"
+                observed_evidence = check_evidence_sha256(check)
+                baseline_observations.append(
+                    {
+                        "scenario": scenario,
+                        "check_id": check_id,
+                        "expected_status": status,
+                        "evidence_sha256": observed_evidence,
+                    }
+                )
                 if entry is None:
                     unclassified.append(label)
+                    continue
+                if entry.expected_status != status:
+                    evidence_mismatches.append(
+                        f"{label} expected status {entry.expected_status}"
+                    )
+                    continue
+                if entry.evidence_sha256 != observed_evidence:
+                    evidence_mismatches.append(
+                        f"{label} evidence changed: expected {entry.evidence_sha256}, "
+                        f"observed {observed_evidence}"
+                    )
                     continue
                 expected.append(
                     {
                         "scenario": scenario,
                         "check_id": check_id,
                         "status": status,
+                        "evidence_sha256": observed_evidence,
                         "classification": entry.classification,
                         "reason": entry.reason,
                         "evidence": entry.evidence,
@@ -256,8 +371,29 @@ def evaluate_reports(
 
     if applicable_checks == 0:
         problems.append("zero applicable SUCCESS/FAILURE/WARNING checks were emitted")
+    if harness_exit_code not in {0, 1}:
+        problems.append(
+            f"conformance referee exited abnormally with code {harness_exit_code}; only 0/1 are normal"
+        )
+    scored_failures = statuses.get("FAILURE", 0)
+    if harness_exit_code == 0 and scored_failures > 0:
+        problems.append(
+            f"referee exit code 0 disagrees with {scored_failures} scored FAILURE check(s)"
+        )
+    if harness_exit_code == 1 and scored_failures == 0:
+        problems.append("referee exit code 1 had no scored FAILURE checks")
+    if infrastructure_failures:
+        problems.append(
+            "infrastructure failures cannot satisfy the gate: "
+            + ", ".join(sorted(infrastructure_failures))
+        )
     if unclassified:
         problems.append("unclassified non-success checks: " + ", ".join(sorted(unclassified)))
+    if evidence_mismatches:
+        problems.append(
+            "classified check status/evidence changed and requires review: "
+            + ", ".join(sorted(evidence_mismatches))
+        )
     if inconclusive:
         problems.append(
             "inconclusive infrastructure results cannot satisfy the gate: "
@@ -280,11 +416,11 @@ def evaluate_reports(
         problems.append("stale or uncovered classifications: " + ", ".join(stale))
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": profile,
         "server_sha": metadata.get("server_sha"),
         "harness_sha": metadata.get("harness_sha"),
-        "harness_exit_code": metadata.get("harness_exit_code"),
+        "harness_exit_code": harness_exit_code,
         "required_scenario_count": len(required),
         "not_scored_scenario_count": len(not_scored),
         "reported_scenario_count": len(reports),
@@ -293,6 +429,8 @@ def evaluate_reports(
         "informational_status_counts": dict(sorted(informational_statuses.items())),
         "classified_non_success": expected,
         "informational_non_success": informational_non_success,
+        "baseline_observations": baseline_observations,
+        "infrastructure_failures": infrastructure_failures,
         "missing_scenarios": missing_scenarios,
         "missing_not_scored_scenarios": missing_not_scored_scenarios,
         "unexpected_scenarios": unexpected_scenarios,

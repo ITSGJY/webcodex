@@ -33,6 +33,7 @@ class ReportGateTests(unittest.TestCase):
         self,
         scenarios: list[str],
         not_scored: list[dict[str, str]] | None = None,
+        harness_exit_code: int = 0,
     ) -> None:
         self.metadata.write_text(
             json.dumps(
@@ -40,7 +41,7 @@ class ReportGateTests(unittest.TestCase):
                     "profile": self.profile,
                     "server_sha": "a" * 40,
                     "harness_sha": "b" * 40,
-                    "harness_exit_code": 0,
+                    "harness_exit_code": harness_exit_code,
                     "required_scenarios": scenarios,
                     "not_scored_scenarios": not_scored or [],
                 }
@@ -52,33 +53,49 @@ class ReportGateTests(unittest.TestCase):
         self.baseline.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "profiles": {self.profile: {"classifications": entries}},
                 }
             ),
             encoding="utf-8",
         )
 
-    def write_checks(self, scenario: str, checks: list[dict[str, str]]) -> None:
+    def write_checks(self, scenario: str, checks: list[dict[str, object]]) -> None:
         result = self.raw / f"server-{scenario}-2026-09-14T00-00-00-000Z"
         result.mkdir()
         (result / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
 
     @staticmethod
-    def check(check_id: str, status: str) -> dict[str, str]:
-        return {
+    def check(
+        check_id: str,
+        status: str,
+        *,
+        error_message: str | None = None,
+        description: str | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
             "id": check_id,
             "name": check_id,
-            "description": check_id,
+            "description": description or check_id,
             "status": status,
             "timestamp": "2026-09-14T00:00:00Z",
         }
+        if error_message is not None:
+            result["errorMessage"] = error_message
+        return result
 
     @staticmethod
-    def classification(check_id: str, kind: str = "genuine_protocol_failure") -> dict[str, str]:
+    def classification(
+        check: dict[str, object],
+        kind: str = "genuine_protocol_failure",
+        *,
+        scenario: str = "scenario-a",
+    ) -> dict[str, str]:
         return {
-            "scenario": "scenario-a",
-            "check_id": check_id,
+            "scenario": scenario,
+            "check_id": str(check["id"]),
+            "expected_status": str(check["status"]),
+            "evidence_sha256": report_gate.check_evidence_sha256(check),
             "classification": kind,
             "reason": "reviewed baseline reason",
             "evidence": "MCP 2026-07-28 section/example",
@@ -95,12 +112,21 @@ class ReportGateTests(unittest.TestCase):
         self.assertTrue(summary["gate_passed"])
         self.assertEqual(summary["applicable_check_count"], 1)
 
+    def test_exact_classified_failure_passes(self) -> None:
+        failed = self.check("known-gap", "FAILURE", error_message="stable protocol mismatch")
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(failed)])
+        self.write_checks("scenario-a", [failed])
+        summary = self.evaluate()
+        self.assertTrue(summary["gate_passed"])
+
     def test_all_skipped_is_not_mistaken_for_coverage(self) -> None:
+        skipped = self.check("not-applicable", "SKIPPED")
         self.write_metadata(["scenario-a"])
         self.write_baseline(
-            [self.classification("not-applicable", "inconclusive_infrastructure")]
+            [self.classification(skipped, "inconclusive_infrastructure")]
         )
-        self.write_checks("scenario-a", [self.check("not-applicable", "SKIPPED")])
+        self.write_checks("scenario-a", [skipped])
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("zero applicable" in problem for problem in summary["problems"]))
@@ -112,6 +138,31 @@ class ReportGateTests(unittest.TestCase):
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertEqual(summary["missing_scenarios"], ["scenario-b"])
+
+    def test_required_empty_report_fails_even_with_other_coverage(self) -> None:
+        self.write_metadata(["scenario-a", "scenario-b"])
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks("scenario-b", [])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("scenario-b" in p and "no verdict" in p for p in summary["problems"]))
+
+    def test_required_info_only_report_fails_even_with_other_coverage(self) -> None:
+        self.write_metadata(["scenario-a", "scenario-b"])
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks("scenario-b", [self.check("info", "INFO")])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("scenario-b" in p and "no verdict" in p for p in summary["problems"]))
+
+    def test_unknown_status_is_rejected(self) -> None:
+        self.write_metadata(["scenario-a"])
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("broken", "ERROR")])
+        with self.assertRaisesRegex(report_gate.GateError, "unknown status"):
+            self.evaluate()
 
     def test_not_scored_failure_is_visible_but_does_not_require_classification(self) -> None:
         self.write_metadata(
@@ -126,6 +177,27 @@ class ReportGateTests(unittest.TestCase):
         self.assertEqual(summary["informational_status_counts"], {"FAILURE": 1})
         self.assertEqual(summary["informational_non_success"][0]["reason"], "extension")
 
+    def test_not_scored_timeout_is_infrastructure_failure(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "extension-a", "reason": "extension"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks(
+            "extension-a",
+            [
+                self.check(
+                    "scenario-timeout",
+                    "FAILURE",
+                    error_message="Scenario 'extension-a' did not complete within 10000ms.",
+                )
+            ],
+        )
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("infrastructure failures" in p for p in summary["problems"]))
+
     def test_missing_not_scored_scenario_fails_coverage_integrity(self) -> None:
         self.write_metadata(
             ["scenario-a"],
@@ -137,35 +209,118 @@ class ReportGateTests(unittest.TestCase):
         self.assertFalse(summary["gate_passed"])
         self.assertEqual(summary["missing_not_scored_scenarios"], ["pending-a"])
 
-    def test_classified_harness_error_remains_inconclusive(self) -> None:
-        self.write_metadata(["scenario-a"])
-        self.write_baseline(
-            [self.classification("scenario-a", "inconclusive_infrastructure")]
+    def test_empty_not_scored_report_fails_coverage_integrity(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "pending-a", "reason": "pending"}],
         )
-        self.write_checks("scenario-a", [self.check("scenario-a", "FAILURE")])
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks("pending-a", [])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("not-scored scenario" in p and "empty" in p for p in summary["problems"]))
+
+    def test_classified_harness_error_remains_inconclusive(self) -> None:
+        failed = self.check("scenario-a", "FAILURE", error_message="unreviewable harness result")
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline(
+            [self.classification(failed, "inconclusive_infrastructure")]
+        )
+        self.write_checks("scenario-a", [failed])
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("inconclusive infrastructure" in p for p in summary["problems"]))
 
+    def test_abnormal_harness_exit_is_infrastructure_failure(self) -> None:
+        self.write_metadata(["scenario-a"], harness_exit_code=137)
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("exited abnormally" in p for p in summary["problems"]))
+
+    def test_exit_one_without_scored_failure_is_rejected(self) -> None:
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("exit code 1 had no scored FAILURE" in p for p in summary["problems"]))
+
     def test_new_failure_requires_exact_classification(self) -> None:
-        self.write_metadata(["scenario-a"])
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
         self.write_baseline([])
         self.write_checks("scenario-a", [self.check("new-regression", "FAILURE")])
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("new-regression" in p for p in summary["problems"]))
 
+    def test_changed_failure_evidence_requires_review(self) -> None:
+        expected = self.check(
+            "tools-call-simple-text",
+            "FAILURE",
+            error_message="Unknown tool: test_simple_text",
+        )
+        actual = self.check(
+            "tools-call-simple-text",
+            "FAILURE",
+            error_message="Tool returned a different protocol error",
+        )
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected, "missing_harness_fixture")])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
+    def test_connection_failure_cannot_hide_behind_fixture_classification(self) -> None:
+        expected = self.check(
+            "tools-call-simple-text",
+            "FAILURE",
+            error_message="Unknown tool: test_simple_text",
+        )
+        actual = self.check(
+            "tools-call-simple-text",
+            "FAILURE",
+            error_message="connect ECONNREFUSED 127.0.0.1:12345",
+        )
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected, "missing_harness_fixture")])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("infrastructure failures" in p for p in summary["problems"]))
+
+    def test_status_change_requires_review(self) -> None:
+        expected = self.check("subscription-ack", "SKIPPED")
+        actual = self.check(
+            "subscription-ack",
+            "FAILURE",
+            error_message="subscription protocol assertion failed",
+        )
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline(
+            [self.classification(expected, "optional_capability_not_implemented")]
+        )
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("expected status SKIPPED" in p for p in summary["problems"]))
+
     def test_passing_expected_failure_is_stale(self) -> None:
+        expected = self.check("fixed-check", "FAILURE", error_message="known bug")
         self.write_metadata(["scenario-a"])
-        self.write_baseline([self.classification("fixed-check")])
+        self.write_baseline([self.classification(expected)])
         self.write_checks("scenario-a", [self.check("fixed-check", "SUCCESS")])
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("now passing" in p for p in summary["problems"]))
 
     def test_info_only_expected_failure_is_uncovered(self) -> None:
+        expected = self.check("no-verdict", "FAILURE", error_message="known bug")
         self.write_metadata(["scenario-a"])
-        self.write_baseline([self.classification("no-verdict")])
+        self.write_baseline([self.classification(expected)])
         self.write_checks(
             "scenario-a",
             [self.check("no-verdict", "INFO"), self.check("ok", "SUCCESS")],
@@ -181,6 +336,8 @@ class ReportGateTests(unittest.TestCase):
                 {
                     "scenario": "scenario-a",
                     "check_id": "*",
+                    "expected_status": "FAILURE",
+                    "evidence_sha256": "0" * 64,
                     "classification": "genuine_protocol_failure",
                     "reason": "too broad",
                     "evidence": "none",

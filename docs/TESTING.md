@@ -97,12 +97,13 @@ The lanes above define test semantics; workflows decide when to run them.
   lane is `success` when required or `skipped` when not required, avoiding a skipped
   required-check context that could leave branch protection pending.
 - MCP dated-revision evidence has its own bounded `mcp-conformance` lane. It pins
-  the upstream referee, runs the `2026-07-28` and `2025-11-25` server requirements
-  against a test-only loopback WebCodex endpoint, validates the report gate itself,
-  and uploads raw reports on success or failure. `test-native` requires this lane
-  to succeed, so missing coverage, stale classifications, and unclassified new
-  failures are merge-blocking even when the upstream referee exits zero. See
-  [`MCP_CONFORMANCE.md`](MCP_CONFORMANCE.md) for baseline semantics.
+  and freshly builds the upstream referee, runs the `2026-07-28` and `2025-11-25`
+  server requirements against a test-only loopback WebCodex endpoint, validates
+  the report gate itself, and uploads raw reports on success or failure.
+  `test-native` requires this lane to succeed, so missing per-scenario verdicts,
+  abnormal/infrastructure runs, stale or changed classifications, and unclassified
+  new failures are merge-blocking. See [`MCP_CONFORMANCE.md`](MCP_CONFORMANCE.md)
+  for baseline semantics.
 - Linux Rust execution remains package-sharded: the server package `webcodex`, the
   Runner/LSP packages, and the remaining workspace crates run in parallel. The
   Runner/LSP shard compiles with `--features runner-real-process-tests` to prevent
