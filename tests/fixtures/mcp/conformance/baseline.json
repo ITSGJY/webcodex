@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "harness_commit": "7169291ec0b68eb370fddcd9947313ab0d5e4156",
+  "profiles": {
+    "2025-11-25": {
+      "classifications": []
+    },
+    "2026-07-28": {
+      "classifications": []
+    }
+  },
+  "supplemental_findings": [
+    {
+      "id": "2026-streamed-resource-cache-hints",
+      "classification": "genuine_protocol_failure",
+      "evidence": "src/mcp_tests/artifact_export.rs::http_mcp_artifact_export_resources_read_streams_valid_json_blob",
+      "summary": "The streamed artifact resources/read result currently omits ttlMs and cacheScope. This baseline records the finding but does not change production framing."
+    },
+    {
+      "id": "2026-completed-task-nested-result-type",
+      "classification": "genuine_protocol_failure",
+      "evidence": "src/mcp_tests/project_connector.rs::http_project_connector_2026_tasks_poll_durable_execution_across_reopen",
+      "summary": "A completed Connector Task currently embeds its original tool result without resultType. This baseline records the finding but does not change production framing."
+    }
+  ]
+}

@@ -907,6 +907,12 @@ async fn http_project_connector_2026_tasks_poll_durable_execution_across_reopen(
     let completed_body: Value = completed.take_json().await.unwrap();
     assert_eq!(completed_body["result"]["status"], "completed");
     assert_eq!(completed_body["result"]["taskId"], task_id);
+    // MCP 2026 conformance baseline finding: the completed Task is finalized,
+    // but the nested original tool result is not yet discriminated as complete.
+    // Keep the observation explicit until the focused result-shape follow-up.
+    assert!(completed_body["result"]["result"]
+        .get("resultType")
+        .is_none());
     assert_eq!(
         completed_body["result"]["result"]["structuredContent"]["data"]["execution"]
             ["execution_status"],
