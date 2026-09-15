@@ -78,6 +78,11 @@ impl RetainedJobReceipt {
             // Validation identity may contain exact argv. Receipts deliberately
             // retain only step names/progress, never executable validation plans.
             || snapshot.context.validation.is_some()
+            // Test-count evidence is meaningful only when bound to the exact
+            // structured Cargo validation identity, which receipts intentionally
+            // do not retain. Reject injected/drifted receipt payloads rather than
+            // hydrating provenance-free correctness evidence.
+            || snapshot.test_count_evidence.is_some()
             || snapshot.context.structured_execution.as_ref().is_some_and(|metadata| !metadata.is_valid() || metadata.execution_source == "run_detached_process")
         {
             return Err("invalid receipt terminal snapshot");

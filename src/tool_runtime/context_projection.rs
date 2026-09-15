@@ -121,8 +121,6 @@ fn context_material_scope_available(
 
 fn projection_envelope(materials: Vec<Value>, truncated: bool) -> Value {
     json!({
-        "timing": "post_tool",
-        "applies_to_current_effect": false,
         "materials": materials,
         "truncated": truncated,
     })
@@ -130,16 +128,12 @@ fn projection_envelope(materials: Vec<Value>, truncated: bool) -> Value {
 
 #[derive(Serialize)]
 struct ContextProjectionMeasure<'a> {
-    timing: &'static str,
-    applies_to_current_effect: bool,
     materials: &'a [Value],
     truncated: bool,
 }
 
 fn fits_projection_budget(materials: &[Value], truncated: bool) -> bool {
     serialized_json_len(&ContextProjectionMeasure {
-        timing: "post_tool",
-        applies_to_current_effect: false,
         materials,
         truncated,
     })

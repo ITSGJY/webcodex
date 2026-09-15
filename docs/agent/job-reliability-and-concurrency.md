@@ -249,7 +249,7 @@ item errors, or one shared absolute deadline expires. It never returns an
 `updated` wake reason: at the deadline `wait.outcome=timeout` can coexist with
 `changed=true`. Item errors take precedence over terminal, then timeout.
 
-Canonical execution handoffs suggest `wait_secs=60, wake_on=terminal`. This is
+Canonical execution handoffs suggest `wait_secs=100, wake_on=terminal`. This is
 a maximum wait, so terminal completion wakes immediately. Any missing token
 still gives an immediate baseline, and omitting `wait_secs` gives an immediate
 observation. Each Job waiter advances a private opaque cursor on non-terminal

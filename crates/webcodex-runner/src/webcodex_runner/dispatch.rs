@@ -198,6 +198,7 @@ fn submit_invalid_job_start(sink: &RunnerSink, request: &RunnerRequest, error: S
         error: Some(error),
         command_execution_state,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished: true,
     });

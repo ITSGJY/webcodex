@@ -547,7 +547,7 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         .as_str()
         .unwrap();
     assert!(budget_description.contains("runtime-clamped"));
-    assert!(budget_description.contains("whole-query"));
+    assert!(budget_description.to_lowercase().contains("whole-query"));
     assert!(budget_description.contains("narrow"));
     let removed_input_cursor = ["match", "offset"].join("_");
     assert!(schema["properties"]["queries"]["items"]["properties"]
@@ -2429,7 +2429,6 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
     assert!(result.output.get("session_continuity").is_none());
     assert!(result.output.get("session_recovery").is_none());
     assert!(result.output.get("session_context_revision").is_none());
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
     assert_eq!(
         result.output["context_projection"]["materials"][0]["key"],
         "webcodex.workflow"

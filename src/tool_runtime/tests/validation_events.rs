@@ -149,6 +149,7 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })
@@ -285,6 +286,7 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
             error: None,
             command_execution_state: Some(crate::runner_protocol::ShellCommandExecutionState::Completed),
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })

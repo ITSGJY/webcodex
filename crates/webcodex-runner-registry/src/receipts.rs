@@ -146,6 +146,10 @@ fn capture(job: &ShellJobRecord) -> Option<RetainedJobReceipt> {
             stdout: stream(&job.stdout),
             stderr: stream(&job.stderr),
             validation_progress: job.validation_progress.clone(),
+            // Receipts deliberately omit exact structured-validation identity.
+            // A test count without that provenance is not reusable correctness
+            // evidence, so keep it only in Runner-owned snapshots/inventory.
+            test_count_evidence: None,
             activity: None,
         },
     };

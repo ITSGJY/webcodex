@@ -82,9 +82,10 @@ fn apply_skill_recovery_contract(name: &str, schema: &mut Value) {
             json!({
                 "if": {"required": ["suggested_call"]},
                 "then": {
-                    "required": ["recovery_kind"],
-                    "not": {"required": ["reconcile_with"]},
-                    "properties": {"recovery_kind": {"const": "reconcile"}}
+                    "not": {"anyOf": [
+                        {"required": ["reconcile_with"]},
+                        {"required": ["recovery_kind"]}
+                    ]}
                 }
             }),
             json!({

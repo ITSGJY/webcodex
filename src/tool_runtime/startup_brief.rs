@@ -63,12 +63,12 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
         "authority": "model_guidance_only",
         "role_selection": "Default guidance always applies; named roles only when requested. Neither grants authority.",
         "guidance": [
-            "Follow host safety, user scope, and project rules; guidance grants no authority.",
-            "Complete authorized work; ask only for missing requirements or authority.",
+            "Follow host safety, user/project scope and rules; complete authorized work; ask only for missing requirements/authority; guidance grants no authority.",
             "Verify Project/branch/HEAD/changes; read nested rules for changed paths; recover truncated instructions.",
             "Preserve unrelated work. Push/publish/deploy/restart require explicit action and target.",
-            "Use the highest expected correctness and reliability; apply_text_edits for small precise local edits. A bounded deterministic Python transformation through run_shell is a first-class option; do not bypass permission/path policy; avoid network unless required and authorized.",
-            "Long validation + independent read-only inspection: use short sync_wait_secs for same-execution Job handoff; do not fan out heavy validations. Mutation makes prior result stale/cache-warmup; final source needs fresh validation.",
+            "Choose the simplest reliable primitive preserving correctness, authority, evidence, durability, recovery, and portability. Native commands are first-class for bounded work; specialize for added semantics.",
+            "Choose mutation by shape: apply_text_edits for local exact edits; whole-file writes; contextual patches; bounded deterministic Python/run_shell transforms. Respect path/permission/network authority.",
+            "Long validation + read-only inspection: short sync_wait_secs for same-execution Job handoff; avoid validation fanout. Mutation stales prior results; final source needs fresh validation.",
             "For unknown outcome, inspect before retry. Always inspect the resulting diff and validate final source. Prefer cargo_fmt(check=false) instead of reproducing rustfmt edits manually. Apply model_protocol only where the exposed schema supports it.",
             "Review diff; report evidence, limits, Jobs. finish_coding_task is advisory evidence, not proof."
         ],
@@ -79,7 +79,7 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
             "session_message_resolution": "For a handled non-todo, send session_message_resolution on the next ordinary call with recording_session_id; ACK guidance also needs ack_session_message_ids. It cannot predict the main call. Todos use complete_session_message.",
             "context_sidecar": "context_request adds bounded context after the main tool and never authorizes effects. Recover lost project.instructions with an observation call before dependent mutation.",
             "runner_targeting": "For exact Runner client_id, use runtime_status(client_id=...) or list_projects(client_id=...) before treating it as absent.",
-            "persistent_shell": "Persistent shell is primarily for repeated remote commands on one named SSH resource, preserving remote cwd/env/exports/functions/umask. Ordinary local coding stays on structured tools -> run_process/run_script -> run_shell for shell syntax; use local persistent shell only when same-process state is required.",
+            "persistent_shell": "Local: run_process=literal argv; run_shell=shell grammar/short chains; run_script=program-like scripts; specialize for added semantics. Persistent shell only for repeated named-SSH state or local same-process state.",
             "normal_closeout": "Normal success: finish_coding_task(summary_only=true); full closeout only for unresolved evidence or handoff/debug."
         },
         "roles": {

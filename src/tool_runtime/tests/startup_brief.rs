@@ -174,16 +174,17 @@ fn assert_builtin_workflow(output: &Value) {
     for phrase in [
         "cargo_fmt(check=false)",
         "instead of reproducing rustfmt edits manually",
-        "highest expected correctness and reliability",
-        "bounded deterministic Python transformation through run_shell",
-        "first-class option",
-        "do not bypass permission/path policy",
+        "simplest reliable primitive",
+        "correctness, authority, evidence, durability, recovery, and portability",
+        "Native commands are first-class for bounded work",
+        "bounded deterministic Python/run_shell transforms",
+        "Respect path/permission/network authority",
         "Always inspect the resulting diff and validate final source",
-        "independent read-only inspection",
+        "read-only inspection",
         "short sync_wait_secs",
         "same-execution Job handoff",
-        "do not fan out heavy validations",
-        "stale/cache-warmup",
+        "avoid validation fanout",
+        "stales prior results",
         "final source needs fresh validation",
     ] {
         assert!(defaults.contains(phrase), "workflow guidance: {phrase}");
@@ -191,13 +192,21 @@ fn assert_builtin_workflow(output: &Value) {
     let persistent_shell_guidance = workflow["model_protocol"]["persistent_shell"]
         .as_str()
         .expect("persistent shell guidance");
-    assert!(persistent_shell_guidance.contains("primarily for repeated remote commands"));
-    assert!(persistent_shell_guidance.contains("one named SSH resource"));
-    assert!(persistent_shell_guidance.contains("remote cwd/env/exports/functions/umask"));
-    assert!(persistent_shell_guidance
+    for phrase in [
+        "run_process=literal argv",
+        "run_shell=shell grammar/short chains",
+        "run_script=program-like scripts",
+        "specialize for added semantics",
+        "repeated named-SSH state",
+        "local same-process state",
+    ] {
+        assert!(
+            persistent_shell_guidance.contains(phrase),
+            "persistent shell guidance: {phrase}"
+        );
+    }
+    assert!(!persistent_shell_guidance
         .contains("structured tools -> run_process/run_script -> run_shell"));
-    assert!(persistent_shell_guidance
-        .contains("local persistent shell only when same-process state is required"));
     assert!(!persistent_shell_guidance.contains("For repeated commands in one Workflow Session"));
     let closeout_guidance = workflow["model_protocol"]["normal_closeout"]
         .as_str()
@@ -1022,6 +1031,7 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -1161,6 +1171,7 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })

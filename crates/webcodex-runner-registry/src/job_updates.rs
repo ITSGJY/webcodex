@@ -295,6 +295,7 @@ struct JobPublicMutationSignature {
     duration_ms: Option<u64>,
     command_execution_state: Option<ShellCommandExecutionState>,
     validation_progress: Option<webcodex_core::runner_protocol::ShellJobValidationProgress>,
+    test_count_evidence: Option<webcodex_core::runner_protocol::ShellJobTestCountEvidence>,
     activity: Option<ShellJobActivity>,
     recovered_after_server_restart: bool,
     reconciled_at: Option<i64>,
@@ -314,6 +315,7 @@ fn public_mutation_signature(job: &ShellJobRecord) -> JobPublicMutationSignature
         duration_ms: job.duration_ms,
         command_execution_state: job.command_execution_state,
         validation_progress: job.validation_progress.clone(),
+        test_count_evidence: job.test_count_evidence.clone(),
         activity: job.activity,
         recovered_after_server_restart: job.recovery.recovered_after_server_restart,
         reconciled_at: job.recovery.reconciled_at,
@@ -413,6 +415,23 @@ fn validate_validation_progress(
     } else {
         invalid_progress("validation_progress_invalid")
     }
+}
+
+fn validate_test_count_evidence(
+    job: &ShellJobRecord,
+    update: &RunnerJobUpdateRequest,
+    lifecycle: JobLifecycleState,
+) -> Result<(), ValidationProtocolError> {
+    let Some(evidence) = update.test_count_evidence.as_ref() else {
+        return Ok(());
+    };
+    let cargo_test = job.validation.as_ref().is_some_and(|metadata| {
+        metadata.tool == "cargo_test" && metadata.kind == "test" && metadata.no_run != Some(true)
+    });
+    if !cargo_test || !lifecycle.is_terminal() || !update.finished || !evidence.is_valid() {
+        return invalid_progress("test_count_evidence_invalid");
+    }
+    Ok(())
 }
 
 fn validation_activity_phase(step: &str) -> Option<ShellJobActivityPhase> {
@@ -1159,6 +1178,7 @@ impl RunnerRegistry {
             validation_steps: validation_step_names,
             validation,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             last_update_seq: 0,
             visibility: metadata.visibility,
@@ -2166,6 +2186,7 @@ impl RunnerRegistry {
                 &body,
             );
             if let Err(error) = validate_validation_progress(job, &body, incoming_lifecycle)
+                .and_then(|_| validate_test_count_evidence(job, &body, incoming_lifecycle))
                 .and_then(|_| validate_command_execution_state(job, &body, incoming_lifecycle))
                 .and_then(|_| validate_job_activity(job, &body, incoming_lifecycle))
             {
@@ -2198,6 +2219,9 @@ impl RunnerRegistry {
                 }
                 if body.validation_progress.is_some() {
                     job.validation_progress = body.validation_progress.clone();
+                }
+                if body.test_count_evidence.is_some() {
+                    job.test_count_evidence = body.test_count_evidence.clone();
                 }
                 if body.activity.is_some() {
                     job.activity = body.activity;

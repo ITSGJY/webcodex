@@ -573,11 +573,6 @@ async fn memory_bootstrap_is_lightweight_explicit_bounded_and_post_tool() {
             },
         )
         .await;
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        result.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert!(result.output["context_projection"]["materials"]
         .as_array()
         .unwrap()
@@ -818,11 +813,6 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
         public.output["context_projection"]["materials"][0]["status"],
         "available"
     );
-    assert_eq!(public.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        public.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
 }
 
 #[tokio::test]
@@ -905,11 +895,6 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
         .unwrap();
     assert_eq!(material["status"], "available");
     assert!(material.to_string().contains(private_summary));
-    assert_eq!(explicit.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        explicit.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert!(!explicit.output["session_recovery"]
         .to_string()
         .contains(private_summary));
@@ -1182,14 +1167,6 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         .result
         .expect("memory_set sidecar result");
     assert!(mutation_with_bootstrap.success);
-    assert_eq!(
-        mutation_with_bootstrap.output["context_projection"]["timing"],
-        "post_tool"
-    );
-    assert_eq!(
-        mutation_with_bootstrap.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert_eq!(
         mutation_with_bootstrap.output["context_projection"]["materials"][0]["status"],
         "available"

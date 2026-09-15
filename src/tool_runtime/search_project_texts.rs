@@ -2,7 +2,7 @@
 
 use super::files::{SearchOptions, SearchRequest};
 use super::project_resolution::ResolvedProject;
-use super::{SearchProjectTextsQuery, ToolResult, ToolRuntime};
+use super::{SearchProjectTextsQuery, SuggestedToolCall, ToolResult, ToolRuntime};
 use crate::json_measurement::serialized_json_len;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
@@ -53,7 +53,7 @@ fn search_request_and_pattern_mode(
     )
 }
 
-fn normalized_result_budget(max_result_bytes: Option<usize>) -> usize {
+pub(crate) fn normalized_result_budget(max_result_bytes: Option<usize>) -> usize {
     max_result_bytes
         .unwrap_or(DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES)
         .clamp(
@@ -83,8 +83,10 @@ fn batch_output(
         "failed_count": returned_count - succeeded_count,
         "items": items,
         "output_truncated": output_truncated,
-        "next_index": next_index,
     });
+    if let Some(next_index) = next_index {
+        output["next_index"] = json!(next_index);
+    }
     if let Some(reason) = truncation_reason {
         output["truncation_reason"] = json!(reason);
     }
@@ -105,6 +107,26 @@ fn serialized_value_len(value: &Value) -> usize {
 fn projected_batch_serialized_len(output: &Value, default_timeouts: &[bool]) -> usize {
     let mut projected = ToolResult::ok(output.clone());
     super::dispatch::sparsify_search_batch_success_for_model(default_timeouts, &mut projected);
+    serialized_json_len(&projected).unwrap_or(usize::MAX)
+}
+
+fn projected_batch_serialized_len_with_continuation(
+    output: &Value,
+    default_timeouts: &[bool],
+    project: &str,
+    original_queries: &[SearchProjectTextsQuery],
+    session_id: Option<&str>,
+    max_result_bytes: Option<usize>,
+) -> usize {
+    let mut projected = ToolResult::ok(output.clone());
+    super::dispatch::sparsify_search_batch_success_for_model(default_timeouts, &mut projected);
+    add_actionable_search_continuation(
+        &mut projected,
+        project,
+        original_queries,
+        session_id,
+        max_result_bytes,
+    );
     serialized_json_len(&projected).unwrap_or(usize::MAX)
 }
 
@@ -383,10 +405,101 @@ fn batch_item(index: usize, mut result: ToolResult) -> Value {
     })
 }
 
+fn search_query_argument_value(query: &SearchProjectTextsQuery) -> Value {
+    let mut value =
+        serde_json::to_value(query).expect("SearchProjectTextsQuery serialization is infallible");
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    value
+}
+
+fn search_suggested_arguments(
+    project: &str,
+    queries: &[SearchProjectTextsQuery],
+    session_id: Option<&str>,
+    max_result_bytes: Option<usize>,
+) -> Value {
+    let mut arguments = json!({
+        "project": project,
+        "queries": queries.iter().map(search_query_argument_value).collect::<Vec<_>>(),
+    });
+    if let Some(session_id) = session_id {
+        arguments["session_id"] = json!(session_id);
+    }
+    if let Some(max_result_bytes) = max_result_bytes {
+        arguments["max_result_bytes"] = json!(max_result_bytes);
+    }
+    arguments
+}
+
+/// Compile producer-only whole-query next_index bookkeeping into one directly
+/// reusable suffix rerun. Individual query match positions remain deliberately
+/// non-resumable because backend order is not a stable cursor.
+pub(crate) fn add_actionable_search_continuation(
+    result: &mut ToolResult,
+    project: &str,
+    original_queries: &[SearchProjectTextsQuery],
+    session_id: Option<&str>,
+    max_result_bytes: Option<usize>,
+) {
+    if !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    let truncated = output.get("output_truncated").and_then(Value::as_bool) == Some(true);
+    let next_index = output
+        .get("next_index")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    if !truncated {
+        output.remove("next_index");
+        return;
+    }
+    let Some(next_index) = next_index else {
+        return;
+    };
+    let returned_count = output
+        .get("returned_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let mut next_budget = max_result_bytes;
+    if returned_count == 0 && next_index == 0 {
+        let reason = output.get("truncation_reason").and_then(Value::as_str);
+        let current_budget = normalized_result_budget(max_result_bytes);
+        if reason == Some("hard_result_cap") || current_budget >= MAX_SERIALIZED_OUTPUT_BYTES {
+            // No bounded parameter change can prove progress. Preserve the
+            // truncation reason, but never manufacture a looping next call.
+            output.remove("next_index");
+            return;
+        }
+        next_budget = Some(MAX_SERIALIZED_OUTPUT_BYTES);
+    }
+    if let Some(remaining) = original_queries
+        .get(next_index..)
+        .filter(|queries| !queries.is_empty())
+    {
+        output.insert(
+            "suggested_call".to_string(),
+            SuggestedToolCall::new(
+                "search_project_texts",
+                search_suggested_arguments(project, remaining, session_id, next_budget),
+            )
+            .to_value(),
+        );
+    }
+    output.remove("next_index");
+}
+
 pub(crate) fn apply_model_facing_output_budget(
     result: &mut ToolResult,
     default_timeouts: &[bool],
     max_result_bytes: Option<usize>,
+    project: &str,
+    original_queries: &[SearchProjectTextsQuery],
+    session_id: Option<&str>,
 ) {
     if !result.success {
         return;
@@ -394,7 +507,7 @@ pub(crate) fn apply_model_facing_output_budget(
     let Some(output) = result.output.as_object() else {
         return;
     };
-    let Some(project) = output
+    let Some(output_project) = output
         .get("project")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -412,13 +525,38 @@ pub(crate) fn apply_model_facing_output_budget(
         return;
     };
 
-    let budgeted = apply_output_budget(
-        &project,
+    let mut budgeted = apply_output_budget(
+        &output_project,
         requested_count,
         completed,
         default_timeouts,
         max_result_bytes,
     );
+
+    // The parser-ready suffix call is part of the primary model-facing search
+    // projection. Measure it against that primary budget before reattaching
+    // independently bounded Session/continuity overlays. The producer packer
+    // already chose the largest returned prefix; if even its smallest remaining
+    // suffix call cannot fit, retain the useful prefix but suppress producer-only
+    // cursor bookkeeping rather than returning an oversized/fake continuation.
+    // Removing more returned items cannot help because it only enlarges the
+    // original-query suffix carried by the exact follow-up.
+    let payload_budget = normalized_result_budget(max_result_bytes)
+        .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES);
+    if projected_batch_serialized_len_with_continuation(
+        &budgeted,
+        default_timeouts,
+        project,
+        original_queries,
+        session_id,
+        max_result_bytes,
+    ) > payload_budget
+    {
+        if let Some(root) = budgeted.as_object_mut() {
+            root.remove("next_index");
+        }
+    }
+
     let Some(root) = result.output.as_object_mut() else {
         return;
     };
@@ -442,10 +580,22 @@ pub(crate) fn apply_model_facing_output_budget(
     }
 }
 
-fn final_model_result_len(output: &Value, default_timeouts: &[bool]) -> usize {
-    let mut projected = ToolResult::ok(output.clone());
-    super::dispatch::sparsify_search_batch_success_for_model(default_timeouts, &mut projected);
-    serialized_json_len(&projected).unwrap_or(usize::MAX)
+fn final_model_result_len(
+    output: &Value,
+    default_timeouts: &[bool],
+    project: &str,
+    original_queries: &[SearchProjectTextsQuery],
+    session_id: Option<&str>,
+    max_result_bytes: Option<usize>,
+) -> usize {
+    projected_batch_serialized_len_with_continuation(
+        output,
+        default_timeouts,
+        project,
+        original_queries,
+        session_id,
+        max_result_bytes,
+    )
 }
 
 fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {
@@ -484,9 +634,20 @@ fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {
 pub(crate) fn enforce_final_model_facing_hard_cap(
     result: &mut ToolResult,
     default_timeouts: &[bool],
+    project: &str,
+    original_queries: &[SearchProjectTextsQuery],
+    session_id: Option<&str>,
+    max_result_bytes: Option<usize>,
 ) {
     if !result.success
-        || final_model_result_len(&result.output, default_timeouts) <= MAX_SERIALIZED_OUTPUT_BYTES
+        || final_model_result_len(
+            &result.output,
+            default_timeouts,
+            project,
+            original_queries,
+            session_id,
+            max_result_bytes,
+        ) <= MAX_SERIALIZED_OUTPUT_BYTES
     {
         return;
     }
@@ -509,12 +670,26 @@ pub(crate) fn enforce_final_model_facing_hard_cap(
                 return;
             };
             let Some(removed) = items.pop() else {
+                // No business item remains to trim. If the exact parser-ready
+                // suffix call itself cannot fit the hard model ceiling, expose
+                // truthful truncation without a fake/raw continuation cursor.
+                if let Some(root) = result.output.as_object_mut() {
+                    root.remove("next_index");
+                }
                 return;
             };
             removed["index"].as_u64().unwrap_or(0) as usize
         };
         mark_final_hard_cap_truncation(&mut result.output, removed_index);
-        if final_model_result_len(&result.output, default_timeouts) <= MAX_SERIALIZED_OUTPUT_BYTES {
+        if final_model_result_len(
+            &result.output,
+            default_timeouts,
+            project,
+            original_queries,
+            session_id,
+            max_result_bytes,
+        ) <= MAX_SERIALIZED_OUTPUT_BYTES
+        {
             return;
         }
     }
@@ -721,7 +896,28 @@ mod tests {
             None,
             None,
         ));
-        apply_model_facing_output_budget(&mut result, &[true; 8], None);
+        let queries = (0..8)
+            .map(|index| SearchProjectTextsQuery {
+                pattern: format!("needle-{index}"),
+                pattern_mode: None,
+                path: None,
+                limit: None,
+                context_before: None,
+                context_after: None,
+                include_globs: None,
+                exclude_globs: None,
+                result_mode: None,
+                timeout_secs: None,
+            })
+            .collect::<Vec<_>>();
+        apply_model_facing_output_budget(
+            &mut result,
+            &[true; 8],
+            None,
+            "agent:oe:demo",
+            &queries,
+            None,
+        );
         assert_eq!(result.output["output_truncated"], false);
         assert!(result.output["next_index"].is_null());
         assert_eq!(result.output["items"].as_array().unwrap().len(), 8);
@@ -886,6 +1082,74 @@ mod tests {
     }
 
     #[test]
+    fn actionable_search_continuation_is_parser_ready_and_hard_cap_fails_closed() {
+        let query = SearchProjectTextsQuery {
+            pattern: "needle".to_string(),
+            pattern_mode: None,
+            path: None,
+            limit: Some(120),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: None,
+            timeout_secs: None,
+        };
+        let mut soft = ToolResult::ok(apply_output_budget(
+            "agent:resolved:demo",
+            1,
+            vec![default_matches_item(0, 120, 900)],
+            &[true],
+            None,
+        ));
+        assert_eq!(soft.output["next_index"], 0);
+        add_actionable_search_continuation(
+            &mut soft,
+            "agent:resolved:demo",
+            std::slice::from_ref(&query),
+            Some("wc_sess_demo"),
+            None,
+        );
+        assert!(soft.output.get("next_index").is_none());
+        let suggested = &soft.output["suggested_call"];
+        assert_eq!(suggested["tool"], "search_project_texts");
+        assert_eq!(suggested["arguments"]["project"], "agent:resolved:demo");
+        assert_eq!(suggested["arguments"]["session_id"], "wc_sess_demo");
+        assert_eq!(
+            suggested["arguments"]["max_result_bytes"],
+            MAX_SERIALIZED_OUTPUT_BYTES
+        );
+        assert_eq!(suggested["arguments"]["queries"][0]["pattern"], "needle");
+        assert!(suggested["arguments"]["queries"][0]
+            .get("pattern_mode")
+            .is_none());
+        crate::tool_runtime::ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .expect("whole-query search follow-up must be parser-ready");
+
+        let mut hard = ToolResult::ok(apply_output_budget(
+            "agent:resolved:demo",
+            1,
+            vec![matches_item(0, 199, 3_000)],
+            &[false],
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+        ));
+        assert_eq!(hard.output["next_index"], 0);
+        assert_eq!(hard.output["truncation_reason"], "hard_result_cap");
+        add_actionable_search_continuation(
+            &mut hard,
+            "agent:resolved:demo",
+            &[query],
+            None,
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+        );
+        assert!(hard.output.get("next_index").is_none());
+        assert!(hard.output.get("suggested_call").is_none());
+    }
+
+    #[test]
     fn hard_cap_pressure_omits_oversized_query_without_partial_matches() {
         let output = apply_output_budget(
             "agent:oe:demo",
@@ -903,6 +1167,20 @@ mod tests {
 
     #[test]
     fn final_hard_cap_accounts_for_outer_session_overlay_bytes() {
+        let queries = (0..3)
+            .map(|index| SearchProjectTextsQuery {
+                pattern: format!("needle-{index}"),
+                pattern_mode: None,
+                path: None,
+                limit: None,
+                context_before: None,
+                context_after: None,
+                include_globs: None,
+                exclude_globs: None,
+                result_mode: None,
+                timeout_secs: None,
+            })
+            .collect::<Vec<_>>();
         let completed = (0..3)
             .map(|index| default_matches_item(index, 1, 120 * 1024))
             .collect::<Vec<_>>();
@@ -917,9 +1195,25 @@ mod tests {
         result.output["session_recovery"] = json!({
             "model_facing_events": ["o".repeat(220 * 1024)]
         });
-        assert!(final_model_result_len(&result.output, &[false; 3]) > MAX_SERIALIZED_OUTPUT_BYTES);
+        assert!(
+            final_model_result_len(
+                &result.output,
+                &[false; 3],
+                "agent:oe:demo",
+                &queries,
+                None,
+                Some(MAX_SERIALIZED_OUTPUT_BYTES),
+            ) > MAX_SERIALIZED_OUTPUT_BYTES
+        );
 
-        enforce_final_model_facing_hard_cap(&mut result, &[false; 3]);
+        enforce_final_model_facing_hard_cap(
+            &mut result,
+            &[false; 3],
+            "agent:oe:demo",
+            &queries,
+            None,
+            Some(MAX_SERIALIZED_OUTPUT_BYTES),
+        );
 
         assert_eq!(result.output["output_truncated"], true);
         assert_eq!(result.output["truncation_reason"], "hard_result_cap");
@@ -934,7 +1228,71 @@ mod tests {
                 .len(),
             220 * 1024
         );
-        assert!(final_model_result_len(&result.output, &[false; 3]) <= MAX_SERIALIZED_OUTPUT_BYTES);
+        assert!(
+            final_model_result_len(
+                &result.output,
+                &[false; 3],
+                "agent:oe:demo",
+                &queries,
+                None,
+                Some(MAX_SERIALIZED_OUTPUT_BYTES),
+            ) <= MAX_SERIALIZED_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn oversized_parser_ready_suffix_is_suppressed_before_soft_budget_overflow() {
+        let glob = format!("src/{}", "g".repeat(252));
+        assert_eq!(glob.len(), 256);
+        let queries = (0..8)
+            .map(|index| SearchProjectTextsQuery {
+                pattern: format!("needle-{index}"),
+                pattern_mode: Some(crate::tool_runtime::SearchPatternMode::Literal),
+                path: Some("src".to_string()),
+                limit: Some(50),
+                context_before: None,
+                context_after: None,
+                include_globs: Some(vec![glob.clone(); 32]),
+                exclude_globs: Some(vec![glob.clone(); 32]),
+                result_mode: None,
+                timeout_secs: None,
+            })
+            .collect::<Vec<_>>();
+        let completed = (0..8)
+            .map(|index| default_matches_item(index, 1, 9_000))
+            .collect::<Vec<_>>();
+        let mut result = ToolResult::ok(batch_output(
+            "agent:oe:demo",
+            8,
+            completed,
+            false,
+            None,
+            None,
+        ));
+
+        apply_model_facing_output_budget(
+            &mut result,
+            &[true; 8],
+            None,
+            "agent:oe:demo",
+            &queries,
+            None,
+        );
+
+        assert_eq!(result.output["output_truncated"], true);
+        assert!(result.output["returned_count"].as_u64().unwrap() > 0);
+        assert!(
+            result.output.get("next_index").is_none(),
+            "producer-only cursor must not survive when its parser-ready call exceeds the model budget"
+        );
+        super::super::dispatch::sparsify_search_batch_success_for_model(&[true; 8], &mut result);
+        add_actionable_search_continuation(&mut result, "agent:oe:demo", &queries, None, None);
+        assert!(result.output.get("suggested_call").is_none());
+        let bytes = serialized_json_len(&result).unwrap();
+        assert!(
+            bytes <= DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES,
+            "final search projection exceeded its soft result budget after continuation handling: {bytes}"
+        );
     }
 
     #[test]

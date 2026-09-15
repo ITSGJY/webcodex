@@ -45,7 +45,7 @@ fn structured_execution_output(
                     "job_id": job_id.expect("promoted Job id"),
                     "after_observation_token": "observation"
                 }],
-                "wait_secs": 60,
+                "wait_secs": 100,
                 "wake_on": "terminal"
             }
         });
@@ -63,20 +63,49 @@ fn structured_execution_output(
 }
 
 #[test]
-fn t2_continuation_output_schemas_distinguish_cursor_kinds_and_carriers() {
+fn observation_schemas_do_not_repeat_static_continuation_semantics() {
     let specs = registered_tool_specs();
+    for name in [
+        "coding_agent_start",
+        "coding_agent_observe",
+        "observe_session_messages",
+    ] {
+        let spec = spec_named(&specs, name);
+        assert!(
+            spec.output_schema["properties"]["output"]["properties"]
+                .get("continuation_semantics")
+                .is_none(),
+            "{name} must rely on its explicit observation token/input contract"
+        );
+    }
 
-    let coding = spec_named(&specs, "coding_agent_observe");
-    let coding_semantics = &coding.output_schema["properties"]["output"]["properties"]
-        ["continuation_semantics"]["properties"];
-    assert_eq!(coding_semantics["kind"]["const"], "observe");
-    assert_eq!(coding_semantics["carrier"]["const"], "observation_token");
-
-    let session = spec_named(&specs, "observe_session_messages");
-    let session_semantics = &session.output_schema["properties"]["output"]["properties"]
-        ["continuation_semantics"]["properties"];
-    assert_eq!(session_semantics["kind"]["const"], "observe");
-    assert_eq!(session_semantics["carrier"]["const"], "observation_token");
+    let observe_jobs = spec_named(&specs, "observe_jobs");
+    let variants = observe_jobs.output_schema["properties"]["output"]["anyOf"]
+        .as_array()
+        .expect("observe_jobs output variants");
+    let full = variants
+        .iter()
+        .find(|variant| variant["properties"].get("suggested_call").is_some())
+        .expect("observe_jobs full batch output");
+    let item_output = &full["properties"]["items"]["items"]["properties"]["output"]["anyOf"][0];
+    assert!(
+        item_output["properties"]
+            .get("continuation_semantics")
+            .is_none(),
+        "observe_jobs items must rely on observation_token -> after_observation_token"
+    );
+    assert!(
+        full["properties"].get("continuation_semantics").is_none()
+            && full["properties"].get("next_index").is_none(),
+        "observe_jobs must keep aggregate packing indices private"
+    );
+    let suggested = &full["properties"]["suggested_call"];
+    assert_eq!(suggested["properties"]["tool"]["const"], "observe_jobs");
+    let arguments = &suggested["properties"]["arguments"]["properties"];
+    assert!(arguments.get("items").is_some());
+    assert!(arguments.get("tail_lines").is_some());
+    assert!(arguments.get("wait_secs").is_none());
+    assert!(arguments.get("wake_on").is_none());
 }
 
 #[test]
@@ -605,7 +634,6 @@ fn observe_jobs_failure_item_schema_closes_recovery_metadata() {
                 "success": false,
                 "output": null,
                 "error_kind": "unknown_job",
-                "recovery_kind": "reobserve",
                 "suggested_call": {"tool": "list_jobs", "arguments": {}},
                 "error": "unknown job"
             }],
@@ -615,16 +643,15 @@ fn observe_jobs_failure_item_schema_closes_recovery_metadata() {
             },
             "changed_count": 0,
             "terminal_count": 0,
-            "output_truncated": false,
-            "next_index": null
+            "output_truncated": false
         },
         "error": null
     });
     validate(&result).unwrap();
 
-    let mut invalid_kind = result.clone();
-    invalid_kind["output"]["items"][0]["recovery_kind"] = json!("blind_retry");
-    assert!(validate(&invalid_kind).is_err());
+    let mut duplicate_kind = result.clone();
+    duplicate_kind["output"]["items"][0]["recovery_kind"] = json!("reobserve");
+    assert!(validate(&duplicate_kind).is_err());
 
     let mut invalid_tool = result.clone();
     invalid_tool["output"]["items"][0]["suggested_call"]["tool"] = json!("computer_list_windows");
@@ -1249,11 +1276,11 @@ fn key_tool_output_schemas_include_expected_fields() {
         assert_eq!(continuation["properties"]["tool"]["const"], "observe_jobs");
         assert_eq!(
             continuation["properties"]["arguments"]["properties"]["wait_secs"]["maximum"],
-            60
+            webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
         );
         assert_eq!(
             continuation["properties"]["arguments"]["properties"]["wait_secs"]["const"],
-            60
+            webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
         );
         assert_eq!(
             continuation["properties"]["arguments"]["properties"]["wake_on"]["const"],
@@ -1956,7 +1983,6 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
     let canonical_recovery = json!({
         "success": false,
         "output": {
-            "recovery_kind": "reobserve",
             "suggested_call": {
                 "tool": "computer_list_windows",
                 "arguments": {"client_id": "special"}
@@ -1965,6 +1991,9 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
         "error": "reobserve"
     });
     test_support::validate_schema_instance(&canonical_recovery, &schema).unwrap();
+    let mut duplicate_kind = canonical_recovery.clone();
+    duplicate_kind["output"]["recovery_kind"] = json!("reobserve");
+    assert!(test_support::validate_schema_instance(&duplicate_kind, &schema).is_err());
 
     let mut legacy = canonical_recovery.clone();
     legacy["output"]["recovery_tool"] = json!("computer_list_windows");
@@ -1986,7 +2015,6 @@ fn skill_recovery_output_schema_accepts_canonical_shapes_and_declares_legacy_rej
             "skill_key": "demo",
             "outcome_unknown": true,
             "state_changed": null,
-            "recovery_kind": "reconcile",
             "suggested_call": {
                 "tool": "skill_versions",
                 "arguments": {
@@ -2005,6 +2033,7 @@ fn skill_recovery_output_schema_accepts_canonical_shapes_and_declares_legacy_rej
         .as_object_mut()
         .unwrap()
         .remove("suggested_call");
+    family_only["output"]["recovery_kind"] = json!("reconcile");
     family_only["output"]["reconcile_with"] = json!("skill_versions");
     test_support::validate_schema_instance(&family_only, &schema).unwrap();
 
@@ -2024,7 +2053,13 @@ fn skill_recovery_output_schema_accepts_canonical_shapes_and_declares_legacy_rej
         .any(|constraint| constraint["not"]["required"] == json!(["recovery_tool"])));
     assert!(recovery_constraints.iter().any(|constraint| {
         constraint["if"]["required"] == json!(["suggested_call"])
-            && constraint["then"]["not"]["required"] == json!(["reconcile_with"])
+            && constraint["then"]["not"]["anyOf"]
+                .as_array()
+                .is_some_and(|forbidden| {
+                    forbidden
+                        .iter()
+                        .any(|entry| entry["required"] == json!(["recovery_kind"]))
+                })
     }));
     assert!(recovery_constraints.iter().any(|constraint| {
         constraint["if"]["required"] == json!(["reconcile_with"])

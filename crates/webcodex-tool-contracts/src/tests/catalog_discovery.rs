@@ -138,6 +138,15 @@ fn tool_recommended_flows_reference_visible_defined_tools() {
                 );
                 assert!(is_model_visible_tool_name(tool), "{}: {tool}", flow.name);
             }
+            for native in ["run_process", "run_script", "run_shell"] {
+                if flow.manifest_purpose.contains(native) {
+                    assert!(
+                        flow.tools.contains(&native),
+                        "{} purpose recommends {native} but its machine-readable tools omit it",
+                        flow.name
+                    );
+                }
+            }
             flow.summary
         })
         .collect::<Vec<_>>();
@@ -145,7 +154,7 @@ fn tool_recommended_flows_reference_visible_defined_tools() {
 }
 
 #[test]
-fn edit_recommended_flow_pairs_reads_with_guarded_exact_edits() {
+fn edit_recommended_flow_selects_mutation_by_shape_without_weakening_guards() {
     let flow = TOOL_RECOMMENDED_FLOWS
         .iter()
         .find(|flow| flow.name == "edit")
@@ -153,29 +162,35 @@ fn edit_recommended_flow_pairs_reads_with_guarded_exact_edits() {
     assert_eq!(flow.tools.first().copied(), Some("read_files"));
     assert_eq!(flow.tools.get(1).copied(), Some("apply_text_edits"));
     assert_eq!(flow.tools.get(2).copied(), Some("apply_patch"));
-    assert!(flow
-        .summary
-        .starts_with("Edit: after read_files, apply_text_edits with current SHA is the default"));
-    assert!(flow.summary.contains("even when many lines change"));
-    assert!(flow.summary.contains("Use apply_patch only when"));
     let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
     for phrase in [
-        "canonical default even when many lines change",
+        "edit by mutation shape",
+        "apply_text_edits for small/local exact edits",
+        "intentional whole-file replacement",
+        "bounded deterministic programmatic transforms",
+        "repetitive mechanical",
+        "do not add a ritual read",
+        "read_revision",
+        "naturally contextual",
         "stable unique containing function/impl/type/test/module context",
         "matching_mode_rejected",
-        "do not weaken the guard or switch to first_match",
-        "prefer apply_text_edits if exact edits are easy",
-        "bounded read_files recovery",
-        "preserve the requested guard",
-        "unique retries use matching_mode=unique with unique context",
-        "exact_unique retries remain matching_mode=exact_unique",
-        "never downgrade the stale-context/concurrency fence",
+        "never weaken the guard or switch to first_match",
+        "preserve unique/exact_unique",
         "context_mismatch requires bounded reread",
         "never blind retry",
     ] {
         assert!(
             guidance.contains(phrase),
             "edit flow should mention {phrase}: {guidance}"
+        );
+    }
+    for obsolete in [
+        "canonical default even when many lines change",
+        "after read_files, apply_text_edits with current sha is the default",
+    ] {
+        assert!(
+            !guidance.contains(obsolete),
+            "obsolete edit ritual returned: {guidance}"
         );
     }
 }
@@ -343,27 +358,103 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         "run_job is runner-owned immediate async",
         "run_detached_process is supervisor-owned immediate async",
         "session_shell_exec continues an existing session shell",
-        "inspect: on adaptive runtime prefer search_project_texts/read_files even for one query/range",
-        "run_shell for a short tightly related shell chain",
-        "run_script for program-like shell content",
-        "edit: after read_files, apply_text_edits with current sha is the default",
-        "even when many lines change",
-        "use apply_patch only when contextual/large multi-hunk patch form is materially clearer",
-        "external diffs use apply_unified_diff",
-        "validate: cargo_fmt / cargo_check / cargo_test / go_test are structured runner-owned sync-first validation",
-        "when a mode supports handoff",
+        "inspect: choose the simplest sufficient primitive",
+        "native commands are first-class for small bounded observations",
+        "search_project_texts/read_files when batching",
+        "edit by mutation shape",
+        "bounded deterministic transforms",
+        "validate: use structured validators when their canonical diagnostics",
+        "native execution is first-class when the command is outside or awkward",
         "file transfer: host/conversation attachment -> import_conversation_files_to_project",
         "project artifact -> export_project_artifact",
         "caller-held bounded binary -> save_project_artifact/artifact_upload_*",
         "bounded inspection -> read_project_artifact",
         "copy show_changes.head.commit",
-        "review: start with show_changes for the bounded worktree overview",
-        "if hunks truncate, continue/focus with git_diff_hunks",
+        "review: small bounded git observations may use native git",
+        "git_review_summary to map broad or unknown committed ranges",
+        "git_diff_hunks for fenced, paged, or continued review",
         "handoff: use session_summary / session_handoff_summary",
     ] {
         assert!(
             joined_flows.contains(phrase),
             "recommended flows should mention {phrase}"
+        );
+    }
+}
+
+#[test]
+fn recommended_flows_encode_simplest_sufficient_selection_without_old_rituals() {
+    let flow = |name: &str| {
+        TOOL_RECOMMENDED_FLOWS
+            .iter()
+            .find(|flow| flow.name == name)
+            .unwrap_or_else(|| panic!("missing recommended flow {name}"))
+    };
+
+    let inspect = format!(
+        "{}\n{}",
+        flow("inspect").summary,
+        flow("inspect").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "simplest sufficient primitive",
+        "native commands are first-class for small bounded observations",
+        "batching",
+        "read_revision",
+        "snapshot continuation",
+    ] {
+        assert!(inspect.contains(phrase), "inspect selection: {phrase}");
+    }
+
+    let validate = format!(
+        "{}\n{}",
+        flow("validate").summary,
+        flow("validate").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "canonical diagnostics",
+        "test-count",
+        "validation identity",
+        "native validation is first-class",
+        "run_process for one literal-argv executable",
+        "run_shell when shell grammar/output shaping is required",
+    ] {
+        assert!(validate.contains(phrase), "validate selection: {phrase}");
+    }
+
+    let review = format!(
+        "{}\n{}",
+        flow("review").summary,
+        flow("review").manifest_purpose
+    )
+    .to_lowercase();
+    for phrase in [
+        "small bounded git observations may use native git",
+        "workspace-wide review",
+        "broad/unknown committed-range mapping",
+        "scope/fence-bound paging",
+    ] {
+        assert!(review.contains(phrase), "review selection: {phrase}");
+    }
+
+    let all = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .flat_map(|flow| [flow.summary, flow.manifest_purpose])
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    for obsolete in [
+        "prefer search_project_texts/read_files even for one query/range",
+        "use search_project_texts/read_files for inspection even with one query or range",
+        "canonical default even when many lines change",
+        "use structured rust or go validation",
+        "use run_shell only for shell-specific validation",
+    ] {
+        assert!(
+            !all.contains(obsolete),
+            "obsolete selection ritual returned: {obsolete}"
         );
     }
 }

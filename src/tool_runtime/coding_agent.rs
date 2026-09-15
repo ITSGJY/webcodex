@@ -1565,10 +1565,6 @@ fn start_projection(run: &CodingAgentRunSnapshot, token: String) -> Value {
         "state": state_name(&run.state),
         "execution_state": execution_name(run.execution_state),
         "observation_token": token,
-        "continuation_semantics": super::ContinuationSemantics::new(
-            super::ContinuationKind::Observe,
-            super::ContinuationCarrier::ObservationToken,
-        ).to_value(),
         "terminal": terminal_projection(run),
     })
 }
@@ -1605,10 +1601,6 @@ fn observe_projection(
         "execution_state": execution_name(run.execution_state),
         "events": events,
         "observation_token": token,
-        "continuation_semantics": super::ContinuationSemantics::new(
-            super::ContinuationKind::Observe,
-            super::ContinuationCarrier::ObservationToken,
-        ).to_value(),
         "has_more": observation.has_more,
         "history_lost": observation.history_lost || reset,
         "first_retained_sequence": observation.first_retained_sequence,

@@ -1427,6 +1427,8 @@ impl ToolRuntime {
             &stdout_tail,
             &stderr_tail,
             stdout_truncated || stderr_truncated,
+            job.as_ref()
+                .and_then(|job| job.test_count_evidence.as_ref()),
             handoff.minimum_tests,
             handoff.require_tests,
             handoff.no_run,
@@ -1547,6 +1549,7 @@ impl ToolRuntime {
             &stdout_tail,
             &stderr_tail,
             stdout_truncated || stderr_truncated,
+            None,
             minimum_tests,
             require_tests,
             no_run,

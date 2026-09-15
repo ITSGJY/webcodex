@@ -635,10 +635,6 @@ impl ToolRuntime {
                 "session_id": session_id,
                 "messages": observation.messages,
                 "observation_token": observation.observation_token,
-                "continuation_semantics": super::ContinuationSemantics::new(
-                    super::ContinuationKind::Observe,
-                    super::ContinuationCarrier::ObservationToken,
-                ).to_value(),
                 "changed": observation.changed,
                 "wait_outcome": observation.wait_outcome,
                 "waited_ms": observation.waited_ms,

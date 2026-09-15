@@ -271,6 +271,116 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
 }
 
 #[tokio::test]
+async fn handoff_cargo_test_authoritative_count_passes_session_validation() {
+    let client_id = "vhandoff-authoritative-test-count";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(50));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_cargo_test_count_assertion: true,
+            structured_cargo_test_execution_policy: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let session_id = session.session_id.clone();
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let session_id = session_id.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::CargoTest {
+                        project,
+                        session_id: Some(session_id),
+                        cwd: None,
+                        filter: Some("focused".to_string()),
+                        lib: None,
+                        all_targets: None,
+                        all_features: None,
+                        no_default_features: None,
+                        features: None,
+                        package: None,
+                        no_run: None,
+                        require_tests: Some(true),
+                        min_tests: Some(100),
+                        timeout_secs: Some(1800),
+                        sync_wait_secs: None,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    let handoff = task.await.unwrap();
+    assert!(handoff.success, "{:?}", handoff.error);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
+
+    let mut update = cargo_test_update(
+        client_id,
+        &request.request_id,
+        &job_id,
+        "completed",
+        "retained tail without cargo harness summaries\n",
+        "",
+        Some(0),
+        completed_progress(),
+        true,
+    );
+    update.test_count_evidence = Some(crate::runner_protocol::ShellJobTestCountEvidence {
+        tests_detected: true,
+        tests_run_count: Some(120),
+        status: webcodex_core::validation_evidence::CargoTestCountEvidenceStatus::CompleteSummary,
+    });
+    runtime.runner_registry.update_job(update).await.unwrap();
+
+    let status = runtime
+        .job_status_for_auth(job_id.clone(), false, Some(&auth))
+        .await;
+    assert!(status.success, "{:?}", status.error);
+    assert_eq!(status.output["status"], "completed");
+    assert_eq!(status.output["validation"]["tests_run_count"], 120);
+    assert_eq!(status.output["validation"]["passed"], true);
+    assert_eq!(
+        status.output["validation"]["test_count_assertion"]["reason_code"],
+        "minimum_satisfied"
+    );
+
+    let summary = runtime
+        .sessions
+        .summary(&session.session_id, Some(50))
+        .unwrap();
+    let validation = runtime
+        .validation_summary_for_session_with_jobs(&summary, 50, Some(&auth))
+        .await;
+    assert_eq!(validation["status"], "passed", "{validation:#}");
+    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(
+        validation["current_evidence"]["evidence_gap_event_count"],
+        0
+    );
+    assert_eq!(
+        validation["latest"]["test_count_assertion"]["actual_tests_run"],
+        120
+    );
+    assert_eq!(
+        validation["latest"]["test_count_assertion"]["reason_code"],
+        "minimum_satisfied"
+    );
+}
+
+#[tokio::test]
 async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_blocking_at_handoff() {
     let client_id = "vhandoff-minimum-misassertion-closeout";
     let runtime = runtime_with_agent_project(client_id)

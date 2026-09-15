@@ -1260,11 +1260,20 @@ fn assert_recommended_flows_subset_of_manifest_tools(manifest: &Value, context: 
                 json!(omitted),
                 "{context}: {flow_name}"
             );
+            let purpose = flow["purpose"]
+                .as_str()
+                .expect("partial recommended flow purpose");
             assert!(
-                flow["purpose"].as_str().is_some_and(
-                    |purpose| purpose.starts_with("Partial projection of the canonical flow")
-                ),
+                purpose.starts_with("Partial projection of the canonical flow"),
                 "{context}: partial flow purpose must identify projection: {flow}"
+            );
+            assert!(
+                purpose.contains("not selected into this projection"),
+                "{context}: partial flow purpose must distinguish sparse selection from availability: {flow}"
+            );
+            assert!(
+                !purpose.contains("unavailable"),
+                "{context}: partial flow purpose must not misclassify omitted tools as unavailable: {flow}"
             );
         }
     }

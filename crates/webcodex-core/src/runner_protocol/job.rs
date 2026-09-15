@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::validation_evidence::CargoTestCountEvidenceStatus;
+
 use super::{
     ShellCommandExecutionState, ShellScriptLanguage, PROCESS_ARG_MAX_COUNT, SCRIPT_ARG_MAX_COUNT,
     SCRIPT_MAX_BYTES, SCRIPT_MIN_BYTES,
@@ -127,6 +129,8 @@ pub struct RunnerJobUpdateRequest {
     /// plan. Project stdout/stderr never populates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_progress: Option<ShellJobValidationProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_count_evidence: Option<ShellJobTestCountEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ShellJobActivity>,
     #[serde(default)]
@@ -501,6 +505,25 @@ pub struct ShellJobValidationProgress {
     pub failed_step: Option<String>,
 }
 
+/// Runner-authoritative terminal Cargo test-count evidence produced before lossy log retention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobTestCountEvidence {
+    pub tests_detected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_run_count: Option<u64>,
+    pub status: CargoTestCountEvidenceStatus,
+}
+
+impl ShellJobTestCountEvidence {
+    pub fn is_valid(&self) -> bool {
+        if self.status.count_is_proven() {
+            self.tests_detected && self.tests_run_count.is_some()
+        } else {
+            self.tests_run_count.is_none()
+        }
+    }
+}
+
 /// Bounded Runner-owned observation of what an active Job is currently doing.
 /// Activity is advisory execution telemetry only: it never replaces canonical
 /// Job status, proves completion, or grants retry/continuation authority.
@@ -844,6 +867,8 @@ pub struct ShellJobSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_progress: Option<ShellJobValidationProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_count_evidence: Option<ShellJobTestCountEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ShellJobActivity>,
 }
 
@@ -925,6 +950,8 @@ pub struct ShellJobInfo {
     pub result: Option<RunnerJobResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_progress: Option<ShellJobValidationProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_count_evidence: Option<ShellJobTestCountEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ShellJobActivity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

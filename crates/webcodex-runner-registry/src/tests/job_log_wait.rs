@@ -46,6 +46,7 @@ fn wait_job_update(
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished,
     }
@@ -365,6 +366,7 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_tail_is_same() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -394,6 +396,7 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_tail_is_same() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -502,6 +505,7 @@ async fn job_log_wait_legacy_update_between_calls_and_noop_replacement() {
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished: false,
     };
@@ -597,6 +601,7 @@ async fn job_log_wait_activity_only_legacy_transition_advances_revision_and_wake
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished: false,
     };
@@ -775,6 +780,7 @@ async fn agent_job_log_observation_is_baseline_then_independent_deltas() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -973,6 +979,7 @@ async fn agent_job_log_replays_partial_lines_until_each_stream_completes() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -1011,6 +1018,7 @@ async fn agent_job_log_replays_partial_lines_until_each_stream_completes() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })

@@ -3235,6 +3235,109 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
 
 #[cfg(unix)]
 #[test]
+fn cargo_test_terminal_count_evidence_survives_runner_stream_retention() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 7000 ]; do printf 'noise-%04d\\n' \"$i\"; i=$((i + 1)); done\nprintf 'running 120 tests\\n'\nprintf 'test result: ok. 100 passed; 0 failed; 0 ignored\\n'\nprintf 'test result: ok. 20 passed; 0 failed; 0 ignored\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let step = ShellJobValidationStep {
+        name: "test".into(),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        env: Vec::new(),
+    };
+    let mut context = test_job_context(temp.path(), vec!["test".to_string()]);
+    context.purpose = Some("test".to_string());
+    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        tool: "cargo_test".to_string(),
+        kind: "test".to_string(),
+        steps: vec![step.clone()],
+        effective_timeout_secs: 60,
+        sync_wait_secs: 10,
+        adapter: "cargo_test".to_string(),
+        validation_target_id: None,
+        minimum_tests: Some(100),
+        require_tests: Some(true),
+        no_run: None,
+    });
+
+    let (sink, mut rx) = structured_test_sink("validation-agent", "validation-instance");
+    let mut shell = ShellConfig::default();
+    shell.path_prepend.push(bin);
+    let manager = JobManager::new(1);
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            RunnerPolicy {
+                allow_cwd_anywhere: true,
+                ..RunnerPolicy::default()
+            },
+            shell,
+            SshConfig::default(),
+            temp.path().join("project-registry"),
+            serde_json::from_value(json!({
+                "request_id": "cargo-count-retention-request",
+                "client_id": "validation-agent",
+                "kind": "start_validation_job",
+                "job_id": "cargo-count-retention-job",
+                "cwd": temp.path(),
+                "command": serde_json::to_string(&[step]).unwrap(),
+                "timeout_secs": 60,
+                "requested_by": "test",
+                "created_at": 1,
+                "job_context": context,
+            }))
+            .unwrap(),
+        ),
+    );
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(30));
+    let terminal = updates
+        .iter()
+        .rev()
+        .find(|update| update.finished)
+        .expect("cargo test terminal update");
+    assert_eq!(terminal.status, "completed", "{terminal:?}");
+    assert_eq!(terminal.exit_code, Some(0));
+    let logs = terminal
+        .log_snapshot
+        .as_ref()
+        .expect("terminal bounded logs");
+    assert!(logs.stdout.truncated);
+    assert!(logs.stdout.tail.len() <= JOB_SNAPSHOT_STREAM_MAX_BYTES);
+    let evidence = terminal
+        .test_count_evidence
+        .as_ref()
+        .expect("authoritative terminal test-count evidence");
+    assert!(evidence.tests_detected);
+    assert_eq!(evidence.tests_run_count, Some(120));
+    assert_eq!(
+        evidence.status,
+        webcodex_core::validation_evidence::CargoTestCountEvidenceStatus::CompleteSummary
+    );
+
+    let snapshot = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "cargo-count-retention-job")
+        .expect("terminal snapshot in Runner inventory");
+    assert!(snapshot.stdout.truncated);
+    assert_eq!(snapshot.test_count_evidence, terminal.test_count_evidence);
+}
+
+#[cfg(unix)]
+#[test]
 fn validation_job_exposes_activity_during_silent_step_and_clears_terminal() {
     use std::os::unix::fs::PermissionsExt;
 

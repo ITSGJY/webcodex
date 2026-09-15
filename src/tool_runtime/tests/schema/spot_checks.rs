@@ -150,7 +150,8 @@ fn tool_specs_structured_validation_schema_and_output() {
             "complete_summary",
             "output_truncated",
             "partial_harness_summary",
-            "no_complete_summary"
+            "no_complete_summary",
+            "incomplete_stream"
         ])
     );
     let openapi = crate::openapi::build_openapi_spec();

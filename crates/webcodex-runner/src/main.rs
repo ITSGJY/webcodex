@@ -35,9 +35,10 @@ use runner_protocol::{
     RunnerProjectSummary, RunnerRegisterRequest, RunnerRegisterResponse, RunnerRequest,
     ShellCommandExecutionState, ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource,
     ShellJobActivityState, ShellJobContext, ShellJobInventory, ShellJobLogSnapshot,
-    ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobValidationProgress, ShellJobValidationStep,
-    ShellProfileSummaryEntry, ShellProfilesSummary, ShellProjectInventoryPage,
-    ShellProjectInventoryStatus, JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
+    ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobTestCountEvidence,
+    ShellJobValidationProgress, ShellJobValidationStep, ShellProfileSummaryEntry,
+    ShellProfilesSummary, ShellProjectInventoryPage, ShellProjectInventoryStatus,
+    JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
     JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
     RUNNER_PROTOCOL_GENERATION_V2, VALIDATION_STEP_SPAWN_FAILED_CODE,
     VALIDATION_STEP_WAIT_FAILED_CODE, VALIDATION_TOOL_UNAVAILABLE_CODE,
@@ -365,6 +366,7 @@ struct PendingJobUpdateDelivery {
     error: Option<String>,
     command_execution_state: Option<ShellCommandExecutionState>,
     validation_progress: Option<ShellJobValidationProgress>,
+    test_count_evidence: Option<ShellJobTestCountEvidence>,
     activity: Option<ShellJobActivity>,
     finished: bool,
 }
@@ -379,6 +381,7 @@ impl PendingJobUpdateDelivery {
             error: update.error.clone(),
             command_execution_state: update.command_execution_state.clone(),
             validation_progress: update.validation_progress.clone(),
+            test_count_evidence: update.test_count_evidence.clone(),
             activity: update.activity,
             finished: update.finished,
         }
@@ -476,6 +479,7 @@ fn job_update_from_delivery(
     update.error = pending.error.clone();
     update.command_execution_state = pending.command_execution_state.clone();
     update.validation_progress = pending.validation_progress.clone();
+    update.test_count_evidence = pending.test_count_evidence.clone();
     update.activity = pending.activity;
     update.finished = pending.finished;
     update
@@ -620,6 +624,7 @@ fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
     }
 }
@@ -2815,8 +2820,33 @@ struct RunnerJobDelta {
     command_execution_state: Option<ShellCommandExecutionState>,
     stream_limit_bytes: Option<usize>,
     validation_progress: Option<ShellJobValidationProgress>,
+    test_count_evidence: Option<ShellJobTestCountEvidence>,
     activity: Option<ShellJobActivity>,
     finished: bool,
+}
+
+fn observe_cargo_test_count_chunks(
+    accumulator: &mut Option<webcodex_core::cargo_test_count::CargoTestRunMetadataAccumulator>,
+    stdout: &str,
+    stderr: &str,
+) {
+    if let Some(accumulator) = accumulator.as_mut() {
+        accumulator.push_stdout_chunk(stdout);
+        accumulator.push_stderr_chunk(stderr);
+    }
+}
+
+fn finish_cargo_test_count_evidence(
+    accumulator: Option<webcodex_core::cargo_test_count::CargoTestRunMetadataAccumulator>,
+) -> Option<ShellJobTestCountEvidence> {
+    accumulator.map(|accumulator| {
+        let metadata = accumulator.finish();
+        ShellJobTestCountEvidence {
+            tests_detected: metadata.tests_detected,
+            tests_run_count: metadata.tests_run_count,
+            status: metadata.count_evidence_status,
+        }
+    })
 }
 
 fn process_running_activity() -> ShellJobActivity {
@@ -3004,6 +3034,7 @@ fn job_update_from_snapshot(
         error: snapshot.error.clone(),
         command_execution_state: snapshot.command_execution_state,
         validation_progress: snapshot.validation_progress.clone(),
+        test_count_evidence: snapshot.test_count_evidence.clone(),
         activity: snapshot.activity,
         finished: runner_job_is_terminal(&snapshot.status),
     }
@@ -3565,6 +3596,9 @@ impl JobManager {
             if delta.validation_progress.is_some() {
                 job.snapshot.validation_progress = delta.validation_progress.clone();
             }
+            if delta.test_count_evidence.is_some() {
+                job.snapshot.test_count_evidence = delta.test_count_evidence.clone();
+            }
             if let Some(activity) = delta.activity {
                 debug_assert!(activity.is_canonical());
                 job.snapshot.activity = Some(activity);
@@ -3653,6 +3687,7 @@ impl JobManager {
                         error: snapshot.error.clone(),
                         command_execution_state: snapshot.command_execution_state.clone(),
                         validation_progress: snapshot.validation_progress.clone(),
+                        test_count_evidence: snapshot.test_count_evidence.clone(),
                         activity: snapshot.activity,
                         finished: runner_job_is_terminal(&snapshot.status),
                     };
@@ -4180,6 +4215,7 @@ impl JobManager {
                 error: Some(error),
                 command_execution_state,
                 validation_progress: None,
+                test_count_evidence: None,
                 activity: None,
                 finished: true,
             });
@@ -4249,6 +4285,7 @@ impl JobManager {
                         stdout: ShellJobStreamSnapshot::default(),
                         stderr: ShellJobStreamSnapshot::default(),
                         validation_progress: None,
+                        test_count_evidence: None,
                         activity: None,
                     },
                     child: None,
@@ -4652,6 +4689,11 @@ impl JobManager {
             ),
             _ => unreachable!("shell Job starter received non shell/validation operation"),
         };
+        let capture_cargo_test_count = context.validation.as_ref().is_some_and(|metadata| {
+            metadata.tool == "cargo_test"
+                && metadata.kind == "test"
+                && metadata.no_run != Some(true)
+        });
         if !policy.allow_raw_shell {
             self.fail_job(
                 &operation,
@@ -4874,6 +4916,8 @@ impl JobManager {
             let _worker_guard = worker_guard;
             let timeout_secs = timeout_secs.min(policy.max_timeout_secs).max(1);
             let mut step_index = 0;
+            let mut test_count_accumulator = capture_cargo_test_count
+                .then(webcodex_core::cargo_test_count::CargoTestRunMetadataAccumulator::default);
             let (final_status, out, err, final_progress) = loop {
                 const OUTPUT_CHANNEL_CAPACITY: usize = 64;
                 let (tx, rx) = mpsc::sync_channel::<OutputChunk>(OUTPUT_CHANNEL_CAPACITY);
@@ -4905,6 +4949,7 @@ impl JobManager {
                         }
                     }
                     if !out.is_empty() || !err.is_empty() {
+                        observe_cargo_test_count_chunks(&mut test_count_accumulator, &out, &err);
                         let activity = validation
                             .then(|| cargo_activity_from_stderr(&steps[step_index], &err))
                             .flatten();
@@ -5000,6 +5045,7 @@ impl JobManager {
                         OutputChunk::Stderr(text) => err.push_str(&text),
                     }
                 }
+                observe_cargo_test_count_chunks(&mut test_count_accumulator, &out, &err);
                 if step_status.0 == "completed" && step_index + 1 < step_count {
                     step_index += 1;
                     if stop_requested.load(Ordering::SeqCst) {
@@ -5136,6 +5182,7 @@ impl JobManager {
             };
             let command_execution_state = (!validation)
                 .then(|| raw_shell_job_terminal_lifecycle(&final_status.0, final_status.1));
+            let test_count_evidence = finish_cargo_test_count_evidence(test_count_accumulator);
             manager.update_and_send(
                 &job_id,
                 RunnerJobDelta {
@@ -5148,6 +5195,7 @@ impl JobManager {
                     command_execution_state,
                     stream_limit_bytes: None,
                     validation_progress: final_progress,
+                    test_count_evidence,
                     activity: None,
                     finished: true,
                 },

@@ -1907,11 +1907,6 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
     assert_eq!(attention_messages[0]["message_truncated"], true);
     assert_eq!(result.output["session_attention"]["truncated"], true);
     assert_eq!(result.output["session_attention"]["omitted_count"], 4);
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        result.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert_eq!(
         result.output["context_projection"]["materials"][0]["key"],
         "webcodex.workflow"

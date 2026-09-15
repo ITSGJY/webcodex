@@ -1877,6 +1877,7 @@ async fn set_job_state(
             command_execution_state: finished
                 .then_some(crate::runner_protocol::ShellCommandExecutionState::Completed),
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished,
         })
@@ -1934,6 +1935,7 @@ async fn complete_result_app_validation_job(
                 current_step: None,
                 failed_step: None,
             }),
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })

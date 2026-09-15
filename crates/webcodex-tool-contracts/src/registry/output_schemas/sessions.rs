@@ -10,12 +10,10 @@ use super::super::input_schemas::{
 };
 use super::common::{
     array_schema, cargo_test_count_assertion_schema, continuation_feedback_schema,
-    continuation_semantics_schema, evidence_history_schema, evidence_integrity_schema,
-    handoff_brief_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
-    permission_summary_schema, schema_type, task_outcome_schema, validation_delta_schema,
-    wrapped_output_schema,
+    evidence_history_schema, evidence_integrity_schema, handoff_brief_schema,
+    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
+    schema_type, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
 };
-use webcodex_core::runtime_contract::{ContinuationCarrier, ContinuationKind};
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
@@ -265,11 +263,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             ("observation_token", schema_type("string", "Opaque bounded Session-bound durable observation token. Return it unchanged on the next observation call.")),
-            ("continuation_semantics", continuation_semantics_schema(
-                ContinuationKind::Observe,
-                ContinuationCarrier::ObservationToken,
-                "The Session-message observation token is Session-bound durable observation state passed back through after_observation_token; it is not message authority, a completion key, or retry authority.",
-            )),
             ("changed", schema_type("boolean", "Whether durable message observation revision advanced beyond the supplied token.")),
             ("wait_outcome", json!({"type": "string", "enum": ["immediate", "updated", "timeout"], "description": "Closed one-shot wait outcome; timeout remains a successful tool result."})),
             ("waited_ms", schema_type("integer", "Monotonic elapsed wait duration in milliseconds.")),

@@ -1912,14 +1912,6 @@ async fn skill_surface_sidecar_privacy_and_authority_are_fenced() {
     )
     .await;
     assert!(with_sidecar.success);
-    assert_eq!(
-        with_sidecar.output["context_projection"]["timing"],
-        "post_tool"
-    );
-    assert_eq!(
-        with_sidecar.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     let material = with_sidecar.output["context_projection"]["materials"]
         .as_array()
         .unwrap()

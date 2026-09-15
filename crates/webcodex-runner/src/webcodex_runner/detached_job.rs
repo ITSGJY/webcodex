@@ -1395,6 +1395,7 @@ pub(crate) fn snapshot_from_detached_record(
         stdout: stream(&record.stdout),
         stderr: stream(&record.stderr),
         validation_progress: None,
+        test_count_evidence: None,
         activity,
     })
 }

@@ -860,12 +860,7 @@ async fn adaptive_runtime_gateway_uses_long_tail_target_checkpoint_policy_once()
 }
 
 #[tokio::test]
-async fn direct_and_gateway_routes_preserve_result_continuation_semantics() {
-    let expected = json!({
-        "kind": "observe",
-        "carrier": "observation_token"
-    });
-
+async fn direct_and_gateway_routes_omit_redundant_continuation_semantics() {
     let direct_runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     let direct_session = direct_runtime
         .sessions
@@ -888,10 +883,9 @@ async fn direct_and_gateway_routes_preserve_result_continuation_semantics() {
     };
     let direct_structured = &direct_value["result"]["structuredContent"];
     assert_eq!(direct_structured["success"], true, "{direct_value}");
-    assert_eq!(
-        direct_structured["output"]["continuation_semantics"],
-        expected
-    );
+    assert!(direct_structured["output"]
+        .get("continuation_semantics")
+        .is_none());
 
     let gateway_runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
     let gateway_session = gateway_runtime
@@ -918,10 +912,9 @@ async fn direct_and_gateway_routes_preserve_result_continuation_semantics() {
     };
     let gateway_structured = &gateway_value["result"]["structuredContent"];
     assert_eq!(gateway_structured["success"], true, "{gateway_value}");
-    assert_eq!(
-        gateway_structured["output"]["continuation_semantics"],
-        expected
-    );
+    assert!(gateway_structured["output"]
+        .get("continuation_semantics")
+        .is_none());
 }
 
 #[tokio::test]
