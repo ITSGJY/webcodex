@@ -29,7 +29,11 @@ class ReportGateTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def write_metadata(self, scenarios: list[str]) -> None:
+    def write_metadata(
+        self,
+        scenarios: list[str],
+        not_scored: list[dict[str, str]] | None = None,
+    ) -> None:
         self.metadata.write_text(
             json.dumps(
                 {
@@ -38,6 +42,7 @@ class ReportGateTests(unittest.TestCase):
                     "harness_sha": "b" * 40,
                     "harness_exit_code": 0,
                     "required_scenarios": scenarios,
+                    "not_scored_scenarios": not_scored or [],
                 }
             ),
             encoding="utf-8",
@@ -107,6 +112,30 @@ class ReportGateTests(unittest.TestCase):
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertEqual(summary["missing_scenarios"], ["scenario-b"])
+
+    def test_not_scored_failure_is_visible_but_does_not_require_classification(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "extension-a", "reason": "extension"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks("extension-a", [self.check("pending", "FAILURE")])
+        summary = self.evaluate()
+        self.assertTrue(summary["gate_passed"])
+        self.assertEqual(summary["informational_status_counts"], {"FAILURE": 1})
+        self.assertEqual(summary["informational_non_success"][0]["reason"], "extension")
+
+    def test_missing_not_scored_scenario_fails_coverage_integrity(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "pending-a", "reason": "pending"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertEqual(summary["missing_not_scored_scenarios"], ["pending-a"])
 
     def test_classified_harness_error_remains_inconclusive(self) -> None:
         self.write_metadata(["scenario-a"])

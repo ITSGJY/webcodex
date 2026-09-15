@@ -65,11 +65,14 @@ The upstream runner saves one `checks.json` file per scenario. After each profil
 `scripts/mcp_conformance_report.py` verifies the raw reports against the exact
 required server-scenario list and the reviewed baseline.
 
-Every `FAILURE`, `WARNING`, or `SKIPPED` check must have an exact
-`<scenario>, <check_id>` classification in
+Every `FAILURE`, `WARNING`, or `SKIPPED` check from a **scored required**
+scenario must have an exact `<scenario>, <check_id>` classification in
 `tests/fixtures/mcp/conformance/baseline.json`. Whole-scenario wildcards are
 rejected because they can hide a newly failing check behind an unrelated known
-failure. Supported classifications are:
+failure. The referee's `not_scored` server scenarios are still required to run
+and are retained as informational evidence, but their verdicts do not affect the
+gate and do not consume expected-failure classifications. Supported scored
+classifications are:
 
 | Classification | Meaning |
 |---|---|
@@ -82,8 +85,9 @@ failure. Supported classifications are:
 The gate also fails when:
 
 - no applicable `SUCCESS`/`FAILURE`/`WARNING` checks were emitted;
-- a required scenario report is missing, duplicated, or unexpectedly present;
-- a new non-success check has no exact classification;
+- a scored or `not_scored` scenario report expected by the frozen requirements is
+  missing, duplicated, or an unknown scenario is unexpectedly present;
+- a new non-success check in a scored required scenario has no exact classification;
 - a classified check is no longer emitted or now passes, making its baseline
   entry stale;
 - an inconclusive infrastructure result is present.
@@ -98,8 +102,9 @@ The report gate's own regression suite is dependency-free:
 python3 scripts/tests/test_mcp_conformance_report.py
 ```
 
-It covers all-skipped output, missing required scenarios, harness errors, new
-failures, stale classifications, and rejection of broad masks.
+It covers all-skipped scored output, missing scored/informational scenarios,
+harness errors, new scored failures, informational non-success reporting, stale
+classifications, and rejection of broad masks.
 
 ## Raw evidence and review policy
 
@@ -108,7 +113,8 @@ Each profile retains:
 - the referee's raw per-scenario `checks.json` files;
 - the referee stdout/stderr log;
 - metadata containing the WebCodex source SHA, referee SHA, profile, upstream
-  referee exit code, and exact required scenario list;
+  referee exit code, exact scored scenario list, and frozen `not_scored` server
+  scenarios with their upstream reasons;
 - the coverage-aware WebCodex summary.
 
 Baseline updates should be narrow. Add a classification only after reproducing

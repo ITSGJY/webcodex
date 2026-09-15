@@ -157,29 +157,81 @@ def evaluate_reports(
     if len(required) != len(set(required)):
         raise GateError("metadata required_scenarios contains duplicates")
 
+    raw_not_scored = metadata.get("not_scored_scenarios", [])
+    if not isinstance(raw_not_scored, list):
+        raise GateError("metadata not_scored_scenarios must be an array")
+    not_scored: dict[str, str] = {}
+    for index, raw in enumerate(raw_not_scored):
+        if not isinstance(raw, dict):
+            raise GateError(f"metadata not_scored_scenarios[{index}] must be an object")
+        scenario = raw.get("scenario")
+        reason = raw.get("reason")
+        if not isinstance(scenario, str) or not scenario or not isinstance(reason, str) or not reason:
+            raise GateError(
+                f"metadata not_scored_scenarios[{index}] requires non-empty scenario and reason"
+            )
+        if scenario in not_scored:
+            raise GateError(f"metadata not_scored_scenarios duplicates {scenario!r}")
+        not_scored[scenario] = reason
+
+    required_set = set(required)
+    if required_set & set(not_scored):
+        raise GateError("metadata scenario cannot be both required and not_scored")
+
     reports = load_reports(report_root)
     classifications = load_classifications(baseline_path, profile)
     problems: list[str] = []
-    missing_scenarios = sorted(set(required) - set(reports))
-    unexpected_scenarios = sorted(set(reports) - set(required))
+    missing_scenarios = sorted(required_set - set(reports))
+    missing_not_scored_scenarios = sorted(set(not_scored) - set(reports))
+    expected_scenarios = required_set | set(not_scored)
+    unexpected_scenarios = sorted(set(reports) - expected_scenarios)
     if missing_scenarios:
         problems.append("missing required scenario reports: " + ", ".join(missing_scenarios))
+    if missing_not_scored_scenarios:
+        problems.append(
+            "missing not-scored scenario reports: " + ", ".join(missing_not_scored_scenarios)
+        )
     if unexpected_scenarios:
         problems.append("unexpected scenario reports: " + ", ".join(unexpected_scenarios))
 
+    invalid_classification_scenarios = sorted(
+        {entry.scenario for entry in classifications.values() if entry.scenario not in required_set}
+    )
+    if invalid_classification_scenarios:
+        problems.append(
+            "classifications may target scored required scenarios only: "
+            + ", ".join(invalid_classification_scenarios)
+        )
+
     statuses = Counter()
+    informational_statuses = Counter()
     emitted: dict[tuple[str, str], set[str]] = {}
     applicable_checks = 0
     unclassified: list[str] = []
     expected: list[dict[str, str]] = []
+    informational_non_success: list[dict[str, str]] = []
     inconclusive: list[str] = []
 
     for scenario, checks in sorted(reports.items()):
+        scored = scenario in required_set
         for check in checks:
             check_id = check["id"]
             status = check["status"]
-            statuses[status] += 1
             key = (scenario, check_id)
+            if not scored:
+                informational_statuses[status] += 1
+                if scenario in not_scored and status in NON_SUCCESS_STATUSES:
+                    informational_non_success.append(
+                        {
+                            "scenario": scenario,
+                            "check_id": check_id,
+                            "status": status,
+                            "reason": not_scored[scenario],
+                        }
+                    )
+                continue
+
+            statuses[status] += 1
             emitted.setdefault(key, set()).add(status)
             if status in APPLICABLE_STATUSES:
                 applicable_checks += 1
@@ -214,6 +266,8 @@ def evaluate_reports(
 
     stale: list[str] = []
     for key, entry in sorted(classifications.items()):
+        if entry.scenario not in required_set:
+            continue
         states = emitted.get(key)
         label = f"{entry.scenario}:{entry.check_id}"
         if not states:
@@ -232,11 +286,15 @@ def evaluate_reports(
         "harness_sha": metadata.get("harness_sha"),
         "harness_exit_code": metadata.get("harness_exit_code"),
         "required_scenario_count": len(required),
+        "not_scored_scenario_count": len(not_scored),
         "reported_scenario_count": len(reports),
         "applicable_check_count": applicable_checks,
         "status_counts": dict(sorted(statuses.items())),
+        "informational_status_counts": dict(sorted(informational_statuses.items())),
         "classified_non_success": expected,
+        "informational_non_success": informational_non_success,
         "missing_scenarios": missing_scenarios,
+        "missing_not_scored_scenarios": missing_not_scored_scenarios,
         "unexpected_scenarios": unexpected_scenarios,
         "problems": problems,
         "gate_passed": not problems,

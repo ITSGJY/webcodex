@@ -140,17 +140,52 @@ import sys
 
 requirements_path, output_path, profile, server_sha, harness_sha, harness_exit = sys.argv[1:]
 server = []
-in_server = False
+not_scored = []
+section = None
+current_not_scored = None
+
+def retain_not_scored(entry):
+    if not entry or entry.get("leg") != "server":
+        return
+    scenario = entry.get("scenario")
+    reason = entry.get("reason")
+    if not scenario or not reason:
+        raise SystemExit(f"malformed server not_scored entry in {requirements_path}: {entry}")
+    not_scored.append({"scenario": scenario, "reason": reason})
+
 for raw in pathlib.Path(requirements_path).read_text(encoding="utf-8").splitlines():
-    if raw == "server:":
-        in_server = True
+    if raw in {"server:", "client:", "not_scored:"}:
+        retain_not_scored(current_not_scored)
+        current_not_scored = None
+        section = raw[:-1]
         continue
-    if in_server and raw and not raw.startswith(" "):
-        break
-    if in_server and raw.startswith("  - "):
+    if raw and not raw.startswith(" "):
+        retain_not_scored(current_not_scored)
+        current_not_scored = None
+        section = None
+        continue
+    if section == "server" and raw.startswith("  - "):
         server.append(raw[4:].strip())
+    elif section == "not_scored":
+        if raw.startswith("  - scenario: "):
+            retain_not_scored(current_not_scored)
+            current_not_scored = {"scenario": raw[len("  - scenario: "):].strip()}
+        elif current_not_scored is not None and raw.startswith("    leg: "):
+            current_not_scored["leg"] = raw[len("    leg: "):].strip()
+        elif current_not_scored is not None and raw.startswith("    reason: "):
+            current_not_scored["reason"] = raw[len("    reason: "):].strip()
+retain_not_scored(current_not_scored)
+
 if not server:
     raise SystemExit(f"no scored server scenarios found in {requirements_path}")
+if len(server) != len(set(server)):
+    raise SystemExit(f"duplicate scored server scenarios in {requirements_path}")
+not_scored_names = [entry["scenario"] for entry in not_scored]
+if len(not_scored_names) != len(set(not_scored_names)):
+    raise SystemExit(f"duplicate server not_scored scenarios in {requirements_path}")
+if set(server) & set(not_scored_names):
+    raise SystemExit(f"server scenario is both scored and not_scored in {requirements_path}")
+
 pathlib.Path(output_path).write_text(
     json.dumps(
         {
@@ -160,6 +195,7 @@ pathlib.Path(output_path).write_text(
             "harness_sha": harness_sha,
             "harness_exit_code": int(harness_exit),
             "required_scenarios": server,
+            "not_scored_scenarios": not_scored,
         },
         indent=2,
         sort_keys=True,
