@@ -190,21 +190,37 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "scope/fence-bound",
         "max_page_bytes",
         "raw producer page",
+        "shared safe producer maximum",
         "512 kib",
         "final model-facing",
-        "next complete-line fragment",
         "parser-ready next_call",
         "recovery.later_hunks.next_call",
-        "later-record only",
+        "next logical diff record",
+        "never an intra-hunk cursor",
         "recovery.current_hunk.next_call",
         "bounded refinement",
         "exact hunk-fragment token",
+        "next complete diff line",
+        "line-budget and page-byte-budget truncation",
+        "positive complete-line progress",
+        "safe forward progress is not proven",
     ] {
         assert!(
             git_diff_hunks_desc.contains(phrase),
             "git_diff_hunks description should mention {phrase}: {git_diff_hunks_desc}"
         );
     }
+    let default_page_bytes = git_diff_hunks.input_schema["properties"]["max_page_bytes"]["default"]
+        .as_u64()
+        .expect("git_diff_hunks max_page_bytes default");
+    assert_eq!(
+        default_page_bytes as usize,
+        webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
+    );
+    assert_eq!(
+        webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES,
+        webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES
+    );
     let continuation_desc = git_diff_hunks.input_schema["properties"]["continuation"]
         ["description"]
         .as_str()

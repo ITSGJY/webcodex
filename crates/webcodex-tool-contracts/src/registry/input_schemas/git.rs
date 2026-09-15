@@ -132,7 +132,7 @@ pub fn git_diff_hunks_input_schema() -> Value {
         (
             "max_page_bytes",
             "integer",
-            "Raw producer page budget in bytes, independent of the final serialized model result. Defaults to 64 KiB. Any recognized nonnegative integer is accepted and runtime-clamped to the fixed 16..192 KiB producer bounds so ordinary Runner result retention retains framing headroom.",
+            "Raw producer page budget in bytes, independent of the final serialized model result. The concrete default and producer bounds are derived from the shared runtime contract.",
             false,
         ),
         (
@@ -166,6 +166,13 @@ pub fn git_diff_hunks_input_schema() -> Value {
     schema["properties"]["max_page_bytes"]["minimum"] = Value::from(0);
     schema["properties"]["max_page_bytes"]["default"] =
         Value::from(webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES);
+    let min_page_kib = webcodex_core::runtime_contract::MIN_GIT_DIFF_HUNKS_PAGE_BYTES / 1024;
+    let default_page_kib =
+        webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES / 1024;
+    let max_page_kib = webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES / 1024;
+    schema["properties"]["max_page_bytes"]["description"] = json!(format!(
+        "Raw producer page budget in bytes, independent of the final serialized model result. Defaults to the shared safe producer maximum ({default_page_kib} KiB). Any recognized nonnegative integer is accepted and runtime-clamped to the fixed {min_page_kib}..{max_page_kib} KiB producer bounds so ordinary Runner result retention retains framing headroom."
+    ));
     for field in ["base_commit", "head_commit"] {
         schema["properties"][field]["minLength"] = Value::from(40);
         schema["properties"][field]["maxLength"] = Value::from(40);
