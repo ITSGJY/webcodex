@@ -81,6 +81,14 @@ name/description). If the same check ID starts failing for a different reason or
 with a different severity, the gate requires review instead of reusing the old
 classification. Whole-scenario wildcards are rejected.
 
+Classifications that rely on an optional capability also bind to the fixture's
+actual capability advertisement. Before the referee run, the script probes the
+same HTTP endpoint with `server/discover` for `2026-07-28` and `initialize` for
+`2025-11-25`, keeps the relevant tools/resources/prompts/logging/completions
+capabilities, and compares them with the profile snapshot in the baseline. If the
+server starts advertising a previously absent capability, those optional
+classifications require review even when the old check ID still fails.
+
 The referee's `not_scored` server scenarios are still required to run and are
 retained as informational protocol evidence. Their protocol verdicts do not
 consume expected-failure classifications, but infrastructure failures such as a
@@ -106,8 +114,10 @@ The gate also fails when:
 - a new non-success check in a scored required scenario has no exact classification;
 - a classified check changes status/evidence, disappears, or now passes;
 - the referee exits abnormally, its exit code disagrees with the scored FAILURE
-  set, or any scored/not-scored scenario reports a timeout, connection failure,
-  or other recognized infrastructure error;
+  set, or any scored/not-scored scenario emits one of the pinned referee's
+  structural infrastructure failures (`scenario-timeout` or `Failed to run scenario`);
+- the server capability advertisement changes while optional-capability baseline
+  entries depend on the previous advertisement;
 - an explicitly classified inconclusive infrastructure result is present.
 
 For the pinned referee, exit `0` means no scored FAILURE and exit `1` means at
@@ -123,8 +133,10 @@ python3 scripts/tests/test_mcp_conformance_report.py
 
 It covers all-skipped output, missing/empty/INFO-only scenarios, unknown statuses,
 abnormal referee exits, scored and not-scored infrastructure failures, changed
-status/evidence for an existing check ID, new scored failures, informational
-non-success reporting, stale classifications, and rejection of broad masks.
+status/evidence for an existing check ID, capability-advertisement drift,
+duplicate check IDs, harness-pin mismatch, placeholder evidence, new scored
+failures, informational non-success reporting, stale classifications, and
+rejection of broad masks.
 
 ## Raw evidence and review policy
 
@@ -133,8 +145,8 @@ Each profile retains:
 - the referee's raw per-scenario `checks.json` files;
 - the referee stdout/stderr log;
 - metadata containing the WebCodex source SHA, referee SHA, profile, upstream
-  referee exit code, exact scored scenario list, and frozen `not_scored` server
-  scenarios with their upstream reasons;
+  referee exit code, observed server capability projection, exact scored scenario
+  list, and frozen `not_scored` server scenarios with their upstream reasons;
 - the coverage-aware WebCodex summary.
 
 Baseline updates should be narrow. Add a classification only after reproducing

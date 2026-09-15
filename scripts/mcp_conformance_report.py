@@ -34,20 +34,7 @@ APPLICABLE_STATUSES = {"SUCCESS", "FAILURE", "WARNING"}
 VERDICT_STATUSES = {"SUCCESS", "FAILURE", "WARNING", "SKIPPED"}
 SCENARIO_DIR_RE = re.compile(r"^server-(.+)-\d{4}-\d{2}-\d{2}T.*Z$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-INFRASTRUCTURE_ERROR_MARKERS = (
-    "econnrefused",
-    "connection refused",
-    "econnreset",
-    "connection reset",
-    "enotfound",
-    "fetch failed",
-    "failed to fetch",
-    "network error",
-    "socket hang up",
-    "did not complete within",
-    "timed out",
-    "connect timeout",
-)
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class GateError(RuntimeError):
@@ -94,16 +81,14 @@ def check_evidence_sha256(check: dict[str, Any]) -> str:
 
 
 def _infrastructure_reason(check: dict[str, Any]) -> str | None:
+    # These are structural failure shapes emitted by the pinned referee itself.
+    # Do not scan arbitrary assertion text for words such as "timeout": a valid
+    # protocol/schema assertion can mention those words and must remain a scored
+    # protocol result rather than being promoted to infrastructure failure.
     if check.get("id") == "scenario-timeout":
         return "referee scenario timeout"
     if check.get("description") == "Failed to run scenario":
         return "referee failed to run scenario"
-    error_message = check.get("errorMessage")
-    if isinstance(error_message, str):
-        lowered = error_message.lower()
-        for marker in INFRASTRUCTURE_ERROR_MARKERS:
-            if marker in lowered:
-                return f"network/timeout error marker {marker!r}"
     return None
 
 
@@ -136,6 +121,7 @@ def load_reports(report_root: Path) -> dict[str, list[dict[str, Any]]]:
         if not isinstance(value, list):
             raise GateError(f"{checks_path} must contain a JSON array")
         checks: list[dict[str, Any]] = []
+        check_ids: set[str] = set()
         for index, check in enumerate(value):
             if not isinstance(check, dict):
                 raise GateError(f"{checks_path}[{index}] is not an object")
@@ -143,6 +129,9 @@ def load_reports(report_root: Path) -> dict[str, list[dict[str, Any]]]:
             status = check.get("status")
             if not isinstance(check_id, str) or not check_id:
                 raise GateError(f"{checks_path}[{index}] has no non-empty check id")
+            if check_id in check_ids:
+                raise GateError(f"{checks_path} contains duplicate check id {check_id!r}")
+            check_ids.add(check_id)
             if not isinstance(status, str) or not status:
                 raise GateError(f"{checks_path}[{index}] has no non-empty status")
             if status not in VALID_STATUSES:
@@ -194,6 +183,10 @@ def load_classifications(baseline_path: Path, profile: str) -> dict[tuple[str, s
             raise GateError(
                 f"classification {scenario}:{check_id} needs a lowercase 64-hex evidence_sha256"
             )
+        if evidence_sha256 == "0" * 64:
+            raise GateError(
+                f"classification {scenario}:{check_id} has placeholder evidence_sha256"
+            )
         if kind not in CLASSIFICATIONS:
             raise GateError(
                 f"classification {scenario}:{check_id} has unsupported kind {kind!r}"
@@ -226,9 +219,27 @@ def evaluate_reports(
     metadata = _load_json(metadata_path)
     if not isinstance(metadata, dict):
         raise GateError("metadata must be a JSON object")
+    if metadata.get("schema_version") != 1:
+        raise GateError("metadata must have schema_version=1")
     if metadata.get("profile") != profile:
         raise GateError(
             f"metadata profile {metadata.get('profile')!r} does not match requested {profile!r}"
+        )
+    server_sha = metadata.get("server_sha")
+    harness_sha = metadata.get("harness_sha")
+    if not isinstance(server_sha, str) or not GIT_SHA_RE.fullmatch(server_sha):
+        raise GateError("metadata server_sha must be a full lowercase Git SHA")
+    if not isinstance(harness_sha, str) or not GIT_SHA_RE.fullmatch(harness_sha):
+        raise GateError("metadata harness_sha must be a full lowercase Git SHA")
+    baseline_metadata = _load_json(baseline_path)
+    if not isinstance(baseline_metadata, dict) or baseline_metadata.get("schema_version") != 2:
+        raise GateError("baseline must be an object with schema_version=2")
+    pinned_harness = baseline_metadata.get("harness_commit")
+    if not isinstance(pinned_harness, str) or not GIT_SHA_RE.fullmatch(pinned_harness):
+        raise GateError("baseline harness_commit must be a full lowercase Git SHA")
+    if harness_sha != pinned_harness:
+        raise GateError(
+            f"metadata harness_sha {harness_sha} does not match pinned baseline {pinned_harness}"
         )
     harness_exit_code = metadata.get("harness_exit_code")
     if isinstance(harness_exit_code, bool) or not isinstance(harness_exit_code, int):
@@ -263,6 +274,35 @@ def evaluate_reports(
     reports = load_reports(report_root)
     classifications = load_classifications(baseline_path, profile)
     problems: list[str] = []
+    optional_classifications = [
+        entry
+        for entry in classifications.values()
+        if entry.classification == "optional_capability_not_implemented"
+    ]
+    server_capabilities = metadata.get("server_capabilities")
+    if optional_classifications:
+        if not isinstance(server_capabilities, dict):
+            raise GateError(
+                "metadata server_capabilities must be an object when optional-capability classifications exist"
+            )
+        profiles = baseline_metadata.get("profiles")
+        profile_config = profiles.get(profile) if isinstance(profiles, dict) else None
+        expected_capabilities = (
+            profile_config.get("expected_server_capabilities")
+            if isinstance(profile_config, dict)
+            else None
+        )
+        if not isinstance(expected_capabilities, dict):
+            raise GateError(
+                f"baseline profile {profile!r} needs expected_server_capabilities for optional classifications"
+            )
+        if server_capabilities != expected_capabilities:
+            problems.append(
+                "server capability advertisement changed; optional-capability classifications "
+                "require review"
+            )
+    elif server_capabilities is not None and not isinstance(server_capabilities, dict):
+        raise GateError("metadata server_capabilities must be an object when present")
     missing_scenarios = sorted(required_set - set(reports))
     missing_not_scored_scenarios = sorted(set(not_scored) - set(reports))
     expected_scenarios = required_set | set(not_scored)
@@ -418,9 +458,10 @@ def evaluate_reports(
     return {
         "schema_version": 2,
         "profile": profile,
-        "server_sha": metadata.get("server_sha"),
-        "harness_sha": metadata.get("harness_sha"),
+        "server_sha": server_sha,
+        "harness_sha": harness_sha,
         "harness_exit_code": harness_exit_code,
+        "server_capabilities": server_capabilities,
         "required_scenario_count": len(required),
         "not_scored_scenario_count": len(not_scored),
         "reported_scenario_count": len(reports),

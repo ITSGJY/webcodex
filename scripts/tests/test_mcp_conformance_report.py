@@ -34,14 +34,19 @@ class ReportGateTests(unittest.TestCase):
         scenarios: list[str],
         not_scored: list[dict[str, str]] | None = None,
         harness_exit_code: int = 0,
+        server_capabilities: dict[str, object] | None = None,
     ) -> None:
         self.metadata.write_text(
             json.dumps(
                 {
                     "profile": self.profile,
+                    "schema_version": 1,
                     "server_sha": "a" * 40,
                     "harness_sha": "b" * 40,
                     "harness_exit_code": harness_exit_code,
+                    "server_capabilities": server_capabilities
+                    if server_capabilities is not None
+                    else {"tools": {"listChanged": False}},
                     "required_scenarios": scenarios,
                     "not_scored_scenarios": not_scored or [],
                 }
@@ -49,12 +54,24 @@ class ReportGateTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def write_baseline(self, entries: list[dict[str, str]]) -> None:
+    def write_baseline(
+        self,
+        entries: list[dict[str, str]],
+        expected_server_capabilities: dict[str, object] | None = None,
+    ) -> None:
         self.baseline.write_text(
             json.dumps(
                 {
                     "schema_version": 2,
-                    "profiles": {self.profile: {"classifications": entries}},
+                    "harness_commit": "b" * 40,
+                    "profiles": {
+                        self.profile: {
+                            "expected_server_capabilities": expected_server_capabilities
+                            if expected_server_capabilities is not None
+                            else {"tools": {"listChanged": False}},
+                            "classifications": entries,
+                        }
+                    },
                 }
             ),
             encoding="utf-8",
@@ -162,6 +179,26 @@ class ReportGateTests(unittest.TestCase):
         self.write_baseline([])
         self.write_checks("scenario-a", [self.check("broken", "ERROR")])
         with self.assertRaisesRegex(report_gate.GateError, "unknown status"):
+            self.evaluate()
+
+    def test_duplicate_check_id_is_rejected(self) -> None:
+        self.write_metadata(["scenario-a"])
+        self.write_baseline([])
+        self.write_checks(
+            "scenario-a",
+            [self.check("duplicate", "SUCCESS"), self.check("duplicate", "SUCCESS")],
+        )
+        with self.assertRaisesRegex(report_gate.GateError, "duplicate check id"):
+            self.evaluate()
+
+    def test_metadata_harness_sha_must_match_baseline_pin(self) -> None:
+        self.write_metadata(["scenario-a"])
+        self.write_baseline([])
+        metadata = json.loads(self.metadata.read_text(encoding="utf-8"))
+        metadata["harness_sha"] = "c" * 40
+        self.metadata.write_text(json.dumps(metadata), encoding="utf-8")
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        with self.assertRaisesRegex(report_gate.GateError, "does not match pinned baseline"):
             self.evaluate()
 
     def test_not_scored_failure_is_visible_but_does_not_require_classification(self) -> None:
@@ -284,6 +321,7 @@ class ReportGateTests(unittest.TestCase):
             "tools-call-simple-text",
             "FAILURE",
             error_message="connect ECONNREFUSED 127.0.0.1:12345",
+            description="Failed to run scenario",
         )
         self.write_metadata(["scenario-a"], harness_exit_code=1)
         self.write_baseline([self.classification(expected, "missing_harness_fixture")])
@@ -308,6 +346,26 @@ class ReportGateTests(unittest.TestCase):
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("expected status SKIPPED" in p for p in summary["problems"]))
 
+    def test_optional_classification_requires_same_capability_advertisement(self) -> None:
+        failed = self.check(
+            "prompts-list",
+            "FAILURE",
+            error_message="Failed: method not found",
+        )
+        self.write_metadata(
+            ["scenario-a"],
+            harness_exit_code=1,
+            server_capabilities={"tools": {"listChanged": False}, "prompts": {}},
+        )
+        self.write_baseline(
+            [self.classification(failed, "optional_capability_not_implemented")],
+            expected_server_capabilities={"tools": {"listChanged": False}},
+        )
+        self.write_checks("scenario-a", [failed])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("capability advertisement changed" in p for p in summary["problems"]))
+
     def test_passing_expected_failure_is_stale(self) -> None:
         expected = self.check("fixed-check", "FAILURE", error_message="known bug")
         self.write_metadata(["scenario-a"])
@@ -328,6 +386,25 @@ class ReportGateTests(unittest.TestCase):
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("no verdict emitted" in p for p in summary["problems"]))
+
+    def test_placeholder_evidence_hash_is_rejected(self) -> None:
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline(
+            [
+                {
+                    "scenario": "scenario-a",
+                    "check_id": "failure",
+                    "expected_status": "FAILURE",
+                    "evidence_sha256": "0" * 64,
+                    "classification": "genuine_protocol_failure",
+                    "reason": "not reviewed",
+                    "evidence": "placeholder",
+                }
+            ]
+        )
+        self.write_checks("scenario-a", [self.check("failure", "FAILURE")])
+        with self.assertRaisesRegex(report_gate.GateError, "placeholder evidence_sha256"):
+            self.evaluate()
 
     def test_broad_expected_failure_masks_are_rejected(self) -> None:
         self.write_metadata(["scenario-a"])

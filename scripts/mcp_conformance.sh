@@ -152,7 +152,7 @@ prepare_report_root() {
   fi
   touch "$REPORT_ROOT/$REPORT_OWNER_MARKER"
   rm -rf "$REPORT_ROOT/2026-07-28" "$REPORT_ROOT/2025-11-25"
-  rm -f "$REPORT_ROOT/fixture.log"
+  rm -f "$REPORT_ROOT/fixture.log" "$REPORT_ROOT/server-capabilities.json"
 }
 
 prepare_harness_build() {
@@ -210,6 +210,118 @@ case "$fixture_url" in
   *) echo "fixture published unexpected URL: $fixture_url" >&2; exit 1 ;;
 esac
 
+capabilities_file="$REPORT_ROOT/server-capabilities.json"
+python3 - "$fixture_url" "$capabilities_file" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.error
+import urllib.request
+
+server_url, output_path = sys.argv[1:]
+
+def rpc_request(payload, headers=None):
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(
+        server_url,
+        data=encoded,
+        headers=request_headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw = response.read().decode("utf-8")
+            content_type = response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"capability probe HTTP {exc.code}: {body[:500]}") from exc
+    except OSError as exc:
+        raise SystemExit(f"capability probe transport error: {exc}") from exc
+
+    messages = []
+    if "text/event-stream" in content_type:
+        for line in raw.splitlines():
+            if not line.startswith("data:"):
+                continue
+            candidate = line[len("data:"):].strip()
+            if candidate:
+                messages.append(json.loads(candidate))
+    else:
+        messages.append(json.loads(raw))
+    request_id = payload["id"]
+    message = next((item for item in messages if item.get("id") == request_id), None)
+    if not isinstance(message, dict):
+        raise SystemExit("capability probe did not receive the matching JSON-RPC response")
+    if "error" in message:
+        raise SystemExit(f"capability probe returned JSON-RPC error: {message['error']}")
+    result = message.get("result")
+    if not isinstance(result, dict):
+        raise SystemExit("capability probe response has no result object")
+    capabilities = result.get("capabilities")
+    if not isinstance(capabilities, dict):
+        raise SystemExit("capability probe result has no capabilities object")
+    return capabilities
+
+modern = rpc_request(
+    {
+        "jsonrpc": "2.0",
+        "id": "webcodex-capabilities-2026",
+        "method": "server/discover",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "webcodex-conformance-capability-probe",
+                    "version": "1.0",
+                },
+            }
+        },
+    },
+    {
+        "MCP-Protocol-Version": "2026-07-28",
+        "Mcp-Method": "server/discover",
+    },
+)
+legacy = rpc_request(
+    {
+        "jsonrpc": "2.0",
+        "id": "webcodex-capabilities-2025",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "webcodex-conformance-capability-probe",
+                "version": "1.0",
+            },
+        },
+    }
+)
+
+relevant_keys = ("completions", "logging", "prompts", "resources", "tools")
+def project(capabilities):
+    return {key: capabilities[key] for key in relevant_keys if key in capabilities}
+
+pathlib.Path(output_path).write_text(
+    json.dumps(
+        {
+            "2026-07-28": project(modern),
+            "2025-11-25": project(legacy),
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n",
+    encoding="utf-8",
+)
+PY
+
 server_sha="$(git rev-parse HEAD)"
 overall=0
 for profile in "${PROFILES[@]}"; do
@@ -229,12 +341,24 @@ for profile in "${PROFILES[@]}"; do
 
   metadata="$profile_root/metadata.json"
   python3 - "$harness_build_dir/requirements/$profile.yaml" "$metadata" "$profile" \
-    "$server_sha" "$HARNESS_COMMIT" "$harness_exit" <<'PY'
+    "$server_sha" "$HARNESS_COMMIT" "$harness_exit" "$capabilities_file" <<'PY'
 import json
 import pathlib
 import sys
 
-requirements_path, output_path, profile, server_sha, harness_sha, harness_exit = sys.argv[1:]
+(
+    requirements_path,
+    output_path,
+    profile,
+    server_sha,
+    harness_sha,
+    harness_exit,
+    capabilities_path,
+) = sys.argv[1:]
+capability_map = json.loads(pathlib.Path(capabilities_path).read_text(encoding="utf-8"))
+server_capabilities = capability_map.get(profile)
+if not isinstance(server_capabilities, dict):
+    raise SystemExit(f"missing capability probe result for {profile}")
 server = []
 not_scored = []
 section = None
@@ -290,6 +414,7 @@ pathlib.Path(output_path).write_text(
             "server_sha": server_sha,
             "harness_sha": harness_sha,
             "harness_exit_code": int(harness_exit),
+            "server_capabilities": server_capabilities,
             "required_scenarios": server,
             "not_scored_scenarios": not_scored,
         },
