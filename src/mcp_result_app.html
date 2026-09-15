@@ -204,19 +204,17 @@
   function addEvidenceEvent(body, event) {
     if (!event || typeof event !== "object") return;
     const name = toolTitle(event.tool_name);
-    const summary = boundedString(event.summary);
     const failure = boundedString(event.failure_kind);
     const line = document.createElement("div");
     line.style.fontSize = "12px";
     line.style.overflowWrap = "anywhere";
     const facts = [];
     if (typeof event.validation_passed === "boolean") facts.push("validation " + (event.validation_passed ? "passed" : "not passed"));
-    if (typeof event.execution_success === "boolean") facts.push("execution " + (event.execution_success ? "succeeded" : "did not succeed"));
     if (typeof event.expectation_satisfied === "boolean") facts.push("expectation " + (event.expectation_satisfied ? "satisfied" : "not satisfied"));
     if (failure) facts.push(failure);
     if (Number.isInteger(event.tests_run_count)) facts.push(String(event.tests_run_count) + " tests");
     if (Number.isInteger(event.tests_failed)) facts.push(String(event.tests_failed) + " failed");
-    line.textContent = name + (summary ? " · " + summary : "") + (facts.length ? " · " + facts.join(" · ") : "");
+    line.textContent = name + (facts.length ? " · " + facts.join(" · ") : "");
     body.appendChild(line);
   }
 

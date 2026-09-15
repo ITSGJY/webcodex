@@ -1227,7 +1227,8 @@ async fn public_failure_expectation_preserves_raw_cargo_failure_as_expected_vali
     assert_eq!(validation["expected_results"], 1);
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], false);
+    assert!(validation["latest"].get("execution_success").is_none());
+    assert_eq!(validation["latest"]["validation_passed"], false);
     assert_eq!(validation["latest"]["expectation_satisfied"], true);
     assert_eq!(validation["latest"]["exit_code"], 101);
 
@@ -1309,7 +1310,7 @@ async fn cargo_test_zero_tests_success_is_detected_and_warns_in_handoff() {
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["passed"], true);
+    assert!(result.output.get("passed").is_none());
     assert_eq!(result.output["tests_detected"], true);
     assert_eq!(result.output["tests_run_count"], 0);
     assert_eq!(result.output["zero_tests_run"], true);
@@ -2161,10 +2162,7 @@ async fn session_handoff_summary_includes_validation_by_default_from_session_led
     assert_eq!(validation["latest_success"]["validation_kind"], "check");
     assert_eq!(validation["latest_success"]["success"], true);
     assert_eq!(validation["latest_success"]["exit_code"], 0);
-    assert_eq!(
-        validation["latest_success"]["summary"],
-        "cargo_check succeeded"
-    );
+    assert!(validation["latest_success"].get("summary").is_none());
     assert_eq!(validation["parser"]["available"], false);
     assert_eq!(
         validation["parser"]["reason"],

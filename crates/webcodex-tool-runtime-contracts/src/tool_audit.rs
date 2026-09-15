@@ -9,6 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use webcodex_core::audit_preview::{command_preview, process_preview};
 use webcodex_core::runner_protocol::{normalize_cargo_value, normalize_rust_test_filter};
+use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 use webcodex_workflow_session::SessionExecutionContext;
 
 pub fn session_log_arguments_for_tool_request(tool_name: &str, arguments: &Value) -> Value {
@@ -1141,12 +1142,7 @@ pub struct GenericValidationIdentity {
 }
 
 fn validation_like_purpose(purpose: Option<&str>) -> bool {
-    purpose.is_some_and(|purpose| {
-        matches!(
-            purpose,
-            "validation" | "test" | "build" | "format" | "release"
-        )
-    })
+    purpose.is_some_and(is_validation_like_execution_purpose)
 }
 
 fn generic_validation_digest<'a>(
@@ -1366,6 +1362,71 @@ pub fn run_script_validation_identity(
         identity: generic_validation_digest("run_script", purpose, cwd, parts),
         validation_tool: None,
     })
+}
+
+#[cfg(test)]
+mod execution_purpose_classification_tests {
+    use super::{run_process_validation_identity, run_script_validation_identity};
+
+    #[test]
+    fn generic_validation_identity_uses_canonical_execution_purpose_classification() {
+        let args = vec!["--check".to_string()];
+        for purpose in ["validation", "test", "build", "format", "release"] {
+            assert!(
+                run_process_validation_identity(
+                    "custom-validator",
+                    &args,
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_some(),
+                "run_process {purpose}"
+            );
+            assert!(
+                run_script_validation_identity(
+                    "sh",
+                    "custom-validator --check",
+                    &[],
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_some(),
+                "run_script {purpose}"
+            );
+        }
+
+        for purpose in ["diagnostic", "operation", "other"] {
+            assert!(
+                run_process_validation_identity(
+                    "custom-validator",
+                    &args,
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_none(),
+                "run_process {purpose}"
+            );
+            assert!(
+                run_script_validation_identity(
+                    "sh",
+                    "custom-validator --check",
+                    &[],
+                    None,
+                    Some("."),
+                    Some(purpose),
+                )
+                .is_none(),
+                "run_script {purpose}"
+            );
+        }
+        assert!(
+            run_process_validation_identity("custom-validator", &args, None, Some("."), None)
+                .is_none()
+        );
+    }
 }
 
 #[cfg(test)]

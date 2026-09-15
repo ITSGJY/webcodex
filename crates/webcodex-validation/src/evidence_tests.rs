@@ -154,12 +154,19 @@ fn cargo_check_success_produces_validation_event() {
     assert_eq!(event["validation_kind"], "check");
     assert_eq!(event["success"], true);
     assert_eq!(event["exit_code"], 0);
-    assert_eq!(event["summary"], "cargo_check succeeded");
+    for redundant in [
+        "execution_success",
+        "failure_category",
+        "execution_source",
+        "summary",
+        "session_id",
+    ] {
+        assert!(event.get(redundant).is_none(), "{redundant}: {event}");
+    }
     assert!(event.get("input_summary").is_none());
     assert!(event["identity"]
         .as_str()
         .is_some_and(|identity| identity.starts_with("target:")));
-    assert_eq!(event["execution_source"], "cargo_check");
     assert_eq!(event["purpose"], "validation");
     assert_eq!(validation["parser"]["available"], false);
     assert_eq!(
@@ -1489,7 +1496,8 @@ fn generic_test_success_without_structured_counts_resolves_same_identity_failure
     assert_eq!(validation["historical_failures"]["unresolved"], false);
     assert_eq!(validation["resolved_failures"]["count"], 1);
     assert_eq!(validation["unresolved_failures"]["count"], 0);
-    assert_eq!(validation["latest"]["execution_source"], "run_process");
+    assert!(validation["latest"].get("execution_source").is_none());
+    assert_eq!(validation["latest"]["tool_name"], "run_process");
     assert_eq!(validation["latest"]["validation_kind"], "test");
     assert_eq!(validation["latest"]["identity"], identity);
     assert!(validation["latest"]["tests_run_count"].is_null());
@@ -2285,8 +2293,8 @@ fn cargo_test_request_scoped_assertion_failures_are_evidence_gaps_not_correctnes
         );
         assert_eq!(validation["evidence_gaps"]["count"], 1, "{}", case.label);
         assert_eq!(validation["latest"]["success"], false, "{}", case.label);
-        assert_eq!(
-            validation["latest"]["execution_success"], true,
+        assert!(
+            validation["latest"].get("execution_success").is_none(),
             "{}",
             case.label
         );
@@ -2696,7 +2704,8 @@ fn materialized_run_script_terminal_preserves_recoverable_assertion_label() {
     let validation =
         validation_summary_for_session(&store.summary(&session.session_id, Some(20)).unwrap());
     let latest = &validation["latest"];
-    assert_eq!(latest["execution_source"], "run_script");
+    assert!(latest.get("execution_source").is_none());
+    assert_eq!(latest["tool_name"], "run_script");
     assert_eq!(latest["identity"], identity);
     assert_eq!(latest["assertion_name"], assertion_name);
 }
@@ -2932,7 +2941,8 @@ fn validation_job_terminal_inherits_public_failure_expectation() {
     assert_eq!(validation["status"], "expected");
     assert_eq!(validation["latest_status"], "expected");
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], false);
+    assert!(validation["latest"].get("execution_success").is_none());
+    assert_eq!(validation["latest"]["validation_passed"], false);
     assert_eq!(validation["latest"]["expectation_satisfied"], true);
     assert_eq!(validation["expected_results"], 1);
     assert_eq!(validation["latest"]["exit_code"], 101);
@@ -3024,7 +3034,8 @@ fn validation_job_terminal_inherits_expectation_beyond_default_summary_window() 
     assert_eq!(validation["status"], "expected");
     assert_eq!(validation["latest_status"], "expected");
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], false);
+    assert!(validation["latest"].get("execution_success").is_none());
+    assert_eq!(validation["latest"]["validation_passed"], false);
     assert_eq!(validation["latest"]["expectation_satisfied"], true);
     assert_eq!(validation["expected_results"], 1);
     assert_eq!(validation["unresolved_failures"]["count"], 0);
@@ -3089,7 +3100,8 @@ fn expected_observation_failure_does_not_resolve_prior_same_identity_validation_
         1
     );
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], false);
+    assert!(validation["latest"].get("execution_success").is_none());
+    assert_eq!(validation["latest"]["validation_passed"], false);
     assert_eq!(validation["latest"]["expectation_satisfied"], true);
 }
 

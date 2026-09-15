@@ -349,16 +349,22 @@ fn project_execution_output_schemas_do_not_advertise_server_local_executor() {
         "run_shell",
         "run_job",
         "job_tail",
-        "cargo_fmt",
-        "cargo_check",
-        "cargo_test",
-        "go_test",
     ] {
         let schema = super::super::registry::output_schema_for_tool(name);
         let executor = &schema["properties"]["output"]["properties"]["executor"];
         assert_eq!(
             executor["const"], "agent",
             "{name} must publish the Runner-only Project execution contract"
+        );
+    }
+
+    for name in ["cargo_fmt", "cargo_check", "cargo_test", "go_test"] {
+        let schema = super::super::registry::output_schema_for_tool(name);
+        assert!(
+            schema["properties"]["output"]["properties"]
+                .get("executor")
+                .is_none(),
+            "{name} tool identity already determines the Runner-backed executor"
         );
     }
 }

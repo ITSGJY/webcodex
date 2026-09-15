@@ -9,9 +9,16 @@ use webcodex_core::runner_protocol::{
     SCRIPT_STDIN_MAX_BYTES,
 };
 use webcodex_core::workflow_session_contract::{
-    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, TOOL_ACCEPTED_EXIT_CODES_FIELD,
-    TOOL_ASSERTION_NAME_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
+    EXECUTION_PURPOSE_VALUES, MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
+    TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
 };
+
+const EXECUTION_PURPOSE_DESCRIPTION: &str = "Optional caller-declared evidence intent. Set it only when the execution has a real validation/test/build/format/release/diagnostic/operation classification; it never changes the command, authorization, or execution authority.";
+
+fn apply_execution_purpose_vocabulary(schema: &mut Value) {
+    schema["properties"]["purpose"]["enum"] = json!(EXECUTION_PURPOSE_VALUES);
+    schema["properties"]["purpose"]["description"] = json!(EXECUTION_PURPOSE_DESCRIPTION);
+}
 
 fn with_optional_validation_assertion(mut schema: Value) -> Value {
     schema["properties"][TOOL_ASSERTION_NAME_FIELD] = json!({
@@ -83,7 +90,7 @@ pub fn run_process_input_schema() -> Value {
         (
             "purpose",
             "string",
-            "Declared execution intent: validation, test, build, format, release, diagnostic, operation, or other. This records evidence and never changes authorization.",
+            EXECUTION_PURPOSE_DESCRIPTION,
             false,
         ),
     ]));
@@ -103,16 +110,7 @@ pub fn run_process_input_schema() -> Value {
     schema["properties"]["timeout_secs"]["minimum"] = json!(1);
     schema["properties"]["timeout_secs"]["default"] = json!(60);
     schema["properties"]["sync_wait_secs"]["minimum"] = json!(1);
-    schema["properties"]["purpose"]["enum"] = json!([
-        "validation",
-        "test",
-        "build",
-        "format",
-        "release",
-        "diagnostic",
-        "operation",
-        "other"
-    ]);
+    apply_execution_purpose_vocabulary(&mut schema);
     with_optional_result_expectation(with_optional_validation_assertion(schema), true)
 }
 
@@ -201,7 +199,7 @@ pub fn run_script_input_schema() -> Value {
         (
             "purpose",
             "string",
-            "Declared execution intent: validation, test, build, format, release, diagnostic, operation, or other. This records evidence and never changes authorization.",
+            EXECUTION_PURPOSE_DESCRIPTION,
             false,
         ),
     ]));
@@ -226,16 +224,7 @@ pub fn run_script_input_schema() -> Value {
     schema["properties"]["timeout_secs"]["minimum"] = json!(1);
     schema["properties"]["timeout_secs"]["default"] = json!(60);
     schema["properties"]["sync_wait_secs"]["minimum"] = json!(1);
-    schema["properties"]["purpose"]["enum"] = json!([
-        "validation",
-        "test",
-        "build",
-        "format",
-        "release",
-        "diagnostic",
-        "operation",
-        "other"
-    ]);
+    apply_execution_purpose_vocabulary(&mut schema);
     with_optional_result_expectation(with_optional_validation_assertion(schema), false)
 }
 
@@ -258,7 +247,7 @@ pub fn run_shell_input_schema() -> Value {
         (
             "purpose",
             "string",
-            "Declared execution intent: validation, test, build, format, release, diagnostic, operation, or other. This records evidence and never changes authorization.",
+            EXECUTION_PURPOSE_DESCRIPTION,
             false,
         ),
         (
@@ -268,16 +257,7 @@ pub fn run_shell_input_schema() -> Value {
             false,
         ),
     ]));
-    schema["properties"]["purpose"]["enum"] = json!([
-        "validation",
-        "test",
-        "build",
-        "format",
-        "release",
-        "diagnostic",
-        "operation",
-        "other"
-    ]);
+    apply_execution_purpose_vocabulary(&mut schema);
     schema["properties"]["shell"]["enum"] = json!(["sh", "bash"]);
     schema["properties"]["command"]["maxLength"] = json!(RAW_SHELL_COMMAND_MAX_BYTES);
     schema["properties"]["command"]["description"] = json!(format!(
@@ -312,7 +292,7 @@ pub fn run_job_input_schema() -> Value {
         (
             "purpose",
             "string",
-            "Declared execution intent: validation, test, build, format, release, diagnostic, operation, or other. This records evidence and never changes authorization.",
+            EXECUTION_PURPOSE_DESCRIPTION,
             false,
         ),
         (
@@ -322,16 +302,7 @@ pub fn run_job_input_schema() -> Value {
             false,
         ),
     ]));
-    schema["properties"]["purpose"]["enum"] = json!([
-        "validation",
-        "test",
-        "build",
-        "format",
-        "release",
-        "diagnostic",
-        "operation",
-        "other"
-    ]);
+    apply_execution_purpose_vocabulary(&mut schema);
     schema["properties"]["shell"]["enum"] = json!(["sh", "bash"]);
     schema["properties"]["command"]["maxLength"] = json!(RAW_SHELL_COMMAND_MAX_BYTES);
     schema["properties"]["command"]["description"] = json!(format!(
@@ -391,7 +362,7 @@ pub fn session_shell_exec_input_schema() -> Value {
         (
             "purpose",
             "string",
-            "Declared execution intent recorded as evidence.",
+            EXECUTION_PURPOSE_DESCRIPTION,
             false,
         ),
     ]);
@@ -401,16 +372,7 @@ pub fn session_shell_exec_input_schema() -> Value {
     schema["properties"]["command"]["description"] = json!(format!(
         "One command evaluated by the existing long-lived shell. At most {RAW_SHELL_COMMAND_MAX_BYTES} UTF-8 bytes."
     ));
-    schema["properties"]["purpose"]["enum"] = json!([
-        "validation",
-        "test",
-        "build",
-        "format",
-        "release",
-        "diagnostic",
-        "operation",
-        "other"
-    ]);
+    apply_execution_purpose_vocabulary(&mut schema);
     with_optional_result_expectation(schema, false)
 }
 

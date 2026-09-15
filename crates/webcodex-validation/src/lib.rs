@@ -18,8 +18,8 @@ mod profile_tests;
 mod recipe_tests;
 
 pub use adapters::{
-    validation_adapter_for_tool, ValidationAdapter, ValidationCommandOptions,
-    ValidationFailureEvidence,
+    execution_purpose_for_validation_kind, validation_adapter_for_tool, ValidationAdapter,
+    ValidationCommandOptions, ValidationFailureEvidence,
 };
 pub use cargo_test::{parse_cargo_test_run_metadata, CargoTestRunMetadata};
 pub use evidence::{

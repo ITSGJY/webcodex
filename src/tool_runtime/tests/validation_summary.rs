@@ -581,6 +581,8 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
             "stderr_truncated": false,
             "tests_detected": true,
             "tests_run_count": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
             "zero_tests_run": true
         }),
     );
@@ -607,6 +609,12 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
         result.output["validation"]["historical_failures"]["unresolved"],
         true
     );
+    let schema = output_schema_for_tool("validation_summary");
+    let serialized = serde_json::to_value(&result).unwrap();
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
+        .unwrap_or_else(|error| {
+            panic!("validation_summary runtime/schema drift: {error}; {serialized}")
+        });
 }
 
 #[tokio::test]

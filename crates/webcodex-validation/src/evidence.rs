@@ -18,6 +18,7 @@ use webcodex_core::validation_identity::{
     assertion_validation_identity, is_structured_validation_target_identity,
     is_validation_execution_identity, structured_validation_target_identity,
 };
+use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 use webcodex_tool_contracts::{runtime_tool_session_evidence_policy, ToolValidationIdentityKind};
 use webcodex_workflow_session::{
     canonical_tool_call_finished_events, current_attempt_event_view,
@@ -31,7 +32,6 @@ const VALIDATION_PARSER_SOURCE: &str = "bounded_validation_metadata";
 #[derive(Debug, Clone, Serialize)]
 pub struct ValidationEvent {
     pub tool_name: String,
-    pub execution_source: String,
     #[serde(skip)]
     adapter_tool_identity: Option<&'static str>,
     pub identity: String,
@@ -41,8 +41,6 @@ pub struct ValidationEvent {
     pub validation_kind: String,
     /// Immutable raw ToolResult truth recorded by the Workflow Session ledger.
     pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_success: Option<bool>,
     /// Semantic validator/correctness result, independent from request-scoped
     /// evidence assertions such as cargo_test min_tests/require_tests.
     pub validation_passed: bool,
@@ -51,11 +49,9 @@ pub struct ValidationEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expectation_satisfied: Option<bool>,
     pub failure_kind: &'static str,
-    pub failure_category: &'static str,
     pub unresolved_failure: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
-    pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_summary: Option<String>,
     pub cwd: String,
@@ -63,7 +59,6 @@ pub struct ValidationEvent {
     pub execution_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,7 +171,10 @@ pub struct CurrentValidationEvidenceProjection {
     pub non_actionable_tool_failure_event_ids: HashSet<String>,
 }
 
-use crate::adapters::{validation_adapter_for_tool, ValidationAdapter, ValidationFailureEvidence};
+use crate::adapters::{
+    execution_purpose_for_validation_kind, validation_adapter_for_tool, ValidationAdapter,
+    ValidationFailureEvidence,
+};
 
 pub fn skipped_validation_summary() -> Value {
     let mut validation = to_value(ValidationSummary {
@@ -940,13 +938,9 @@ pub fn validation_kind_for_tool(tool_name: &str) -> Option<&'static str> {
 fn execution_purpose(event: &SessionEvent) -> Option<String> {
     if let Some(kind) = validation_kind_for_tool(&event.tool_name) {
         return Some(
-            match kind {
-                "test" => "test",
-                "check" => "validation",
-                "format" => "format",
-                _ => "validation",
-            }
-            .to_string(),
+            execution_purpose_for_validation_kind(kind)
+                .as_str()
+                .to_string(),
         );
     }
     if !matches!(
@@ -967,11 +961,7 @@ fn execution_purpose(event: &SessionEvent) -> Option<String> {
                 .and_then(|summary| summary.get("purpose"))
                 .and_then(Value::as_str)
         })?;
-    matches!(
-        purpose,
-        "validation" | "test" | "build" | "format" | "release"
-    )
-    .then(|| purpose.to_string())
+    is_validation_like_execution_purpose(purpose).then(|| purpose.to_string())
 }
 
 pub fn event_observes_validation_activity(event: &SessionEvent) -> bool {
@@ -1100,32 +1090,25 @@ fn validation_event_from_finished(
             "zero_tests_run": zero_tests_run,
         })
     });
-    let outcome = if success { "succeeded" } else { "failed" };
-
     let mut event = ValidationEvent {
         tool_name: finished.tool_name.clone(),
-        execution_source: finished.tool_name.clone(),
         adapter_tool_identity: adapter.map(|adapter| adapter.tool_identity()),
         identity,
         assertion_name,
         purpose,
         validation_kind,
         success,
-        execution_success: Some(validation_passed),
         validation_passed,
         failure_class: "none",
         expectation_satisfied,
         failure_kind,
-        failure_category: failure_kind,
         unresolved_failure: false,
         exit_code: finished.exit_code,
-        summary: format!("{} {}", finished.tool_name, outcome),
         command_summary,
         cwd,
         shell,
         execution_state,
         project,
-        session_id: finished.session_id.clone(),
         started_at,
         completed_at,
         duration_ms: finished.duration_ms,

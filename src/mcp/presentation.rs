@@ -1,5 +1,6 @@
 use serde_json::{json, Map, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_validation::validation_kind_for_tool;
 
 pub(super) const MCP_PRESENTATION_META_KEY: &str = "webcodex/presentation";
 pub(super) const MCP_PRESENTATION_VERSION: u64 = 1;
@@ -55,14 +56,6 @@ fn tool_has_result_presentation_projection(tool_name: &str) -> bool {
             | "show_changes"
             | "git_review_summary"
     )
-}
-
-fn validation_kind_for_tool(tool_name: &str) -> Option<&'static str> {
-    match tool_name {
-        "cargo_check" => Some("check"),
-        "cargo_test" | "go_test" => Some("test"),
-        _ => None,
-    }
 }
 
 fn bounded_text(value: &Value) -> Option<String> {
@@ -589,14 +582,12 @@ fn validation_event_presentation(event: &Value) -> Option<Value> {
         "validation_kind",
         "failure_class",
         "failure_kind",
-        "summary",
     ] {
         copy_bounded_text(event, &mut item, key);
     }
     for key in [
         "success",
         "validation_passed",
-        "execution_success",
         "expectation_satisfied",
         "unresolved_failure",
         "duration_ms",
