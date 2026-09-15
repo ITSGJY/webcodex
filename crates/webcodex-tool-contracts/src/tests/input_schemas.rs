@@ -1,5 +1,6 @@
 use super::*;
 use webcodex_core::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES;
+use webcodex_core::workflow_session_contract::EXECUTION_PURPOSE_VALUES;
 
 macro_rules! assert_schema_fields {
     (
@@ -427,6 +428,33 @@ fn raw_shell_tools_expose_the_shared_authored_command_bound() {
         assert_eq!(command["maxLength"], RAW_SHELL_COMMAND_MAX_BYTES, "{name}");
         let description = command["description"].as_str().unwrap_or_default();
         assert!(description.contains("16000") || description.contains("16,000"));
+    }
+}
+
+#[test]
+fn execution_purpose_schemas_share_canonical_vocabulary_and_validators_do_not_accept_it() {
+    let specs = registered_tool_specs();
+    for name in [
+        "run_process",
+        "run_script",
+        "run_shell",
+        "run_job",
+        "session_shell_exec",
+    ] {
+        let purpose = &spec_named(&specs, name).input_schema["properties"]["purpose"];
+        assert_eq!(purpose["enum"], json!(EXECUTION_PURPOSE_VALUES), "{name}");
+        assert!(purpose["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("caller-declared evidence intent")));
+    }
+    for name in ["cargo_fmt", "cargo_check", "cargo_test", "go_test"] {
+        let properties = spec_named(&specs, name).input_schema["properties"]
+            .as_object()
+            .unwrap();
+        assert!(
+            !properties.contains_key("purpose"),
+            "{name} validation purpose must be Runtime-derived"
+        );
     }
 }
 

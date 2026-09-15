@@ -1,9 +1,13 @@
-use crate::{validation_adapter_for_tool, ValidationCommandOptions, ValidationFailureEvidence};
+use crate::{
+    execution_purpose_for_validation_kind, validation_adapter_for_tool, ValidationCommandOptions,
+    ValidationFailureEvidence,
+};
 use webcodex_core::runner_protocol::{GO_TEST_PACKAGE_MAX_BYTES, GO_TEST_PACKAGE_MAX_ITEMS};
 use webcodex_core::validation_evidence::{
     parse_cargo_check_diagnostics, parse_cargo_test_diagnostics, parse_go_test_diagnostics,
     PARSER_KIND, PARSER_VERSION,
 };
+use webcodex_core::workflow_session_contract::{ExecutionPurpose, EXECUTION_PURPOSE_VALUES};
 use webcodex_tool_contracts::{is_known_tool_name, registered_tool_specs};
 use webcodex_tool_runtime_contracts::{
     tool_audit::{
@@ -11,6 +15,44 @@ use webcodex_tool_runtime_contracts::{
     },
     ToolCall,
 };
+
+#[test]
+fn execution_purpose_vocabulary_classification_and_validator_mapping_are_canonical() {
+    let cases = [
+        ("validation", ExecutionPurpose::Validation, true),
+        ("test", ExecutionPurpose::Test, true),
+        ("build", ExecutionPurpose::Build, true),
+        ("format", ExecutionPurpose::Format, true),
+        ("release", ExecutionPurpose::Release, true),
+        ("diagnostic", ExecutionPurpose::Diagnostic, false),
+        ("operation", ExecutionPurpose::Operation, false),
+        ("other", ExecutionPurpose::Other, false),
+    ];
+    assert_eq!(
+        EXECUTION_PURPOSE_VALUES,
+        cases.map(|(value, _, _)| value).as_slice()
+    );
+    for (value, purpose, validation_like) in cases {
+        assert_eq!(ExecutionPurpose::parse(value), Some(purpose), "{value}");
+        assert_eq!(purpose.as_str(), value, "{value}");
+        assert_eq!(purpose.is_validation_like(), validation_like, "{value}");
+    }
+    assert_eq!(ExecutionPurpose::parse("unknown"), None);
+
+    for (tool, expected) in [
+        ("cargo_check", ExecutionPurpose::Validation),
+        ("cargo_test", ExecutionPurpose::Test),
+        ("cargo_fmt", ExecutionPurpose::Format),
+        ("go_test", ExecutionPurpose::Test),
+    ] {
+        let adapter = validation_adapter_for_tool(tool).expect("structured validation adapter");
+        assert_eq!(
+            execution_purpose_for_validation_kind(adapter.validation_kind()),
+            expected,
+            "{tool}"
+        );
+    }
+}
 
 #[test]
 fn rust_profile_selects_cargo_fmt_adapter_and_preserves_command() {

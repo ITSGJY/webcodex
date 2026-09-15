@@ -1,5 +1,8 @@
 use serde_json::{json, Value};
-use webcodex_core::workflow_session_contract::MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS;
+use webcodex_core::workflow_session_contract::{
+    is_validation_like_execution_purpose, EXECUTION_PURPOSE_VALUES,
+    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
+};
 
 use super::super::input_schemas::{
     session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
@@ -751,32 +754,32 @@ fn validation_parser_metadata_schema() -> Value {
 }
 
 fn validation_event_schema() -> Value {
+    let validation_like_purposes = EXECUTION_PURPOSE_VALUES
+        .iter()
+        .copied()
+        .filter(|purpose| is_validation_like_execution_purpose(purpose))
+        .collect::<Vec<_>>();
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "tool_name": { "type": "string", "enum": ["cargo_fmt", "cargo_check", "cargo_test", "go_test", "run_process", "run_script", "run_shell", "run_job"] },
-            "execution_source": { "type": "string" },
             "identity": { "type": "string", "maxLength": 256 },
             "assertion_name": { "type": "string", "minLength": 1, "maxLength": MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS },
-            "purpose": { "type": "string", "enum": ["validation", "test", "build", "format", "release"] },
+            "purpose": { "type": "string", "enum": validation_like_purposes },
             "validation_kind": { "type": "string", "enum": ["format", "check", "test", "build", "release", "validation"] },
             "success": { "type": "boolean", "description": "Immutable raw ToolResult success recorded by the Workflow Session. A request-scoped evidence assertion can make this false even when validator execution and correctness passed." },
-            "execution_success": { "type": "boolean", "description": "Derived execution result from authoritative completion state and exit code; independent from request-scoped evidence assertions." },
             "validation_passed": { "type": "boolean", "description": "True when the validator/correctness execution itself passed. This can remain true while the invocation's evidence assertion is insufficient." },
             "failure_class": { "type": "string", "enum": ["none", "execution_or_correctness", "outcome_unknown", "evidence_assertion", "evidence_insufficient", "expected_result"] },
             "expectation_satisfied": { "type": "boolean", "description": "Present for public result expectations; true when the pre-declared expectation matched. This is separate from validation success." },
             "failure_kind": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
-            "failure_category": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
             "unresolved_failure": { "type": "boolean" },
             "exit_code": { "type": "integer" },
-            "summary": { "type": "string", "maxLength": 80 },
             "command_summary": { "type": "string", "maxLength": 512 },
             "cwd": { "type": "string", "maxLength": 4096 },
             "shell": { "type": "string", "enum": ["sh", "bash", "configured", "remote", "direct_argv"] },
             "execution_state": { "type": "string", "enum": ["not_started", "started", "outcome_unknown", "completed", "cancelled", "timed_out"] },
             "project": { "type": "string", "maxLength": 512 },
-            "session_id": { "type": "string", "maxLength": 128 },
             "started_at": { "type": "integer" },
             "completed_at": { "type": "integer" },
             "duration_ms": { "type": "integer", "minimum": 0 },
@@ -792,6 +795,8 @@ fn validation_event_schema() -> Value {
             },
             "tests_detected": { "type": "boolean" },
             "tests_run_count": { "type": "integer", "minimum": 0 },
+            "tests_passed": { "type": "integer", "minimum": 0 },
+            "tests_failed": { "type": "integer", "minimum": 0 },
             "zero_tests_run": { "type": "boolean" },
             "require_tests": { "type": "boolean" },
             "no_run": { "type": "boolean" },
@@ -804,10 +809,9 @@ fn validation_event_schema() -> Value {
             "stderr_evidence": { "type": "string" }
         },
         "required": [
-            "tool_name", "execution_source", "identity", "purpose",
-            "validation_kind", "success", "validation_passed", "failure_class", "failure_kind", "failure_category",
-            "unresolved_failure", "summary", "cwd", "shell", "execution_state",
-            "session_id", "stdout_truncated", "stderr_truncated"
+            "tool_name", "identity", "purpose", "validation_kind", "success",
+            "validation_passed", "failure_class", "failure_kind", "unresolved_failure",
+            "cwd", "shell", "execution_state", "stdout_truncated", "stderr_truncated"
         ]
     })
 }

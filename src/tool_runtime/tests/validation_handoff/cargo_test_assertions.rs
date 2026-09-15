@@ -95,7 +95,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
     assert!(error.contains("full qualified name"), "{error}");
     assert!(error.contains("--exact"), "{error}");
     assert_eq!(result.output["test_count_assertion"]["actual_tests_run"], 0);
-    assert_cargo_result_matches_schema("cargo_test", &result);
+    assert_model_cargo_result_matches_schema("cargo_test", &result);
     assert!(
         runtime.list_jobs_for_auth(None, None, None).await.output["jobs"]
             .as_array()
@@ -114,7 +114,7 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     assert_eq!(validation["evidence_gaps"]["count"], 1);
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], true);
+    assert!(validation["latest"].get("execution_success").is_none());
     assert_eq!(validation["latest"]["validation_passed"], true);
     assert_eq!(validation["latest"]["failure_class"], "evidence_assertion");
     assert_eq!(validation["latest"]["exit_code"], 0);
@@ -194,8 +194,7 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
     assert_eq!(validation.no_run, None);
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_eq!(handoff.output["job_id"], job_id);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
     runtime
         .runner_registry
@@ -261,7 +260,7 @@ async fn handoff_cargo_test_count_gap_preserves_completed_job_and_inconclusive_s
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     assert_eq!(validation["evidence_gaps"]["count"], 1);
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], true);
+    assert!(validation["latest"].get("execution_success").is_none());
     assert_eq!(validation["latest"]["validation_passed"], true);
     assert_eq!(validation["latest"]["failure_class"], "evidence_assertion");
     assert_eq!(validation["latest"]["exit_code"], 0);
@@ -347,7 +346,11 @@ async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_bloc
             result.success, expect_success,
             "minimum={minimum}: {result:?}"
         );
-        assert_eq!(result.output["exit_code"], 0);
+        if expect_success {
+            assert_sparse_validation_terminal_success(&result);
+        } else {
+            assert_eq!(result.output["exit_code"], 0);
+        }
         assert_eq!(result.output["tests_run_count"], 1);
         assert_eq!(result.output["tests_failed"], 0);
         assert_eq!(
@@ -524,8 +527,7 @@ async fn durable_cargo_test_explicit_zero_opt_out_survives_job_reconciliation() 
 
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_eq!(handoff.output["job_id"], job_id);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
     runtime
         .runner_registry

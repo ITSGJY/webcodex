@@ -16,7 +16,7 @@ use super::validation_profile::{
     validation_adapter_for_tool, ValidationAdapter, ValidationCommandOptions,
     ValidationFailureEvidence,
 };
-use super::{ExecutionPurpose, ToolRuntime};
+use super::ToolRuntime;
 use crate::auth::AuthContext;
 use crate::runner_http::ShellJobStartMetadata;
 use crate::runner_protocol::{
@@ -25,6 +25,8 @@ use crate::runner_protocol::{
 };
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_core::runtime_contract::STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS;
+use webcodex_core::workflow_session_contract::ExecutionPurpose;
+use webcodex_validation::execution_purpose_for_validation_kind;
 pub(crate) use webcodex_validation::parse_cargo_test_run_metadata;
 
 const CARGO_STDIO_TAIL_CHARS: usize = 12_000;
@@ -973,11 +975,7 @@ impl ToolRuntime {
                 "verify the project id with list_projects, then retry with a registered project.",
             )),
         };
-        let purpose = match adapter.validation_kind() {
-            "test" => ExecutionPurpose::Test,
-            "format" => ExecutionPurpose::Format,
-            _ => ExecutionPurpose::Validation,
-        };
+        let purpose = execution_purpose_for_validation_kind(adapter.validation_kind());
         let timeout_secs = budget.effective_timeout_secs;
         let sync_wait_secs = budget.sync_wait_secs;
         let session_id = request.session_id.clone();
@@ -1507,11 +1505,7 @@ impl ToolRuntime {
             .unwrap_or_else(|_| ".".to_string());
         let shell = "configured";
         let executor = "agent";
-        let purpose = match adapter.validation_kind() {
-            "test" => "test",
-            "format" => "format",
-            _ => "validation",
-        };
+        let purpose = execution_purpose_for_validation_kind(adapter.validation_kind()).as_str();
         let mut payload = json!({
             "project": project,
             "command_summary": crate::runner_http::command_preview(command),

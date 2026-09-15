@@ -1015,13 +1015,11 @@ fn validation_summary_presentation_bounds_events_and_excludes_private_event_fiel
                 "tool_name": if index % 2 == 0 { "cargo_check" } else { "cargo_test" },
                 "validation_kind": if index % 2 == 0 { "check" } else { "test" },
                 "success": index % 3 != 0,
-                "execution_success": index % 3 != 0,
                 "validation_passed": index % 4 != 0,
                 "expectation_satisfied": index % 5 == 0,
                 "failure_class": "execution_or_correctness",
                 "failure_kind": "validation_failed",
                 "unresolved_failure": index == 0,
-                "summary": format!("{index}-{}", "证".repeat(300)),
                 "duration_ms": 33,
                 "tests_run_count": 7,
                 "diagnostics": {"test_summary": {"passed": 6, "failed": 1}},
@@ -1067,10 +1065,14 @@ fn validation_summary_presentation_bounds_events_and_excludes_private_event_fiel
     assert_eq!(meta["validation"]["events"][0]["tests_failed"], 1);
     assert_eq!(meta["validation"]["events"][0]["success"], true);
     assert_eq!(meta["validation"]["events"][0]["validation_passed"], false);
-    assert!(meta["validation"]["events"][0]["summary"]
-        .as_str()
-        .unwrap()
-        .starts_with("4-"));
+    assert_eq!(
+        meta["validation"]["events"][0]["failure_kind"],
+        "validation_failed"
+    );
+    assert!(meta["validation"]["events"][0]
+        .get("execution_success")
+        .is_none());
+    assert!(meta["validation"]["events"][0].get("summary").is_none());
     assert_presentation_strings_bounded(meta);
     let serialized = serde_json::to_string(meta).unwrap();
     for forbidden in [
@@ -2185,15 +2187,28 @@ async fn mcp_validation_run_and_summary_use_real_canonical_contracts() {
         panic!("expected real cargo_check MCP result");
     };
     let cargo_result = &cargo_call["result"];
-    assert_eq!(
-        cargo_result["structuredContent"]["output"]["execution_state"],
-        "completed"
-    );
-    assert_eq!(cargo_result["structuredContent"]["output"]["passed"], true);
+    let model_output = &cargo_result["structuredContent"]["output"];
+    for redundant in [
+        "execution_state",
+        "passed",
+        "execution_source",
+        "purpose",
+        "executor",
+        "shell",
+    ] {
+        assert!(
+            model_output.get(redundant).is_none(),
+            "model result leaked {redundant}: {model_output}"
+        );
+    }
+    assert_eq!(model_output["warnings_count"], 0);
+    assert_eq!(model_output["errors_count"], 0);
     assert_eq!(presentation(cargo_result)["kind"], "validation_run");
     assert_eq!(presentation(cargo_result)["tool"], "cargo_check");
-    assert_eq!(presentation(cargo_result)["execution_state"], "completed");
-    assert_eq!(presentation(cargo_result)["passed"], true);
+    assert_eq!(presentation(cargo_result)["warnings_count"], 0);
+    assert_eq!(presentation(cargo_result)["errors_count"], 0);
+    assert!(presentation(cargo_result).get("execution_state").is_none());
+    assert!(presentation(cargo_result).get("passed").is_none());
     assert!(!serde_json::to_string(presentation(cargo_result))
         .unwrap()
         .contains("secret log body"));

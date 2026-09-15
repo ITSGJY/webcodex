@@ -67,7 +67,8 @@ async fn run_shell_declared_validation_enters_unified_summary_with_shell_and_roo
         .await;
     assert!(summary.success, "{:?}", summary.error);
     let event = &summary.output["validation"]["latest"];
-    assert_eq!(event["execution_source"], "run_shell");
+    assert!(event.get("execution_source").is_none());
+    assert_eq!(event["tool_name"], "run_shell");
     assert_eq!(event["purpose"], "test");
     assert_eq!(event["validation_kind"], "test");
     assert_eq!(event["cwd"], ".");
@@ -171,7 +172,8 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["validation"]["status"], "passed");
     let event = &handoff.output["validation"]["latest"];
-    assert_eq!(event["execution_source"], "run_job");
+    assert!(event.get("execution_source").is_none());
+    assert_eq!(event["tool_name"], "run_job");
     assert_eq!(event["purpose"], "test");
     assert_eq!(event["execution_state"], "completed");
     assert_eq!(event["exit_code"], 0);
@@ -304,7 +306,8 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
     assert_eq!(validation["status"], "passed");
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     let latest = &validation["latest"];
-    assert_eq!(latest["execution_source"], "run_process");
+    assert!(latest.get("execution_source").is_none());
+    assert_eq!(latest["tool_name"], "run_process");
     assert_eq!(latest["validation_kind"], "test");
     assert_eq!(latest["identity"], target);
     assert_eq!(latest["assertion_name"], assertion_name);
@@ -478,14 +481,11 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
     assert_eq!(validation["latest_success"]["tool_name"], "cargo_check");
     assert_eq!(validation["latest_success"]["validation_kind"], "check");
     assert_eq!(validation["latest_success"]["exit_code"], 0);
-    assert_eq!(
-        validation["latest_success"]["summary"],
-        "cargo_check succeeded"
-    );
+    assert!(validation["latest_success"].get("summary").is_none());
     assert_eq!(validation["latest_failure"]["tool_name"], "cargo_test");
     assert_eq!(validation["latest_failure"]["validation_kind"], "test");
     assert_eq!(validation["latest_failure"]["exit_code"], 101);
-    assert_eq!(validation["latest_failure"]["summary"], "cargo_test failed");
+    assert!(validation["latest_failure"].get("summary").is_none());
     assert_eq!(validation["parser"]["available"], true);
     assert_eq!(validation["parser"]["kind"], PARSER_KIND);
     assert!(validation["parser"].get("reason").is_none());

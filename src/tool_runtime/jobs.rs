@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 
 use super::helpers::{
     command_rejected_message, explicit_shell_dispatch_command, is_safe_job_id,
@@ -1623,12 +1624,10 @@ impl ToolRuntime {
                 .as_ref()
                 .and_then(|metadata| metadata.validation_identity.as_deref())
                 .is_some()
-                && job.purpose.as_deref().is_some_and(|purpose| {
-                    matches!(
-                        purpose,
-                        "validation" | "test" | "build" | "format" | "release"
-                    )
-                });
+                && job
+                    .purpose
+                    .as_deref()
+                    .is_some_and(is_validation_like_execution_purpose);
             if job.project_id.as_deref() == Some(project)
                 && requested.contains(session_id)
                 && (job.validation.is_some() || generic_validation)

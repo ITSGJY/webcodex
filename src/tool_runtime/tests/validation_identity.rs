@@ -193,7 +193,8 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
     assert_eq!(validation["status"], "passed");
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     let latest = &validation["latest"];
-    assert_eq!(latest["execution_source"], "run_shell");
+    assert!(latest.get("execution_source").is_none());
+    assert_eq!(latest["tool_name"], "run_shell");
     assert_eq!(latest["validation_kind"], "test");
     assert_eq!(latest["identity"], expected_identity);
     assert_eq!(latest["assertion_name"], assertion_name);

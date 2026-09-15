@@ -52,11 +52,135 @@ pub(super) fn decorate_structured_execution_prestart_denial(
     result.output = Value::Object(output);
 }
 
+fn is_structured_validation_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test"
+    )
+}
+
+fn sparsify_terminal_structured_validation_success(tool_name: &str, result: &mut ToolResult) {
+    if !is_structured_validation_tool(tool_name) || !result.success {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    let terminal_success = output.get("execution_state").and_then(Value::as_str)
+        == Some("completed")
+        && output.get("command_started").and_then(Value::as_bool) == Some(true)
+        && output.get("command_completed").and_then(Value::as_bool) == Some(true)
+        && output.get("passed").and_then(Value::as_bool) == Some(true)
+        && output.get("promoted_to_job").and_then(Value::as_bool) == Some(false)
+        && output.get("terminal").and_then(Value::as_bool) == Some(true)
+        && output.get("job_id").map(Value::is_null).unwrap_or(true)
+        && output.get("job_status").map(Value::is_null).unwrap_or(true)
+        && output
+            .get("observation_token")
+            .map(Value::is_null)
+            .unwrap_or(true);
+    if !terminal_success {
+        return;
+    }
+
+    for key in [
+        "project",
+        "command_summary",
+        "cwd",
+        "shell",
+        "executor",
+        "execution_source",
+        "purpose",
+        "execution_state",
+        "exit_code",
+        "duration_ms",
+        "passed",
+        "command_started",
+        "command_completed",
+        "promoted_to_job",
+        "terminal",
+        "job_id",
+        "job_status",
+        "observation_token",
+        "effective_timeout_secs",
+        "sync_wait_secs",
+    ] {
+        output.remove(key);
+    }
+    output.remove("async_handoff_available");
+    if output.get("failure_kind").is_some_and(Value::is_null) {
+        output.remove("failure_kind");
+    }
+    for key in ["stdout_tail", "stderr_tail"] {
+        if output.get(key).and_then(Value::as_str) == Some("") {
+            output.remove(key);
+        }
+    }
+    for key in ["stdout_lines", "stderr_lines"] {
+        if output.get(key).and_then(Value::as_u64) == Some(0) {
+            output.remove(key);
+        }
+    }
+    for key in ["stdout_truncated", "stderr_truncated"] {
+        if output.get(key).and_then(Value::as_bool) == Some(false) {
+            output.remove(key);
+        }
+    }
+}
+
+fn sparsify_structured_validation_runtime_metadata(tool_name: &str, result: &mut ToolResult) {
+    if !is_structured_validation_tool(tool_name) {
+        return;
+    }
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    for key in ["execution_source", "purpose", "executor", "shell"] {
+        output.remove(key);
+    }
+    if result.success
+        && matches!(
+            output.get("execution_state").and_then(Value::as_str),
+            Some("queued" | "running" | "started" | "pending")
+        )
+    {
+        for key in [
+            "project",
+            "cwd",
+            "terminal",
+            "command_started",
+            "command_completed",
+            "sync_wait_secs",
+        ] {
+            output.remove(key);
+        }
+        for key in ["stdout_tail", "stderr_tail"] {
+            if output.get(key).and_then(Value::as_str) == Some("") {
+                output.remove(key);
+            }
+        }
+        for key in ["stdout_lines", "stderr_lines"] {
+            if output.get(key).and_then(Value::as_u64) == Some(0) {
+                output.remove(key);
+            }
+        }
+        for key in ["stdout_truncated", "stderr_truncated"] {
+            if output.get(key).and_then(Value::as_bool) == Some(false) {
+                output.remove(key);
+            }
+        }
+    }
+}
+
 /// Remove facts that are fully implied by a successful synchronous terminal
 /// structured execution, but only after the complete ToolResult has already
 /// been recorded into the Session ledger. Failure/uncertain/Job projections
 /// remain explicit because they participate in retry and reconciliation safety.
 fn sparsify_terminal_structured_execution_success(tool_name: &str, result: &mut ToolResult) {
+    if is_structured_validation_tool(tool_name) {
+        sparsify_terminal_structured_validation_success(tool_name, result);
+        return;
+    }
     if !matches!(tool_name, "run_process" | "run_script") || !result.success {
         return;
     }
@@ -284,7 +408,11 @@ impl ModelFacingProjectionPlan {
             | ToolCall::RunProcess { .. }
             | ToolCall::RunScript { .. }
             | ToolCall::RunShell { .. }
-            | ToolCall::RunDetachedProcess { .. } => ModelFacingProjection::JobHandoff,
+            | ToolCall::RunDetachedProcess { .. }
+            | ToolCall::CargoFmt { .. }
+            | ToolCall::CargoCheck { .. }
+            | ToolCall::CargoTest { .. }
+            | ToolCall::GoTest { .. } => ModelFacingProjection::JobHandoff,
             ToolCall::ReadFiles { .. } => {
                 ModelFacingProjection::Read(super::read_files::ReadModelProjection::capture(call))
             }
@@ -1548,6 +1676,7 @@ impl ToolRuntime {
         )
         .await;
         sparsify_terminal_structured_execution_success(tool_name, &mut result);
+        sparsify_structured_validation_runtime_metadata(tool_name, &mut result);
         result
     }
 
@@ -2594,6 +2723,50 @@ mod structured_execution_sparse_projection_tests {
         assert!(alternate.output.get("cwd").is_none());
         assert!(alternate.output.get("executor").is_none());
         assert!(alternate.output.get("execution_state").is_none());
+    }
+
+    #[test]
+    fn terminal_validation_success_keeps_only_independent_mutation_truth() {
+        let mut result = ToolResult::ok(json!({
+            "project": "agent:test:webcodex",
+            "command_summary": "cargo fmt",
+            "cwd": ".",
+            "shell": "configured",
+            "executor": "agent",
+            "execution_source": "cargo_fmt",
+            "purpose": "format",
+            "execution_state": "completed",
+            "exit_code": 0,
+            "duration_ms": 5,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "command_started": true,
+            "command_completed": true,
+            "passed": true,
+            "failure_kind": null,
+            "promoted_to_job": false,
+            "terminal": true,
+            "job_id": null,
+            "job_status": null,
+            "observation_token": null,
+            "effective_timeout_secs": 60,
+            "sync_wait_secs": 60,
+            "async_handoff_available": false,
+            "changed": true,
+            "state_changed": true
+        }));
+
+        sparsify_terminal_structured_execution_success("cargo_fmt", &mut result);
+        sparsify_structured_validation_runtime_metadata("cargo_fmt", &mut result);
+
+        assert_eq!(
+            result.output,
+            json!({"changed": true, "state_changed": true})
+        );
     }
 
     #[test]

@@ -277,19 +277,85 @@ async fn seed_retained_terminal_validation_job(
     }
 }
 
-fn assert_cargo_result_matches_schema(tool_name: &str, result: &crate::tool_runtime::ToolResult) {
+fn assert_model_cargo_result_matches_schema(
+    tool_name: &str,
+    result: &crate::tool_runtime::ToolResult,
+) {
     use crate::tool_runtime::registry::output_schema_for_tool;
     use crate::tool_runtime::startup_brief::validate_schema_instance_for_test;
 
-    if result.output["promoted_to_job"] == true {
+    if result.output.get("continuation").is_some() {
         assert_observe_job_continuation(&result.output);
     }
     let schema = output_schema_for_tool(tool_name);
     let value = serde_json::to_value(result).unwrap();
     assert!(
         validate_schema_instance_for_test(&value, &schema).is_ok(),
-        "{tool_name} result did not satisfy its output schema: {value}"
+        "{tool_name} model result did not satisfy its output schema: {value}"
     );
+}
+
+fn assert_sparse_validation_terminal_success(result: &crate::tool_runtime::ToolResult) {
+    assert!(result.success, "{:?}", result.error);
+    for redundant in [
+        "project",
+        "command_summary",
+        "cwd",
+        "shell",
+        "executor",
+        "execution_source",
+        "purpose",
+        "execution_state",
+        "exit_code",
+        "duration_ms",
+        "passed",
+        "command_started",
+        "command_completed",
+        "promoted_to_job",
+        "terminal",
+        "job_id",
+        "job_status",
+        "observation_token",
+        "continuation_semantics",
+        "effective_timeout_secs",
+        "sync_wait_secs",
+    ] {
+        assert!(
+            result.output.get(redundant).is_none(),
+            "terminal success leaked {redundant}: {:?}",
+            result.output
+        );
+    }
+}
+
+fn sparse_validation_handoff_token(output: &serde_json::Value, job_id: &str) -> String {
+    assert_eq!(output["job_id"], job_id);
+    assert_observe_job_continuation(output);
+    for redundant in [
+        "project",
+        "cwd",
+        "shell",
+        "executor",
+        "execution_source",
+        "purpose",
+        "promoted_to_job",
+        "async_handoff_available",
+        "observation_token",
+        "continuation_semantics",
+        "terminal",
+        "command_started",
+        "command_completed",
+        "sync_wait_secs",
+    ] {
+        assert!(
+            output.get(redundant).is_none(),
+            "Job handoff leaked {redundant}: {output}"
+        );
+    }
+    output["continuation"]["arguments"]["items"][0]["after_observation_token"]
+        .as_str()
+        .expect("parser-ready Job continuation observation token")
+        .to_string()
 }
 
 #[tokio::test]
@@ -430,18 +496,13 @@ async fn fast_go_test_uses_exact_structured_argv_cwd_and_records_session_evidenc
         .unwrap();
 
     let result = task.await.unwrap();
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["command_summary"], "go test -json ./...");
-    assert_eq!(result.output["cwd"], "internal/nodeapp");
-    assert_eq!(result.output["promoted_to_job"], false);
-    assert_eq!(result.output["effective_timeout_secs"], 60);
-    assert_eq!(result.output["sync_wait_secs"], 60);
+    assert_sparse_validation_terminal_success(&result);
     assert_eq!(result.output["tests_detected"], true);
     assert_eq!(result.output["tests_run_count"], 2);
     assert_eq!(result.output["tests_passed"], 1);
     assert_eq!(result.output["tests_failed"], 0);
     assert_eq!(result.output["diagnostics"]["test_summary"]["ignored"], 1);
-    assert_cargo_result_matches_schema("go_test", &result);
+    assert_model_cargo_result_matches_schema("go_test", &result);
 
     let session = runtime.sessions.summary(&session_id, Some(50)).unwrap();
     let validation = validation_summary_for_session(&session);
@@ -536,7 +597,7 @@ async fn go_test_failure_reports_failed_test_identity_in_result_and_session() {
         result.output["diagnostics"]["failed_test_details"][0]["name"],
         "example/pkg::TestFail"
     );
-    assert_cargo_result_matches_schema("go_test", &result);
+    assert_model_cargo_result_matches_schema("go_test", &result);
 
     let session = runtime.sessions.summary(&session_id, Some(50)).unwrap();
     let validation = validation_summary_for_session(&session);
@@ -611,14 +672,8 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
     assert!(steps[0].env.is_empty());
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["promoted_to_job"], true);
-    assert_eq!(result.output["sync_wait_secs"], 1);
-    assert_eq!(result.output["terminal"], false);
-    assert_eq!(result.output["job_id"], job_id);
-    let observation_token = result.output["observation_token"]
-        .as_str()
-        .expect("go_test handoff observation token")
-        .to_string();
+    assert_eq!(result.output["effective_timeout_secs"], 1800);
+    let observation_token = sparse_validation_handoff_token(&result.output, &job_id);
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
@@ -640,7 +695,7 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
             .as_str()
             .expect("observed go_test observation token"),
     );
-    assert_cargo_result_matches_schema("go_test", &result);
+    assert_model_cargo_result_matches_schema("go_test", &result);
 
     let stdout = concat!(
         "{\"Action\":\"run\",\"Package\":\"example/pkg\",\"Test\":\"TestLater\"}\n",
@@ -737,15 +792,11 @@ async fn fast_cargo_check_completes_in_windows_and_leaves_no_visible_job() {
         .unwrap();
 
     let result = task.await.unwrap();
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["execution_state"], "completed");
-    assert_eq!(result.output["passed"], true);
-    assert_eq!(result.output["command_completed"], true);
-    assert_eq!(result.output["promoted_to_job"], false);
-    assert_eq!(result.output["effective_timeout_secs"], 600);
-    assert!(result.output.get("observation_token").is_none());
-    assert_eq!(result.output["sync_wait_secs"], 60);
-    assert_cargo_result_matches_schema("cargo_check", &result);
+    assert_sparse_validation_terminal_success(&result);
+    assert_eq!(result.output["warnings_count"], 0);
+    assert_eq!(result.output["errors_count"], 0);
+    assert!(result.output.get("diagnostics").is_some());
+    assert_model_cargo_result_matches_schema("cargo_check", &result);
     // No redundant visible job.
     let list = runtime.list_jobs_for_auth(None, None, None).await;
     assert!(list.success);
@@ -876,7 +927,6 @@ async fn long_cargo_check_hands_off_with_immediately_observable_token() {
             .as_str()
             .expect("observed cargo_check observation token"),
     );
-    assert_cargo_result_matches_schema("cargo_check", &result);
 }
 
 /// Auto handoff: a validation still running when the injected sync window
@@ -963,7 +1013,6 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
     assert!(result.output.get("passed").is_none());
     assert!(result.output.get("failure_kind").is_none());
     assert_eq!(result.output["job_id"].as_str().unwrap(), job_id.as_str());
-    assert_cargo_result_matches_schema("cargo_test", &result);
     let observation_token = result.output["observation_token"]
         .as_str()
         .expect("cargo_test handoff observation token")
@@ -1213,7 +1262,7 @@ async fn handoff_job_terminal_success_produces_passed_validation_summary() {
 
     let handoff = task.await.unwrap();
     assert!(handoff.success);
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
     // Advance the job to terminal success.
     runtime
@@ -1586,8 +1635,7 @@ async fn async_same_cargo_check_target_success_resolves_prior_failure_without_du
         .unwrap();
     let handoff = success_task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_eq!(handoff.output["job_id"], success_job_id);
+    let _ = sparse_validation_handoff_token(&handoff.output, &success_job_id);
 
     runtime
         .runner_registry
@@ -1742,7 +1790,7 @@ async fn partial_agent_status_is_conservative_while_delta_log_uses_frozen_valida
         .unwrap();
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
     let mut stdout = String::from("running 3 tests\n");
     stdout.push_str(
@@ -2053,7 +2101,6 @@ async fn explicit_short_timeout_never_creates_a_job() {
     assert_eq!(result.output["execution_state"], "timed_out");
     assert_eq!(result.output["command_started"], true);
     assert_eq!(result.output["command_completed"], false);
-    assert_cargo_result_matches_schema("cargo_check", &result);
     // No job was created.
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
@@ -2480,7 +2527,7 @@ async fn stop_job_stops_a_handoff_job() {
         .unwrap();
     let handoff = task.await.unwrap();
     assert!(handoff.success);
-    assert_eq!(handoff.output["promoted_to_job"], true);
+    let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
     let stopped = runtime
         .dispatch_with_auth(
@@ -2669,7 +2716,6 @@ async fn cargo_fmt_ensure_formatted_mutates_only_after_stable_format_diff() {
     assert_eq!(result.output["command_summary"], "cargo fmt");
     assert_ne!(result.output["promoted_to_job"], true);
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
-    assert_cargo_result_matches_schema("cargo_fmt", &result);
 }
 
 #[tokio::test]
@@ -2711,7 +2757,6 @@ async fn cargo_fmt_ensure_formatted_non_format_precheck_failure_never_mutates() 
         .as_deref()
         .is_some_and(|error| error.contains("No source formatting was attempted")));
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
-    assert_cargo_result_matches_schema("cargo_fmt", &result);
 }
 
 #[tokio::test]
@@ -2779,7 +2824,6 @@ async fn cargo_fmt_ensure_formatted_mutation_uncertainty_forbids_blind_retry() {
         "{error}"
     );
     assert!(error.contains("inspect the actual Job, process, service, or target state"));
-    assert_cargo_result_matches_schema("cargo_fmt", &result);
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
@@ -2797,21 +2841,10 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
     let handoff = json!({
         "success": true,
         "output": {
-            "project": "agent:x:y",
             "command_summary": "cargo test",
-            "cwd": ".",
-            "shell": "configured",
-            "executor": "agent",
-            "execution_source": "cargo_test",
-            "purpose": "test",
             "execution_state": "running",
             "job_id": "job-123",
             "job_status": "running",
-            "observation_token": "observation",
-            "continuation_semantics": {
-                "kind": "observe",
-                "carrier": "observation_token"
-            },
             "activity": {
                 "state": "working",
                 "phase": "validation_test",
@@ -2828,18 +2861,7 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
                     "wake_on": "terminal"
                 }
             },
-            "promoted_to_job": true,
-            "command_started": true,
-            "command_completed": false,
-            "effective_timeout_secs": 1800,
-            "sync_wait_secs": 60,
-            "terminal": false,
-            "stdout_tail": "",
-            "stderr_tail": "",
-            "stdout_lines": 0,
-            "stderr_lines": 0,
-            "stdout_truncated": false,
-            "stderr_truncated": false
+            "effective_timeout_secs": 1800
         }
     });
     assert!(accepts(&handoff), "handoff should validate");
@@ -2851,10 +2873,11 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
         ("terminal", 3),
         ("passed", 4),
         ("timeout failure", 5),
-        ("missing observation_token", 6),
+        ("duplicate observation token", 6),
         ("missing activity", 7),
         ("missing continuation", 8),
-        ("missing continuation semantics", 9),
+        ("redundant promoted flag", 9),
+        ("runtime-derived purpose", 10),
     ] {
         let mut invalid = handoff.clone();
         let output = invalid["output"].as_object_mut().unwrap();
@@ -2878,7 +2901,7 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
                 output.insert("failure_kind".to_string(), json!("timeout"));
             }
             6 => {
-                output.remove("observation_token");
+                output.insert("observation_token".to_string(), json!("observation"));
             }
             7 => {
                 output.remove("activity");
@@ -2887,7 +2910,10 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
                 output.remove("continuation");
             }
             9 => {
-                output.remove("continuation_semantics");
+                output.insert("promoted_to_job".to_string(), json!(true));
+            }
+            10 => {
+                output.insert("purpose".to_string(), json!("test"));
             }
             _ => unreachable!(),
         }
@@ -2897,29 +2923,6 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
     let terminal = json!({
         "success": true,
         "output": {
-            "project": "agent:x:y",
-            "command_summary": "cargo test",
-            "cwd": ".",
-            "shell": "configured",
-            "executor": "agent",
-            "execution_source": "cargo_test",
-            "purpose": "test",
-            "execution_state": "completed",
-            "passed": true,
-            "exit_code": 0,
-            "duration_ms": 5,
-            "stdout_tail": "running 1 test\ntest result: ok. 1 passed; 0 failed\n",
-            "stderr_tail": "",
-            "stdout_lines": 2,
-            "stderr_lines": 0,
-            "stdout_truncated": false,
-            "stderr_truncated": false,
-            "command_started": true,
-            "command_completed": true,
-            "promoted_to_job": false,
-            "effective_timeout_secs": 1800,
-            "sync_wait_secs": 60,
-            "terminal": true,
             "tests_detected": true,
             "tests_run_count": 1,
             "tests_passed": 1,
@@ -2931,12 +2934,9 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
     });
     assert!(accepts(&terminal), "terminal result should validate");
 
-    let mut missing_passed = terminal.clone();
-    missing_passed["output"]
-        .as_object_mut()
-        .unwrap()
-        .remove("passed");
-    assert!(!accepts(&missing_passed));
+    let mut redundant_passed = terminal.clone();
+    redundant_passed["output"]["passed"] = json!(true);
+    assert!(!accepts(&redundant_passed));
     let mut promoted_terminal = terminal.clone();
     promoted_terminal["output"]["promoted_to_job"] = json!(true);
     assert!(!accepts(&promoted_terminal));
@@ -2966,10 +2966,6 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
             "project": "agent:x:y",
             "command_summary": "cargo test",
             "cwd": ".",
-            "shell": "configured",
-            "executor": "agent",
-            "execution_source": "cargo_test",
-            "purpose": "test",
             "execution_state": "timed_out",
             "passed": false,
             "failure_kind": "timeout",
@@ -3024,7 +3020,6 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
         "success": false,
         "error": "Runner capability unavailable",
         "output": {
-            "execution_source": "cargo_test",
             "command_started": false,
             "command_completed": false,
             "failure_kind": "capability_unavailable"

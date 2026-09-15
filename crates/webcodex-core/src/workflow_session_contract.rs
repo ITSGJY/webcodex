@@ -58,6 +58,74 @@ impl ExecutionShell {
     }
 }
 
+/// Execution intent used for evidence classification. Generic execution may
+/// declare it explicitly; structured validators derive it from tool identity.
+/// It never grants authority or selects the command that Runtime executes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPurpose {
+    Validation,
+    Test,
+    Build,
+    Format,
+    Release,
+    Diagnostic,
+    Operation,
+    #[default]
+    Other,
+}
+
+pub const EXECUTION_PURPOSE_VALUES: &[&str] = &[
+    "validation",
+    "test",
+    "build",
+    "format",
+    "release",
+    "diagnostic",
+    "operation",
+    "other",
+];
+
+impl ExecutionPurpose {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Validation => "validation",
+            Self::Test => "test",
+            Self::Build => "build",
+            Self::Format => "format",
+            Self::Release => "release",
+            Self::Diagnostic => "diagnostic",
+            Self::Operation => "operation",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "validation" => Some(Self::Validation),
+            "test" => Some(Self::Test),
+            "build" => Some(Self::Build),
+            "format" => Some(Self::Format),
+            "release" => Some(Self::Release),
+            "diagnostic" => Some(Self::Diagnostic),
+            "operation" => Some(Self::Operation),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    pub const fn is_validation_like(self) -> bool {
+        matches!(
+            self,
+            Self::Validation | Self::Test | Self::Build | Self::Format | Self::Release
+        )
+    }
+}
+
+pub fn is_validation_like_execution_purpose(value: &str) -> bool {
+    ExecutionPurpose::parse(value).is_some_and(ExecutionPurpose::is_validation_like)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
