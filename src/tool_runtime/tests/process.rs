@@ -182,6 +182,7 @@ async fn update_process_job(
             error: error.map(str::to_string),
             command_execution_state: state,
             validation_progress: None,
+            test_count_evidence: None,
             activity,
             finished: state.is_some(),
         })
@@ -907,6 +908,7 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
                     stdout: Default::default(),
                     stderr: Default::default(),
                     validation_progress: None,
+                    test_count_evidence: None,
                     activity: Some(ShellJobActivity {
                         state: ShellJobActivityState::Working,
                         phase: ShellJobActivityPhase::ProcessRunning,

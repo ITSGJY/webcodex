@@ -19,10 +19,12 @@ use crate::runner_protocol::{
     RunnerProjectSummary, RunnerRequest, RunnerCapabilities,
     RunnerRegisterRequest, ShellCommandExecutionState, ShellJobContext, ShellJobInventory,
     ShellJobLogSnapshot, ShellJobOpRequest, ShellJobSnapshot, ShellJobStreamSnapshot,
-    ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
+    ShellJobTestCountEvidence, ShellJobValidationMetadata, ShellJobValidationProgress,
+    ShellJobValidationStep,
     ShellProcessArgv, ShellScriptLanguage, ShellScriptPayload, JOB_INVENTORY_MAX_TERMINAL_JOBS,
     JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
 };
+use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
 
 const CLIENT_ID: &str = "oe";
 const INSTANCE_A: &str = "instance-reconcile-a";
@@ -248,6 +250,7 @@ fn snapshot_from_request(
         stdout,
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
     }
 }
@@ -277,6 +280,7 @@ fn update(
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
         finished,
     }
@@ -439,6 +443,7 @@ async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_st
                 current_step: current_step.map(str::to_string),
                 failed_step: None,
             }),
+            test_count_evidence: None,
             activity,
             finished,
         }
@@ -689,21 +694,21 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
     let mut snapshot = snapshot_from_request(
         &job,
         &request,
-        "running",
+        "completed",
         2,
-        stream("running 4 tests\n", 1, false),
+        stream("retained tail after truncation\n", 42, true),
     );
     snapshot.validation_progress = Some(ShellJobValidationProgress {
-        completed: 0,
-        current_step: Some("test".to_string()),
+        completed: 1,
+        current_step: None,
         failed_step: None,
     });
-    snapshot.activity = Some(crate::runner_protocol::ShellJobActivity {
-        state: crate::runner_protocol::ShellJobActivityState::Working,
-        phase: crate::runner_protocol::ShellJobActivityPhase::ValidationTest,
-        source: crate::runner_protocol::ShellJobActivitySource::ValidationPlan,
+    snapshot.test_count_evidence = Some(ShellJobTestCountEvidence {
+        tests_detected: true,
+        tests_run_count: Some(6),
+        status: CargoTestCountEvidenceStatus::CompleteSummary,
     });
-    let expected_activity = snapshot.activity;
+    let expected_evidence = snapshot.test_count_evidence.clone();
     let inventory: ShellJobInventory = serde_json::from_value(
         serde_json::to_value(ShellJobInventory {
             active_complete: true,
@@ -721,8 +726,10 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
         restored_validation.validation_target_id.as_deref(),
         Some(target)
     );
-    assert_eq!(restored.status, "running");
-    assert_eq!(restored.activity, expected_activity);
+    assert_eq!(restored.status, "completed");
+    assert!(restored.stdout_log_truncated);
+    assert_eq!(restored.stdout_retained_from_line, Some(42));
+    assert_eq!(restored.test_count_evidence, expected_evidence);
     assert!(restored.recovered_after_server_restart);
 }
 
@@ -2554,6 +2561,7 @@ fn standalone_snapshot(job_id: &str, status: &str) -> ShellJobSnapshot {
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        test_count_evidence: None,
         activity: None,
     }
 }

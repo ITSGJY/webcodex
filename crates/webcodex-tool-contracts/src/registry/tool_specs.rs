@@ -406,6 +406,12 @@ mod tests {
             .as_str()
             .expect("observe_jobs wait description");
         assert!(wait.contains("one shared bounded wait"), "{wait}");
+        assert!(
+            wait.contains(
+                &webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS.to_string()
+            ),
+            "{wait}"
+        );
 
         let register = find("register_project");
         assert!(

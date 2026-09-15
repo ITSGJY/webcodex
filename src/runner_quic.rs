@@ -1147,6 +1147,7 @@ mod tests {
                     error: None,
                     command_execution_state: None,
                     validation_progress: None,
+                    test_count_evidence: None,
                     activity: None,
                     finished: false,
                 },

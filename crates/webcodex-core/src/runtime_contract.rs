@@ -22,6 +22,10 @@ pub const MAX_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 192 * 1024;
 pub const DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES: usize = MAX_GIT_DIFF_HUNKS_PAGE_BYTES;
 pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 192;
 pub const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
+/// Maximum explicit bounded wait for observing already-accepted Job work.
+/// This is intentionally separate from execution timeouts and initial
+/// synchronous handoff grace budgets.
+pub const MAX_JOB_OBSERVATION_WAIT_SECS: u64 = 100;
 pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
 
 pub const MAX_SKILL_LIST_LIMIT: usize = 64;

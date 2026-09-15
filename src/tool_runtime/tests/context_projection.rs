@@ -169,11 +169,10 @@ async fn context_projection_is_explicit_deduped_open_ended_and_nonfatal() {
         )
         .await;
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        result.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
+    assert!(result.output["context_projection"].get("timing").is_none());
+    assert!(result.output["context_projection"]
+        .get("applies_to_current_effect")
+        .is_none());
     let materials = result.output["context_projection"]["materials"]
         .as_array()
         .unwrap();
@@ -551,11 +550,6 @@ async fn mutation_context_projection_is_post_tool_and_does_not_change_authority_
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["permission"]["status"], "auto_approved");
     assert_eq!(result.output["permission"]["risk"], "write");
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        result.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert!(context_material(&result, "project.instructions")
         .to_string()
         .contains("RECOVER_BEFORE_MUTATION"));
@@ -792,7 +786,6 @@ async fn context_projection_coexists_with_session_continuity_and_attention() {
     assert!(result.output.get("session_continuity").is_none());
     assert!(result.output.get("session_recovery").is_none());
     assert!(result.output["session_attention"]["requires_ack"].as_bool() == Some(true));
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
     assert_eq!(
         context_material(&result, "webcodex.workflow")["status"],
         "available"

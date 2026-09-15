@@ -780,6 +780,7 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
                 error: None,
                 command_execution_state: None,
                 validation_progress: None,
+                test_count_evidence: None,
                 activity: None,
                 finished: false,
             },
@@ -823,6 +824,7 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })

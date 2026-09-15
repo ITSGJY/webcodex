@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS;
 use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 
 use super::helpers::{
@@ -12,7 +13,8 @@ use crate::auth::AuthContext;
 use crate::runner_http::{command_preview, ShellJobStartMetadata, COMMAND_PREVIEW_MAX_CHARS};
 use crate::runner_protocol::{
     ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
-    ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata, ShellJobValidationStep,
+    ShellJobInfo, ShellJobOpRequest, ShellJobStructuredExecutionMetadata,
+    ShellJobTestCountEvidence, ShellJobValidationStep,
 };
 
 pub(crate) fn is_blocking_active_job_status(status: &str) -> bool {
@@ -315,7 +317,7 @@ pub(crate) fn structured_validation_evidence(
             evidence.test_count_evidence_reason = Some(if truncated {
                 "output_truncated"
             } else {
-                metadata.count_evidence_reason
+                metadata.count_evidence_reason()
             });
             if !truncated {
                 evidence.tests_run_count = metadata.tests_run_count;
@@ -354,6 +356,7 @@ pub(crate) fn validation_job_projection(
         stdout,
         stderr,
         truncated,
+        None,
         minimum_tests,
         None,
         None,
@@ -368,6 +371,7 @@ pub(crate) fn validation_job_projection_with_policy(
     stdout: &str,
     stderr: &str,
     truncated: bool,
+    authoritative_test_count: Option<&ShellJobTestCountEvidence>,
     minimum_tests: Option<u64>,
     require_tests: Option<bool>,
     no_run: Option<bool>,
@@ -434,7 +438,16 @@ pub(crate) fn validation_job_projection_with_policy(
         return Some(value);
     }
     let process_passed = lifecycle == Some(RunnerJobLifecycle::Completed) && exit_code == Some(0);
-    let evidence = structured_validation_evidence(tool, kind, stdout, stderr, truncated);
+    let mut evidence = structured_validation_evidence(tool, kind, stdout, stderr, truncated);
+    if tool == "cargo_test" {
+        if let Some(authoritative) = authoritative_test_count.filter(|evidence| evidence.is_valid())
+        {
+            evidence.tests_detected = Some(authoritative.tests_detected);
+            evidence.tests_run_count = authoritative.tests_run_count;
+            evidence.zero_tests_run = authoritative.tests_run_count.map(|count| count == 0);
+            evidence.test_count_evidence_reason = Some(authoritative.status.reason_code());
+        }
+    }
     let mut passed = process_passed;
     let mut value = json!({
         "tool": tool,
@@ -664,7 +677,7 @@ pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&
         "observe_jobs",
         json!({
             "items": [item],
-            "wait_secs": 60,
+            "wait_secs": MAX_JOB_OBSERVATION_WAIT_SECS,
             "wake_on": "terminal",
         }),
     )
@@ -743,7 +756,6 @@ fn unknown_job_observation_result(job_id: &str) -> ToolResult {
             "suggested_call": list_jobs_recovery_suggested_call(None),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve)
 }
 
 fn agent_job_log_error_result(job_id: &str, error: String) -> ToolResult {
@@ -796,7 +808,6 @@ fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
             "suggested_call": list_jobs_recovery_suggested_call(Some(project)),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve)
 }
 
 fn job_project_mismatch_result(
@@ -1318,6 +1329,7 @@ impl ToolRuntime {
                         &stdout,
                         &stderr,
                         truncated,
+                        job.test_count_evidence.as_ref(),
                         validation_metadata.and_then(|metadata| metadata.minimum_tests),
                         validation_metadata.and_then(|metadata| metadata.require_tests),
                         validation_metadata.and_then(|metadata| metadata.no_run),
@@ -1352,10 +1364,10 @@ impl ToolRuntime {
     /// binding are validated before execution or waiting by the selected executor.
     fn validate_job_log_wait(wait_secs: Option<u64>) -> Result<(), String> {
         if let Some(secs) = wait_secs {
-            if secs == 0 || secs > 60 {
+            if secs == 0 || secs > MAX_JOB_OBSERVATION_WAIT_SECS {
                 return Err(format!(
-                    "invalid wait_secs: must be between 1 and 60, got {}",
-                    secs
+                    "invalid wait_secs: must be between 1 and {}, got {}",
+                    MAX_JOB_OBSERVATION_WAIT_SECS, secs
                 ));
             }
         }
@@ -1422,6 +1434,7 @@ impl ToolRuntime {
                     &wait.analysis_stdout,
                     &wait.analysis_stderr,
                     wait.analysis_truncated,
+                    job.test_count_evidence.as_ref(),
                     job.validation
                         .as_ref()
                         .and_then(|metadata| metadata.minimum_tests),
@@ -1955,10 +1968,11 @@ mod recovery_projection_tests {
     use super::{
         confirmation_required_result, job_not_found_result, job_project_mismatch_result,
         job_recovering_stop_result, job_stop_forbidden_result, recovery_reason_text,
-        validation_job_projection,
+        validation_job_projection, validation_job_projection_with_policy,
     };
-    use crate::runner_protocol::ShellJobInfo;
+    use crate::runner_protocol::{ShellJobInfo, ShellJobTestCountEvidence};
     use serde_json::json;
+    use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
 
     #[test]
     fn recovery_reason_text_recovering_explains_wait() {
@@ -2049,7 +2063,7 @@ mod recovery_projection_tests {
 
         let missing = job_not_found_result("agent:special:demo", "job-missing");
         assert_eq!(missing.output["failure_kind"], "job_not_found");
-        assert_eq!(missing.output["recovery_kind"], "reobserve");
+        assert!(missing.output.get("recovery_kind").is_none());
         assert!(missing.output.get("recovery_tool").is_none());
         assert_eq!(
             missing.output["suggested_call"],
@@ -2322,6 +2336,107 @@ mod recovery_projection_tests {
     }
 
     #[test]
+    fn authoritative_cargo_test_count_survives_truncated_logs_and_still_fails_closed() {
+        let complete = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: Some(120),
+            status: CargoTestCountEvidenceStatus::CompleteSummary,
+        };
+        let passed = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "retained tail without the harness summary",
+            "",
+            true,
+            Some(&complete),
+            Some(100),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(passed["truncated"], true);
+        assert_eq!(passed["tests_run_count"], 120);
+        assert_eq!(passed["test_count_assertion"]["status"], "passed");
+        assert_eq!(
+            passed["test_count_assertion"]["reason_code"],
+            "minimum_satisfied"
+        );
+
+        let below_minimum = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: Some(5),
+            status: CargoTestCountEvidenceStatus::CompleteSummary,
+        };
+        let failed = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "",
+            "",
+            true,
+            Some(&below_minimum),
+            Some(6),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(failed["passed"], false);
+        assert_eq!(
+            failed["test_count_assertion"]["reason_code"],
+            "minimum_not_met"
+        );
+
+        let incomplete = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: None,
+            status: CargoTestCountEvidenceStatus::IncompleteStream,
+        };
+        let unproven = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "",
+            "",
+            true,
+            Some(&incomplete),
+            Some(1),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(unproven["passed"], false);
+        assert!(unproven["tests_run_count"].is_null());
+        assert_eq!(
+            unproven["test_count_assertion"]["reason_code"],
+            "test_count_unproven"
+        );
+        assert_eq!(
+            unproven["test_count_assertion"]["evidence_reason_code"],
+            "incomplete_stream"
+        );
+
+        let command_failure = validation_job_projection_with_policy(
+            Some("cargo_test"),
+            Some("test"),
+            "failed",
+            Some(101),
+            "",
+            "",
+            true,
+            Some(&complete),
+            Some(100),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(command_failure["passed"], false);
+    }
+
+    #[test]
     fn validation_projection_reports_check_counts_and_never_fakes_truncated_counts() {
         let complete = validation_job_projection(
             Some("cargo_check"),
@@ -2431,6 +2546,7 @@ mod recovery_projection_tests {
             codex: None,
             result: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             validation: None,
             recovery_state: None,
@@ -2482,6 +2598,7 @@ mod recovery_projection_tests {
             codex: None,
             result: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             validation: None,
             recovery_state: Some("lost_after_reconcile".to_string()),

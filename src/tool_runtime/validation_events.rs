@@ -423,7 +423,12 @@ impl ToolRuntime {
                     "test_count_assertion",
                     "diagnostics",
                 ] {
-                    if let Some(value) = validation.get(field) {
+                    // A structured terminal count can be independently proven
+                    // even when bounded-log component diagnostics are absent.
+                    // Do not persist JSON nulls as explicit contradictory test
+                    // metadata; absence remains fail-closed in the ledger while
+                    // a non-null authoritative tests_run_count stays usable.
+                    if let Some(value) = validation.get(field).filter(|value| !value.is_null()) {
                         output[field] = value.clone();
                     }
                 }

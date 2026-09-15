@@ -2012,7 +2012,6 @@ fn skill_error_dynamic(
         let target = output
             .as_object_mut()
             .expect("Skill store error projection is always an object");
-        target.insert("recovery_kind".to_string(), json!("reconcile"));
         if !project.is_empty() {
             if let Some(skill_key) = recovery_skill_key.as_deref() {
                 target.insert(
@@ -2024,9 +2023,11 @@ fn skill_error_dynamic(
                     .to_value(),
                 );
             } else {
+                target.insert("recovery_kind".to_string(), json!("reconcile"));
                 target.insert("reconcile_with".to_string(), json!("skill_versions"));
             }
         } else {
+            target.insert("recovery_kind".to_string(), json!("reconcile"));
             target.insert("reconcile_with".to_string(), json!("skill_versions"));
         }
         if outcome_unknown {
@@ -2397,6 +2398,7 @@ mod tests {
             .is_ok());
             assert!(result.output.get("recovery_tool").is_none());
             assert!(result.output.get("reconcile_with").is_none());
+            assert!(result.output.get("recovery_kind").is_none());
         };
 
         let unknown = skill_error_dynamic(
@@ -2406,7 +2408,6 @@ mod tests {
             true,
         );
         assert_eq!(unknown.output["outcome_unknown"], true);
-        assert_eq!(unknown.output["recovery_kind"], "reconcile");
         assert_actionable(&unknown);
         assert_eq!(unknown.output["retry_same_idempotency_key"], true);
         assert!(!unknown.output.to_string().contains("new key"));
@@ -2445,7 +2446,6 @@ mod tests {
             false,
         );
         assert_eq!(claimed.output["outcome_unknown"], false);
-        assert_eq!(claimed.output["recovery_kind"], "reconcile");
         assert_actionable(&claimed);
         assert!(claimed.output.get("retry_same_idempotency_key").is_none());
 

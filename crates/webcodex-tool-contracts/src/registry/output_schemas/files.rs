@@ -303,14 +303,18 @@ fn search_project_texts_output_schema() -> Value {
             "failed_count": {"type": "integer", "minimum": 0, "maximum": 8},
             "items": {"type": "array", "maxItems": 8, "items": item_schema.clone()},
             "output_truncated": {"type": "boolean"},
-            "next_index": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 7}, {"type": "null"}]},
             "truncation_reason": {"type": "string", "enum": ["batch_response_budget", "hard_result_cap"]},
+            "suggested_call": suggested_tool_call_schema(
+                "search_project_texts",
+                crate::registry::input_schemas::search_project_texts_input_schema(),
+                "Parser-ready whole-query suffix rerun when the complete call itself fits the bounded model result. If it cannot fit, Runtime keeps truncation truthful and exposes no raw cursor or oversized fake call. Zero-progress soft-budget results may raise max_result_bytes; hard-cap zero progress exposes no fake next call."
+            ),
             "session_hint": session_hint_schema(),
             "permission": permission_decision_schema()
         },
         "required": [
             "project", "requested_count", "returned_count", "succeeded_count",
-            "failed_count", "items", "output_truncated", "next_index"
+            "failed_count", "items", "output_truncated"
         ]
     });
     let sparse_success_item = json!({

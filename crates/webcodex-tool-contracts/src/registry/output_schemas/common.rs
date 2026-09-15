@@ -124,7 +124,12 @@ pub fn observe_job_continuation_schema() -> Value {
                         "required": ["job_id"]
                     }
                 },
-                "wait_secs": {"type": "integer", "const": 60, "minimum": 1, "maximum": 60},
+                "wait_secs": {
+                    "type": "integer",
+                    "const": webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS,
+                    "minimum": 1,
+                    "maximum": webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
+                },
                 "wake_on": {"type": "string", "const": "terminal"}
             },
             "required": ["items", "wait_secs", "wake_on"]
@@ -545,7 +550,7 @@ pub fn cargo_test_count_assertion_schema() -> Value {
             },
             "evidence_reason_code": {
                 "type": "string",
-                "enum": ["complete_summary", "output_truncated", "partial_harness_summary", "no_complete_summary"],
+                "enum": ["complete_summary", "output_truncated", "partial_harness_summary", "no_complete_summary", "incomplete_stream"],
                 "description": "Why executed-test count evidence was proven or remained unavailable; this refines evidence diagnostics without changing the assertion verdict."
             }
         },

@@ -447,11 +447,11 @@ async fn receipts_protocol_violation_and_recovery_sweep_capture_final_evidence()
 }
 
 #[tokio::test]
-async fn receipts_validation_argv_is_omitted_and_inventory_cannot_restore_it() {
+async fn receipts_validation_provenance_is_restored_only_by_same_instance_inventory() {
     let store = Arc::new(MemoryReceipts::default());
     let a = durable(&store).await;
     register(&a, INSTANCE_A, empty_inventory()).await;
-    let (job, request) = start_and_take_over(&a, INSTANCE_A).await;
+    let (job, _) = start_and_take_over(&a, INSTANCE_A).await;
     {
         let mut inner = a.inner.lock().await;
         let record = inner.jobs_by_id.get_mut(&job.job_id).unwrap();
@@ -464,33 +464,66 @@ async fn receipts_validation_argv_is_omitted_and_inventory_cannot_restore_it() {
         current_step: None,
         failed_step: None,
     });
+    let test_count_evidence = ShellJobTestCountEvidence {
+        tests_detected: true,
+        tests_run_count: Some(6),
+        status: CargoTestCountEvidenceStatus::CompleteSummary,
+    };
+    terminal.test_count_evidence = Some(test_count_evidence.clone());
     a.update_job(terminal).await.unwrap();
-    assert!(store.rows.lock().unwrap()[0]
-        .snapshot
-        .context
-        .validation
-        .is_none());
+    let (receipt_snapshot, mut injected_receipt) = {
+        let rows = store.rows.lock().unwrap();
+        let stored = &rows[0].snapshot;
+        assert!(stored.context.validation.is_none());
+        assert!(
+            stored.test_count_evidence.is_none(),
+            "receipt must not detach test-count evidence from its omitted validation identity"
+        );
+        (stored.clone(), rows[0].clone())
+    };
+    injected_receipt.snapshot.test_count_evidence = Some(test_count_evidence.clone());
+    let injected_store = Arc::new(MemoryReceipts::default());
+    injected_store.rows.lock().unwrap().push(injected_receipt);
+    let rejected = durable(&injected_store).await;
+    assert!(
+        rejected.get_job(&job.job_id).await.is_err(),
+        "receipt hydration must reject provenance-free test-count evidence"
+    );
     drop(a);
-    let b = durable(&store).await;
-    let mut snapshot = snapshot_from_request(&job, &request, "completed", 2, stream("", 1, false));
-    snapshot.context.validation = cargo_validation_start_metadata(None, None, None).validation;
-    snapshot.context.validation_steps = vec!["test".into()];
-    snapshot.validation_progress = Some(ShellJobValidationProgress {
-        completed: 1,
-        current_step: None,
-        failed_step: None,
-    });
-    register(
-        &b,
-        INSTANCE_A,
-        ShellJobInventory {
-            active_complete: true,
-            jobs: vec![snapshot],
-        },
-    )
-    .await;
-    assert!(b.get_job(&job.job_id).await.unwrap().validation.is_none());
-    assert!(b.inner.lock().await.pending_by_id.is_empty());
+
+    let mut snapshot = receipt_snapshot;
+    let validation = cargo_validation_start_metadata(None, None, None).validation;
+    snapshot.context.validation = validation.clone();
+    snapshot.test_count_evidence = Some(test_count_evidence.clone());
+    let inventory = ShellJobInventory {
+        active_complete: true,
+        jobs: vec![snapshot],
+    };
+
+    let different_instance = durable(&store).await;
+    register(&different_instance, INSTANCE_B, inventory.clone()).await;
+    let still_historical = different_instance.get_job(&job.job_id).await.unwrap();
+    assert!(still_historical.validation.is_none());
+    assert!(still_historical.test_count_evidence.is_none());
+    drop(different_instance);
+
+    let mut drifted_inventory = inventory.clone();
+    drifted_inventory.jobs[0].duration_ms = Some(2_001);
+    let drifted_same_instance = durable(&store).await;
+    register(&drifted_same_instance, INSTANCE_A, drifted_inventory).await;
+    let still_unproven = drifted_same_instance.get_job(&job.job_id).await.unwrap();
+    assert!(still_unproven.validation.is_none());
+    assert!(still_unproven.test_count_evidence.is_none());
+    drop(drifted_same_instance);
+
+    let same_instance = durable(&store).await;
+    register(&same_instance, INSTANCE_A, inventory).await;
+    let restored = same_instance.get_job(&job.job_id).await.unwrap();
+    assert_eq!(restored.status, "completed");
+    assert_eq!(restored.validation, validation);
+    assert_eq!(restored.test_count_evidence, Some(test_count_evidence));
+    assert!(restored.recovered_after_server_restart);
+    assert!(same_instance.inner.lock().await.pending_by_id.is_empty());
 }
 
 #[tokio::test]

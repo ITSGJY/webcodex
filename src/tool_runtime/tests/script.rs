@@ -135,6 +135,7 @@ async fn update_script_job(
             error: error.map(str::to_string),
             command_execution_state: state,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: state.is_some(),
         })

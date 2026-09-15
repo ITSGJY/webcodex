@@ -781,7 +781,7 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         .unwrap()
         .contains("\"session_context_continuation\""));
     assert!(read_files_output.contains("context_projection"));
-    assert!(read_files_output.contains("post_tool"));
+    assert!(read_files_output.contains("post-tool context sidecar"));
     assert!(read_files_output.contains("ignored_invocation_metadata"));
     assert!(read_files_output.contains("accepted but not consumed by this target"));
     assert!(!read_files_output.contains("session_continuity"));
@@ -795,10 +795,13 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
     let context_output =
         &list_tools["outputSchema"]["properties"]["output"]["properties"]["context_projection"];
     assert_eq!(context_output["type"], "object");
-    assert_eq!(context_output["properties"]["timing"]["const"], "post_tool");
+    assert!(context_output["properties"].get("timing").is_none());
+    assert!(context_output["properties"]
+        .get("applies_to_current_effect")
+        .is_none());
     assert_eq!(
-        context_output["properties"]["applies_to_current_effect"]["const"],
-        false
+        context_output["required"],
+        json!(["materials", "truncated"])
     );
 
     let generic = registered_tool_specs()

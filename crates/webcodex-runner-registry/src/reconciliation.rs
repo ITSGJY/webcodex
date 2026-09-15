@@ -288,6 +288,20 @@ fn validate_snapshot(
     validate_context(client_id, projects, require_project_membership, snapshot)?;
     validate_stream_snapshot(&snapshot.stdout, "stdout")?;
     validate_stream_snapshot(&snapshot.stderr, "stderr")?;
+    if let Some(evidence) = snapshot.test_count_evidence.as_ref() {
+        let cargo_test = snapshot
+            .context
+            .validation
+            .as_ref()
+            .is_some_and(|metadata| {
+                metadata.tool == "cargo_test"
+                    && metadata.kind == "test"
+                    && metadata.no_run != Some(true)
+            });
+        if !cargo_test || !lifecycle.is_terminal() || !evidence.is_valid() {
+            return Err("job inventory test_count_evidence is inconsistent".to_string());
+        }
+    }
     if snapshot.context.validation_steps.is_empty() && snapshot.validation_progress.is_some() {
         return Err("job inventory validation_progress is unexpected".to_string());
     }
@@ -511,6 +525,40 @@ fn same_context(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
         && job.structured_execution == context.structured_execution
 }
 
+fn receipt_terminal_validation_enrichment_matches(
+    job: &ShellJobRecord,
+    runner_instance_id: &str,
+    snapshot: &ShellJobSnapshot,
+) -> bool {
+    let context = &snapshot.context;
+    job.lifecycle.is_terminal()
+        && job.observation.receipt_expires_at.is_some()
+        && job.runner_instance_id == runner_instance_id
+        && parse_job_lifecycle(&snapshot.status).ok() == Some(job.lifecycle)
+        && snapshot.update_seq == job.last_update_seq
+        && job.request_id.as_deref() == Some(snapshot.request_id.as_str())
+        && job.project_id == context.runtime_project_id
+        && job.session_id == context.workflow_session_id
+        && job.ssh_resource == context.ssh_resource
+        && job.cwd == context.cwd
+        && job.project_cwd == context.project_cwd
+        && job.purpose == context.purpose
+        && job.shell == context.shell
+        && job.command_preview == context.command_preview
+        && job.validation_steps == context.validation_steps
+        && job.structured_execution == context.structured_execution
+        && job.started_at == snapshot.started_at
+        && job.ended_at == snapshot.ended_at
+        && job.exit_code == snapshot.exit_code
+        && job.duration_ms == snapshot.duration_ms
+        && job.error == snapshot.error
+        && job.command_execution_state == snapshot.command_execution_state
+        && job.validation_progress == snapshot.validation_progress
+        && job.validation.is_none()
+        && job.test_count_evidence.is_none()
+        && context.validation.is_some()
+}
+
 fn detached_instance_transfer_allowed(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
     job.kind == "run_detached_process"
         && job
@@ -552,8 +600,10 @@ pub(super) fn preflight_inventory_locked(
             ));
         }
         if existing.lifecycle.is_terminal() && existing.observation.receipt_expires_at.is_some() {
-            // Historical receipts have no live lease or executable validation
-            // plan. Incoming inventory is ignored, never applied to this record.
+            // Historical receipts have no live lease. Reconciliation may later
+            // enrich validation provenance only when the same Runner instance
+            // proves the exact retained terminal execution; otherwise inventory
+            // remains non-authoritative for this historical record.
             continue;
         }
         let detached_instance_transfer = existing.runner_instance_id != runner_instance_id
@@ -698,6 +748,7 @@ pub(crate) fn record_from_snapshot(
         validation_steps: context.validation_steps.clone(),
         validation: context.validation.clone(),
         validation_progress: snapshot.validation_progress.clone(),
+        test_count_evidence: snapshot.test_count_evidence.clone(),
         activity: snapshot.activity,
         visibility: super::state::ShellJobVisibility::Public,
         last_update_seq: snapshot.update_seq,
@@ -731,6 +782,7 @@ fn apply_snapshot(
     job.command_execution_state = snapshot.command_execution_state;
     job.structured_execution = snapshot.context.structured_execution.clone();
     job.validation_progress = snapshot.validation_progress.clone();
+    job.test_count_evidence = snapshot.test_count_evidence.clone();
     job.activity = snapshot.activity;
     job.validation = snapshot.context.validation.clone();
     replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
@@ -1037,9 +1089,20 @@ pub(super) fn reconcile_inventory_locked(
             });
         if let Some(existing) = inner.jobs_by_id.get_mut(&snapshot.job_id) {
             if existing.lifecycle.is_terminal() {
-                // A server-authoritative terminal state (deadline, replacement,
-                // or a previously accepted terminal result) never revives or
-                // changes terminal class.
+                // A Server-authoritative terminal state never revives or changes
+                // terminal class. A receipt-restored record may, however, regain
+                // the validation provenance the receipt deliberately omitted when
+                // the exact same Runner terminal snapshot proves the same execution.
+                if receipt_terminal_validation_enrichment_matches(
+                    existing,
+                    runner_instance_id,
+                    snapshot,
+                ) {
+                    existing.validation = snapshot.context.validation.clone();
+                    existing.test_count_evidence = snapshot.test_count_evidence.clone();
+                    notify_job_update(existing);
+                    summary.updated += 1;
+                }
                 continue;
             }
             let detached_instance_transfer = existing.runner_instance_id != runner_instance_id

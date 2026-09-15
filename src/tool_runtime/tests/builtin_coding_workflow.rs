@@ -52,20 +52,21 @@ fn builtin_coding_workflow_defaults_cover_unnamed_tasks_without_granting_authori
         "explicit action and target",
         "nested rules for changed paths",
         "recover truncated instructions",
-        "highest expected correctness and reliability",
-        "apply_text_edits for small precise local edits",
-        "bounded deterministic Python transformation through run_shell",
-        "first-class option",
-        "do not bypass permission/path policy",
-        "avoid network unless required and authorized",
+        "simplest reliable primitive",
+        "correctness, authority, evidence, durability, recovery, and portability",
+        "Native commands are first-class for bounded work",
+        "specialize for added semantics",
+        "apply_text_edits for local exact edits",
+        "bounded deterministic Python/run_shell transforms",
+        "Respect path/permission/network authority",
         "inspect the resulting diff and validate final source",
         "only where the exposed schema supports it",
         "unknown outcome",
-        "independent read-only inspection",
+        "read-only inspection",
         "short sync_wait_secs",
         "same-execution Job handoff",
-        "do not fan out heavy validations",
-        "stale/cache-warmup",
+        "avoid validation fanout",
+        "stales prior results",
         "final source needs fresh validation",
         "advisory evidence, not proof",
     ] {
@@ -81,11 +82,12 @@ fn builtin_coding_workflow_routes_persistent_shell_to_ssh_state_not_local_comman
         .expect("persistent shell guidance");
 
     for boundary in [
-        "primarily for repeated remote commands",
-        "one named SSH resource",
-        "remote cwd/env/exports/functions/umask",
-        "structured tools -> run_process/run_script -> run_shell",
-        "local persistent shell only when same-process state is required",
+        "run_process=literal argv",
+        "run_shell=shell grammar/short chains",
+        "run_script=program-like scripts",
+        "specialize for added semantics",
+        "repeated named-SSH state",
+        "local same-process state",
     ] {
         assert!(
             guidance.contains(boundary),
@@ -93,6 +95,7 @@ fn builtin_coding_workflow_routes_persistent_shell_to_ssh_state_not_local_comman
         );
     }
     assert!(!guidance.contains("For repeated commands in one Workflow Session"));
+    assert!(!guidance.contains("structured tools -> run_process/run_script -> run_shell"));
 }
 
 #[test]

@@ -13,13 +13,13 @@ pub use job::{
     RunnerShellJobResult, ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource,
     ShellJobActivityState, ShellJobCodexMetadata, ShellJobContext, ShellJobInfo, ShellJobInventory,
     ShellJobLogSnapshot, ShellJobOpRequest, ShellJobOpResponse, ShellJobSnapshot,
-    ShellJobStreamSnapshot, ShellJobStructuredExecutionMetadata, ShellJobValidationMetadata,
-    ShellJobValidationProgress, ShellJobValidationStep, CARGO_TEST_MIN_TESTS_MAX,
-    CARGO_VALUE_MAX_BYTES, GO_TEST_PACKAGE_MAX_BYTES, GO_TEST_PACKAGE_MAX_ITEMS,
-    JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
-    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
-    RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN, RUST_TEST_FILTER_MAX_BYTES,
-    VALIDATION_ASSERTION_NAME_MAX_CHARS,
+    ShellJobStreamSnapshot, ShellJobStructuredExecutionMetadata, ShellJobTestCountEvidence,
+    ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
+    CARGO_TEST_MIN_TESTS_MAX, CARGO_VALUE_MAX_BYTES, GO_TEST_PACKAGE_MAX_BYTES,
+    GO_TEST_PACKAGE_MAX_ITEMS, JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS,
+    JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
+    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, RUNNER_JOB_CONCURRENCY_MAX,
+    RUNNER_JOB_CONCURRENCY_MIN, RUST_TEST_FILTER_MAX_BYTES, VALIDATION_ASSERTION_NAME_MAX_CHARS,
 };
 
 pub use transport::{
@@ -2851,6 +2851,7 @@ mod envelope_tests {
                 },
                 stderr: ShellJobStreamSnapshot::default(),
                 validation_progress: None,
+                test_count_evidence: None,
                 activity: None,
             }],
         }
@@ -3488,6 +3489,7 @@ mod envelope_tests {
                 error: None,
                 command_execution_state: None,
                 validation_progress: None,
+                test_count_evidence: None,
                 activity: None,
                 finished: false,
             },
@@ -3849,6 +3851,7 @@ mod envelope_tests {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         };

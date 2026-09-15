@@ -305,7 +305,7 @@ canonical authority mode.
 | Default (unset/empty) | `trusted_agent`; source reported as `default` |
 | `trusted_agent` | Consequential runtime tools auto-execute after hard safety with no approval interruptions; external release actions remain user-task-scoped; every permission-bearing call records an auditable ledger decision (`policy=trusted_agent`, `status=auto_approved`, `reason=trusted_agent_authority`) |
 | `restricted` | Runtime tools deny (`restricted_requires_human_authorization`); connector `commands_run` keeps the one-time human approval loop |
-| Legacy env set | Invalid configuration; consequential tools fail closed with `invalid_authority_mode:...` and source `rejected_legacy_env:WEBCODEX_PERMISSION_MODE`. No alias, no migration |
+| Legacy env set | Unambiguous legacy values migrate: `dev_auto_approve` → `trusted_agent`, `require_approval` → `restricted`; legacy-only configuration reports `migrated_env:WEBCODEX_PERMISSION_MODE`. Unknown or conflicting legacy/current values remain invalid and fail closed with source `rejected_legacy_env:WEBCODEX_PERMISSION_MODE` |
 | Shared surfaces | Both modes share the same tool implementations, schemas, session model, evidence, and audit records |
 | Projection | `runtime_status` and internal full startup diagnostics report one canonical `authority` object; the sparse external `work_on_project` projection omits it. The old `permissions` profile object is deleted |
 | Connector | Under `trusted_agent`, `commands_run` records a durable `authority_auto_authorized` task event instead of approval records or `approval_required` interruptions |

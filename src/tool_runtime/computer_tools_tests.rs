@@ -218,7 +218,7 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
     );
     assert_eq!(unknown.output["error_kind"], "outcome_unknown");
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(unknown.output["recovery_kind"], "reobserve");
+    assert!(unknown.output.get("recovery_kind").is_none());
     assert_computer_suggested_call(
         &unknown,
         "computer_list_windows",
@@ -263,7 +263,7 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
         assert_eq!(result.output["state_changed"], false);
         let serialized = serde_json::to_string(&result.output).unwrap();
         if error.starts_with("stale_application") {
-            assert_eq!(result.output["recovery_kind"], "reobserve");
+            assert!(result.output.get("recovery_kind").is_none());
             assert_computer_suggested_call(
                 &result,
                 "computer_list_applications",
@@ -1632,7 +1632,7 @@ fn computer_save_snapshot_lifecycle_distinguishes_not_started_from_unknown() {
     assert!(!unknown.success);
     assert_eq!(unknown.output["error_kind"], "outcome_unknown");
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(unknown.output["recovery_kind"], "reconcile");
+    assert!(unknown.output.get("recovery_kind").is_none());
     assert_computer_suggested_call(
         &unknown,
         "read_project_artifact_metadata",

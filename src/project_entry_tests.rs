@@ -638,6 +638,7 @@ async fn complete_project_job(
                 current_step: None,
                 failed_step: None,
             }),
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })

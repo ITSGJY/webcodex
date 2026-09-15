@@ -63,6 +63,7 @@ fn sink_send_job_update_sends_job_update_envelope() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         };
@@ -124,6 +125,7 @@ fn sink_try_send_job_update_preserves_full_ws_and_quic_queue_for_retry() {
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         };

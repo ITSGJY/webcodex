@@ -140,6 +140,7 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: false,
         })
@@ -172,6 +173,7 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
                 crate::runner_protocol::ShellCommandExecutionState::Completed,
             ),
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })

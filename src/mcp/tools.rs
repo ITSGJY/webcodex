@@ -394,8 +394,6 @@ fn mcp_context_projection_output_schema() -> Value {
         "type": "object",
         "description": "Optional bounded post-tool context sidecar. It describes material projected after the main effect/observation and never grants authority or retroactively governs that effect.",
         "properties": {
-            "timing": {"type": "string", "const": "post_tool"},
-            "applies_to_current_effect": {"type": "boolean", "const": false},
             "materials": {
                 "type": "array",
                 "maxItems": crate::tool_runtime::context_projection::MAX_CONTEXT_REQUEST_ITEMS,
@@ -413,7 +411,7 @@ fn mcp_context_projection_output_schema() -> Value {
             },
             "truncated": {"type": "boolean"}
         },
-        "required": ["timing", "applies_to_current_effect", "materials", "truncated"],
+        "required": ["materials", "truncated"],
         "additionalProperties": false
     })
 }

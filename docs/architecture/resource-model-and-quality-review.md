@@ -217,7 +217,7 @@ Plugin 已有 `NotStarted / OutcomeUnknown / Completed`，见 [plugin.rs](../../
 
 ### 5.4 将模型上下文视为按需查询的投影
 
-当前 context sidecar 明确 `post_tool` 与 `applies_to_current_effect=false`，见 [context_projection.rs](../../src/tool_runtime/context_projection.rs)，120–126。这是好的读模型边界。
+当前 context sidecar 的 contract 明确它只在主 effect/observation 之后投影，且不追溯授权或治理当前 effect；该静态语义保留在 `context_request` / `context_projection` 描述中，不再作为每次结果重复字段。见 [context_projection.rs](../../src/tool_runtime/context_projection.rs)。
 
 可逐步增加按需刷新与来源版本说明，避免每次重复大段目录；但要保留请求级 ACK 对模型上下文保留状态的意义，不能用 session id、窗口身份或服务器缓存命中替代。summary、read body、execute schema 应分别预算。
 

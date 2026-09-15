@@ -1530,6 +1530,7 @@ mod phase_e2_status_tests {
                 codex: None,
                 result: None,
                 validation_progress: None,
+                test_count_evidence: None,
                 activity: None,
                 validation: None,
                 recovery_state: None,

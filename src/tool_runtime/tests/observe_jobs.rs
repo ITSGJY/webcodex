@@ -90,6 +90,7 @@ async fn update_observed_job(
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity,
             finished,
         })
@@ -149,10 +150,6 @@ fn canonical_observation(
         "recovery_reason_code": null,
         "recovery_reason": null,
         "observation_token": format!("wjob1:a:{job_id}:fixture_epoch:7"),
-        "continuation_semantics": {
-            "kind": "observe",
-            "carrier": "observation_token"
-        },
         "log_delta_status": log_delta_status,
         "stdout_delta_reset": false,
         "stderr_delta_reset": false,
@@ -207,8 +204,7 @@ fn canonical_batch(items: Vec<Value>, wait_outcome: &str, waited_ms: u64) -> Too
         "wait": {"outcome": wait_outcome, "waited_ms": waited_ms},
         "changed_count": changed_count,
         "terminal_count": terminal_count,
-        "output_truncated": false,
-        "next_index": null
+        "output_truncated": false
     }))
 }
 
@@ -335,7 +331,7 @@ fn observe_jobs_tool_call_enforces_batch_and_scalar_bounds() {
         )
         .is_err());
     }
-    for wait_secs in [1, 60, 61, 120] {
+    for wait_secs in [1, 100, 101, 120] {
         assert!(ToolCall::from_tool_name(
             "observe_jobs",
             json!({"items": [{"job_id": "job"}], "wait_secs": wait_secs})
@@ -806,7 +802,6 @@ fn observe_jobs_compact_projection_preserves_mixed_failure_and_budget_recovery()
         "success": false,
         "output": null,
         "error_kind": "unknown_job",
-        "recovery_kind": "reobserve",
         "suggested_call": {"tool": "list_jobs", "arguments": {}},
         "error": "unknown job: missing-job"
     });
@@ -949,7 +944,7 @@ fn observe_jobs_projection_reports_deterministic_byte_measurements() {
             ),
             json!({
                 "index": 1, "job_id": "missing-measure", "success": false,
-                "output": null, "error_kind": "unknown_job", "recovery_kind": "reobserve",
+                "output": null, "error_kind": "unknown_job",
                 "suggested_call": {"tool": "list_jobs", "arguments": {}},
                 "error": "unknown job: missing-measure"
             }),
@@ -1280,7 +1275,7 @@ async fn observe_jobs_terminal_transition_wakes_shared_wait() {
                         item(&waiting_job, Some(token)),
                     ],
                     tail_lines: 40,
-                    wait_secs: Some(5),
+                    wait_secs: Some(100),
                     wake_on: ObserveJobsWakeOn::Terminal,
                 },
                 Some(&waiting_auth),
@@ -1301,7 +1296,7 @@ async fn observe_jobs_terminal_transition_wakes_shared_wait() {
 
     let result = tokio::time::timeout(Duration::from_secs(2), task)
         .await
-        .expect("terminal must wake well before five seconds")
+        .expect("terminal must wake well before the 100-second maximum")
         .unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["wait"]["outcome"], "terminal");
@@ -1400,6 +1395,7 @@ async fn ordinary_receipts_production_sqlite_dual_restart_observe_and_list_filte
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: None,
             finished: true,
         })
@@ -1565,6 +1561,7 @@ async fn observe_jobs_terminal_policy_coalesces_noisy_jobs_with_one_deadline_and
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
             activity: Some(process_activity()),
             finished: false,
         })
@@ -1700,7 +1697,7 @@ fn observe_jobs_canonical_continuation_is_parser_ready_with_or_without_baseline(
         assert!(matches!(
             parsed,
             ToolCall::ObserveJobs {
-                wait_secs: Some(60),
+                wait_secs: Some(100),
                 wake_on: ObserveJobsWakeOn::Terminal,
                 ..
             }

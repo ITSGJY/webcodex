@@ -463,7 +463,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "recommended_flows",
                 array_schema(
-                    open_object_schema("Recommended tool flow with name, purpose, and tools; filtered partial projections also identify partial=true and omitted_tools."),
+                    open_object_schema("Recommended tool flow with name, purpose, and tools; filtered partial projections also identify partial=true and omitted_tools for canonical members not selected into that projection."),
                     "Short list of recommended tool flows for common tasks.",
                 ),
             ),

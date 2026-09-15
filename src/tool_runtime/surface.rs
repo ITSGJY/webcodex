@@ -1037,7 +1037,7 @@ where
             Some(json!({
                 "name": flow.name,
                 "purpose": format!(
-                    "Partial projection of the canonical flow; omitted_tools lists unavailable members. {}",
+                    "Partial projection of the canonical flow; omitted_tools lists canonical members not selected into this projection. {}",
                     flow.manifest_purpose
                 ),
                 "tools": tools,

@@ -40,14 +40,18 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let read_files_desc = desc("read_files");
     for phrase in [
-        "adaptive runtime preferred batch-capable inspect tool",
-        "only one known range",
+        "batch/snapshot-aware project inspect",
+        "read_revision",
+        "snapshot-bound continuation",
+        "protected-path policy",
+        "range normalization",
+        "small known one-off observation",
+        "without downstream snapshot dependency",
+        "native file commands",
         "no fake continuation",
         "512 kib",
         "exact resolved project",
         "business session_id",
-        "read_revision",
-        "single output-level suggested_call",
         "continued ranges are fenced",
         "runtime rejects a continuation",
     ] {
@@ -58,11 +62,30 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     }
 
     let batch_search_desc = desc("search_project_texts");
+    for obsolete in [
+        "adaptive runtime preferred batch-capable inspect tool",
+        "including when only one known range is needed",
+    ] {
+        assert!(
+            !read_files_desc.contains(obsolete),
+            "obsolete read ritual: {read_files_desc}"
+        );
+    }
+
     for phrase in [
+        "batch-capable project-text search",
+        "bounded structured results",
+        "protected-path policy",
+        "isolated failures",
+        "portable runtime search semantics",
+        "small known-scope search",
+        "native rg via run_process is first-class",
         "pattern_mode=literal",
         "request context explicitly",
         "whole-query",
-        "authoritative next_index",
+        "parser-ready suggested_call",
+        "fits the model result budget",
+        "without a raw cursor or fake call",
         "no safe match cursor",
         "refined",
     ] {
@@ -71,13 +94,13 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "search_project_texts description should mention {phrase}: {batch_search_desc}"
         );
     }
-    for phrase in [
+    for obsolete in [
         "adaptive runtime preferred batch-capable project-text search",
-        "only one query",
+        "including when only one query is needed",
     ] {
         assert!(
-            batch_search_desc.contains(phrase),
-            "search_project_texts description should mention {phrase}: {batch_search_desc}"
+            !batch_search_desc.contains(obsolete),
+            "obsolete search ritual returned: {batch_search_desc}"
         );
     }
 
@@ -171,9 +194,11 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let show_changes_desc = desc("show_changes");
     for phrase in [
-        "default inspect/review tool",
-        "before final response",
-        "bounded hunks",
+        "canonical bounded workspace-wide review",
+        "worktree overview",
+        "compact session signals",
+        "structured closeout evidence",
+        "tiny targeted git observations need not call it first",
         "diff_review_handoff",
         "git_diff_hunks",
     ] {
@@ -184,10 +209,27 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     }
 
     let git_diff_hunks = spec_named(&specs, "git_diff_hunks");
+    assert!(!show_changes_desc.contains("default inspect/review tool before final response"));
+
+    let git_review_summary_desc = desc("git_review_summary");
+    for phrase in [
+        "broad or unknown ranges",
+        "file/change map",
+        "targeted git_diff_hunks/read_files",
+        "small bounded understood committed diffs may use native git directly",
+        "never mutates",
+    ] {
+        assert!(
+            git_review_summary_desc.contains(phrase),
+            "git_review_summary description should mention {phrase}: {git_review_summary_desc}"
+        );
+    }
+
     let git_diff_hunks_desc = git_diff_hunks.description.to_lowercase();
     for phrase in [
         "targeted/paged",
-        "scope/fence-bound",
+        "scope/fence-bound opaque continuation",
+        "safe bounded traversal",
         "max_page_bytes",
         "raw producer page",
         "shared safe producer maximum",
@@ -346,13 +388,47 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     for name in ["cargo_check", "cargo_test"] {
         let validation_desc = desc(name);
         assert!(
-            validation_desc.contains("preferred structured"),
-            "{name} should be described as preferred structured validation: {validation_desc}"
+            validation_desc.contains("structured") && validation_desc.contains("common supported"),
+            "{name} should explain the structured option's supported semantics: {validation_desc}"
+        );
+        for phrase in ["validation identity", "same execution job handoff"] {
+            assert!(
+                validation_desc.contains(phrase),
+                "{name} should explain structured evidence semantics {phrase}: {validation_desc}"
+            );
+        }
+        assert!(
+            !validation_desc.contains("preferred structured"),
+            "{name} must not encode structure as an unconditional preference: {validation_desc}"
         );
         assert!(
             !validation_desc.contains("run_shell"),
-            "{name} should express structured preference without sibling-tool name pollution: {validation_desc}"
+            "{name} should stay focused on its own differentiating semantics: {validation_desc}"
         );
+    }
+    let cargo_test_desc = desc("cargo_test");
+    for phrase in [
+        "executed-test evidence",
+        "min_tests/require_tests",
+        "bounded output",
+    ] {
+        assert!(cargo_test_desc.contains(phrase), "cargo_test: {phrase}");
+    }
+    let go_test_desc = desc("go_test");
+    for phrase in [
+        "structured option for common supported",
+        "go json test-count evidence",
+    ] {
+        assert!(go_test_desc.contains(phrase), "go_test: {phrase}");
+    }
+    assert!(!go_test_desc.contains("preferred structured"));
+    let cargo_fmt_desc = desc("cargo_fmt");
+    for phrase in [
+        "ensure rust formatting",
+        "precheck",
+        "changed/state_changed",
+    ] {
+        assert!(cargo_fmt_desc.contains(phrase), "cargo_fmt: {phrase}");
     }
 
     let workspace_hygiene_desc = desc("workspace_hygiene_check");
@@ -947,6 +1023,10 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         .find(|spec| spec.name == "observe_jobs")
         .unwrap();
     let wake = &spec.input_schema["properties"]["wake_on"];
+    assert_eq!(
+        webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS,
+        100
+    );
     assert_eq!(wake["enum"], serde_json::json!(["change", "terminal"]));
     assert_eq!(wake["default"], "change");
     assert!(!spec.input_schema["required"]
@@ -958,8 +1038,14 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         "no wait_secs",
         "wake_on=change",
         "wake_on=terminal",
+        "wait_secs=100",
         "changed=true",
     ] {
         assert!(spec.description.contains(phrase), "missing {phrase}");
     }
+    let wait_description = spec.input_schema["properties"]["wait_secs"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(wait_description.contains("above 100 seconds"));
+    assert!(wait_description.contains("clamped to 100"));
 }

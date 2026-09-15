@@ -28,7 +28,6 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
                 "application_id": application_id,
                 "state_changed": false,
                 "execution_state": "not_started",
-                "recovery_kind": "reobserve",
                 "suggested_call": {
                     "tool": "computer_list_applications",
                     "arguments": {"client_id": "msi"}
@@ -53,12 +52,9 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
     inferred_argument["output"]["suggested_call"]["arguments"]["surface_id"] =
         json!("surface_should_not_be_inferred");
     assert!(validate(&inferred_argument).is_err());
-    let mut invalid_recovery = stale.clone();
-    invalid_recovery["output"]["recovery_kind"] = json!("blind_retry");
-    assert!(validate(&invalid_recovery).is_err());
-    let mut invalid_tool_class = stale.clone();
-    invalid_tool_class["output"]["recovery_kind"] = json!("fix_input");
-    assert!(validate(&invalid_tool_class).is_err());
+    let mut duplicate_kind = stale.clone();
+    duplicate_kind["output"]["recovery_kind"] = json!("reobserve");
+    assert!(validate(&duplicate_kind).is_err());
 
     let mut recovery_on_success =
         serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({

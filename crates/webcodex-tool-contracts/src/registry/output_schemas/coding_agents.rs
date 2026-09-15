@@ -1,10 +1,6 @@
 use serde_json::{json, Value};
 
-use super::common::{
-    array_schema, continuation_semantics_schema, nullable_schema, schema_type,
-    wrapped_output_schema,
-};
-use webcodex_core::runtime_contract::{ContinuationCarrier, ContinuationKind};
+use super::common::{array_schema, nullable_schema, schema_type, wrapped_output_schema};
 
 fn state_schema() -> Value {
     json!({"type":"string","enum":["starting","running","waiting_permission","completed","failed","cancelled","lost"]})
@@ -107,25 +103,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "observation_token",
                 schema_type("string", "Opaque Run-bound observation token."),
             ));
-            fields.push((
-                "continuation_semantics",
-                continuation_semantics_schema(
-                    ContinuationKind::Observe,
-                    ContinuationCarrier::ObservationToken,
-                    "The CodingAgentRun observation token is a run-bound stream cursor for later coding_agent_observe calls; it is not retry authority or an idempotency key.",
-                ),
-            ));
             Some(wrapped_output_schema(fields))
         }
         "coding_agent_observe" => {
             fields.extend([
                 ("events", array_schema(event_schema(), "Only-new retained normalized CodingAgentRun events; raw ACP JSON is never exposed.")),
                 ("observation_token", schema_type("string", "Opaque Run-bound token for the next observation.")),
-                ("continuation_semantics", continuation_semantics_schema(
-                    ContinuationKind::Observe,
-                    ContinuationCarrier::ObservationToken,
-                    "The returned token continues observation of this exact CodingAgentRun and must be passed back through the domain's after_observation_token input; token encoding remains CodingAgent-owned.",
-                )),
                 ("has_more", schema_type("boolean", "True when retained newer events remain after this page.")),
                 ("history_lost", schema_type("boolean", "True when the requested cursor predates retained history or the Server epoch rebaselined.")),
                 ("first_retained_sequence", schema_type("integer", "First currently retained Runner event sequence.")),

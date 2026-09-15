@@ -709,10 +709,7 @@ fn apply_computer_recovery_contract(schema: &mut Value) {
         }),
         json!({
             "if": {"required": ["suggested_call"]},
-            "then": {
-                "required": ["recovery_kind"],
-                "properties": {"recovery_kind": {"enum": ["reobserve", "reconcile"]}}
-            }
+            "then": {"not": {"required": ["recovery_kind"]}}
         }),
         json!({
             "if": {"required": ["reconcile_with"]},

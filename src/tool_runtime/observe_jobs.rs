@@ -1,8 +1,7 @@
 //! Bounded multi-Job observation composed from the canonical single-Job path.
 
 use super::{
-    ContinuationCarrier, ContinuationKind, ContinuationSemantics, ObserveJobsItem,
-    ObserveJobsWakeOn, RecoveryKind, SuggestedToolCall, ToolResult, ToolRuntime,
+    ObserveJobsItem, ObserveJobsWakeOn, RecoveryKind, SuggestedToolCall, ToolResult, ToolRuntime,
 };
 use crate::auth::AuthContext;
 use crate::json_measurement::serialized_json_len;
@@ -11,12 +10,13 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::Instant;
-use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES;
+use webcodex_core::runtime_contract::{
+    MAX_JOB_OBSERVATION_WAIT_SECS, MODEL_INSPECTION_MAX_RESULT_BYTES,
+};
 use webcodex_workspace::file_read_normalize::MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
 
 pub(crate) const MAX_OBSERVE_JOBS_ITEMS: usize = 8;
 pub(crate) const MAX_OBSERVE_JOBS_TAIL_LINES: usize = 200;
-const MAX_OBSERVE_JOBS_WAIT_SECS: u64 = 60;
 /// Final serialized model-facing budget for packing multiple already-bounded
 /// Job observations. This does not change any single Job stream/tail retention.
 const MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES: usize = MODEL_INSPECTION_MAX_RESULT_BYTES;
@@ -111,6 +111,7 @@ fn batch_item(observed: ObservedJob) -> Value {
             // fact to the model.
             output.remove("wait_outcome");
             output.remove("waited_ms");
+            output.remove("continuation_semantics");
         }
         json!({
             "index": observed.index,
@@ -129,11 +130,12 @@ fn batch_item(observed: ObservedJob) -> Value {
             "success": false,
             "output": null,
             "error_kind": error_kind,
-            "recovery_kind": recovery_kind.as_str(),
             "error": bounded_error(observed.result.error.as_deref()),
         });
         if error_kind == "unknown_job" {
             item["suggested_call"] = SuggestedToolCall::new("list_jobs", json!({})).to_value();
+        } else {
+            item["recovery_kind"] = json!(recovery_kind.as_str());
         }
         item
     }
@@ -191,14 +193,50 @@ fn batch_output(
         "changed_count": changed_count,
         "terminal_count": terminal_count,
         "output_truncated": output_truncated,
-        "next_index": next_index,
     });
-    if next_index.is_some() {
-        output["continuation_semantics"] =
-            ContinuationSemantics::new(ContinuationKind::Batch, ContinuationCarrier::Index)
-                .to_value();
+    if let Some(next_index) = next_index {
+        output["next_index"] = json!(next_index);
     }
     output
+}
+
+fn observe_jobs_item_argument_value(item: &ObserveJobsItem) -> Value {
+    let mut value = json!({"job_id": item.job_id});
+    if let Some(token) = item.after_observation_token.as_deref() {
+        value["after_observation_token"] = json!(token);
+    }
+    value
+}
+
+fn add_actionable_batch_continuation(
+    output: &mut Value,
+    original_items: &[ObserveJobsItem],
+    tail_lines: usize,
+) {
+    let Some(root) = output.as_object_mut() else {
+        return;
+    };
+    let Some(next_index) = root.get("next_index").and_then(Value::as_u64) else {
+        return;
+    };
+    let Some(remaining) = original_items
+        .get(next_index as usize..)
+        .filter(|items| !items.is_empty())
+    else {
+        return;
+    };
+    root.insert(
+        "suggested_call".to_string(),
+        SuggestedToolCall::new(
+            "observe_jobs",
+            json!({
+                "items": remaining.iter().map(observe_jobs_item_argument_value).collect::<Vec<_>>(),
+                "tail_lines": tail_lines,
+            }),
+        )
+        .to_value(),
+    );
+    root.remove("next_index");
 }
 
 fn serialized_batch_fits(output: &Value) -> bool {
@@ -456,8 +494,17 @@ pub(crate) fn sparsify_observe_jobs_model_result(result: &mut ToolResult) {
     let Some(output) = result.output.as_object_mut() else {
         return;
     };
+    if output.get("output_truncated").and_then(Value::as_bool) == Some(true) {
+        if output.get("suggested_call").is_some() {
+            output.remove("next_index");
+            output.remove("continuation_semantics");
+        }
+        return;
+    }
     if output.get("output_truncated").and_then(Value::as_bool) != Some(false)
-        || !output.get("next_index").is_some_and(Value::is_null)
+        || output
+            .get("next_index")
+            .is_some_and(|value| !value.is_null())
     {
         return;
     }
@@ -535,7 +582,7 @@ fn normalize_observe_jobs_preferences(
 ) -> (usize, Option<u64>) {
     (
         tail_lines.min(MAX_OBSERVE_JOBS_TAIL_LINES),
-        wait_secs.map(|wait_secs| wait_secs.min(MAX_OBSERVE_JOBS_WAIT_SECS)),
+        wait_secs.map(|wait_secs| wait_secs.min(MAX_JOB_OBSERVATION_WAIT_SECS)),
     )
 }
 
@@ -744,7 +791,10 @@ impl ToolRuntime {
 
         let completed = observed.into_iter().map(batch_item).collect();
         match apply_output_budget(requested_count, completed, wake_reason, waited_ms) {
-            Ok(output) => ToolResult::ok(output),
+            Ok(mut output) => {
+                add_actionable_batch_continuation(&mut output, &items, tail_lines);
+                ToolResult::ok(output)
+            }
             Err(error) => ToolResult::err(error),
         }
     }
@@ -768,7 +818,7 @@ mod tests {
             normalize_observe_jobs_preferences(500, Some(120)),
             (
                 MAX_OBSERVE_JOBS_TAIL_LINES,
-                Some(MAX_OBSERVE_JOBS_WAIT_SECS)
+                Some(MAX_JOB_OBSERVATION_WAIT_SECS)
             )
         );
         assert_eq!(
@@ -785,7 +835,7 @@ mod tests {
             result: ToolResult::err("unknown job: job-missing"),
         });
         assert_eq!(missing["error_kind"], "unknown_job");
-        assert_eq!(missing["recovery_kind"], "reobserve");
+        assert!(missing.get("recovery_kind").is_none());
         assert!(missing.get("recovery_tool").is_none());
         let suggested = &missing["suggested_call"];
         assert_eq!(suggested, &json!({"tool": "list_jobs", "arguments": {}}));
@@ -828,6 +878,45 @@ mod tests {
         assert!(success.get("recovery_kind").is_none());
         assert!(success.get("recovery_tool").is_none());
         assert!(success.get("suggested_call").is_none());
+    }
+
+    #[test]
+    fn batch_continuation_is_parser_ready_and_omits_absent_tokens() {
+        let originals = vec![
+            ObserveJobsItem {
+                job_id: "job-0".to_string(),
+                after_observation_token: Some("token-0".to_string()),
+            },
+            ObserveJobsItem {
+                job_id: "job-1".to_string(),
+                after_observation_token: None,
+            },
+            ObserveJobsItem {
+                job_id: "job-2".to_string(),
+                after_observation_token: Some("token-2".to_string()),
+            },
+        ];
+        let mut output = json!({
+            "output_truncated": true,
+            "next_index": 1,
+        });
+        add_actionable_batch_continuation(&mut output, &originals, 17);
+        assert!(output.get("next_index").is_none());
+        let suggested = &output["suggested_call"];
+        assert_eq!(suggested["tool"], "observe_jobs");
+        assert_eq!(suggested["arguments"]["tail_lines"], 17);
+        assert!(suggested["arguments"].get("wait_secs").is_none());
+        assert!(suggested["arguments"].get("wake_on").is_none());
+        let items = suggested["arguments"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["job_id"], "job-1");
+        assert!(items[0].get("after_observation_token").is_none());
+        assert_eq!(items[1]["after_observation_token"], "token-2");
+        crate::tool_runtime::ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .expect("aggregate Job follow-up must be parser-ready");
     }
 
     #[test]
@@ -885,7 +974,7 @@ mod tests {
         // but fit comfortably inside the explicit 512 KiB model-facing packer.
         assert_eq!(output["returned_count"], 4);
         assert_eq!(output["output_truncated"], false);
-        assert!(output["next_index"].is_null());
+        assert!(output.get("next_index").is_none());
         assert_eq!(output["wait"]["outcome"], "immediate");
         assert!(
             serde_json::to_vec(&ToolResult::ok(output)).unwrap().len()

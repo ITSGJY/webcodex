@@ -7,6 +7,7 @@ pub mod artifact_policy;
 pub mod audit_preview;
 pub mod authority;
 pub mod build_info;
+pub mod cargo_test_count;
 pub mod coding_agent;
 pub mod job_observation;
 pub mod lsp_bridge;

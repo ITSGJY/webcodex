@@ -8,6 +8,7 @@ use webcodex_core::runner_protocol::{
     SCRIPT_ARG_MAX_BYTES, SCRIPT_ARG_MAX_COUNT, SCRIPT_CWD_MAX_BYTES, SCRIPT_MAX_BYTES,
     SCRIPT_STDIN_MAX_BYTES,
 };
+use webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS;
 use webcodex_core::workflow_session_contract::{
     EXECUTION_PURPOSE_VALUES, MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
     TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
@@ -454,7 +455,7 @@ pub fn observe_jobs_input_schema() -> Value {
             "wait_secs": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Optional one shared bounded wait (a maximum), never a minimum sleep or multiplied by item count. Omission or any item without a token returns an immediate observation/baseline. Values above 60 seconds are clamped to 60. With tokens, wake_on selects early wake behavior; updates never extend the deadline."
+                "description": format!("Optional one shared bounded wait (a maximum), never a minimum sleep or multiplied by item count. Omission or any item without a token returns an immediate observation/baseline. Values above {MAX_JOB_OBSERVATION_WAIT_SECS} seconds are clamped to {MAX_JOB_OBSERVATION_WAIT_SECS}. With tokens, wake_on selects early wake behavior; updates never extend the deadline.")
             },
             "wake_on": {
                 "type": "string",

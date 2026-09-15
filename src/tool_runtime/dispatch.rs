@@ -358,6 +358,9 @@ fn add_run_process_expectation_projection(
 enum SearchModelProjection {
     None,
     Batch {
+        project: String,
+        queries: Vec<super::SearchProjectTextsQuery>,
+        session_id: Option<String>,
         default_timeouts: Vec<bool>,
         max_result_bytes: Option<usize>,
     },
@@ -367,15 +370,21 @@ impl SearchModelProjection {
     fn capture(call: &ToolCall) -> Self {
         match call {
             ToolCall::SearchProjectTexts {
+                project,
                 queries,
+                session_id,
                 max_result_bytes,
-                ..
             } => Self::Batch {
+                project: project.clone(),
+                queries: queries.clone(),
+                session_id: session_id.clone(),
                 default_timeouts: queries
                     .iter()
                     .map(|query| caller_uses_default_search_timeout(&query.timeout_secs))
                     .collect(),
-                max_result_bytes: *max_result_bytes,
+                max_result_bytes: max_result_bytes.map(|bytes| {
+                    super::search_project_texts::normalized_result_budget(Some(bytes))
+                }),
             },
             _ => Self::None,
         }
@@ -428,6 +437,14 @@ impl ModelFacingProjectionPlan {
         if let ModelFacingProjection::Read(projection) = &mut self.projection {
             projection.bind_resolved_project(resolved);
         }
+        let Some(resolved) = resolved else {
+            return;
+        };
+        if let ModelFacingProjection::Search(SearchModelProjection::Batch { project, .. }) =
+            &mut self.projection
+        {
+            *project = resolved.resolved_id.clone();
+        }
     }
 
     /// Consume the plan at the only stage allowed to turn canonical execution
@@ -460,6 +477,9 @@ impl ModelFacingProjectionPlan {
             }
             ModelFacingProjection::Search(projection) => {
                 if let SearchModelProjection::Batch {
+                    project,
+                    queries,
+                    session_id,
                     default_timeouts,
                     max_result_bytes,
                 } = &projection
@@ -468,13 +488,36 @@ impl ModelFacingProjectionPlan {
                         result,
                         default_timeouts,
                         *max_result_bytes,
+                        project,
+                        queries,
+                        session_id.as_deref(),
                     );
                     super::search_project_texts::enforce_final_model_facing_hard_cap(
                         result,
                         default_timeouts,
+                        project,
+                        queries,
+                        session_id.as_deref(),
+                        *max_result_bytes,
                     );
                 }
                 sparsify_search_success_for_model(&projection, result);
+                if let SearchModelProjection::Batch {
+                    project,
+                    queries,
+                    session_id,
+                    max_result_bytes,
+                    ..
+                } = &projection
+                {
+                    super::search_project_texts::add_actionable_search_continuation(
+                        result,
+                        project,
+                        queries,
+                        session_id.as_deref(),
+                        *max_result_bytes,
+                    );
+                }
             }
         }
     }
@@ -665,7 +708,7 @@ fn sparsify_search_success_for_model(projection: &SearchModelProjection, result:
                             && output.get("failed_count").and_then(Value::as_u64) == Some(0)
                             && output.get("output_truncated").and_then(Value::as_bool)
                                 == Some(false)
-                            && output.get("next_index").is_some_and(Value::is_null)
+                            && output.get("next_index").is_none_or(Value::is_null)
                     });
             let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) else {
                 return;
@@ -719,6 +762,9 @@ pub(crate) fn sparsify_search_batch_success_for_model(
 ) {
     sparsify_search_success_for_model(
         &SearchModelProjection::Batch {
+            project: String::new(),
+            queries: Vec::new(),
+            session_id: None,
             default_timeouts: default_timeouts.to_vec(),
             max_result_bytes: None,
         },
