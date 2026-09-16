@@ -54,7 +54,11 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
             git_review_summary_input_schema,
         )))),
         120,
-    ),
+    )
+    .with_composition(super::ToolCompositionContract {
+        eligibility: super::ToolCompositionPolicy::Allowed,
+        concurrency: super::ToolConcurrencyPolicy::Parallel,
+    }),
     adaptive_runtime_direct(
         context_reobservable(change_summary_like(git_like(model_spec(
             def(

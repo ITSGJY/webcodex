@@ -1,6 +1,209 @@
 use super::*;
 
 #[test]
+fn tool_definitions_are_composition_contract_ssot() {
+    let parallel = ToolCompositionContract {
+        eligibility: ToolCompositionPolicy::Allowed,
+        concurrency: ToolConcurrencyPolicy::Parallel,
+    };
+    assert_eq!(
+        ToolCompositionContract::CONSERVATIVE,
+        ToolCompositionContract {
+            eligibility: ToolCompositionPolicy::Denied,
+            concurrency: ToolConcurrencyPolicy::Sequential,
+        }
+    );
+    assert_eq!(
+        runtime_tool_composition_contract("git_review_summary"),
+        parallel
+    );
+
+    for definition in tool_definitions() {
+        let expected = if definition.name == "git_review_summary" {
+            parallel
+        } else {
+            ToolCompositionContract::CONSERVATIVE
+        };
+        assert_eq!(definition.composition, expected, "{}", definition.name);
+        assert_eq!(
+            runtime_tool_composition_contract(definition.name),
+            definition.composition,
+            "{} composition lookup must use ToolDefinition",
+            definition.name
+        );
+    }
+}
+
+#[test]
+fn composition_defaults_cover_unreviewed_tools_and_unknown_gateways() {
+    for name in [
+        "read_files",
+        "search_project_texts",
+        "project_overview",
+        "git_diff_hunks",
+        "show_changes",
+        "write_project_file",
+        "apply_text_edits",
+        "apply_patch",
+        "git_commit_paths",
+        "start_session",
+        "work_on_project",
+        "finish_coding_task",
+        "close_session",
+        "post_session_message",
+        "resolve_session_message",
+        "run_shell",
+        "run_script",
+        "run_process",
+        "run_detached_process",
+        "session_shell_exec",
+        "run_job",
+        "observe_jobs",
+        "stop_job",
+        "cargo_check",
+        "cargo_test",
+        "cargo_fmt",
+        "computer_observe",
+        "computer_control",
+        "plugin_tool",
+        "ssh_resource",
+    ] {
+        assert!(lookup_tool_definition(name).is_some(), "{name}");
+        assert_eq!(
+            runtime_tool_composition_contract(name),
+            ToolCompositionContract::CONSERVATIVE,
+            "{name}"
+        );
+    }
+    for name in [
+        "__unknown_composition_tool__",
+        "call_runtime_tool",
+        "tool_search",
+    ] {
+        assert!(lookup_tool_definition(name).is_none(), "{name}");
+        assert_eq!(
+            runtime_tool_composition_contract(name),
+            ToolCompositionContract::CONSERVATIVE,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn composition_opt_in_requires_an_explicit_declaration() {
+    let reviewed = *lookup_tool_definition("git_review_summary").unwrap();
+    let mut definition = *lookup_tool_definition("write_project_file").unwrap();
+    definition.name = reviewed.name;
+    assert_eq!(
+        definition.composition,
+        ToolCompositionContract::CONSERVATIVE
+    );
+
+    definition.metadata = reviewed.metadata;
+    definition.model_surface = reviewed.model_surface;
+    definition.policy = reviewed.policy;
+    definition.runner_capability = reviewed.runner_capability;
+    assert_eq!(
+        definition.composition,
+        ToolCompositionContract::CONSERVATIVE
+    );
+
+    for contract in [
+        ToolCompositionContract::CONSERVATIVE,
+        ToolCompositionContract {
+            eligibility: ToolCompositionPolicy::Allowed,
+            concurrency: ToolConcurrencyPolicy::Sequential,
+        },
+        reviewed.composition,
+    ] {
+        let declared = definition.with_composition(contract);
+        assert_eq!(declared.composition, contract);
+        assert_eq!(
+            declared.effect_annotations(),
+            definition.effect_annotations()
+        );
+        assert_eq!(declared.execution, definition.execution);
+        assert_eq!(declared.session_evidence, definition.session_evidence);
+    }
+}
+
+#[test]
+fn parallel_composition_declarations_match_reviewed_inspection_facts() {
+    for definition in tool_definitions()
+        .filter(|definition| definition.composition.concurrency == ToolConcurrencyPolicy::Parallel)
+    {
+        let name = definition.name;
+        assert_eq!(
+            definition.composition.eligibility,
+            ToolCompositionPolicy::Allowed,
+            "{name}"
+        );
+        assert!(is_adaptive_runtime_direct_tool(name), "{name}");
+        assert_eq!(definition.metadata.effect, ToolEffect::Observe, "{name}");
+        assert_eq!(
+            definition.metadata.idempotency,
+            ToolIdempotency::PureRead,
+            "{name}"
+        );
+        assert_eq!(
+            definition.context_continuity_policy(),
+            ToolContextContinuityPolicy::REOBSERVABLE,
+            "{name}"
+        );
+        assert_eq!(definition.execution, None, "{name}");
+        assert_eq!(
+            definition.session_evidence.lifecycle,
+            ToolSessionLifecycleEffect::None,
+            "{name}"
+        );
+        assert!(!definition.metadata.destructive, "{name}");
+        assert!(!definition.metadata.shell_like, "{name}");
+    }
+}
+
+#[test]
+fn composition_policy_stays_out_of_tool_specs_and_annotations() {
+    let spec_keys = BTreeSet::from([
+        "name",
+        "description",
+        "inputSchema",
+        "outputSchema",
+        "annotations",
+    ]);
+    let annotation_keys = BTreeSet::from([
+        "readOnlyHint",
+        "destructiveHint",
+        "idempotentHint",
+        "openWorldHint",
+    ]);
+    for spec in registered_tool_specs() {
+        let serialized = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            serialized
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            spec_keys,
+            "{} ToolSpec fields",
+            spec.name
+        );
+        assert_eq!(
+            serialized["annotations"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            annotation_keys,
+            "{} annotation fields",
+            spec.name
+        );
+    }
+}
+
+#[test]
 fn tool_definitions_are_context_continuity_ssot() {
     use crate::metadata::ToolEffect;
     use crate::tool_definition::{

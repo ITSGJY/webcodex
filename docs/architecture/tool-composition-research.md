@@ -1,14 +1,15 @@
 # Tool composition research and development plan
 
-Status: deferred exploratory design note. This document records research findings
-and a staged direction for reducing model/tool round trips. It is intentionally
+Status: Phase 0 canonical policy foundation implemented; composition runtime
+remains deferred. This document records research findings and a staged direction
+for reducing model/tool round trips. It is intentionally
 **downstream** of the current tool-contract friction/style work in
 [`../agent/tool-contract-guidelines.md`](../agent/tool-contract-guidelines.md):
 first make primitive tools consistent and low-friction, then evaluate surface
 pruning, and only then decide whether composition still removes meaningful outer
-turns. It is not a current runtime contract and does not authorize implementation
-shortcuts around existing tool, Session, Job, permission, audit, or Project
-boundaries.
+turns. The current primitive contracts and policy inventory are described below;
+the proposed composition runtime does not authorize implementation shortcuts
+around existing tool, Session, Job, permission, audit, or Project boundaries.
 
 ## Motivation
 
@@ -136,8 +137,8 @@ A WebCodex composition layer should follow these rules:
    `tools` object.
 4. **No recursive composition.** A composition program cannot invoke the
    composition tool itself, directly or through adaptive discovery.
-5. **Parallelism is opt-in and bounded.** A tool definition or adjacent canonical
-   registry owns its concurrency policy. Unknown tools are sequential or denied,
+5. **Parallelism is opt-in and bounded.** `ToolDefinition.composition` owns
+   eligibility and concurrency policy. Unknown tools are denied and sequential,
    never optimistically parallel.
 6. **Adaptive discovery is not bypassed.** Composition must not become a backdoor
    for model-hidden, gateway-only, or otherwise non-admitted tools. The first
@@ -262,20 +263,44 @@ Specialized gateways should be excluded from the first version. If they are ever
 admitted, they must continue through their existing action-specific governance
 boundary rather than becoming generic nested callbacks.
 
-## Concurrency contract
+## Current composition policy contract (Phase 0)
 
-The first useful runtime contract can remain small:
+`webcodex-tool-contracts` owns a small static contract:
 
 ```text
-ToolConcurrencyPolicy::Parallel
-ToolConcurrencyPolicy::Sequential
-CompositionPolicy::Allowed | Denied
+ToolCompositionPolicy::{Denied, Allowed}
+ToolConcurrencyPolicy::{Sequential, Parallel}
+ToolCompositionContract { eligibility, concurrency }
 ```
 
-The default should be denied or sequential until a tool is reviewed. Read-only,
-independent inspection tools are the first candidates for `Parallel`. Mutation,
-Session-management, publication, release, Git-index/worktree mutation, and other
-shared-state tools stay sequential initially.
+`ToolDefinition.composition` is the sole declaration, set explicitly with the
+const `with_composition(...)` builder. The shared definition constructor defaults
+to `ToolCompositionContract::CONSERVATIVE` (`Denied + Sequential`).
+`runtime_tool_composition_contract(name)` returns that field, or `CONSERVATIVE`
+for an unknown name, including adapter-only gateways. It does not infer opt-in
+from names, effects, idempotency, capabilities, or direct exposure.
+
+A declaration covers every supported input and provider path. The initial
+inventory is deliberately narrow:
+
+| Tool | Policy | Review basis |
+|---|---|---|
+| `git_review_summary` | `Allowed + Parallel` | Already adaptive direct; compares exact commits with lazy fetch, optional Git locks, external diff, and textconv disabled. Each Git inspection uses a separate temporary view; synchronous Runner requests create no Job and result computation is invocation-local. |
+| `read_files` | `Denied + Sequential` | Uses a shared revision registry with eviction and epoch rotation. Locking alone does not prove cross-call continuation independence. |
+| `search_project_texts` | `Denied + Sequential` | May use a shared external MCP provider; parallel safety is not established for every configuration. |
+| `project_overview` | `Denied + Sequential` | Native metadata inspection, but currently adaptive long tail; the initial inventory stays within existing direct tools. |
+| `git_diff_hunks` | `Denied + Sequential` | Its worktree mode does not disable Git's default index stat refresh; policy must cover all input modes. See [Git's `diff.autoRefreshIndex` contract](https://git-scm.com/docs/git-config#Documentation/git-config.txt-diffautoRefreshIndex). |
+
+All other definitions retain `CONSERVATIVE`; no current tool declares
+`Allowed + Sequential`. Inspection may use invocation-owned temporary directories
+that are cleaned up when it ends. Existing audit and Workflow Session evidence
+recording keep their normal paths; `git_review_summary` does not advance a context
+checkpoint or mutate Session lifecycle, messages, or permissions.
+
+This is an internal inventory only: no serialization, ToolSpec/annotation/model
+fields, second registry, execution consumer, scheduler, or composition runtime is
+added. Future composition must still apply ordinary admission and authority
+checks. Phase 1 remains unimplemented, and direct tools remain first-class.
 
 A later, evidence-driven extension may add a resource key such as:
 
@@ -400,14 +425,18 @@ must remain separate because only the former are wholly service-owned.
 - Use Window/server-trace correlation to measure model-facing outer-call counts,
   tool durations, Runner timing available today, and gaps outside WebCodex.
 - Classify existing direct tools by composition eligibility and concurrency safety.
-- Identify which current ToolDefinition fields can own the policy without a
-  parallel registry.
+- Keep eligibility and concurrency on `ToolDefinition.composition`, without a
+  parallel registry (the policy foundation above is implemented).
 - Define parent/child diagnostic identity and bounded audit projection before
   changing execution behavior.
 - Establish representative review/implementation traces to compare outer MCP
   calls, canonical child calls, Runner calls, and wall time separately.
   The concrete Direct-vs-Code-Mode capture/report protocol is documented in
   [`../experiments/agent-loop-baseline.md`](../experiments/agent-loop-baseline.md).
+
+The canonical policy inventory complements the baseline profiler added in
+[#489](https://github.com/yyjeqhc/webcodex/pull/489); it does not implement the
+measurement work or the Phase 1 runtime.
 
 Success means we can explain where elapsed time is spent without claiming access
 to model-private state.
@@ -531,8 +560,8 @@ A production-ready first slice should satisfy all of the following:
    admitted direct surface?
 3. How should nested tool schemas be made ergonomic without recreating the large
    composed-schema projection problem observed in WebCodex Next?
-4. What is the smallest canonical concurrency metadata that supports Phase 1
-   without prematurely designing resource locks for mutation?
+4. Which additional inspection tools can satisfy the canonical composition
+   contract across all input/provider paths without shared-state hazards?
 5. How should parent/child invocation identities appear in ActionAudit and the
    Windows view while preserving current privacy policy?
 6. What final Session continuity projection is correct once one parent response

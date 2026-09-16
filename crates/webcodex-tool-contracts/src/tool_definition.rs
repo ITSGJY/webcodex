@@ -58,7 +58,7 @@ pub use super::tool_policy::{
     model_visible_tool_definitions, model_visible_tool_names_csv, runtime_tool_accepts_context_ack,
     runtime_tool_activity_interaction, runtime_tool_activity_semantics,
     runtime_tool_advances_context_checkpoint, runtime_tool_approval_policy,
-    runtime_tool_captures_validation_output, runtime_tool_category,
+    runtime_tool_captures_validation_output, runtime_tool_category, runtime_tool_composition_contract,
     runtime_tool_effect_annotations, runtime_tool_execution_contract,
     runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
     runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_metadata,
@@ -828,6 +828,37 @@ impl ToolExecutionContract {
     }
 }
 
+/// Explicit eligibility for future canonical tool composition. This declaration
+/// does not grant authority or change direct-tool admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCompositionPolicy {
+    Denied,
+    Allowed,
+}
+
+/// Reviewed concurrency within composition, covering every supported input and
+/// provider path. Read-only metadata alone does not imply parallel safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolConcurrencyPolicy {
+    Sequential,
+    Parallel,
+}
+
+/// Static composition facts owned only by ToolDefinition. Phase 0 records these
+/// facts without adding a runtime consumer or model-facing projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolCompositionContract {
+    pub eligibility: ToolCompositionPolicy,
+    pub concurrency: ToolConcurrencyPolicy,
+}
+
+impl ToolCompositionContract {
+    pub const CONSERVATIVE: Self = Self {
+        eligibility: ToolCompositionPolicy::Denied,
+        concurrency: ToolConcurrencyPolicy::Sequential,
+    };
+}
+
 /// Static Stateless Operator protocol-extension classification. This declares only
 /// which protocol capability family admits a hidden runtime tool; authorization,
 /// permission, Project authority, and Runner capability remain independent.
@@ -934,6 +965,8 @@ pub struct ToolDefinition {
     pub operator_extension_family: Option<ToolOperatorExtensionFamily>,
     /// Optional canonical selection semantics for ordinary execution tools.
     pub execution: Option<ToolExecutionContract>,
+    /// Explicit composition policy; unreviewed tools remain denied/sequential.
+    pub composition: ToolCompositionContract,
     pub visibility: ToolVisibility,
     pub category: &'static str,
     pub metadata: ToolMetadata,
@@ -957,6 +990,11 @@ impl ToolDefinition {
 
     pub const fn with_execution(mut self, execution: ToolExecutionContract) -> Self {
         self.execution = Some(execution);
+        self
+    }
+
+    pub const fn with_composition(mut self, composition: ToolCompositionContract) -> Self {
+        self.composition = composition;
         self
     }
 
@@ -1136,6 +1174,7 @@ const fn def(
         model_surface: ToolModelSurfaceDeclaration::DEFAULT,
         operator_extension_family: None,
         execution: None,
+        composition: ToolCompositionContract::CONSERVATIVE,
         visibility,
         category,
         metadata: make_tool_metadata(
