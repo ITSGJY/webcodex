@@ -214,6 +214,8 @@ mod agent_continuation_app;
 mod artifact_export;
 #[path = "mcp_tests/computer_app.rs"]
 mod computer_app;
+#[path = "mcp_tests/conformance.rs"]
+mod conformance;
 #[path = "mcp_tests/file_import.rs"]
 mod file_import;
 #[path = "mcp_tests/goal_plan_app.rs"]
