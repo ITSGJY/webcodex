@@ -157,9 +157,13 @@ and understanding the exact check, then record its observed status and evidence
 fingerprint. Fingerprints retain semantic diagnostics but normalize two narrowly
 scoped referee noise sources: the numeric value (not presence/type) of the two
 known SEP-2575 millisecond-epoch response IDs, and the duplicated offending
-message only inside the structured `wire-schema-valid` violation list. Wire-schema
-origin/context/errors/specVersion remain hashed, and ordinary objects with similar
-field names are not normalized. A changed fingerprint is a review prompt, not something
+message only inside the structured `wire-schema-valid` violation list. For a
+`ListToolsResult/tools/<index>/...` diagnostic, that volatile array ordinal is
+resolved through the offending response to the referenced tool name before hashing,
+so unrelated tool insertion/reordering does not rename the finding; moving the defect
+to a different tool still changes the fingerprint. Wire-schema origin/context/errors/
+specVersion remain hashed, and ordinary objects with similar field names are not
+normalized. A changed fingerprint is a review prompt, not something
 to refresh mechanically. Remove the entry as soon as the check passes. Do not replace
 multiple check IDs with a scenario-wide exception. The SEP-2164 `data.uri`
 finding is kept as an advisory SHOULD/WARNING rather than described as a MUST

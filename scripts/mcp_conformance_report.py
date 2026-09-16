@@ -50,6 +50,7 @@ DYNAMIC_JSONRPC_ID_SENTINEL = {
 }
 WIRE_SCHEMA_CHECK_ID = "wire-schema-valid"
 WIRE_SCHEMA_MESSAGE_SENTINEL = "<wire-schema-offending-message>"
+WIRE_SCHEMA_TOOL_INDEX_RE = re.compile(r"ListToolsResult/tools/(?P<index>\d+)")
 
 # Structural or top-level scenario failures emitted by the immutable referee pin.
 # These IDs mean the scenario/harness aborted outside its intended protocol
@@ -131,6 +132,36 @@ def _normalize_evidence_value(
     return normalized
 
 
+def _wire_schema_errors_with_tool_names(errors: Any, message: Any) -> Any:
+    """Replace volatile tools/list array ordinals with the referenced tool name."""
+
+    if not isinstance(errors, list) or not isinstance(message, dict):
+        return errors
+    result = message.get("result")
+    tools = result.get("tools") if isinstance(result, dict) else None
+    if not isinstance(tools, list):
+        return errors
+
+    def replace_tool_index(match: re.Match[str]) -> str:
+        tool_index = int(match.group("index"))
+        if tool_index >= len(tools):
+            return match.group(0)
+        tool = tools[tool_index]
+        if not isinstance(tool, dict):
+            return match.group(0)
+        tool_name = tool.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            return match.group(0)
+        return "ListToolsResult/tools[" + json.dumps(tool_name, ensure_ascii=False) + "]"
+
+    return [
+        WIRE_SCHEMA_TOOL_INDEX_RE.sub(replace_tool_index, error)
+        if isinstance(error, str)
+        else error
+        for error in errors
+    ]
+
+
 def _wire_schema_semantic_details(check: dict[str, Any]) -> Any | None:
     """Return structured wire-schema evidence with only the duplicated message normalized."""
 
@@ -163,6 +194,14 @@ def _wire_schema_semantic_details(check: dict[str, Any]) -> Any | None:
         normalized_violation = normalized_violations[index]
         if not isinstance(normalized_violation, dict):
             continue
+        # Tool insertion/reordering changes the numeric array position in the
+        # referee diagnostic even when the same named tool has the same schema
+        # defect. Resolve that ordinal through the offending response before the
+        # complete message is replaced. If resolution fails, keep the raw index
+        # so the gate fails closed.
+        normalized_violation["errors"] = _wire_schema_errors_with_tool_names(
+            normalized_violation.get("errors"), violation.get("message")
+        )
         # The same complete JSON-RPC object is also rendered into the referee's
         # errorMessage. Retain message *presence* with a sentinel and hash the
         # authoritative origin/context/errors/specVersion fields instead.

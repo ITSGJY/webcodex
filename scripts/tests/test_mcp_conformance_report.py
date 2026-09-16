@@ -526,6 +526,49 @@ class ReportGateTests(unittest.TestCase):
         summary = self.evaluate()
         self.assertTrue(summary["gate_passed"])
 
+    def test_wire_schema_tool_index_shift_uses_tool_identity(self) -> None:
+        expected = self.check("wire-schema-valid", "FAILURE", error_message="Schema validation failed")
+        expected["details"] = {
+            "messagesValidated": 5,
+            "violations": [{
+                "origin": "implementation",
+                "specVersion": "2025-11-25",
+                "context": "stateful response to 'tools/list'",
+                "errors": ["ListToolsResult/tools/1/outputSchema: must have required property 'type' (result of 'tools/list')"],
+                "message": {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "other"}, {"name": "ssh_resource"}]}},
+            }],
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["violations"][0]["errors"] = [
+            "ListToolsResult/tools/2/outputSchema: must have required property 'type' (result of 'tools/list')"
+        ]
+        actual["details"]["violations"][0]["message"]["result"]["tools"] = [
+            {"name": "inserted"}, {"name": "other"}, {"name": "ssh_resource"}
+        ]
+        self.assertEqual(
+            report_gate.check_evidence_sha256(expected),
+            report_gate.check_evidence_sha256(actual),
+        )
+
+    def test_wire_schema_tool_identity_change_requires_review(self) -> None:
+        expected = self.check("wire-schema-valid", "FAILURE", error_message="Schema validation failed")
+        expected["details"] = {
+            "messagesValidated": 5,
+            "violations": [{
+                "origin": "implementation",
+                "specVersion": "2025-11-25",
+                "context": "stateful response to 'tools/list'",
+                "errors": ["ListToolsResult/tools/0/outputSchema: must have required property 'type' (result of 'tools/list')"],
+                "message": {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "ssh_resource"}]}},
+            }],
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["violations"][0]["message"]["result"]["tools"][0]["name"] = "different_tool"
+        self.assertNotEqual(
+            report_gate.check_evidence_sha256(expected),
+            report_gate.check_evidence_sha256(actual),
+        )
+
     def test_wire_schema_error_change_still_requires_review(self) -> None:
         expected = self.check(
             "wire-schema-valid",

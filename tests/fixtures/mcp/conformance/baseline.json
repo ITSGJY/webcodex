@@ -245,7 +245,7 @@
           "reason": "The 2025-11-25 tools/list wire schema rejects a WebCodex outputSchema that omits the required root type.",
           "evidence": "MCP 2025-11-25 Tool outputSchema wire schema; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "6b9808d684345474a82659c7ddbbcbf8d249325ee5abc1f4a1813ed283cb45d7"
+          "evidence_sha256": "04ac9b7699a61e4970c6efdd1296dc61971f8097fa21e90873d6992f2e1d40ca"
         }
       ],
       "expected_server_capabilities": {
