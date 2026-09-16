@@ -530,6 +530,238 @@ pub(crate) fn json_error(status: StatusCode, msg: impl Into<String>) -> Json<ser
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpOrigin {
+    scheme: String,
+    authority: HttpAuthority,
+}
+
+fn parse_http_authority(value: &str) -> Option<HttpAuthority> {
+    if value.is_empty() || value.trim() != value {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &rest[..close];
+        let suffix = &rest[close + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':')?.parse::<u16>().ok()?)
+        };
+        (host, port)
+    } else {
+        if value.matches(':').count() > 1 {
+            return None;
+        }
+        match value.rsplit_once(':') {
+            Some((host, port)) => {
+                if host.is_empty() || port.is_empty() {
+                    return None;
+                }
+                (host, Some(port.parse::<u16>().ok()?))
+            }
+            None => (value, None),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let host = if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        address.to_string()
+    } else {
+        match url::Host::parse(host).ok()? {
+            url::Host::Domain(domain) => {
+                let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+                if domain.is_empty() {
+                    return None;
+                }
+                domain
+            }
+            url::Host::Ipv4(address) => address.to_string(),
+            url::Host::Ipv6(address) => address.to_string(),
+        }
+    };
+    Some(HttpAuthority { host, port })
+}
+
+fn parse_http_origin(value: &str) -> Option<HttpOrigin> {
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let authority = parse_http_authority(&match parsed.port() {
+        Some(port) if host.contains(':') => format!("[{host}]:{port}"),
+        Some(port) => format!("{host}:{port}"),
+        None if host.contains(':') => format!("[{host}]"),
+        None => host.to_string(),
+    })?;
+    Some(HttpOrigin {
+        scheme: parsed.scheme().to_string(),
+        authority,
+    })
+}
+
+fn default_http_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn origin_effective_port(origin: &HttpOrigin) -> Option<u16> {
+    origin
+        .authority
+        .port
+        .or_else(|| default_http_port(&origin.scheme))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_unspecified_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+}
+
+fn configured_public_origin() -> Option<HttpOrigin> {
+    let value = std::env::var("WEBCODEX_PUBLIC_URL").ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    parse_http_origin(value)
+}
+
+fn authority_matches_configured_origin(authority: &HttpAuthority, origin: &HttpOrigin) -> bool {
+    if authority.host != origin.authority.host {
+        return false;
+    }
+    match origin.authority.port {
+        Some(expected_port) => authority.port == Some(expected_port),
+        None => authority
+            .port
+            .is_none_or(|port| default_http_port(&origin.scheme) == Some(port)),
+    }
+}
+
+fn request_authority_allowed(
+    authority: &HttpAuthority,
+    config: &Config,
+    public_origin: Option<&HttpOrigin>,
+) -> bool {
+    if is_loopback_host(&authority.host) {
+        return true;
+    }
+    if public_origin.is_some_and(|origin| authority_matches_configured_origin(authority, origin)) {
+        return true;
+    }
+    parse_http_authority(&config.addr).is_some_and(|bound| {
+        !is_unspecified_host(&bound.host)
+            && bound.host == authority.host
+            && authority
+                .port
+                .is_none_or(|port| bound.port.is_some_and(|bound_port| bound_port == port))
+    })
+}
+
+fn origin_matches_request_authority(origin: &HttpOrigin, authority: &HttpAuthority) -> bool {
+    if origin.authority.host != authority.host {
+        return false;
+    }
+    match authority.port {
+        Some(port) => origin_effective_port(origin) == Some(port),
+        None => origin.authority.port.is_none(),
+    }
+}
+
+pub(crate) fn require_mcp_request_authority(
+    req: &Request,
+    config: &Config,
+) -> Result<(), (u16, &'static str, &'static str)> {
+    let host = match req.headers().get("host") {
+        Some(value) => value.to_str().ok(),
+        None => req.uri().authority().map(|authority| authority.as_str()),
+    }
+    .and_then(parse_http_authority)
+    .ok_or((400, "invalid_request_authority", "invalid Host header"))?;
+    let public_origin = configured_public_origin();
+    if !request_authority_allowed(&host, config, public_origin.as_ref()) {
+        return Err((
+            403,
+            "untrusted_request_authority",
+            "request Host is not an allowed WebCodex authority",
+        ));
+    }
+
+    let Some(raw_origin) = req.headers().get("origin") else {
+        return Ok(());
+    };
+    let raw_origin = raw_origin
+        .to_str()
+        .map_err(|_| (400, "invalid_origin", "invalid Origin header"))?;
+    let origin =
+        parse_http_origin(raw_origin).ok_or((400, "invalid_origin", "invalid Origin header"))?;
+    if !origin_matches_request_authority(&origin, &host) {
+        return Err((
+            403,
+            "cross_origin_denied",
+            "cross-origin requests are not allowed",
+        ));
+    }
+    if public_origin
+        .as_ref()
+        .is_some_and(|public| authority_matches_configured_origin(&host, public))
+        && public_origin.as_ref().is_some_and(|public| {
+            origin.scheme != public.scheme
+                || origin_effective_port(&origin) != origin_effective_port(public)
+        })
+    {
+        return Err((
+            403,
+            "cross_origin_denied",
+            "cross-origin requests are not allowed",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_mcp_json_request(
+    req: &Request,
+    config: &Config,
+) -> Result<(), (u16, &'static str, &'static str)> {
+    require_mcp_request_authority(req, config)?;
+    if req
+        .content_type()
+        .is_none_or(|content_type| content_type.essence_str() != "application/json")
+    {
+        return Err((
+            415,
+            "unsupported_media_type",
+            "Content-Type must be application/json",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn require_same_origin(req: &Request) -> Result<(), (u16, &'static str, &'static str)> {
     if let Some(origin) = req
         .headers()

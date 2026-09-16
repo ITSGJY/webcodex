@@ -61,6 +61,8 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## Validation
 
+Formatting 属于收尾，不是每次编辑后的 validation。普通循环是：编辑 → focused validation → 必要时继续编辑 → 源码稳定 → format 一次 → 最终 review/validation。Rust 格式化应在相关源码稳定后、最终 diff/closeout 前执行；只有后续 Rust 编辑可能改变格式时才重跑。`cargo_fmt(check=false)` 用于有意执行最终格式化，`check=true` 用于需要最终只读格式证明的情况。CI/release 格式检查保持不变。
+
 能使用 `cargo_test`、`cargo_check`、`go_test` 等 structured validation 时优先使用它们。先运行能够发现当前回归的最小检查，只有实际受影响的边界需要时才扩大范围。
 
 如果一个确定需要执行的 validation 很可能明显超过 synchronous grace，同时还有真正独立的 read-only inspection，可以显式设置较短的 `sync_wait_secs`（通常可用 `1`），让已经启动的 validation 以**同一个 execution** 尽早 handoff 为 Job。随后只继续独立的源码读取、搜索、diff/architecture inspection 或 review，再观察该 Job；不要为了“并行”额外启动 CPU-heavy validation。如果运行中的 validation 所覆盖源码随后发生 mutation，那么其结果只能算 stale/cache-warmup evidence，不能证明 final workspace；最终源码仍需重新运行 task-appropriate validation。
@@ -79,7 +81,7 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## 长时间运行的工作
 
-命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 `wait_secs=100, wake_on=terminal` 有界等待 continuation。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
+命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 `wait_secs=100, wake_on=terminal` 有界等待 continuation。单个 Job 或任一 terminal result 即可推进时使用 `terminal`；预先确定的一组 Job 必须全部结束才能推进时使用 `all_terminal`。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
 
 ## 手动多窗口协作
 

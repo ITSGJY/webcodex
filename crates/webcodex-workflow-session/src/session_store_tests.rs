@@ -26,6 +26,7 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
     let (read_like, write_like, shell_like, path_hint) = match tool_name {
         "read_file" => (true, false, false, SessionPathHint::SinglePath),
         "write_project_file" => (false, true, false, SessionPathHint::SinglePath),
+        "apply_text_edits" => (false, true, false, SessionPathHint::PathList),
         "run_shell" | "session_shell_exec" | "cargo_check" => {
             (false, false, true, SessionPathHint::None)
         }
@@ -150,6 +151,97 @@ fn session_store_persists_and_restores_basic_session() {
         summary.execution_context,
         SessionExecutionContext::default()
     );
+}
+
+#[test]
+fn coding_git_baseline_and_repository_edit_fact_persist_resume_and_default_legacy_false() {
+    fn request(resume_session_id: Option<String>) -> CodingSessionRequest {
+        CodingSessionRequest {
+            project: "agent:oe:private-drop".to_string(),
+            authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
+            resume_session_id,
+            instruction: Some("final changes persistence".to_string()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let baseline = "a".repeat(40);
+    let replacement_candidate = "b".repeat(40);
+    let created = store
+        .ensure_coding_session_with_git_baseline(request(None), Some(baseline.clone()))
+        .unwrap();
+    assert_eq!(
+        created.summary.git_baseline_tree.as_deref(),
+        Some(baseline.as_str())
+    );
+    assert!(!created.summary.repository_edit_observed);
+    let model_facing_summary = serde_json::to_value(&created.summary).unwrap();
+    assert!(model_facing_summary.get("git_baseline_tree").is_none());
+    assert!(model_facing_summary
+        .get("repository_edit_observed")
+        .is_none());
+
+    let session_id = created.summary.session_id.clone();
+    let edit = store
+        .record_tool_call_started(
+            Some(&session_id),
+            SessionTransport::Mcp,
+            "apply_text_edits",
+            &json!({"project": "agent:oe:private-drop", "path": "src/lib.rs"}),
+            session_tool_contract("apply_text_edits"),
+        )
+        .unwrap();
+    store
+        .record_tool_call_finished(
+            Some(edit),
+            true,
+            &json!({"state_changed": true}),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let restored = flush_and_restore(&store, ledger.clone());
+    let restored_summary = restored.summary(&session_id, Some(20)).unwrap();
+    assert_eq!(
+        restored_summary.git_baseline_tree.as_deref(),
+        Some(baseline.as_str())
+    );
+    assert!(restored_summary.repository_edit_observed);
+
+    let resumed = restored
+        .ensure_coding_session_with_git_baseline(
+            request(Some(session_id.clone())),
+            Some(replacement_candidate),
+        )
+        .unwrap();
+    assert!(resumed.reused);
+    assert_eq!(
+        resumed.summary.git_baseline_tree.as_deref(),
+        Some(baseline.as_str())
+    );
+    assert!(resumed.summary.repository_edit_observed);
+
+    restored.flush_persistence();
+    let mut legacy: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    let row = legacy["sessions"][0].as_object_mut().unwrap();
+    row.remove("git_baseline_tree");
+    row.remove("repository_edit_observed");
+    std::fs::write(&ledger, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let legacy_restored = SessionStore::with_persistence(ledger, 10, 10);
+    let legacy_summary = legacy_restored.summary(&session_id, Some(20)).unwrap();
+    assert_eq!(legacy_summary.git_baseline_tree, None);
+    assert!(!legacy_summary.repository_edit_observed);
 }
 
 #[test]

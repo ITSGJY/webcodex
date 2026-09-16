@@ -13,7 +13,10 @@ use webcodex_core::validation_identity::{
     assertion_validation_identity, is_validation_execution_identity,
 };
 use webcodex_core::workflow_session_contract::{is_safe_job_id, PermissionDecision, SessionMode};
-use webcodex_tool_contracts::{runtime_tool_session_evidence_policy, ToolSessionLifecycleEffect};
+use webcodex_tool_contracts::{
+    runtime_tool_activity_semantics, runtime_tool_session_evidence_policy, ToolActivityKind,
+    ToolSessionLifecycleEffect,
+};
 
 use super::assignment::{
     assignment_fence_fingerprint, assignment_fence_from_state, current_assignment_state,
@@ -516,6 +519,8 @@ impl SessionStore {
                 events: VecDeque::new(),
                 events_observed: 0,
                 context_revision: 0,
+                git_baseline_tree: None,
+                repository_edit_observed: false,
                 materialized_validation_job_ids: VecDeque::new(),
                 message_observation_revision: 0,
                 message_observation_floor: 0,
@@ -542,6 +547,17 @@ impl SessionStore {
     pub fn ensure_coding_session(
         &self,
         request: CodingSessionRequest,
+    ) -> Result<CodingSessionOutcome, CodingSessionError> {
+        self.ensure_coding_session_with_git_baseline(request, None)
+    }
+
+    /// Coding bootstrap variant used by `work_on_project` to bind one fresh
+    /// startup Git tree. Exact continuation ignores the supplied candidate and
+    /// preserves the durable Session baseline already recorded at creation.
+    pub fn ensure_coding_session_with_git_baseline(
+        &self,
+        request: CodingSessionRequest,
+        git_baseline_tree: Option<String>,
     ) -> Result<CodingSessionOutcome, CodingSessionError> {
         let explicit_resume_session_id = match request.resume_session_id.as_deref() {
             Some(session_id)
@@ -767,6 +783,8 @@ impl SessionStore {
                     events: VecDeque::from([Arc::new(event)]),
                     events_observed: 1,
                     context_revision: 0,
+                    git_baseline_tree,
+                    repository_edit_observed: false,
                     materialized_validation_job_ids: VecDeque::new(),
                     message_observation_revision: 0,
                     message_observation_floor: 0,
@@ -1431,6 +1449,9 @@ impl SessionStore {
                 record.context_revision = context_revision;
             }
             record.updated_at = record.updated_at.max(event.timestamp);
+            if event_observes_repository_edit(&event) {
+                record.repository_edit_observed = true;
+            }
             record.events.push_back(Arc::new(event));
             record.events_observed = record.events_observed.saturating_add(1);
             while record.events.len() > max_events {
@@ -1983,7 +2004,11 @@ impl SessionStore {
             match stored {
                 StoredSession::Hot(record) => {
                     record.updated_at = now_ts();
-                    record.events.push_back(Arc::new(event.take().unwrap()));
+                    let event = event.take().unwrap();
+                    if event_observes_repository_edit(&event) {
+                        record.repository_edit_observed = true;
+                    }
+                    record.events.push_back(Arc::new(event));
                     record.events_observed = record.events_observed.saturating_add(1);
                     while record.events.len() > max_events_per_session {
                         record.events.pop_front();
@@ -2570,6 +2595,17 @@ fn session_execution_context_updated_event(
     }
 }
 
+fn event_observes_repository_edit(event: &SessionEvent) -> bool {
+    event.kind == "tool_call_finished"
+        && event.status.as_deref() == Some("succeeded")
+        && event
+            .effect_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.state_changed)
+            == Some(true)
+        && runtime_tool_activity_semantics(&event.tool_name).kind == ToolActivityKind::Edit
+}
+
 fn summarize_record(
     record: &SessionRecord,
     limit: Option<usize>,
@@ -2640,6 +2676,8 @@ fn summarize_record(
         guards: record.guards,
         execution_context: record.execution_context.clone(),
         lifecycle: record.lifecycle,
+        git_baseline_tree: record.git_baseline_tree.clone(),
+        repository_edit_observed: record.repository_edit_observed,
         created_at: record.created_at,
         updated_at: record.updated_at,
         counts,

@@ -1314,6 +1314,7 @@ impl ToolRuntime {
             observation.job.exit_code.map(i64::from),
             &observation.stdout_tail,
             &observation.stderr_tail,
+            observation.stdout_truncated || observation.stderr_truncated,
             observation.job.activity.as_ref(),
         );
         let continuation = crate::tool_runtime::jobs::observe_job_continuation(

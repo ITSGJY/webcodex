@@ -1246,6 +1246,104 @@ async fn public_failure_expectation_preserves_raw_cargo_failure_as_expected_vali
 }
 
 #[tokio::test]
+async fn closeout_boundary_gap_keeps_historical_validation_visible_without_current_proof() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "boundary-history", "demo", tmp.path()).await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("historical validation without attempt boundary".to_string()),
+    );
+    let sid = session.session_id.clone();
+    runtime
+        .sessions
+        .ensure_coding_session(crate::tool_runtime::sessions::CodingSessionRequest {
+            project: project.clone(),
+            authority_fingerprint:
+                crate::tool_runtime::sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
+                    .to_string(),
+            resume_session_id: Some(sid.clone()),
+            instruction: Some("validate the retained closeout tail".to_string()),
+            mode: crate::tool_runtime::SessionMode::Normal,
+            guards: crate::tool_runtime::sessions::SessionGuards::default(),
+            execution_context: None,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        })
+        .unwrap();
+    for index in 0..100 {
+        record_handoff_tool_event(
+            &runtime,
+            &sid,
+            "read_files",
+            json!({"project": &project, "items": [{"path": format!("src/{index}.rs")}]}),
+            true,
+            json!({"items": []}),
+        );
+    }
+    record_handoff_tool_event(
+        &runtime,
+        &sid,
+        "cargo_check",
+        json!({"project": &project}),
+        true,
+        json!({"exit_code": 0}),
+    );
+    let closeout = runtime.sessions.summary(&sid, Some(200)).unwrap();
+    assert!(closeout.events_truncated);
+    assert!(!closeout
+        .events
+        .iter()
+        .any(|event| event.kind == "task_instruction"));
+
+    let handoff = handoff_summary_only(&runtime, &sid).await;
+    assert!(handoff.success, "{:?}", handoff.error);
+    assert_eq!(handoff.output["validation"]["status"], "passed");
+    assert_eq!(handoff.output["validation"]["latest_status"], "passed");
+    assert_eq!(handoff.output["validation"]["successes"], 1);
+    assert_eq!(handoff.output["validation"]["events_total"], 1);
+    assert_eq!(
+        handoff.output["validation"]["current_evidence"]["status"],
+        "unknown"
+    );
+    assert_eq!(
+        handoff.output["validation"]["current_evidence"]["reason"],
+        "attempt_boundary_unavailable"
+    );
+    assert_eq!(
+        handoff.output["validation"]["current_evidence"]["events_total"],
+        0
+    );
+
+    let finish = finish_coding_task_summary_only_no_hygiene(
+        &runtime,
+        "boundary-history",
+        project,
+        &sid,
+        true,
+    )
+    .await;
+    assert!(finish.success, "{:?}", finish.error);
+    assert_eq!(finish.output["validation"]["status"], "passed");
+    assert_eq!(finish.output["validation"]["latest_status"], "passed");
+    assert_eq!(finish.output["validation"]["successes"], 1);
+    assert_ne!(
+        finish.output["validation"]["reason"],
+        "no_validation_tool_invoked"
+    );
+    assert_eq!(finish.output["validation"]["current_status"], "unknown");
+    assert_eq!(
+        finish.output["validation"]["current_reason"],
+        "attempt_boundary_unavailable"
+    );
+    assert_eq!(finish.output["validation"]["current_validation_events"], 0);
+    assert_eq!(finish.output["validation"]["current_successes"], 0);
+}
+
+#[tokio::test]
 async fn cargo_test_zero_tests_success_is_detected_and_warns_in_handoff() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
@@ -1613,6 +1711,7 @@ async fn generic_call_runtime_tool_preserves_flattened_failure_expectations() {
         "generic-expect",
         project.clone(),
         &sid,
+        false,
     )
     .await;
     assert!(finish.success, "{:?}", finish.error);
@@ -3792,6 +3891,7 @@ async fn finish_coding_task_summary_only_no_hygiene(
     client_id: &str,
     project: String,
     session_id: &str,
+    include_validation_summary: bool,
 ) -> ToolResult {
     let runtime_for_task = runtime.clone();
     let session_id = session_id.to_string();
@@ -3807,7 +3907,7 @@ async fn finish_coding_task_summary_only_no_hygiene(
                     include_workspace: None,
                     include_hygiene: Some(false),
                     include_handoff: Some(false),
-                    include_validation_summary: Some(false),
+                    include_validation_summary: Some(include_validation_summary),
                 },
                 Some(&auth),
             )

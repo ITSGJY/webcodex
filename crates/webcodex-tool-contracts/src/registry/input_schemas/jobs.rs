@@ -236,7 +236,13 @@ pub fn run_shell_input_schema() -> Value {
         (
             "timeout_secs",
             "integer",
-            "Total command timeout in seconds (minimum 1, default 60). Values above 120 are accepted and clamped to 120. Explicit effective values above 60 may hand off the same original execution as a durable Job when the Runner supports async shell Jobs; default 60-second calls remain synchronous.",
+            "Total lifetime seconds (default 60, min 1); clamped to shared structured-execution ceiling; named SSH keeps direct ceiling.",
+            false,
+        ),
+        (
+            "sync_wait_secs",
+            "integer",
+            "same-execution durable Job handoff grace (default 10s), clamped by 60s and timeout; controls return, not when the command is killed; named SSH unsupported.",
             false,
         ),
         (
@@ -266,6 +272,7 @@ pub fn run_shell_input_schema() -> Value {
     ));
     schema["properties"]["timeout_secs"]["minimum"] = json!(1);
     schema["properties"]["timeout_secs"]["default"] = json!(60);
+    schema["properties"]["sync_wait_secs"]["minimum"] = json!(1);
     with_optional_result_expectation(with_optional_validation_assertion(schema), false)
 }
 
@@ -459,9 +466,9 @@ pub fn observe_jobs_input_schema() -> Value {
             },
             "wake_on": {
                 "type": "string",
-                "enum": ["change", "terminal"],
+                "enum": ["change", "terminal", "all_terminal"],
                 "default": "change",
-                "description": "Bounded-wait wake policy. change (default) returns on any observable change. terminal coalesces non-terminal log/progress/activity changes until any Job is terminal, an item errors, or the shared deadline expires; use terminal waiting when dependent progress is blocked, not as an unconditional next call. Deadline returns timeout even when changed=true; deltas remain relative to the caller's original tokens. No token means immediate baseline; no wait_secs means immediate observation."
+                "description": "Bounded-wait wake policy. change (default) returns on any observable change. terminal waits for any Job to be terminal; use it for one Job or when any terminal result unblocks progress. all_terminal waits for every Job in a predetermined set needed before progress. Both coalesce non-terminal log/progress/activity updates and return immediately on any item error or at the shared deadline. Deadline returns timeout even when changed=true; deltas remain relative to the caller's original tokens. No token means immediate baseline; no wait_secs means immediate observation."
             }
         },
         "required": ["items"]

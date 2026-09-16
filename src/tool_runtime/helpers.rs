@@ -578,7 +578,6 @@ pub(crate) const COMMAND_STDIO_TAIL_CHARS: usize = 12_000;
 /// `runner_http` validation (`wait_timeout_secs` must be <= 120).
 pub(crate) const MIN_SYNC_TIMEOUT_SECS: u64 = 1;
 pub(crate) const MAX_SYNC_TIMEOUT_SECS: u64 = 120;
-pub(crate) const DEFAULT_RUN_SHELL_TIMEOUT_SECS: u64 = 60;
 
 /// Read-only structured validation tools (`cargo_check`, `cargo_test`,
 /// `cargo_fmt(check=true)`) define `timeout_secs` as the total runtime budget

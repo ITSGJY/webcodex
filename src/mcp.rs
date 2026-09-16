@@ -272,7 +272,15 @@ fn mcp_tools_list_audit_summary(
 
 #[handler]
 pub async fn mcp_info(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    if let Err((status, _, message)) = crate::auth::require_same_origin(req) {
+    let Some(config) = crate::auth::get_config(depot) else {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Server configuration not available",
+        ));
+        return;
+    };
+    if let Err((status, _, message)) = crate::auth::require_mcp_request_authority(req, &config) {
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
         res.status_code(status);
         res.render(json_error(status, message));
@@ -282,9 +290,7 @@ pub async fn mcp_info(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         res.status_code(StatusCode::METHOD_NOT_ALLOWED);
         return;
     }
-    let auth_required = crate::auth::get_config(depot)
-        .map(|c| c.is_auth_enabled())
-        .unwrap_or(false);
+    let auth_required = config.is_auth_enabled();
     let Some(runtime) = runtime(depot) else {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
         res.render(json_error(
@@ -332,7 +338,29 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     let mut guard = ToolRequestLifecycle::new("mcp", new_trace_id(), "-", "POST /mcp", None);
     guard.received();
 
-    if let Err((status, _, message)) = crate::auth::require_json_same_origin(req) {
+    let Some(authority_config) = crate::auth::get_config(depot) else {
+        let status = StatusCode::INTERNAL_SERVER_ERROR;
+        guard.parsed("http_validation_error");
+        guard.response_serialized(
+            status.as_u16(),
+            None,
+            Some(false),
+            None,
+            "http_validation_error",
+        );
+        res.status_code(status);
+        res.render(json_error(status, "Server configuration not available"));
+        guard.handler_returned(
+            status.as_u16(),
+            None,
+            Some(false),
+            None,
+            "http_validation_error",
+        );
+        return;
+    };
+    if let Err((status, _, message)) = crate::auth::require_mcp_json_request(req, &authority_config)
+    {
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST);
         guard.parsed("http_validation_error");
         guard.response_serialized(

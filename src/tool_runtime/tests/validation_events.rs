@@ -28,6 +28,7 @@ async fn run_shell_declared_validation_enters_unified_summary_with_shell_and_roo
                         command: "cargo test focused".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: Some(".".to_string()),
                         purpose: Some(ExecutionPurpose::Test),
                         shell: Some(ExecutionShell::Bash),

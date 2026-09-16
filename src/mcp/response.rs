@@ -2,20 +2,31 @@ use crate::connector_runtime::ConnectorCallOutcome;
 use crate::tool_runtime::ToolResult;
 use serde_json::{json, Value};
 
-pub(super) fn mcp_stateless_result(mut result: Value, cacheable: bool) -> Value {
+pub(super) const MCP_STATELESS_CACHE_TTL_MS: u64 = 0;
+pub(super) const MCP_STATELESS_CACHE_SCOPE: &str = "private";
+
+pub(super) fn mcp_complete_result(mut result: Value) -> Value {
     let Some(object) = result.as_object_mut() else {
         return result;
     };
     object
         .entry("resultType".to_string())
         .or_insert_with(|| Value::String("complete".to_string()));
+    result
+}
+
+pub(super) fn mcp_stateless_result(result: Value, cacheable: bool) -> Value {
+    let mut result = mcp_complete_result(result);
+    let Some(object) = result.as_object_mut() else {
+        return result;
+    };
     if cacheable {
         object
             .entry("ttlMs".to_string())
-            .or_insert_with(|| Value::from(0));
+            .or_insert_with(|| Value::from(MCP_STATELESS_CACHE_TTL_MS));
         object
             .entry("cacheScope".to_string())
-            .or_insert_with(|| Value::String("private".to_string()));
+            .or_insert_with(|| Value::String(MCP_STATELESS_CACHE_SCOPE.to_string()));
     }
     let meta = object
         .entry("_meta".to_string())

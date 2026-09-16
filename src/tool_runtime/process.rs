@@ -293,6 +293,106 @@ fn decorate(
 }
 
 impl ToolRuntime {
+    /// Advisory conversion only, before execution. The explicit-shell wrapper
+    /// requires a known POSIX Runner execution dialect. No target, stdin,
+    /// expectation, login-shell or positional-argv semantics may be guessed.
+    pub(super) async fn process_shell_recovery_call(
+        &self,
+        call: &super::ToolCall,
+        expectation: &super::sessions::ToolCallExpectation,
+        ssh_resource: Option<&str>,
+        resolved: Option<&super::project_resolution::ResolvedProject>,
+    ) -> Option<serde_json::Value> {
+        let super::ToolCall::RunProcess {
+            project,
+            executable,
+            args,
+            stdin,
+            session_id,
+            timeout_secs,
+            sync_wait_secs,
+            cwd,
+            purpose,
+        } = call
+        else {
+            return None;
+        };
+        if !matches!(executable.as_str(), "sh" | "bash")
+            || args.len() != 2
+            || args[0] != "-c"
+            || stdin.is_some()
+            || cwd
+                .as_ref()
+                .is_some_and(|cwd| cwd.len() > PROCESS_CWD_MAX_BYTES || cwd.contains('\0'))
+            || ssh_resource.is_some()
+            || !expectation.accepted_exit_codes.is_empty()
+            || expectation.expected_failure
+            || expectation.expected_failure_kind.is_some()
+            || expectation
+                .result_expectation
+                .as_deref()
+                .is_some_and(|value| value != "success")
+        {
+            return None;
+        }
+        let process = ShellProcessArgv {
+            executable: executable.clone(),
+            args: args.clone(),
+        };
+        if validate_process_input(&process, None, cwd.as_deref())
+            .err()
+            .as_deref()
+            != Some(
+                "run_process does not accept shell command modes; use run_shell for shell syntax",
+            )
+        {
+            return None;
+        }
+        super::helpers::explicit_shell_dispatch_command(&args[1], executable).ok()?;
+        let resolved = resolved?;
+        let runner = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await?;
+        let profiles = runner.policy.as_ref()?.shell_profiles.as_ref()?;
+        let entry = runner.projects.iter().find(|entry| {
+            super::runner_project_runtime_id(&runner.client_id, &entry.id) == resolved.resolved_id
+        })?;
+        let selected_profile = entry
+            .shell_profile
+            .as_deref()
+            .or(profiles.default_profile.as_deref());
+        let dialect = match selected_profile {
+            Some(name) => profiles
+                .profiles
+                .iter()
+                .find(|profile| profile.name == name)?
+                .dialect
+                .as_deref(),
+            None => profiles.default_dialect.as_deref(),
+        };
+        if !matches!(dialect, Some("sh" | "bash")) {
+            return None;
+        }
+        let mut arguments = json!({"project": project, "shell": executable, "command": args[1]});
+        for (name, value) in [
+            ("session_id", json!(session_id)),
+            ("cwd", json!(cwd)),
+            ("timeout_secs", json!(timeout_secs)),
+            ("sync_wait_secs", json!(sync_wait_secs)),
+            ("purpose", json!(purpose)),
+            ("assertion_name", json!(expectation.assertion_name)),
+            ("result_expectation", json!(expectation.result_expectation)),
+        ] {
+            if !value.is_null() {
+                arguments[name] = value;
+            }
+        }
+        // Use the real canonical parser, including wrapper-field validation.
+        super::ToolCall::from_tool_name("run_shell", arguments.clone()).ok()?;
+        Some(super::SuggestedToolCall::new("run_shell", arguments).to_value())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_process_with_contract_for_resource(
         &self,
@@ -811,6 +911,7 @@ impl ToolRuntime {
                             observation.job.exit_code.map(i64::from),
                             &observation.stdout_tail,
                             &observation.stderr_tail,
+                            observation.stdout_truncated || observation.stderr_truncated,
                             observation.job.activity.as_ref(),
                         );
                     let continuation = crate::tool_runtime::jobs::observe_job_continuation(

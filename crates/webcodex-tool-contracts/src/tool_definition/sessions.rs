@@ -1,4 +1,4 @@
-use super::RunnerCapabilityRequirement::{GitOrShell, OwnerOnly};
+use super::RunnerCapabilityRequirement::{GitOrShell, InternalPosixScript, OwnerOnly};
 use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
     adaptive_runtime_direct, context_recovery_only, context_reobservable, def, model_spec,
@@ -132,6 +132,43 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         .with_gpt_action_unsupported(),
         155,
     ),
+    adaptive_runtime_direct(
+        requires_explicit_business_session(model_spec(
+            def(
+                "present_changes",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("project", "/changes/project"),
+                    super::ToolAuditResultField::pointer("session_id", "/changes/session_id"),
+                    super::ToolAuditResultField::pointer("snapshot_id", "/changes/snapshot_id"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ]),
+                ModelVisible,
+                "workflow",
+                Some(InternalPosixScript),
+                TOOL_PROVIDER_CONTROL,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Observe,
+                    risk: Read,
+                    approval: super::ToolApprovalPolicy::None,
+                    idempotency: super::ToolIdempotency::NonIdempotent,
+                },
+                Some(PROJECT_READ),
+                true,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
+            ),
+            "Create one final frozen Changes MCP App presentation for the exact coding Workflow Session only when finish_coding_task returned this parser-ready follow-up. Requires exact project + session_id, re-authorizes both independently, creates no work or validation, changes no Session lifecycle, and grants no authority. Repeated explicit calls can create another Host card, so do not call it more than once for the same closeout.",
+            work_result_input_schema,
+        ))
+        .with_gpt_action_unsupported(),
+        156,
+    ),
     def(
         "work_result_state",
         super::ToolAuditPolicy::typed_fields(&[
@@ -143,6 +180,36 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ModelHidden,
         "workflow",
         Some(GitOrShell),
+        TOOL_PROVIDER_CONTROL,
+        super::ToolSemanticContract {
+            effect: super::ToolEffect::Observe,
+            risk: Read,
+            approval: super::ToolApprovalPolicy::None,
+            idempotency: super::ToolIdempotency::PureRead,
+        },
+        Some(PROJECT_READ),
+        true,
+        NoPath,
+        false,
+        false,
+        super::ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        super::ToolActivityPresentation::Transport,
+        super::ToolActivityInteraction::NonMeaningful,
+    ),
+    def(
+        "changes_file_diff",
+        super::ToolAuditPolicy::typed_fields(&[
+            super::ToolAuditResultField::pointer("project", "/changes_file_diff/project"),
+            super::ToolAuditResultField::pointer("session_id", "/changes_file_diff/session_id"),
+            super::ToolAuditResultField::pointer("snapshot_id", "/changes_file_diff/snapshot_id"),
+            super::ToolAuditResultField::pointer("path", "/changes_file_diff/path"),
+            super::ToolAuditResultField::value("error_kind"),
+        ]),
+        ModelHidden,
+        "workflow",
+        Some(InternalPosixScript),
         TOOL_PROVIDER_CONTROL,
         super::ToolSemanticContract {
             effect: super::ToolEffect::Observe,

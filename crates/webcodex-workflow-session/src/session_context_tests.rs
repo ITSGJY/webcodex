@@ -168,6 +168,96 @@ fn dry_run_project_edits_do_not_record_session_changed_paths() {
     assert!(finished[0].changed_paths.is_empty());
     assert!(finished[1].changed_paths.is_empty());
     assert_eq!(finished[2].changed_paths, vec!["src/live.rs"]);
+    assert!(summary.repository_edit_observed);
+}
+
+#[test]
+fn repository_edit_observed_is_canonical_sticky_and_survives_event_eviction() {
+    let store = SessionStore::new(10, 4);
+    let session = store.start_session(Some("proj".to_string()), Some("sticky edit".to_string()));
+
+    let record = |tool_name: &str, success: bool, state_changed: bool| {
+        let contract = if tool_name == "apply_text_edits" {
+            project_edit_contract(SessionPathHint::PathList)
+        } else {
+            session_tool_contract(tool_name)
+        };
+        let start = store
+            .record_tool_call_started(
+                Some(&session.session_id),
+                SessionTransport::Mcp,
+                tool_name,
+                &json!({"project": "proj"}),
+                contract,
+            )
+            .expect("tool start");
+        store
+            .record_tool_call_finished(
+                Some(start),
+                success,
+                &json!({"state_changed": state_changed}),
+                (!success).then_some("failed"),
+                None,
+            )
+            .expect("tool finish");
+    };
+
+    record("apply_text_edits", true, false);
+    assert!(
+        !store
+            .summary(&session.session_id, None)
+            .unwrap()
+            .repository_edit_observed
+    );
+
+    // Shell/process writes are intentionally ineligible even when their generic
+    // effect evidence reports a state change.
+    record("run_process", true, true);
+    assert!(
+        !store
+            .summary(&session.session_id, None)
+            .unwrap()
+            .repository_edit_observed
+    );
+
+    record("apply_text_edits", false, true);
+    assert!(
+        !store
+            .summary(&session.session_id, None)
+            .unwrap()
+            .repository_edit_observed
+    );
+
+    record("apply_text_edits", true, true);
+    assert!(
+        store
+            .summary(&session.session_id, None)
+            .unwrap()
+            .repository_edit_observed
+    );
+
+    // Push enough later events to evict the successful Edit event itself. The
+    // monotonic Session fact must not be reconstructed from retained history.
+    for index in 0..8 {
+        let start = store
+            .record_tool_call_started(
+                Some(&session.session_id),
+                SessionTransport::Api,
+                "read_files",
+                &json!({"project": "proj", "path": format!("src/{index}.rs")}),
+                session_tool_contract("read_files"),
+            )
+            .expect("read start");
+        store
+            .record_tool_call_finished(Some(start), true, &json!({}), None, None)
+            .expect("read finish");
+    }
+    let summary = store.summary(&session.session_id, Some(20)).unwrap();
+    assert!(summary.repository_edit_observed);
+    assert!(summary
+        .events
+        .iter()
+        .all(|event| event.tool_name != "apply_text_edits"));
 }
 
 #[test]

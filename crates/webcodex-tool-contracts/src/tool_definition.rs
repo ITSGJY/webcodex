@@ -83,11 +83,11 @@ use webcodex_core::runner_protocol::{
     RUNNER_CAPABILITY_COMPUTER_POINTER_CONTROL, RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
     RUNNER_CAPABILITY_COMPUTER_TEXT_INPUT, RUNNER_CAPABILITY_COMPUTER_WINDOW_ACTIVATE,
     RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS, RUNNER_CAPABILITY_FILE_READ,
-    RUNNER_CAPABILITY_FILE_WRITE, RUNNER_CAPABILITY_GIT, RUNNER_CAPABILITY_LSP_CALL_HIERARCHY,
-    RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION, RUNNER_CAPABILITY_PERSISTENT_SHELL,
-    RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL, RUNNER_CAPABILITY_SHELL,
-    RUNNER_CAPABILITY_SKILL_MANAGEMENT, RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
-    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+    RUNNER_CAPABILITY_FILE_WRITE, RUNNER_CAPABILITY_GIT, RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
+    RUNNER_CAPABILITY_LSP_CALL_HIERARCHY, RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    RUNNER_CAPABILITY_PERSISTENT_SHELL, RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL,
+    RUNNER_CAPABILITY_SHELL, RUNNER_CAPABILITY_SKILL_MANAGEMENT,
+    RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV, RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 
 /// Runner capability or owner-boundary requirement that must hold before a
@@ -108,6 +108,10 @@ pub enum RunnerCapabilityRequirement {
     /// Bounded typed script payload execution. Never inferred from raw shell
     /// or either structured argv capability.
     StructuredScript,
+    /// Dedicated Server-generated POSIX script runtime. Never infer this from
+    /// shell/git support: older mixed-version Runners may advertise those while
+    /// lacking the typed internal request kind.
+    InternalPosixScript,
     /// `read_file` (Runner path uses the file_read request kind).
     FileRead,
     /// Native file mutation requests handled by the Runner.
@@ -172,6 +176,7 @@ impl RunnerCapabilityRequirement {
             Self::StructuredProcess => RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
             Self::DetachedProcess => RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS,
             Self::StructuredScript => RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+            Self::InternalPosixScript => RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
             Self::FileRead => RUNNER_CAPABILITY_FILE_READ,
             Self::FileWrite => RUNNER_CAPABILITY_FILE_WRITE,
             Self::ApplyPatch => RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
@@ -207,6 +212,7 @@ impl RunnerCapabilityRequirement {
             Self::StructuredProcess => &[RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV],
             Self::DetachedProcess => &[RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS],
             Self::StructuredScript => &[RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD],
+            Self::InternalPosixScript => &[RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT],
             Self::FileRead => &[RUNNER_CAPABILITY_FILE_READ],
             Self::FileWrite => &[RUNNER_CAPABILITY_FILE_WRITE],
             Self::ApplyPatch => &[RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA],

@@ -305,6 +305,7 @@ async fn project_instructions_context_projection_is_authorized_scoped_and_bounde
                 command: "pwd".to_string(),
                 session_id: Some(session.session_id),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,

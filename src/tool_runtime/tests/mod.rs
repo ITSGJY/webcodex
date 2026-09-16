@@ -7,6 +7,7 @@ mod agent_waits;
 mod apply_text_edits;
 mod assignment_fence;
 mod builtin_coding_workflow;
+mod changes;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
 mod coding_task;

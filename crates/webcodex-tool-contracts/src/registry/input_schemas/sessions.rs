@@ -351,6 +351,38 @@ pub fn validation_summary_input_schema() -> Value {
     })
 }
 
+pub fn changes_file_diff_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Required exact runtime Project input. It is independently resolved and authorized on every call and must match the project scoped to session_id."
+            },
+            "session_id": {
+                "type": "string",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
+                "description": "Required exact Workflow Session that owns the frozen Changes snapshot."
+            },
+            "snapshot_id": {
+                "type": "string",
+                "pattern": "^wc_changes_snapshot_[0-9a-f]{32}$",
+                "description": "Opaque Server-generated Changes presentation snapshot id returned by present_changes. It never grants Git-object authority."
+            },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Exact project-relative changed path advertised by this snapshot. Arbitrary paths are rejected."
+            }
+        },
+        "required": ["project", "session_id", "snapshot_id", "path"],
+        "additionalProperties": false
+    })
+}
+
 pub fn work_result_input_schema() -> Value {
     json!({
         "type": "object",

@@ -14,9 +14,22 @@ export function app(filename, { deliverToolMeta = true, deliverToolStructuredCon
   const sent = [];
   let nextTimer = 1;
   const parent = { postMessage(message) { sent.push(message); } };
+  function element(tagName = "div") {
+    const attributes = new Map();
+    return {
+      tagName: String(tagName).toUpperCase(),
+      textContent: "", hidden: false, children: [], className: "", type: "", onclick: null,
+      append(...children) { this.children.push(...children); },
+      appendChild(child) { this.children.push(child); return child; },
+      replaceChildren(...children) { this.children = [...children]; this.textContent = ""; },
+      setAttribute(name, value) { attributes.set(name, String(value)); },
+      getAttribute(name) { return attributes.get(name); },
+    };
+  }
   const document = {
     hidden: false,
-    getElementById: id => nodes[id] ||= { textContent: "", hidden: false },
+    getElementById: id => nodes[id] ||= element(),
+    createElement: tagName => element(tagName),
   };
   function addEventListener(name, listener) {
     if (!listeners.has(name)) listeners.set(name, []);

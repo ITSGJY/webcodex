@@ -391,6 +391,7 @@ mod tests {
         "workspace_hygiene_check",
         "finish_coding_task",
         "present_work_result",
+        "present_changes",
     ];
 
     #[test]

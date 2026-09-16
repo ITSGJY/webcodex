@@ -1,6 +1,7 @@
 use super::protocol::request_client_capabilities;
 use super::response::{
-    connector_call_tool_result, mcp_stateless_result, rpc_error, rpc_error_with_data, rpc_result,
+    connector_call_tool_result, mcp_complete_result, mcp_stateless_result, rpc_error,
+    rpc_error_with_data, rpc_result,
 };
 use super::{require_mcp_scope, scope_forbidden, McpOutcome};
 use crate::auth::{AuthContext, SCOPE_JOB_RUN};
@@ -127,7 +128,7 @@ fn mcp_detailed_task_result(
     let mut result = mcp_task_base(execution, "complete", status);
     if status == "completed" {
         if let (Some(object), Some(call_tool_result)) = (result.as_object_mut(), call_tool_result) {
-            object.insert("result".to_string(), call_tool_result);
+            object.insert("result".to_string(), mcp_complete_result(call_tool_result));
         }
     }
     result

@@ -217,6 +217,7 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
                         command: "echo back".to_string(),
                         session_id: None,
                         timeout_secs: Some(5),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,

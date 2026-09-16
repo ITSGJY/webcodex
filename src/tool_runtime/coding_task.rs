@@ -864,6 +864,12 @@ impl ToolRuntime {
         if !git.is_null() {
             append_workspace_warnings(&workspace_payload_from_git_summary(&git), &mut warnings);
         }
+        let git_baseline_tree = if resume_session_id.is_none() {
+            self.capture_coding_git_baseline_tree(&resolved.resolved_id, &git, &mut warnings)
+                .await
+        } else {
+            None
+        };
         let write_scope_verified =
             auth.is_none_or(|auth| auth.has_scope(crate::auth::SCOPE_PROJECT_WRITE));
         let authority_fingerprint = match workflow_session_authority_fingerprint(auth) {
@@ -882,7 +888,7 @@ impl ToolRuntime {
                 );
             }
         };
-        let session_outcome = match self.sessions.ensure_coding_session(
+        let session_outcome = match self.sessions.ensure_coding_session_with_git_baseline(
             sessions::CodingSessionRequest {
                 project: resolved.resolved_id.clone(),
                 authority_fingerprint,
@@ -901,6 +907,7 @@ impl ToolRuntime {
                 context_refreshed: true,
                 write_scope_verified,
             },
+            git_baseline_tree,
         ) {
             Ok(outcome) => outcome,
             Err(sessions::CodingSessionError::InvalidResumeSessionId) => {
@@ -1623,6 +1630,28 @@ impl ToolRuntime {
             .sessions
             .summary(&session_id, Some(FINISH_SESSION_EVENT_LIMIT))
             .unwrap_or(closeout_pre_validation_summary);
+        let changes_presentation = match self
+            .final_changes_presentation_needed(&resolved.resolved_id, &closeout_session_summary)
+            .await
+        {
+            Ok(true) => Some(json!({
+                "suggested_call": {
+                    "tool": "present_changes",
+                    "arguments": {
+                        "project": resolved.resolved_id.clone(),
+                        "session_id": session_id.clone(),
+                    }
+                }
+            })),
+            Ok(false) => None,
+            Err(message) => {
+                final_warnings.push(json!({
+                    "kind": "changes_presentation_probe_failed",
+                    "message": message,
+                }));
+                None
+            }
+        };
         let review_evidence = review_evidence_summary_for_session(&closeout_session_summary);
         let (work_performed, changed_paths) =
             closeout_work_projection(&closeout_session_summary.events);
@@ -1698,6 +1727,9 @@ impl ToolRuntime {
             "llm_summary": false,
             "final_warnings": final_warnings,
         });
+        if let Some(presentation) = changes_presentation {
+            output["presentation"] = presentation;
+        }
         output["suggested_next_actions"] = json!(finish_suggested_next_actions(&output));
         output["handoff_brief"] = build_handoff_brief(HandoffBriefInput {
             session_summary: &closeout_session_summary,
@@ -1821,6 +1853,118 @@ impl ToolRuntime {
                 false,
             ),
         }
+    }
+
+    async fn capture_coding_git_baseline_tree(
+        &self,
+        project: &str,
+        git: &Value,
+        warnings: &mut Vec<Value>,
+    ) -> Option<String> {
+        if git.get("available").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+
+        let observed_head = git
+            .pointer("/head/commit")
+            .and_then(Value::as_str)
+            .filter(|value| valid_git_object_id(value))
+            .map(str::to_string);
+        let head_commit = if let Some(commit) = observed_head {
+            Some(commit)
+        } else {
+            let probe = self
+                .run_internal_process_sync(
+                    project.to_string(),
+                    "git".to_string(),
+                    vec![
+                        "rev-parse".to_string(),
+                        "--verify".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    30,
+                )
+                .await;
+            if probe.success {
+                process_stdout_git_object_id(&probe)
+            } else {
+                None
+            }
+        };
+
+        if let Some(commit) = head_commit {
+            let result = self
+                .run_internal_process_sync(
+                    project.to_string(),
+                    "git".to_string(),
+                    vec![
+                        "rev-parse".to_string(),
+                        "--verify".to_string(),
+                        format!("{commit}^{{tree}}"),
+                    ],
+                    30,
+                )
+                .await;
+            if let Some(tree) = result
+                .success
+                .then(|| process_stdout_git_object_id(&result))
+                .flatten()
+            {
+                return Some(tree);
+            }
+            warnings.push(json!({
+                "kind": "git_baseline_unavailable",
+                "message": "Git HEAD was observed but its baseline tree could not be resolved",
+            }));
+            return None;
+        }
+
+        // A Git repository with no resolvable HEAD is eligible for the unborn
+        // baseline only when HEAD is still a valid symbolic ref. This keeps a
+        // generic Git/read failure from being mistaken for an empty repository.
+        let symbolic_head = self
+            .run_internal_process_sync(
+                project.to_string(),
+                "git".to_string(),
+                vec![
+                    "symbolic-ref".to_string(),
+                    "-q".to_string(),
+                    "HEAD".to_string(),
+                ],
+                30,
+            )
+            .await;
+        if !symbolic_head.success {
+            warnings.push(json!({
+                "kind": "git_baseline_unavailable",
+                "message": "Git baseline could not distinguish an unborn HEAD from an unavailable HEAD",
+            }));
+            return None;
+        }
+
+        // Ask this exact repository to materialize its own empty tree. Do not
+        // hard-code the SHA-1 empty-tree id: SHA-256 repositories use a different
+        // object id. This writes only the immutable empty tree object.
+        let empty_tree = self
+            .run_internal_process_sync(
+                project.to_string(),
+                "git".to_string(),
+                vec!["mktree".to_string()],
+                30,
+            )
+            .await;
+        if let Some(tree) = empty_tree
+            .success
+            .then(|| process_stdout_git_object_id(&empty_tree))
+            .flatten()
+        {
+            return Some(tree);
+        }
+        warnings.push(json!({
+            "kind": "git_baseline_unavailable",
+            "message": "Unborn Git repository could not create its repository-native empty tree baseline",
+        }));
+        None
     }
 
     async fn coding_startup_git_summary(
@@ -2736,6 +2880,9 @@ fn finish_decision_output(output: &Value) -> Value {
         "warnings": output.get("final_warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });
+    if let Some(presentation) = output.get("presentation") {
+        decision["presentation"] = presentation.clone();
+    }
     apply_compact_workflow_outcomes(&mut decision, true, Some(hygiene_checked));
     let verdict = decision
         .get("verdict")
@@ -2750,7 +2897,7 @@ fn finish_decision_output(output: &Value) -> Value {
 }
 
 fn compact_finish_output(decision: &Value) -> Value {
-    json!({
+    let mut output = json!({
         "summary_only": true,
         "workspace_clean": decision.get("workspace_clean").cloned().unwrap_or(json!(false)),
         "workspace_conflicts": decision.get("workspace_conflicts").cloned().unwrap_or(json!(0)),
@@ -2764,7 +2911,11 @@ fn compact_finish_output(decision: &Value) -> Value {
         "evidence_integrity": decision.get("evidence_integrity").cloned().unwrap_or(Value::Null),
         "warnings": decision.get("warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": decision.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
-    })
+    });
+    if let Some(presentation) = decision.get("presentation") {
+        output["presentation"] = presentation.clone();
+    }
+    output
 }
 
 fn compact_finish_validation(validation: &Value) -> Value {
@@ -3109,6 +3260,18 @@ fn finish_suggested_next_actions(output: &Value) -> Vec<String> {
         );
     }
     actions
+}
+
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn process_stdout_git_object_id(result: &ToolResult) -> Option<String> {
+    let value = result.output.get("stdout_tail")?.as_str()?.trim();
+    valid_git_object_id(value).then(|| value.to_string())
 }
 
 fn changed_files_count_from_counts(counts: &Value) -> u64 {

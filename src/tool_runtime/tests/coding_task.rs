@@ -729,6 +729,198 @@ async fn work_on_project_serviced(
     task.await.unwrap()
 }
 
+#[tokio::test]
+async fn work_on_project_captures_repository_native_unborn_empty_tree_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "changes-unborn-baseline",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+
+    let start = work_on_project_serviced(
+        &runtime,
+        "changes-unborn-baseline",
+        &project,
+        "unborn baseline",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap();
+    let summary = runtime.sessions.summary(session_id, None).unwrap();
+    let baseline = summary
+        .git_baseline_tree
+        .as_deref()
+        .expect("unborn Git repository must capture its native empty tree");
+
+    let expected = std::process::Command::new("git")
+        .arg("mktree")
+        .stdin(std::process::Stdio::null())
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(expected.status.success());
+    assert_eq!(baseline, String::from_utf8(expected.stdout).unwrap().trim());
+    assert!(matches!(baseline.len(), 40 | 64));
+}
+
+#[tokio::test]
+async fn work_on_project_non_git_startup_never_retroactively_acquires_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "changes-non-git-baseline",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+
+    let start = work_on_project_serviced(
+        &runtime,
+        "changes-non-git-baseline",
+        &project,
+        "non Git baseline",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        runtime
+            .sessions
+            .summary(&session_id, None)
+            .unwrap()
+            .git_baseline_tree,
+        None
+    );
+
+    init_git_repo(tmp.path());
+    fs::write(tmp.path().join("README.md"), "created after startup\n").unwrap();
+    let edit = runtime.sessions.record_tool_call_started(
+        Some(&session_id),
+        SessionTransport::Mcp,
+        "apply_text_edits",
+        &json!({
+            "project": project,
+            "changes": [{"kind": "create", "path": "README.md"}]
+        }),
+        crate::tool_runtime::sessions::session_tool_contract("apply_text_edits"),
+    );
+    runtime.sessions.record_tool_call_finished(
+        edit,
+        true,
+        &json!({"state_changed": true}),
+        None,
+        None,
+    );
+    let summary = runtime.sessions.summary(&session_id, None).unwrap();
+    assert!(summary.repository_edit_observed);
+    assert_eq!(summary.git_baseline_tree, None);
+    assert!(!runtime
+        .final_changes_presentation_needed(&project, &summary)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn exact_work_on_project_resume_preserves_original_git_baseline_after_head_moves() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "changes-resume-baseline",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+    let start = work_on_project_serviced(
+        &runtime,
+        "changes-resume-baseline",
+        &project,
+        "resume baseline",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    let original = runtime
+        .sessions
+        .summary(&session_id, None)
+        .unwrap()
+        .git_baseline_tree
+        .expect("baseline");
+
+    commit_file(tmp.path(), "later.txt", "later\n", "move head");
+    let current_tree = {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD^{tree}"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    assert_ne!(current_tree, original);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::WorkOnProject {
+                        project,
+                        client_id: None,
+                        path: None,
+                        mode: None,
+                        base_ref: None,
+                        instruction: "exact resume".to_string(),
+                        session_id: Some(session_id),
+                        include_project_instructions: true,
+                        include_workflow_guidance: true,
+                        include_extension_catalog: false,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    service_agent_task_until_finished(
+        &runtime,
+        "changes-resume-baseline",
+        &task,
+        "exact work_on_project resume",
+    )
+    .await;
+    let resumed = task.await.unwrap();
+    assert!(resumed.success, "{:?}", resumed.error);
+    assert_eq!(
+        runtime
+            .sessions
+            .summary(&session_id, None)
+            .unwrap()
+            .git_baseline_tree
+            .as_deref(),
+        Some(original.as_str())
+    );
+}
+
 fn assert_startup_nonblocking_dirty(result: &ToolResult, workspace_reason: &str) {
     assert!(result.success, "{:?}", result.error);
     let session_id = result.output["session"]["session_id"]
@@ -1265,6 +1457,94 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
         .iter()
         .any(|reason| reason == "workspace_dirty"));
     assert_finish_uses_canonical_outcomes(&result.output);
+}
+
+#[tokio::test]
+async fn finish_coding_task_emits_one_parser_ready_changes_presentation_in_full_and_summary_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "coding-finish-changes",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+    let start = work_on_project_serviced(
+        &runtime,
+        "coding-finish-changes",
+        &project,
+        "changes closeout",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    record_coding_task_tool_event(
+        &runtime,
+        &session_id,
+        "apply_text_edits",
+        json!({
+            "project": project,
+            "changes": [{"kind": "edit", "path": "README.md"}]
+        }),
+        true,
+        json!({"state_changed": true}),
+    );
+    fs::write(tmp.path().join("README.md"), "final task state\n").unwrap();
+
+    for summary_only in [false, true] {
+        let result = finish_coding_task_with_agent(
+            &runtime,
+            "coding-finish-changes",
+            project.clone(),
+            session_id.clone(),
+            auth.clone(),
+            summary_only,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["presentation"]["suggested_call"],
+            json!({
+                "tool": "present_changes",
+                "arguments": {
+                    "project": project,
+                    "session_id": session_id,
+                }
+            })
+        );
+        assert!(result.output["suggested_next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| !action
+                .as_str()
+                .unwrap_or_default()
+                .contains("present_changes")));
+    }
+
+    let restore = std::process::Command::new("git")
+        .args(["restore", "--source=HEAD", "--", "README.md"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(restore.status.success());
+    let reverted = finish_coding_task_with_agent(
+        &runtime,
+        "coding-finish-changes",
+        project,
+        session_id,
+        auth,
+        true,
+    )
+    .await;
+    assert!(reverted.success, "{:?}", reverted.error);
+    assert!(reverted.output.get("presentation").is_none());
 }
 
 #[tokio::test]

@@ -1061,6 +1061,72 @@ async fn setup_ssh(
 }
 
 #[tokio::test]
+async fn named_ssh_run_shell_rejects_unsupported_long_lifetime_before_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) =
+        setup_ssh_with_capabilities(temp.path(), "prod", true, true).await;
+    let auth = auth_context(None, true);
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::RunShell {
+                project,
+                command: "printf remote-long".to_string(),
+                session_id: Some(session.session_id.clone()),
+                timeout_secs: Some(600),
+                sync_wait_secs: None,
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success, "{result:?}");
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "capability_unavailable");
+    assert!(result.error.as_deref().unwrap_or_default().contains("120"));
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
+async fn named_ssh_run_shell_rejects_sync_wait_before_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) =
+        setup_ssh_with_capabilities(temp.path(), "prod", true, true).await;
+    let auth = auth_context(None, true);
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::RunShell {
+                project,
+                command: "printf remote".to_string(),
+                session_id: Some(session.session_id.clone()),
+                timeout_secs: Some(30),
+                sync_wait_secs: Some(1),
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success, "{result:?}");
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "unsupported_resource");
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("sync_wait_secs"));
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
 async fn ssh_persistent_shell_enqueues_with_bound_resource_and_routes_by_record() {
     let temp = tempfile::tempdir().unwrap();
     let (runtime, project, session) = setup_ssh(temp.path(), "prod").await;
@@ -1073,6 +1139,7 @@ async fn ssh_persistent_shell_enqueues_with_bound_resource_and_routes_by_record(
                 command: "printf one-shot".to_string(),
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,

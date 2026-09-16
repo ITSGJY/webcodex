@@ -368,6 +368,17 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
     assert_eq!(timeout["minimum"], 1);
     assert!(timeout.get("maximum").is_none());
     assert_eq!(timeout["default"], 60);
+    let timeout_desc = timeout["description"].as_str().unwrap_or_default();
+    assert!(timeout_desc.contains("shared structured-execution ceiling"));
+    assert!(!timeout_desc.contains("120 are accepted and clamped"));
+    let sync_wait = &run_shell.input_schema["properties"]["sync_wait_secs"];
+    assert_eq!(sync_wait["type"], "integer");
+    assert_eq!(sync_wait["minimum"], 1);
+    assert!(sync_wait.get("maximum").is_none());
+    assert!(sync_wait.get("default").is_none());
+    let sync_desc = sync_wait["description"].as_str().unwrap_or_default();
+    assert!(sync_desc.contains("same-execution durable Job handoff"));
+    assert!(sync_desc.contains("not when the command is killed"));
 
     let search = spec_named(&specs, "search_project_texts");
     assert!(

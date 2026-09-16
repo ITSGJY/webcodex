@@ -7,10 +7,11 @@ pub(super) mod input_schemas {
 
 #[allow(unused_imports)]
 pub(crate) use webcodex_tool_contracts::registry::{
-    agent_continuation_app_tool_specs, goal_plan_app_tool_specs, memory_management_tool_specs,
-    memory_runtime_tool_specs, operator_diagnostic_tool_specs, output_schema_for_tool,
-    registered_tool_specs, skill_management_tool_specs, skill_runtime_tool_specs,
-    stateless_operator_extension_tool_specs, tool_annotations, work_result_app_tool_specs,
+    agent_continuation_app_tool_specs, changes_app_tool_specs, goal_plan_app_tool_specs,
+    memory_management_tool_specs, memory_runtime_tool_specs, operator_diagnostic_tool_specs,
+    output_schema_for_tool, registered_tool_specs, skill_management_tool_specs,
+    skill_runtime_tool_specs, stateless_operator_extension_tool_specs, tool_annotations,
+    work_result_app_tool_specs,
 };
 
 #[cfg(test)]

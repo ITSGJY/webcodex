@@ -5012,9 +5012,24 @@ impl ToolCall {
             | Self::WorkResultState {
                 project,
                 session_id,
+            }
+            | Self::PresentChanges {
+                project,
+                session_id,
             } => serde_json::json!({
                 "project": project,
                 "session_id": session_id,
+            }),
+            Self::ChangesFileDiff {
+                project,
+                session_id,
+                snapshot_id,
+                path,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "snapshot_id": snapshot_id,
+                "path": path,
             }),
             Self::ListProjects {
                 client_id,

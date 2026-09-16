@@ -3190,6 +3190,61 @@ fn current_evidence_different_success_without_mutation_keeps_failure_open() {
 }
 
 #[test]
+fn current_evidence_boundary_unavailable_preserves_historical_validation() {
+    let store = SessionStore::new(16, 6);
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    store
+        .ensure_coding_session(sessions::CodingSessionRequest {
+            project: "agent:eval:demo".to_string(),
+            authority_fingerprint: sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
+                .to_string(),
+            resume_session_id: Some(session.session_id.clone()),
+            instruction: Some("validate the retained tail".to_string()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        })
+        .unwrap();
+    for path in ["src/a.rs", "src/b.rs"] {
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "read_files",
+            json!({"project": "agent:eval:demo", "items": [{"path": path}]}),
+            true,
+            json!({"items": []}),
+        );
+    }
+    record_validation_success(&store, &session.session_id, "cargo_check");
+
+    let summary = store.summary(&session.session_id, Some(50)).unwrap();
+    assert!(summary.events_truncated);
+    assert!(!summary
+        .events
+        .iter()
+        .any(|event| event.kind == "task_instruction"));
+    let validation = validation_summary_for_session(&summary);
+
+    assert_eq!(validation["available"], true);
+    assert_eq!(validation["status"], "passed");
+    assert_eq!(validation["latest_status"], "passed");
+    assert_eq!(validation["events_total"], 1);
+    assert_eq!(validation["successes"], 1);
+    assert_eq!(validation["current_evidence"]["status"], "unknown");
+    assert_eq!(
+        validation["current_evidence"]["reason"],
+        "attempt_boundary_unavailable"
+    );
+    assert_eq!(validation["current_evidence"]["latest_status"], "unknown");
+    assert_eq!(validation["current_evidence"]["events_total"], 0);
+    assert_eq!(validation["current_evidence"]["successes"], 0);
+}
+
+#[test]
 fn current_evidence_same_identity_failure_success_resolves_inside_window() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);

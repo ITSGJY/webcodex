@@ -2252,3 +2252,163 @@ async fn model_facing_session_denials_keep_run_process_prestart_lifecycle() {
         "model-facing Session denials must happen before Runner enqueue"
     );
 }
+
+#[tokio::test]
+async fn run_process_shell_command_mode_recovery_is_lossless_parser_ready_and_prestart() {
+    use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client = "shell-recovery";
+    let project = runner_project_runtime_id(client, "demo");
+    let auth = bootstrap_auth_context();
+    for dialect in [Some("bash"), Some("custom"), None] {
+        register_agent_with_shell_profiles(
+            &runtime,
+            client,
+            Some(RunnerPolicySummary {
+                shell_profiles: Some(ShellProfilesSummary {
+                    default_profile: None,
+                    configured_count: 0,
+                    prepared_cache_count: 0,
+                    profiles: vec![],
+                    default_dialect: dialect.map(str::to_string),
+                    available_dialects: Some(vec!["sh".into(), "bash".into()]),
+                }),
+                ..Default::default()
+            }),
+            vec![registered_project("demo", &temp.path().to_string_lossy())],
+        )
+        .await;
+        for (shell, args, extra, convertible) in [
+            (
+                "sh",
+                json!(["-c", "printf '%s' '雪 $HOME'\nprintf done"]),
+                json!({}),
+                true,
+            ),
+            (
+                "bash",
+                json!(["-c", "printf '%s' 'a b'"]),
+                json!({"result_expectation":"success"}),
+                true,
+            ),
+            ("bash", json!(["-lc", "echo login"]), json!({}), false),
+            (
+                "bash",
+                json!(["-c", "echo $0", "custom-zero"]),
+                json!({}),
+                false,
+            ),
+            ("bash", json!(["-c", "cat"]), json!({"stdin":""}), false),
+            (
+                "bash",
+                json!(["-c", "echo hello"]),
+                json!({"cwd":"bad\0cwd"}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"accepted_exit_codes":[0,1]}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"result_expectation":"failure"}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"result_expectation":"observe"}),
+                false,
+            ),
+            (
+                "powershell",
+                json!(["-Command", "echo hello"]),
+                json!({}),
+                false,
+            ),
+            ("cmd", json!(["/c", "echo hello"]), json!({}), false),
+            ("/bin/bash", json!(["-c", "echo hello"]), json!({}), false),
+            (
+                "bash",
+                json!([
+                    "-c",
+                    "x".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES + 1)
+                ]),
+                json!({}),
+                false,
+            ),
+        ] {
+            let session = runtime.sessions.start_session(Some(project.clone()), None);
+            let mut arguments = json!({"project":project, "executable":shell, "args":args,
+                "session_id":session.session_id, "cwd":".", "timeout_secs":30, "sync_wait_secs":1,
+                "purpose":"test", "assertion_name":"shell recovery"});
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (call, metadata) =
+                ToolCall::from_tool_name_with_recorder_metadata("run_process", arguments.clone())
+                    .unwrap();
+            let result = runtime
+                .dispatch_with_auth_transport_options_and_metadata(
+                    call,
+                    Some(&auth),
+                    sessions::SessionTransport::Mcp,
+                    metadata,
+                )
+                .await;
+            assert!(!result.success, "{result:?}");
+            assert_eq!(result.output["command_started"], false, "{result:?}");
+            assert_eq!(result.output["execution_state"], "not_started");
+            assert_eq!(result.output["failure_kind"], "invalid_arguments");
+            assert!(result.output.get("job_id").is_none());
+            assert!(result.output.get("recovery_kind").is_none());
+            if convertible && dialect == Some("bash") {
+                let suggested = &result.output["suggested_call"];
+                ToolCall::from_tool_name(
+                    suggested["tool"].as_str().unwrap(),
+                    suggested["arguments"].clone(),
+                )
+                .unwrap();
+                let mut expected = arguments.clone();
+                let object = expected.as_object_mut().unwrap();
+                object.remove("executable");
+                object.remove("args");
+                // Explicit success is canonically normalized to omission.
+                object.remove("result_expectation");
+                object.insert("shell".into(), json!(shell));
+                object.insert("command".into(), args[1].clone());
+                assert_eq!(
+                    suggested,
+                    &json!({"tool":"run_shell", "arguments":expected})
+                );
+            } else {
+                assert!(result.output.get("suggested_call").is_none(), "{result:?}");
+            }
+            let schema = crate::tool_runtime::registry::output_schema_for_tool("run_process");
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &json!({
+                "success":result.success, "output":result.output, "error":result.error}),
+                &schema,
+            )
+            .unwrap();
+            assert!(
+                probe_patch_agent_request(&runtime, client).await.is_none(),
+                "no process dispatched"
+            );
+            assert!(
+                runtime.runner_registry.list_jobs(None).await.is_empty(),
+                "no Job admitted"
+            );
+            assert_eq!(
+                std::fs::read_dir(temp.path()).unwrap().count(),
+                0,
+                "workspace state unchanged"
+            );
+        }
+    }
+}

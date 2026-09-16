@@ -104,15 +104,6 @@
           "evidence_sha256": "2eea842958ca1c21934dbf7f31c526278313834d87d01c77b24d28e2ea1d7f17"
         },
         {
-          "scenario": "dns-rebinding-protection",
-          "check_id": "localhost-host-rebinding-rejected",
-          "classification": "genuine_protocol_failure",
-          "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
-          "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
-          "expected_status": "FAILURE",
-          "evidence_sha256": "55fef6d01afbb12e2235724cc78cef53e13ad7b61fb8b387d4b260c19ce74b89"
-        },
-        {
           "scenario": "elicitation-sep1034-defaults",
           "check_id": "elicitation-sep1034-general",
           "classification": "missing_harness_fixture",
@@ -329,15 +320,6 @@
           "evidence_sha256": "96a058e400b47135503f462d35b6865092c786aee626904bcfd88ffa4f51aa02"
         },
         {
-          "scenario": "dns-rebinding-protection",
-          "check_id": "localhost-host-rebinding-rejected",
-          "classification": "genuine_protocol_failure",
-          "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
-          "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
-          "expected_status": "FAILURE",
-          "evidence_sha256": "56f4a8d9b0ea3df7f9ad8f42edb3f6dc249c7f119daa83c9ca4da22bd8f86b16"
-        },
-        {
           "scenario": "input-required-result-basic-elicitation",
           "check_id": "sep-2322-elicitation-incomplete",
           "classification": "missing_harness_fixture",
@@ -473,15 +455,6 @@
           "evidence_sha256": "ae122f912511f271c31f53fee8245c1dde3acfcff41c5db301341055cc9917e0"
         },
         {
-          "scenario": "sep-2164-resource-not-found",
-          "check_id": "sep-2164-data-uri",
-          "classification": "genuine_protocol_failure",
-          "reason": "The resource-not-found error omits the recommended data.uri echo.",
-          "evidence": "SEP-2164 resource-not-found error data; first GitHub Actions conformance baseline raw report",
-          "expected_status": "WARNING",
-          "evidence_sha256": "03e182c64ad2607c2749b90609cbf22dc87eda95ae0951f9c7a4c2f1227aabe0"
-        },
-        {
           "scenario": "server-stateless",
           "check_id": "sep-2575-http-server-no-independent-requests-on-stream",
           "classification": "missing_harness_fixture",
@@ -516,24 +489,6 @@
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
           "evidence_sha256": "54fb37a17716a6faa4e20eba8bbceb73fa4cf5b7c0ede03c4fc3c950642b6ad0"
-        },
-        {
-          "scenario": "server-stateless",
-          "check_id": "sep-2575-request-meta-invalid-missing-meta",
-          "classification": "genuine_protocol_failure",
-          "reason": "The request is rejected with WebCodex header-mismatch code -32020 instead of the required -32602 Invalid params.",
-          "evidence": "SEP-2575 request metadata validation; first GitHub Actions conformance baseline raw report",
-          "expected_status": "FAILURE",
-          "evidence_sha256": "f72e87a4dcd615f71164cc3d3a94bc2e9a8db5fd4da6364c1379115262c62a15"
-        },
-        {
-          "scenario": "server-stateless",
-          "check_id": "sep-2575-request-meta-invalid-missing-protocol-version",
-          "classification": "genuine_protocol_failure",
-          "reason": "The request is rejected with WebCodex header-mismatch code -32020 instead of the required -32602 Invalid params.",
-          "evidence": "SEP-2575 request metadata validation; first GitHub Actions conformance baseline raw report",
-          "expected_status": "FAILURE",
-          "evidence_sha256": "453717c56bda626408c987bb9e6c8dd5c2582e1523481557197a85f3169fc463"
         },
         {
           "scenario": "server-stateless",
@@ -655,18 +610,5 @@
       }
     }
   },
-  "supplemental_findings": [
-    {
-      "id": "2026-streamed-resource-cache-hints",
-      "classification": "genuine_protocol_failure",
-      "evidence": "src/mcp_tests/artifact_export.rs::http_mcp_artifact_export_resources_read_streams_valid_json_blob",
-      "summary": "The streamed artifact resources/read result currently omits ttlMs and cacheScope. This baseline records the finding but does not change production framing."
-    },
-    {
-      "id": "2026-completed-task-nested-result-type",
-      "classification": "genuine_protocol_failure",
-      "evidence": "src/mcp_tests/project_connector.rs::http_project_connector_2026_tasks_poll_durable_execution_across_reopen",
-      "summary": "A completed Connector Task currently embeds its original tool result without resultType. This baseline records the finding but does not change production framing."
-    }
-  ]
+  "supplemental_findings": []
 }

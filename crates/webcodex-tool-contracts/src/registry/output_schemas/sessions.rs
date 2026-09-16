@@ -201,6 +201,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             "work_result",
             open_object_schema("Bounded deterministic Work Result projection for one exact project-scoped Workflow Session."),
         )])),
+        "present_changes" => Some(wrapped_output_schema(vec![(
+            "changes",
+            open_object_schema("Bounded Final Changes V3 metadata bound to one frozen project/session presentation snapshot."),
+        )])),
+        "changes_file_diff" => Some(wrapped_output_schema(vec![(
+            "changes_file_diff",
+            open_object_schema("Bounded lazy unified diff for one exact path in a frozen Final Changes snapshot."),
+        )])),
         "post_session_message" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),
             (

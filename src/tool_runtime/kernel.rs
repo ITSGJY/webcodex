@@ -102,6 +102,9 @@ pub(crate) struct ToolProtocolCapabilities {
     /// Protocol-surface support for the ModelHidden Work Result App explicit
     /// refresh read. Exact Project + Session authority is still checked per call.
     pub(crate) work_result_app: bool,
+    /// Protocol-surface support for the ModelHidden Final Changes lazy frozen-diff
+    /// read. Exact Project + Session + snapshot + path authority is rechecked.
+    pub(crate) changes_app: bool,
     /// Protocol-surface support for ModelHidden MCP App Host-continuation
     /// coordination. Canonical communication authorization and exact
     /// process-local Host binding validation remain mandatory in the runtime.
@@ -286,6 +289,7 @@ impl ToolRuntime {
                 trace_diagnostics: false,
                 goal_plan_app: false,
                 work_result_app: false,
+                changes_app: false,
                 agent_continuation_app: false,
             },
         )
@@ -386,6 +390,19 @@ impl ToolRuntime {
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
                     message: "Work Result App state is available only on Stateless MCP 2026 App-enabled operator surfaces"
+                        .to_string(),
+                }),
+                project: None,
+                model_ergonomics: None,
+                correlation: Default::default(),
+            };
+        }
+        if request.tool_name == "changes_file_diff" && !capabilities.changes_app {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                    message: "Final Changes App lazy diff is available only on Stateless MCP 2026 App-enabled operator surfaces"
                         .to_string(),
                 }),
                 project: None,
@@ -843,6 +860,10 @@ impl ToolRuntime {
         }
 
         let project = tool_project(&call);
+        // Preserve the concrete business Session only for final presentation. The
+        // generic recorder remains independent provenance and Window affinity
+        // never becomes execution or Session authority.
+        let business_session_id = call.session_id().map(str::to_string);
         // Permission is evaluated once inside dispatch (pre-exec gate). Kernel
         // only reuses the attached decision for the outer recording session —
         // never re-evaluate (no second request id / inconsistent outcome).
@@ -920,16 +941,21 @@ impl ToolRuntime {
             correlation.recorder_gap_session_id.as_deref(),
             correlation.resolved_project.as_deref(),
         ) {
-            if let Some(output) = result.output.as_object_mut() {
-                output.insert(
-                    "workflow_recording_attention".to_string(),
-                    serde_json::json!({
-                        "status": "recording_session_missing",
-                        "candidate_session_id": session_id,
-                        "project": project,
-                        "reason": "same_window_recent_explicit_association"
-                    }),
-                );
+            // The gap remains correlation/audit truth. It is not actionable model
+            // guidance when this exact call already supplied the same authorized
+            // business Session for the same resolved Project.
+            if business_session_id.as_deref() != Some(session_id) {
+                if let Some(output) = result.output.as_object_mut() {
+                    output.insert(
+                        "workflow_recording_attention".to_string(),
+                        serde_json::json!({
+                            "status": "recording_session_missing",
+                            "candidate_session_id": session_id,
+                            "project": project,
+                            "reason": "same_window_recent_explicit_association"
+                        }),
+                    );
+                }
             }
         }
         if request.tool_name == "tool_manifest" {

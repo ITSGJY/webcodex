@@ -145,6 +145,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
         tools: &[
             "finish_coding_task",
             "present_work_result",
+            "present_changes",
             "show_changes",
             "git_review_summary",
             "git_diff_hunks",

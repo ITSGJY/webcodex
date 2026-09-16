@@ -1,19 +1,15 @@
-//! Synchronous timeout contract for cargo_* and run_shell.
+//! Timeout contracts for true synchronous helpers and structured validation.
 //!
-//! Read-only structured validation tools (`cargo_check`, `cargo_test`,
-//! `cargo_fmt(check=true)`) now define `timeout_secs` as the total runtime
-//! budget of the command (1..=3600). Short validations return immediately; a
-//! long validation continues as a Job and returns `job_id`. `run_shell` keeps
-//! the public 1..=120 total-timeout contract; explicit values above 60 may use
-//! the same durable Job execution while the default 60-second call stays sync.
+//! Model-facing run_shell now uses StructuredExecutionBudget; this module keeps
+//! the legacy synchronous helper covered only for paths that genuinely remain
+//! bounded by the Runner HTTP 120-second wait contract.
 
 use super::support::*;
 use crate::runner_protocol::{
     RunnerCapabilities, RunnerPollRequest, RunnerResultRequest, ShellCommandExecutionState,
 };
 use crate::tool_runtime::helpers::{
-    resolve_sync_timeout_secs, DEFAULT_RUN_SHELL_TIMEOUT_SECS, MIN_SYNC_TIMEOUT_SECS,
-    SYNC_VALIDATION_WAIT_SECS,
+    resolve_sync_timeout_secs, MIN_SYNC_TIMEOUT_SECS, SYNC_VALIDATION_WAIT_SECS,
 };
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::{SessionMode, ToolCall, ToolResult};
@@ -69,11 +65,8 @@ async fn assert_no_pending_shell_request(
 }
 
 #[test]
-fn resolve_sync_timeout_secs_clamps_above_max_and_rejects_zero() {
-    assert_eq!(
-        resolve_sync_timeout_secs(None, DEFAULT_RUN_SHELL_TIMEOUT_SECS).unwrap(),
-        DEFAULT_RUN_SHELL_TIMEOUT_SECS
-    );
+fn resolve_sync_timeout_secs_clamps_true_sync_paths_and_rejects_zero() {
+    assert_eq!(resolve_sync_timeout_secs(None, 60).unwrap(), 60);
     assert_eq!(resolve_sync_timeout_secs(Some(1), 120).unwrap(), 1);
     assert_eq!(resolve_sync_timeout_secs(Some(120), 120).unwrap(), 120);
     assert_eq!(resolve_sync_timeout_secs(Some(121), 120).unwrap(), 120);

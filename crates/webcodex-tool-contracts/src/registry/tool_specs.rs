@@ -47,6 +47,16 @@ pub fn work_result_app_tool_specs() -> Vec<ToolSpec> {
     )]
 }
 
+/// Fixed lazy frozen-diff contract for the Final Changes MCP App. The canonical
+/// ToolDefinition is ModelHidden and only a UI-capable MCP adapter may expose it.
+pub fn changes_app_tool_specs() -> Vec<ToolSpec> {
+    vec![tool_spec(
+        "changes_file_diff",
+        "App-only bounded lazy read of one path from an exact frozen Final Changes snapshot. Re-authorizes exact project + session, validates caller/snapshot/path binding, grants no authority, and never records the user click into the target Workflow Session ledger.",
+        super::input_schemas::changes_file_diff_input_schema(),
+    )]
+}
+
 /// Fixed MCP App Host-continuation coordination contract. Definitions remain
 /// globally ModelHidden and deliberately stay outside the generic Stateless
 /// operator-extension universe: only the MCP Apps adapter may project them.

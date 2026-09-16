@@ -432,6 +432,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
         panic!("snapshot resource must be hidden from other callers");
     };
     assert_eq!(hidden["error"]["code"], -32602);
+    assert_eq!(hidden["error"]["data"], json!({ "uri": uri }));
 
     let window_auth = snapshot_auth("snapshot-window-owner", false);
     let window_caller = mcp_artifact_export_caller_binding(Some(&window_auth)).unwrap();
@@ -472,6 +473,47 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
     )
     .await;
     assert!(matches!(window_read, McpOutcome::Ok(_)));
+}
+
+#[tokio::test]
+async fn mcp_resources_read_not_found_echoes_uri_without_changing_param_errors() {
+    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let uri = "test://nonexistent-resource-for-conformance-testing";
+
+    let unknown = super::super::resources::handle_read(
+        &runtime,
+        json!({ "uri": uri }),
+        Some(json!(2114)),
+        None,
+        ModelSurface::FullOperatorRuntime,
+        true,
+    )
+    .await;
+    let McpOutcome::BadRequest(unknown) = unknown else {
+        panic!("unknown resource must fail as Invalid params");
+    };
+    assert_eq!(unknown["error"]["code"], -32602);
+    assert_eq!(unknown["error"]["data"], json!({ "uri": uri }));
+    assert!(unknown.get("result").is_none());
+
+    let missing = super::super::resources::handle_read(
+        &runtime,
+        json!({}),
+        Some(json!(2115)),
+        None,
+        ModelSurface::FullOperatorRuntime,
+        true,
+    )
+    .await;
+    let McpOutcome::BadRequest(missing) = missing else {
+        panic!("missing uri must fail as Invalid params");
+    };
+    assert_eq!(missing["error"]["code"], -32602);
+    assert_eq!(
+        missing["error"]["message"],
+        "Invalid params: uri is required"
+    );
+    assert!(missing["error"].get("data").is_none());
 }
 
 #[test]

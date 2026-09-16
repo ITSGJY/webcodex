@@ -2637,3 +2637,16 @@ fn agent_wait_model_schema_separates_matches_from_durable_bookkeeping() {
         }
     }
 }
+
+#[test]
+fn run_process_shell_recovery_schema_is_optional_and_failure_only() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "run_process");
+    let suggested = json!({"tool":"run_shell", "arguments":{"project":"demo","shell":"bash","command":"echo hello"}});
+    let failure = json!({"success":false,"output":{"command_started":false,
+        "command_completed":false,"execution_state":"not_started","failure_kind":"invalid_arguments",
+        "suggested_call":suggested},"error":"shell command mode rejected"});
+    test_support::validate_schema_instance(&failure, &spec.output_schema).unwrap();
+    let success = json!({"success":true,"output":{"suggested_call":suggested},"error":null});
+    assert!(test_support::validate_schema_instance(&success, &spec.output_schema).is_err());
+}

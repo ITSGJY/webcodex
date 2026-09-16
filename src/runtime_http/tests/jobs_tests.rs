@@ -216,7 +216,9 @@ async fn dedicated_run_shell_with_session_id_records_event() {
             .json(&json!({
                 "project": "agent:importer:demo",
                 "command": "echo hi",
-                "session_id": session_id
+                "session_id": session_id,
+                "timeout_secs": 30,
+                "sync_wait_secs": 30
             }))
             .send(&service)
             .await

@@ -74,6 +74,8 @@ The exact matching metadata and transactional protocol are maintainer details; s
 
 ## Validation
 
+Formatting is finalization, not per-edit validation. The normal loop is edit → focused validation → further edits if needed → source stabilizes → format once → final review/validation. For Rust, run formatting after relevant source stabilizes and before final diff/closeout; rerun only after later Rust edits that can change formatting. Use `cargo_fmt(check=false)` for intentional final formatting and `check=true` when read-only final formatting proof is needed. CI and release formatting gates remain unchanged.
+
 Prefer structured validation such as `cargo_test`, `cargo_check`, or `go_test` when available. Use the smallest check that can detect the regression, and broaden only when the affected boundary requires it.
 
 When a required validation is likely to outlast its synchronous grace and independent read-only inspection remains, set a short `sync_wait_secs` (often `1`) so that already-started validation hands off as the **same execution** Job. Continue only independent reads, search, diff/architecture inspection, or review, then observe that Job. Do not start extra CPU-heavy validations merely for parallelism. If source covered by the running validation changes afterward, its result is stale/cache-warmup evidence rather than proof of the final workspace; run task-appropriate validation again on the final source.
@@ -92,7 +94,7 @@ Review the actual workspace/diff after editing and validation. Passing tests do 
 
 ## Long-running work
 
-A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Keep its exact Job identity and parser-ready continuation. If useful independent work remains, continue that work and observe the Job later; do not repeatedly poll a running Job merely to keep it visible. When the next useful action actually depends on the terminal result, use the provided bounded `wait_secs=100, wake_on=terminal` continuation. Recovery/continuation hints never authorize a retry of an uncertain effect.
+A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Keep its exact Job identity and parser-ready continuation. If useful independent work remains, continue that work and observe the Job later; do not repeatedly poll a running Job merely to keep it visible. When the next useful action actually depends on the terminal result, use the provided bounded `wait_secs=100, wake_on=terminal` continuation. For one Job or when any terminal result unblocks progress, use `terminal`; when every Job in a predetermined set is required before progress, use `all_terminal`. Recovery/continuation hints never authorize a retry of an uncertain effect.
 
 ## Manual multi-window collaboration
 

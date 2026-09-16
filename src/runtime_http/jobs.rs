@@ -18,6 +18,8 @@ struct RunShellRequest {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
+    pub sync_wait_secs: Option<u64>,
+    #[serde(default)]
     pub cwd: Option<String>,
 }
 
@@ -139,6 +141,7 @@ pub async fn projects_run_shell(req: &mut Request, depot: &mut Depot, res: &mut 
                 command: body.command,
                 session_id: body.session_id,
                 timeout_secs: body.timeout_secs,
+                sync_wait_secs: body.sync_wait_secs,
                 cwd: body.cwd,
                 purpose: None,
                 shell: None,

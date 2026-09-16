@@ -130,8 +130,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             (
+                "presentation",
+                open_object_schema("Optional parser-ready presentation follow-up. Present only when this exact Workflow Session has a startup Git baseline, durable successful first-class Edit evidence, and the current final workspace still differs from that baseline; contains exactly one present_changes suggested_call and is preserved in full and summary_only closeout."),
+            ),
+            (
                 "suggested_next_actions",
-                array_schema(schema_type("string", "Short suggested action."), "Top-level full and summary_only final closeout actions derived from task outcome and evidence integrity. Preserves bounded finish actions."),
+                array_schema(schema_type("string", "Short suggested action."), "Top-level full and summary_only final closeout actions derived from task outcome and evidence integrity. Preserves bounded finish actions and never duplicates the machine-readable presentation call."),
             ),
         ])),
         _ => None,

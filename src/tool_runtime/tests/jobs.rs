@@ -60,6 +60,7 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
                         command: "printf success-output".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -102,6 +103,7 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
                         command: "printf failure-output; exit 7".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -213,7 +215,15 @@ async fn run_shell_via_agent(
     let command = command.to_string();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .run_shell(project, command, timeout_secs, None)
+            .run_shell_with_contract(
+                project,
+                command,
+                timeout_secs,
+                Some(timeout_secs.unwrap_or(60)),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let req = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -246,7 +256,15 @@ async fn run_shell_via_agent_lifecycle_error(
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .run_shell(project, "printf lifecycle".to_string(), Some(30), None)
+            .run_shell_with_contract(
+                project,
+                "printf lifecycle".to_string(),
+                Some(30),
+                Some(30),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -395,7 +413,8 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
                         project,
                         command: "printf durable-shell; sleep 30".to_string(),
                         session_id: Some(session_id),
-                        timeout_secs: Some(120),
+                        timeout_secs: Some(600),
+                        sync_wait_secs: Some(1),
                         cwd: Some(".".to_string()),
                         purpose: Some(ExecutionPurpose::Diagnostic),
                         shell: Some(ExecutionShell::Bash),
@@ -408,7 +427,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
 
     let start = wait_for_patch_agent_request(&runtime, client_id).await;
     assert_eq!(start.kind, "start_job");
-    assert_eq!(start.timeout_secs, 120);
+    assert_eq!(start.timeout_secs, 600);
     assert!(start.command.starts_with("exec bash -c "));
     let job_id = start.job_id.clone().expect("durable Job id");
     update_agent_shell_job(
@@ -433,8 +452,8 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
     assert_eq!(result.output["execution_state"], "running");
     assert_eq!(result.output["command_started"], true);
     assert_eq!(result.output["command_completed"], false);
-    assert_eq!(result.output["effective_timeout_secs"], 120);
-    assert_eq!(result.output["sync_wait_secs"], 10);
+    assert_eq!(result.output["effective_timeout_secs"], 600);
+    assert_eq!(result.output["sync_wait_secs"], 1);
     assert_eq!(result.output["job_id"], job_id);
     assert_eq!(result.output["purpose"], "diagnostic");
     assert_eq!(result.output["shell"], "bash");
@@ -571,7 +590,7 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
         let runtime = runtime.clone();
         async move {
             runtime
-                .run_shell(project, "printf fast".to_string(), Some(120), None)
+                .run_shell(project, "printf fast".to_string(), Some(600), None)
                 .await
         }
     });
@@ -598,16 +617,17 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
     assert_eq!(result.output["promoted_to_job"], false);
     assert_eq!(result.output["terminal"], true);
     assert_eq!(result.output["job_id"], serde_json::Value::Null);
-    assert_eq!(result.output["effective_timeout_secs"], 120);
+    assert_eq!(result.output["effective_timeout_secs"], 600);
     assert_eq!(result.output["sync_wait_secs"], 10);
     assert_run_shell_result_matches_schema(&result);
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
-async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capability() {
-    let client_id = "shell-default-sync";
-    let runtime = runtime_with_agent_project(client_id);
+async fn run_shell_default_sixty_uses_ten_second_same_execution_handoff() {
+    let client_id = "shell-default-handoff";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_structured_execution_sync_wait(std::time::Duration::from_millis(20));
     register_agent(
         &runtime,
         client_id,
@@ -624,18 +644,38 @@ async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capabilit
         let runtime = runtime.clone();
         async move {
             runtime
-                .run_shell(project, "printf default".to_string(), None, None)
+                .run_shell(project, "printf default; sleep 30".to_string(), None, None)
                 .await
         }
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert_eq!(request.kind, "run_shell");
+    assert_eq!(request.kind, "start_job");
     assert_eq!(request.timeout_secs, 60);
-    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, "default", "").await;
+    let job_id = request.job_id.clone().expect("durable shell Job id");
+    update_agent_shell_job(
+        &runtime,
+        client_id,
+        &request.request_id,
+        &job_id,
+        "running",
+        None,
+        None,
+        Some("default\n"),
+        None,
+        None,
+        false,
+    )
+    .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert_eq!(result.output["terminal"], false);
+    assert_eq!(result.output["job_id"], job_id);
+    assert_eq!(result.output["effective_timeout_secs"], 60);
+    assert_eq!(result.output["sync_wait_secs"], 10);
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+    assert!(runtime.runner_registry.remove_job_record(&job_id).await);
 }
 
 #[tokio::test]
@@ -692,6 +732,7 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
                 command: "printf denied".to_string(),
                 session_id: None,
                 timeout_secs: Some(120),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,

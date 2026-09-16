@@ -100,6 +100,8 @@ impl PersistedSessionRecord {
             messages,
             events_observed: record.events_observed,
             context_revision: record.context_revision,
+            git_baseline_tree: record.git_baseline_tree.clone(),
+            repository_edit_observed: record.repository_edit_observed,
             materialized_validation_job_ids: record
                 .materialized_validation_job_ids
                 .iter()
@@ -137,6 +139,8 @@ impl PersistedSessionRecord {
             && self.updated_at == record.updated_at
             && self.events_observed == record.events_observed
             && self.context_revision == record.context_revision
+            && self.git_baseline_tree == record.git_baseline_tree
+            && self.repository_edit_observed == record.repository_edit_observed
             && self
                 .materialized_validation_job_ids
                 .iter()
@@ -390,6 +394,10 @@ impl PersistedSessionRecord {
             events,
             events_observed: self.events_observed.max(retained_events),
             context_revision: self.context_revision.max(retained_context_revision),
+            git_baseline_tree: self.git_baseline_tree.filter(|tree| {
+                matches!(tree.len(), 40 | 64) && tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            repository_edit_observed: self.repository_edit_observed,
             materialized_validation_job_ids,
             messages,
             project_instructions: None,

@@ -279,6 +279,14 @@ pub struct SessionRecord {
     /// exactly once for each recorded ToolResult returned to the model;
     /// generic/background Session events never advance it.
     pub context_revision: u64,
+    /// Git tree captured exactly once when a fresh coding Workflow Session is
+    /// created. `None` means startup was not a Git repository; continuation
+    /// never retroactively creates or replaces this baseline.
+    pub git_baseline_tree: Option<String>,
+    /// Sticky monotonic fact: this exact Workflow Session has observed at least
+    /// one successful canonical first-class repository Edit whose ToolResult
+    /// reported `state_changed=true`. It is independent of retained event history.
+    pub repository_edit_observed: bool,
     /// Bounded durable exact identities for terminal structured-validation Jobs
     /// already synthesized into this Session. Independent of the retained event
     /// deque so event FIFO eviction cannot resurrect an authoritative Job.
@@ -578,6 +586,13 @@ pub struct PersistedSessionRecord {
     pub mode: SessionMode,
     pub guards: SessionGuards,
     pub execution_context: SessionExecutionContext,
+    /// Optional Git baseline tree for coding Sessions. Legacy rows default to
+    /// `None` and therefore cannot retroactively gain a Changes card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_baseline_tree: Option<String>,
+    /// Sticky first-class repository Edit evidence, durable across event eviction.
+    #[serde(default)]
+    pub repository_edit_observed: bool,
     pub lifecycle: SessionLifecycle,
     pub created_at: i64,
     pub updated_at: i64,
@@ -1249,6 +1264,13 @@ pub struct SessionSummary {
     pub guards: SessionGuards,
     pub execution_context: SessionExecutionContext,
     pub lifecycle: SessionLifecycle,
+    /// Internal Final Changes presentation baseline. Runtime projections read it
+    /// directly; it is not part of the model-facing Session summary payload.
+    #[serde(skip_serializing)]
+    pub git_baseline_tree: Option<String>,
+    /// Internal sticky presentation eligibility fact; never model-facing state.
+    #[serde(skip_serializing)]
+    pub repository_edit_observed: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub counts: SessionCounts,

@@ -591,6 +591,174 @@ fn apply_text_edits_stale_sha_still_rejects_before_occurrence() {
     assert!(!error.contains("occurrence"));
 }
 
+fn parsed_apply_text_edits_changes(arguments: Value) -> Vec<ApplyFileChangeInput> {
+    let call = ToolCall::from_tool_name("apply_text_edits", arguments).unwrap();
+    let ToolCall::ApplyTextEdits { changes, .. } = call else {
+        panic!("expected apply_text_edits");
+    };
+    changes
+}
+
+async fn complete_apply_text_edits_success(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    request_id: String,
+    path: &str,
+) {
+    runtime
+        .runner_registry
+        .complete(RunnerResultRequest {
+            client_id: client_id.to_string(),
+            runner_instance_id: "inst".to_string(),
+            request_id,
+            exit_code: Some(0),
+            stdout: Some(
+                serde_json::json!({
+                    "dry_run": false,
+                    "applied_count": 1,
+                    "changed": true,
+                    "would_change": true,
+                    "files": [],
+                    "changed_paths": [path]
+                })
+                .to_string(),
+            ),
+            stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn apply_text_edits_shorthand_unique_replace_uses_canonical_runner_payload() {
+    let client_id = "ate-shorthand-unique";
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            file_write: true,
+            apply_text_edit_local_guard_without_sha: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let changes = parsed_apply_text_edits_changes(serde_json::json!({
+        "project": &project,
+        "changes": [{"path":"src/lib.rs","old_text":"old","new_text":"new"}]
+    }));
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move { runtime.apply_text_edits(project, changes, None).await }
+    });
+
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert_eq!(request.kind, "file_apply_text_edits");
+    let payload: Value = serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["changes"][0]["kind"], "edit");
+    assert_eq!(payload["changes"][0]["path"], "src/lib.rs");
+    assert!(payload["changes"][0].get("old_text").is_none());
+    assert!(payload["changes"][0].get("new_text").is_none());
+    assert_eq!(payload["changes"][0]["edits"][0]["kind"], "replace_exact");
+    assert_eq!(payload["changes"][0]["edits"][0]["old_text"], "old");
+    assert_eq!(payload["changes"][0]["edits"][0]["new_text"], "new");
+    assert!(payload["changes"][0]["expected_sha256"].is_null());
+
+    complete_apply_text_edits_success(&runtime, client_id, request.request_id, "src/lib.rs").await;
+    assert!(task.await.unwrap().success);
+}
+
+#[tokio::test]
+async fn apply_text_edits_shorthand_read_revision_uses_existing_wire_guard() {
+    let client_id = "ate-shorthand-revision";
+    let runtime = runtime_with_agent_project(client_id);
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            file_write: true,
+            apply_text_edit_occurrence: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let sha = "d".repeat(64);
+    let revision = seed_read_revision(&runtime, &project, "src/lib.rs", &sha).await;
+    let changes = parsed_apply_text_edits_changes(serde_json::json!({
+        "project": &project,
+        "changes": [{
+            "path":"src/lib.rs",
+            "old_text":"dup",
+            "new_text":"SECOND",
+            "expected_read_revision": revision
+        }]
+    }));
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move { runtime.apply_text_edits(project, changes, None).await }
+    });
+
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    let payload: Value = serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["changes"][0]["kind"], "edit");
+    assert_eq!(payload["changes"][0]["expected_sha256"], sha);
+    assert_eq!(payload["changes"][0]["edits"][0]["kind"], "replace_exact");
+    assert!(payload["changes"][0]["edits"][0]["occurrence"].is_null());
+    assert!(payload["changes"][0]
+        .get("expected_read_revision")
+        .is_none());
+
+    complete_apply_text_edits_success(&runtime, client_id, request.request_id, "src/lib.rs").await;
+    assert!(task.await.unwrap().success);
+}
+
+#[tokio::test]
+async fn apply_text_edits_shorthand_positional_guards_match_canonical_rejection() {
+    let runtime = test_runtime();
+    for shorthand in [
+        serde_json::json!({"path":"src/lib.rs","old_text":"dup","new_text":"x","occurrence":2}),
+        serde_json::json!({"path":"src/lib.rs","old_text":"dup","new_text":"x","line_scope":{"start_line":2,"end_line":2}}),
+        serde_json::json!({"path":"src/lib.rs","old_text":"dup","new_text":"x","expected_read_revision":3817291045227_u64,"occurrence":2}),
+    ] {
+        let parsed = ToolCall::from_tool_name(
+            "apply_text_edits",
+            serde_json::json!({
+                "project": "agent:unused:unused",
+                "changes": [shorthand]
+            }),
+        );
+        assert!(
+            parsed.is_err(),
+            "positional shorthand must stay canonical-only"
+        );
+    }
+
+    let empty_old_text = parsed_apply_text_edits_changes(serde_json::json!({
+        "project": "agent:unused:unused",
+        "changes": [{"path":"src/lib.rs","old_text":"","new_text":"x"}]
+    }));
+    let rejected = runtime
+        .apply_text_edits("agent:unused:unused".to_string(), empty_old_text, None)
+        .await;
+    assert!(!rejected.success);
+    assert_eq!(rejected.output["error_kind"], "invalid_edit");
+    assert_eq!(rejected.output["state_changed"], false);
+    assert!(rejected
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("old_text must be non-empty")));
+}
+
 async fn assert_no_apply_text_edits_runner_request(runtime: &ToolRuntime, client_id: &str) {
     let request = runtime
         .runner_registry
@@ -1536,4 +1704,52 @@ async fn apply_text_edits_complete_rollback_is_known_completed_no_effect() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("was rolled back")));
+}
+
+#[tokio::test]
+async fn apply_text_edits_host_structural_schema_accepts_but_runtime_rejects_unguarded_position() {
+    let client = "ate-structural-schema";
+    let runtime = runtime_with_agent_project(client);
+    register_agent(
+        &runtime,
+        client,
+        None,
+        RunnerCapabilities {
+            file_write: true,
+            apply_text_edit_occurrence: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client);
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "apply_text_edits").input_schema;
+    for selector in [
+        serde_json::json!({"occurrence":2}),
+        serde_json::json!({"line_scope":{"start_line":2,"end_line":2}}),
+    ] {
+        let mut edit =
+            serde_json::json!({"kind":"replace_exact","old_text":"dup","new_text":"changed"});
+        edit.as_object_mut()
+            .unwrap()
+            .extend(selector.as_object().unwrap().clone());
+        let arguments = serde_json::json!({"project":project,"changes":[
+            {"kind":"create","path":"must-not-exist.txt","content":"no partial writes"},
+            {"kind":"edit","path":"src/lib.rs","edits":[edit]}
+        ]});
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&arguments, schema)
+            .unwrap();
+        let changes = parsed_apply_text_edits_changes(arguments);
+        let rejected = runtime
+            .apply_text_edits(project.clone(), changes, None)
+            .await;
+        assert!(!rejected.success);
+        assert_eq!(rejected.output["state_changed"], false);
+        assert!(rejected
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("expected_read_revision"));
+        assert_no_apply_text_edits_runner_request(&runtime, client).await;
+    }
 }

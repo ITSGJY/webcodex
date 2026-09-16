@@ -328,6 +328,7 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
             crate::tool_runtime::goal_plan_app_tool_specs()
                 .into_iter()
                 .chain(crate::tool_runtime::work_result_app_tool_specs())
+                .chain(crate::tool_runtime::changes_app_tool_specs())
                 .chain(crate::tool_runtime::agent_continuation_app_tool_specs())
                 .collect(),
             auth,
@@ -533,8 +534,10 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
     };
     for tool in tools {
         let tool_name = tool.get("name").and_then(Value::as_str);
-        if matches!(tool_name, Some("goal_plan_state" | "work_result_state"))
-            || tool_name.is_some_and(is_agent_continuation_app_tool_name)
+        if matches!(
+            tool_name,
+            Some("goal_plan_state" | "work_result_state" | "changes_file_diff")
+        ) || tool_name.is_some_and(is_agent_continuation_app_tool_name)
         {
             continue;
         }
@@ -892,6 +895,9 @@ fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> V
     }
     if app_enabled && presentation::tool_supports_work_result_app(&tool_name) {
         attach_app_metadata(&mut value, resources::MCP_WORK_RESULT_UI_RESOURCE_URI);
+    }
+    if app_enabled && presentation::tool_supports_changes_app(&tool_name) {
+        attach_app_metadata(&mut value, resources::MCP_CHANGES_UI_RESOURCE_URI);
     }
     if app_enabled && presentation::tool_supports_goal_plan_app(&tool_name) {
         attach_app_metadata(&mut value, resources::MCP_GOAL_PLAN_UI_RESOURCE_URI);
@@ -1924,10 +1930,13 @@ pub(super) async fn handle_call(
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let work_result_app_surface =
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
+    let changes_app_surface =
+        server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let agent_continuation_app_surface =
         server_mcp_apps_enabled && stateless_2026 && model_surface.supports_operator_extensions();
     let app_only_goal_plan_state = goal_plan_app_surface && params.name == "goal_plan_state";
     let app_only_work_result_state = work_result_app_surface && params.name == "work_result_state";
+    let app_only_changes_file_diff = changes_app_surface && params.name == "changes_file_diff";
     let app_only_agent_continuation =
         agent_continuation_app_surface && is_agent_continuation_app_tool_name(&params.name);
     let surface_denied = match model_surface {
@@ -1935,6 +1944,7 @@ pub(super) async fn handle_call(
         ModelSurface::AdaptiveRuntime => {
             !app_only_goal_plan_state
                 && !app_only_work_result_state
+                && !app_only_changes_file_diff
                 && !app_only_agent_continuation
                 && !via_adaptive_runtime_gateway
                 && !is_adaptive_runtime_direct_tool(&params.name)
@@ -2010,12 +2020,15 @@ pub(super) async fn handle_call(
             return McpOutcome::BadRequest(rpc_error(id, -32602, message));
         }
     };
-    // Work Result refresh is an App-only observation of the exact business
-    // Session carried inside the tool's own arguments. Never let the generic
-    // Stateless recording wrapper turn a user-driven refresh into a write to
-    // that or any other Workflow Session, even if a caller hand-crafts an
-    // unadvertised recording_session_id field.
-    if params.name == "work_result_state" {
+    // App-only presentation reads observe the exact business Session carried
+    // inside their own arguments. Never let the generic Stateless recording
+    // wrapper turn a user-driven refresh/expand action into a write to that or
+    // any other Workflow Session, even if a caller hand-crafts an unadvertised
+    // recording_session_id field.
+    if matches!(
+        params.name.as_str(),
+        "work_result_state" | "changes_file_diff"
+    ) {
         session_id = None;
     }
     let ack_session_message_ids = if stateless_2026 {
@@ -2088,6 +2101,7 @@ pub(super) async fn handle_call(
     let trace_diagnostics_capable = stateless_2026 && model_surface.supports_operator_extensions();
     let goal_plan_app_capable = goal_plan_app_surface;
     let work_result_app_capable = work_result_app_surface;
+    let changes_app_capable = changes_app_surface;
     let agent_continuation_app_capable = agent_continuation_app_surface;
     let context_request = if context_sidecar_capable {
         match strip_stateless_context_request(&mut params.arguments) {
@@ -2158,6 +2172,7 @@ pub(super) async fn handle_call(
                 trace_diagnostics: trace_diagnostics_capable,
                 goal_plan_app: goal_plan_app_capable,
                 work_result_app: work_result_app_capable,
+                changes_app: changes_app_capable,
                 agent_continuation_app: agent_continuation_app_capable,
             },
         )

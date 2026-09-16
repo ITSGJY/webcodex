@@ -23,6 +23,12 @@ pub(super) fn tool_supports_work_result_app(tool_name: &str) -> bool {
     tool_name == "present_work_result"
 }
 
+/// Final Changes V3 creates a Host card only at the explicit presentation
+/// boundary. Ordinary review/closeout tools and app-only lazy reads never bind it.
+pub(super) fn tool_supports_changes_app(tool_name: &str) -> bool {
+    tool_name == "present_changes"
+}
+
 /// Dedicated sparse Goal Plan App binding. Only the explicit presentation entry
 /// gets a resource; Goal mutations, execution tools, and app-only polling never
 /// create additional Host cards.

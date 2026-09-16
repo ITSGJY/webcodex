@@ -69,8 +69,8 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
             "Ordinary implementation is default: map cross-layer changes end to end; use compiler/schema/exhaustiveness failures for gaps; minimize concepts, avoid speculative redesign.",
             "Use the simplest sufficient primitive preserving correctness/authority/evidence/durability/recovery/portability. Native commands are first-class. Batch predetermined observations; adaptive follow-ups stay sequential; bounded deterministic Python/run_shell fits coherent transforms.",
             "Known target: bounded targeted reads and related-range batching. Broad discovery: files/count/small-context search then targeted reads; predictable native rg is first-class.",
-            "Validation failure is evidence, not queue cleanliness. Fix blockers before dependent work; otherwise continue independent work. Reuse assertion_name on rerun; mutation stales evidence; outcome_unknown fails closed.",
-            "Long work keeps one execution/Job. Keep exact continuation; use wait_secs=100,wake_on=terminal only when blocked on terminal outcome, not for visibility. Final source needs diff review and sufficient fresh validation."
+            "Validation failure is evidence, not queue cleanliness. Fix blockers before dependent work; otherwise continue. Reuse assertion_name on rerun; mutation stales evidence; outcome_unknown fails closed. Formatting is finalization.",
+            "Use one execution/Job, exact continuation; wait_secs=100,wake_on=terminal when blocked, not for visibility. After Rust stabilizes, format once before final diff/closeout; rerun only after later Rust edits. Final source needs sufficient fresh validation."
         ],
         "model_protocol": {
             "session_context_ack": "Checkpoint/recovery tools may expose session_context_revision. Echo the latest retained revision in ack_session_context_revision only where exposed; never invent it. If unknown, omit; use the advertised Session handoff recovery path. ACK is nonblocking.",

@@ -1052,11 +1052,8 @@ async fn http_mcp_artifact_export_resources_read_streams_valid_json_blob() {
     assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["id"], 3190);
     assert_eq!(body["result"]["resultType"], "complete");
-    // MCP 2026 conformance baseline finding: the optimized streaming path has
-    // not yet been aligned with the cache hints emitted by ordinary resources/read.
-    // This baseline records the current wire shape only; a focused follow-up fixes it.
-    assert!(body["result"].get("ttlMs").is_none());
-    assert!(body["result"].get("cacheScope").is_none());
+    assert_eq!(body["result"]["ttlMs"], 0);
+    assert_eq!(body["result"]["cacheScope"], "private");
     assert_eq!(body["result"]["contents"][0]["uri"], uri);
     assert_eq!(body["result"]["contents"][0]["mimeType"], "application/pdf");
     let decoded = general_purpose::STANDARD

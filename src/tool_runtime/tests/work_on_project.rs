@@ -97,26 +97,32 @@ async fn call_hygiene_in_window_with_local_runner(
     runtime: &ToolRuntime,
     client_id: &str,
     project: &str,
-    session_id: Option<&str>,
+    recording_session_id: Option<&str>,
+    business_session_id: Option<&str>,
     auth: &crate::auth::AuthContext,
     window_id: &str,
 ) -> crate::tool_runtime::kernel::ToolCallOutcome {
     let runtime_for_task = runtime.clone();
     let project = project.to_string();
-    let session_id = session_id.map(str::to_string);
+    let recording_session_id = recording_session_id.map(str::to_string);
+    let business_session_id = business_session_id.map(str::to_string);
     let auth = auth.clone();
     let window_id = window_id.to_string();
     let task = tokio::spawn(async move {
         let window = crate::client_window::ClientWindow::for_test(&window_id);
+        let mut arguments = json!({"project": project});
+        if let Some(session_id) = business_session_id {
+            arguments["session_id"] = json!(session_id);
+        }
         runtime_for_task
             .call_tool_with_context(
                 ToolCallRequest {
                     tool_name: "workspace_hygiene_check".to_string(),
-                    arguments: json!({"project": project}),
+                    arguments,
                 },
                 ToolCallContext {
                     transport: ToolTransport::Mcp,
-                    session_id: session_id.as_deref(),
+                    session_id: recording_session_id.as_deref(),
                     auth: Some(&auth),
                     window: Some(&window),
                     record_oauth_scope_denials: true,
@@ -1972,6 +1978,7 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
         "wop-gap",
         &project,
         Some(&session_id),
+        None,
         &auth,
         window_id,
     )
@@ -2006,7 +2013,7 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
     // does not forge a Session event. The exact same Window/principal/Project
     // affinity produces a bounded recovery hint and a Window-only gap fact.
     let unrecorded = call_hygiene_in_window_with_local_runner(
-        &runtime, "wop-gap", &project, None, &auth, window_id,
+        &runtime, "wop-gap", &project, None, None, &auth, window_id,
     )
     .await;
     assert!(unrecorded.success, "{:?}", unrecorded.error_status);
@@ -2036,6 +2043,81 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
             .len(),
         recorded_event_count,
         "missing recorder must not backfill or mutate the Workflow Session ledger"
+    );
+
+    // The recorder gap remains auditable, but an exact business Session equal to
+    // the authorized same-Window candidate makes the model-facing reminder
+    // redundant. The explicit business Session still receives its canonical
+    // tool event; no recorder event is forged.
+    let business_bound = call_hygiene_in_window_with_local_runner(
+        &runtime,
+        "wop-gap",
+        &project,
+        None,
+        Some(&session_id),
+        &auth,
+        window_id,
+    )
+    .await;
+    assert!(business_bound.success, "{:?}", business_bound.error_status);
+    assert_eq!(
+        business_bound
+            .correlation
+            .recorder_gap_session_id
+            .as_deref(),
+        Some(session_id.as_str())
+    );
+    assert!(business_bound
+        .result
+        .as_ref()
+        .expect("business-bound result")
+        .output
+        .get("workflow_recording_attention")
+        .is_none());
+    assert!(
+        runtime
+            .sessions
+            .summary(&session_id, Some(200))
+            .unwrap()
+            .events
+            .len()
+            > recorded_event_count,
+        "explicit business Session must retain canonical business recording"
+    );
+
+    let different_session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("different business session".to_string()),
+    );
+    let different_business = call_hygiene_in_window_with_local_runner(
+        &runtime,
+        "wop-gap",
+        &project,
+        None,
+        Some(&different_session.session_id),
+        &auth,
+        window_id,
+    )
+    .await;
+    assert!(
+        different_business.success,
+        "{:?}",
+        different_business.error_status
+    );
+    assert_eq!(
+        different_business
+            .correlation
+            .recorder_gap_session_id
+            .as_deref(),
+        Some(session_id.as_str())
+    );
+    assert_eq!(
+        different_business
+            .result
+            .as_ref()
+            .expect("different-business result")
+            .output["workflow_recording_attention"]["candidate_session_id"],
+        session_id
     );
     record_window_activity_fixture(
         &window_db,
@@ -2068,6 +2150,7 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
         "wop-gap",
         &project,
         Some(&session_id),
+        None,
         &auth,
         window_id,
     )
@@ -3873,9 +3956,9 @@ async fn work_on_project_sizes_and_runner_request_reduction_are_stable() {
         "the identical advanced fixture should add only the overview request"
     );
     assert_eq!(
-        reused_requests.len(),
+        reused_requests.len() + 1,
         fresh_requests.len(),
-        "unchanged continuation should retain the same lightweight probes"
+        "fresh startup pays exactly one Git baseline probe; exact continuation must preserve the durable baseline without re-probing it"
     );
     assert_eq!(
         workflow_omitted_requests.len(),
@@ -3910,8 +3993,8 @@ async fn work_on_project_sizes_and_runner_request_reduction_are_stable() {
     );
     // The sparse projection itself remains below 1 KiB when static workflow
     // guidance is omitted. With Session ACK/recording/sidecar guidance plus the
-    // v9 early-validation-handoff rule included, this fixture is about 4.5 KiB
-    // fresh and 4.6 KiB on unchanged continuation. Keep the default tightly
+    // current validation/finalization guidance included, this fixture stays within
+    // the dedicated sparse budgets below. Keep the default tightly
     // bounded and still far below the standard startup hard cap while leaving
     // only modest protocol headroom.
     assert!(
