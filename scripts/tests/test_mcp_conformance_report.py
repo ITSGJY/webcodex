@@ -310,6 +310,15 @@ class ReportGateTests(unittest.TestCase):
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("exit code 1 had no scored FAILURE" in p for p in summary["problems"]))
 
+    def test_exit_zero_with_scored_failure_is_rejected(self) -> None:
+        failed = self.check("unexpected-failure", "FAILURE", error_message="protocol mismatch")
+        self.write_metadata(["scenario-a"], harness_exit_code=0)
+        self.write_baseline([self.classification(failed)])
+        self.write_checks("scenario-a", [failed])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("exit code 0" in p and "scored FAILURE" in p for p in summary["problems"]))
+
     def test_new_failure_requires_exact_classification(self) -> None:
         self.write_metadata(["scenario-a"], harness_exit_code=1)
         self.write_baseline([])

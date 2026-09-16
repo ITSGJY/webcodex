@@ -125,9 +125,17 @@ prepare_harness_source() {
         ;;
     esac
     # Older versions of this script created the same default checkout before the
-    # ownership marker existed. Adopt only that exact known-origin checkout; an
-    # externally supplied worktree remains read-only and is never marked/modified.
+    # ownership marker existed. Adopt it only when it is already at the pinned
+    # commit and has no tracked edits; otherwise ownership is ambiguous and we
+    # refuse to mutate it. Externally supplied worktrees are always read-only.
     if [ ! -f "$HARNESS_DIR/$HARNESS_OWNER_MARKER" ]; then
+      legacy_actual="$(git -C "$HARNESS_DIR" rev-parse HEAD 2>/dev/null || true)"
+      if [ "$legacy_actual" != "$HARNESS_COMMIT" ] || \
+         ! git -C "$HARNESS_DIR" diff --quiet --no-ext-diff || \
+         ! git -C "$HARNESS_DIR" diff --cached --quiet --no-ext-diff; then
+        echo "default harness checkout is unowned and not an exact clean pinned checkout; refusing to modify it: $HARNESS_DIR" >&2
+        exit 2
+      fi
       touch "$HARNESS_DIR/$HARNESS_OWNER_MARKER"
     fi
   fi
