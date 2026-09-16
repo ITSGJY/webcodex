@@ -26,7 +26,7 @@ async fn mcp_conformance_fixture_server() {
 
     let config = test_config(None);
     let (_db_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime());
+    let runtime = Arc::new(test_runtime_from_model_surface_env(None));
     let router = build_test_router(config, db, runtime);
     let acceptor = TcpListener::new("127.0.0.1:0").bind().await;
     let addr = acceptor.holdings()[0]

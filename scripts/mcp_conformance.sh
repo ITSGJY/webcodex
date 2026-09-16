@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
 # The conformance referee is intentionally immutable. Updating it is a reviewed
 # baseline change because scenario/check semantics can change between commits.
 BASELINE="tests/fixtures/mcp/conformance/baseline.json"
@@ -56,7 +60,13 @@ fi
 mkdir -p "$WORK_ROOT"
 
 fixture_alive() {
-  [ -n "$fixture_pid" ] && kill -0 "$fixture_pid" 2>/dev/null
+  [ -n "$fixture_pid" ] || return 1
+  kill -0 -- "-$fixture_pid" 2>/dev/null || kill -0 "$fixture_pid" 2>/dev/null
+}
+
+signal_fixture() {
+  local signal="$1"
+  kill "-$signal" -- "-$fixture_pid" 2>/dev/null || kill "-$signal" "$fixture_pid" 2>/dev/null || true
 }
 
 stop_fixture() {
@@ -67,14 +77,14 @@ stop_fixture() {
     sleep 0.1
   done
   if fixture_alive; then
-    kill -TERM "$fixture_pid" 2>/dev/null || true
+    signal_fixture TERM
   fi
   for _ in $(seq 1 50); do
     if ! fixture_alive; then break; fi
     sleep 0.1
   done
   if fixture_alive; then
-    kill -KILL "$fixture_pid" 2>/dev/null || true
+    signal_fixture KILL
   fi
   wait "$fixture_pid" 2>/dev/null || true
   fixture_pid=""
@@ -204,8 +214,11 @@ fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/webcodex-mcp-conformance.XXXXXX")"
 url_file="$fixture_dir/url"
 stop_file="$fixture_dir/stop"
 fixture_log="$REPORT_ROOT/fixture.log"
+# Keep the entire Cargo + test-binary fixture tree in one private process group so
+# fallback teardown cannot leave the loopback server alive if Cargo exits first.
 WEBCODEX_MCP_CONFORMANCE_URL_FILE="$url_file" \
 WEBCODEX_MCP_CONFORMANCE_STOP_FILE="$stop_file" \
+  python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
   cargo test --locked -p webcodex --lib mcp_conformance_fixture_server -- --ignored --nocapture \
   >"$fixture_log" 2>&1 &
 fixture_pid=$!
