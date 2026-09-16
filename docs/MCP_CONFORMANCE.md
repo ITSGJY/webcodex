@@ -76,8 +76,8 @@ Every `FAILURE`, `WARNING`, or `SKIPPED` check from a **scored required**
 scenario must have an exact `<scenario>, <check_id>` classification in
 `tests/fixtures/mcp/conformance/baseline.json`. Each classification also pins the
 observed status and a SHA-256 fingerprint of the stable failure evidence
-(`errorMessage`, then structured details/metadata, falling back to the check's
-name/description). If the same check ID starts failing for a different reason or
+(`errorMessage` plus structured details/metadata when present, falling back to
+the check's name/description). If the same check ID starts failing for a different reason or
 with a different severity, the gate requires review instead of reusing the old
 classification. Whole-scenario wildcards are rejected.
 
