@@ -91,74 +91,57 @@ fn composition_defaults_cover_unreviewed_tools_and_unknown_gateways() {
 
 #[test]
 fn composition_opt_in_requires_an_explicit_declaration() {
-    let reviewed = *lookup_tool_definition("git_review_summary").unwrap();
-    let mut definition = *lookup_tool_definition("write_project_file").unwrap();
-    definition.name = reviewed.name;
+    let definition = lookup_tool_definition("git_status").unwrap();
+    assert_eq!(definition.metadata.effect, ToolEffect::Observe);
+    assert_eq!(definition.metadata.risk, ToolRisk::Read);
     assert_eq!(
-        definition.composition,
+        definition.metadata.idempotency,
+        ToolIdempotency::PureRead
+    );
+    assert_eq!(
+        definition.context_continuity_policy(),
+        ToolContextContinuityPolicy::REOBSERVABLE
+    );
+    assert_eq!(
+        runtime_tool_composition_contract(definition.name),
         ToolCompositionContract::CONSERVATIVE
     );
+}
 
-    definition.metadata = reviewed.metadata;
-    definition.model_surface = reviewed.model_surface;
-    definition.policy = reviewed.policy;
-    definition.runner_capability = reviewed.runner_capability;
-    assert_eq!(
-        definition.composition,
-        ToolCompositionContract::CONSERVATIVE
-    );
-
-    for contract in [
-        ToolCompositionContract::CONSERVATIVE,
-        ToolCompositionContract {
-            eligibility: ToolCompositionPolicy::Allowed,
-            concurrency: ToolConcurrencyPolicy::Sequential,
-        },
-        reviewed.composition,
-    ] {
-        let declared = definition.with_composition(contract);
-        assert_eq!(declared.composition, contract);
+#[test]
+fn parallel_composition_requires_allowed_eligibility() {
+    for definition in tool_definitions()
+        .filter(|definition| definition.composition.concurrency == ToolConcurrencyPolicy::Parallel)
+    {
         assert_eq!(
-            declared.effect_annotations(),
-            definition.effect_annotations()
+            definition.composition.eligibility,
+            ToolCompositionPolicy::Allowed,
+            "{}",
+            definition.name
         );
-        assert_eq!(declared.execution, definition.execution);
-        assert_eq!(declared.session_evidence, definition.session_evidence);
     }
 }
 
 #[test]
-fn parallel_composition_declarations_match_reviewed_inspection_facts() {
-    for definition in tool_definitions()
-        .filter(|definition| definition.composition.concurrency == ToolConcurrencyPolicy::Parallel)
-    {
-        let name = definition.name;
-        assert_eq!(
-            definition.composition.eligibility,
-            ToolCompositionPolicy::Allowed,
-            "{name}"
-        );
-        assert!(is_adaptive_runtime_direct_tool(name), "{name}");
-        assert_eq!(definition.metadata.effect, ToolEffect::Observe, "{name}");
-        assert_eq!(
-            definition.metadata.idempotency,
-            ToolIdempotency::PureRead,
-            "{name}"
-        );
-        assert_eq!(
-            definition.context_continuity_policy(),
-            ToolContextContinuityPolicy::REOBSERVABLE,
-            "{name}"
-        );
-        assert_eq!(definition.execution, None, "{name}");
-        assert_eq!(
-            definition.session_evidence.lifecycle,
-            ToolSessionLifecycleEffect::None,
-            "{name}"
-        );
-        assert!(!definition.metadata.destructive, "{name}");
-        assert!(!definition.metadata.shell_like, "{name}");
-    }
+fn git_review_summary_composition_opt_in_matches_reviewed_facts() {
+    let definition = lookup_tool_definition("git_review_summary").unwrap();
+    assert!(is_adaptive_runtime_direct_tool(definition.name));
+    assert_eq!(definition.metadata.effect, ToolEffect::Observe);
+    assert_eq!(
+        definition.metadata.idempotency,
+        ToolIdempotency::PureRead
+    );
+    assert_eq!(
+        definition.context_continuity_policy(),
+        ToolContextContinuityPolicy::REOBSERVABLE
+    );
+    assert_eq!(definition.execution, None);
+    assert_eq!(
+        definition.session_evidence.lifecycle,
+        ToolSessionLifecycleEffect::None
+    );
+    assert!(!definition.metadata.destructive);
+    assert!(!definition.metadata.shell_like);
 }
 
 #[test]

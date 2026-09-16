@@ -1,15 +1,16 @@
 # Tool composition research and development plan
 
-Status: Phase 0 canonical policy foundation implemented; composition runtime
-remains deferred. This document records research findings and a staged direction
-for reducing model/tool round trips. It is intentionally
+Status: deferred exploratory design note. Phase 0 measurement and canonical policy
+inventory now have initial implementations; composition runtime remains deferred.
+This document records research findings and a staged direction for reducing
+model/tool round trips. It is intentionally
 **downstream** of the current tool-contract friction/style work in
 [`../agent/tool-contract-guidelines.md`](../agent/tool-contract-guidelines.md):
 first make primitive tools consistent and low-friction, then evaluate surface
 pruning, and only then decide whether composition still removes meaningful outer
-turns. The current primitive contracts and policy inventory are described below;
-the proposed composition runtime does not authorize implementation shortcuts
-around existing tool, Session, Job, permission, audit, or Project boundaries.
+turns. The composition proposal is not a current runtime contract and does not
+authorize implementation shortcuts around existing tool, Session, Job, permission,
+audit, or Project boundaries.
 
 ## Motivation
 
