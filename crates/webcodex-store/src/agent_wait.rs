@@ -1,7 +1,7 @@
 use super::agent_task::{AgentTaskState, AGENT_TASK_ID_PREFIX};
 use super::agent_wake::{AgentWakeState, AGENT_WAKE_ID_PREFIX};
 use super::communication::{
-    digest_json, digest_text, lookup_idempotent_resource, new_id, now_unix_ms,
+    allocate_identity, digest_json, digest_text, lookup_idempotent_resource, now_unix_ms,
     record_idempotent_resource, require_agent_owner, require_current_endpoint, store_error,
     validate_communication_principal, validate_id, validate_idempotency_key,
     CommunicationPrincipal, CommunicationStoreError,
@@ -340,7 +340,11 @@ impl Database {
             terminal_snapshots.push((event.clone(), task_state, terminal_attempt_id, terminal_at));
         }
 
-        let wait_id = new_id(AGENT_WAIT_ID_PREFIX);
+        let wait_id = allocate_identity(
+            &transaction,
+            AGENT_WAIT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_waits WHERE wait_id = ?1)",
+        )?;
         let now = now_unix_ms();
         transaction
             .execute(
@@ -753,7 +757,11 @@ fn coalesce_wait_wake_in_transaction(
         }
         return Ok(false);
     }
-    let wake_id = new_id(AGENT_WAKE_ID_PREFIX);
+    let wake_id = allocate_identity(
+        &transaction,
+        AGENT_WAKE_ID_PREFIX,
+        "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
+    )?;
     transaction
         .execute(
             "INSERT INTO wc_agent_wakes (

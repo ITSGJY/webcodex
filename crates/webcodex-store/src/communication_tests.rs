@@ -10,7 +10,60 @@ fn principal(kind: &str, hex: char) -> CommunicationPrincipal {
 }
 
 fn missing_id(prefix: &str, hex: char) -> String {
-    format!("{prefix}{}", hex.to_string().repeat(32))
+    format!("{prefix}{}", hex.to_string().repeat(16))
+}
+
+#[test]
+fn compact_identity_collision_retry_and_proof_strength() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE ids (id TEXT PRIMARY KEY, value INTEGER); INSERT INTO ids VALUES ('occupied', 7);").unwrap();
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let query = "SELECT EXISTS(SELECT 1 FROM ids WHERE id = ?1)";
+    let mut candidates = ["occupied".to_string(), "fresh".to_string()].into_iter();
+    assert_eq!(
+        allocate_identity_with(&transaction, query, || candidates.next().unwrap()).unwrap(),
+        "fresh"
+    );
+    assert!(allocate_identity_with(&transaction, query, || "occupied".into()).is_err());
+    assert!(
+        allocate_identity_with(&transaction, "SELECT missing FROM ids", || "fresh".into()).is_err()
+    );
+    assert_eq!(
+        transaction
+            .query_row("SELECT value FROM ids WHERE id = 'occupied'", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    for prefix in [
+        "wc_dagent_",
+        "wc_endpoint_",
+        "wc_agent_task_",
+        "wc_agent_task_attempt_",
+        "wc_wake_",
+        "wc_wake_attempt_",
+        "wc_agent_wait_",
+        "wc_goal_",
+        "wc_conv_",
+        "wc_participant_",
+        "wc_cmsg_",
+        "wc_delivery_",
+        "wc_attention_event_",
+    ] {
+        let id = allocate_identity(&transaction, prefix, query).unwrap();
+        assert_eq!(id.len(), prefix.len() + 16);
+        validate_id(&id, prefix, "invalid").unwrap();
+        assert!(validate_id(&format!("{prefix}{}", "a".repeat(32)), prefix, "invalid").is_err());
+    }
+    for prefix in ["wc_agent_task_fence_", "wc_wake_claim_", "wc_wake_consume_"] {
+        let proof = new_proof(prefix);
+        assert_eq!(proof.len(), prefix.len() + 22);
+        validate_proof(&proof, prefix, "invalid").unwrap();
+        assert!(validate_proof(&format!("{prefix}{}", "a".repeat(16)), prefix, "invalid").is_err());
+        assert!(validate_proof(&format!("{prefix}{}", "a".repeat(32)), prefix, "invalid").is_err());
+    }
 }
 
 fn assert_same_private_not_found(
@@ -407,6 +460,18 @@ fn conversation_transcript_delivery_replay_offline_and_restart_are_durable() {
         .conversation_id
         .starts_with(CONVERSATION_ID_PREFIX));
     assert_eq!(created.conversation.participants.len(), 3);
+    for participant in &created.conversation.participants {
+        assert_eq!(
+            participant.participant_id.len(),
+            CONVERSATION_PARTICIPANT_ID_PREFIX.len() + 16
+        );
+        validate_id(
+            &participant.participant_id,
+            CONVERSATION_PARTICIPANT_ID_PREFIX,
+            "invalid_participant_id",
+        )
+        .unwrap();
+    }
     assert_eq!(
         created.conversation.conversation.lifecycle,
         ConversationLifecycle::Open

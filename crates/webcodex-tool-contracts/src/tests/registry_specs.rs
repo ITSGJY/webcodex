@@ -45,6 +45,10 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "snapshot-bound continuation",
         "protected-path policy",
         "range normalization",
+        "target symbol/test/implementation region is known",
+        "bounded targeted ranges",
+        "batch related ranges already known to be needed",
+        "do not read an entire large file merely because the budget permits it",
         "small known one-off observation",
         "without downstream snapshot dependency",
         "native file commands",
@@ -78,8 +82,14 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "protected-path policy",
         "isolated failures",
         "portable runtime search semantics",
+        "broad discovery",
+        "files_with_matches/count",
+        "small bounded match set with little context",
+        "target read_files/native reads",
         "small known-scope search",
-        "native rg via run_process is first-class",
+        "native rg via run_process or a shell command is first-class",
+        "batch only queries already known to be needed",
+        "result-dependent follow-ups sequential",
         "pattern_mode=literal",
         "request context explicitly",
         "whole-query",
@@ -141,6 +151,10 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     let read_artifact_desc = desc("read_project_artifact");
     for phrase in [
         "bounded chunk inspection api",
+        "parser-ready suggested_call",
+        "expected_sha256",
+        "snapshot_changed",
+        "do not manually translate",
         "do not loop over base64 chunks",
         "export_project_artifact",
     ] {
@@ -449,23 +463,25 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_shell_desc = desc("run_shell");
     for phrase in [
-        "bounded shell command or short tightly related shell command chain",
+        "bounded shell command or short tightly related chain",
         "shell semantics",
         "model/tool round trips",
-        "run_process preferred for one native executable with literal argv",
-        "independent effects or failure/permission boundaries",
-        "validation, commit, push, deploy, or restart",
+        "predetermined related observations may share one call",
+        "adaptive/result-dependent follow-ups stay sequential",
+        "prefer run_process for one native executable with literal argv",
         "bounded deterministic python heredoc",
-        "first-class programmatic source-transformation path",
-        "do not use it to bypass project/path/permission policy",
-        "avoid network unless the task requires and authorizes it",
-        "inspect the diff and validate the final source",
-        "run_script does not imply python support",
-        "run_script for its supported program-like script languages",
-        "same-process cwd/env/export/function/umask state",
+        "one small program expresses a coherent transformation more reliably",
+        "project/path/permission policy",
+        "avoid unauthorized network",
+        "inspect diff",
+        "validate final source",
+        "run_script handles supported program-like languages",
+        "does not imply python",
+        "failure/permission/validation boundaries",
+        "commit, push, deploy, restart",
+        "same-process state",
         "one named ssh resource",
         "runner-owned",
-        "outlive the current runner process",
         "run_detached_process",
     ] {
         assert!(
@@ -1039,6 +1055,9 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         "wake_on=change",
         "wake_on=terminal",
         "wait_secs=100",
+        "useful progress is blocked on terminal outcome",
+        "independent work remains",
+        "do not poll for visibility",
         "changed=true",
     ] {
         assert!(spec.description.contains(phrase), "missing {phrase}");
@@ -1048,4 +1067,9 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         .unwrap();
     assert!(wait_description.contains("above 100 seconds"));
     assert!(wait_description.contains("clamped to 100"));
+    assert!(wait_description.contains("further useful progress depends on terminal outcome"));
+    assert!(wait_description.contains("independent work continues"));
+    let wake_description = wake["description"].as_str().unwrap();
+    assert!(wake_description.contains("dependent progress is blocked"));
+    assert!(wake_description.contains("not as an unconditional next call"));
 }

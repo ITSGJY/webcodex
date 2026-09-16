@@ -178,19 +178,41 @@ try {
             if ($entry) { $uninstaller = Resolve-UninstallExecutable ([string]$entry.UninstallString) }
         }
         if ($uninstaller -and (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
-            $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+            if (-not $installedDir) {
+                throw "WebCodex install directory is unknown before silent uninstall"
+            }
+            # NSIS normally copies the uninstaller to a temporary directory and exits the
+            # original process. `_?=$INSTDIR` keeps the real uninstall in this process so
+            # `-Wait` is authoritative; the harness then removes only the now-unlocked
+            # uninstaller that this NSIS wait mode intentionally cannot self-delete.
+            $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S _?=$installedDir" -Wait -PassThru
             if ($uninstallProcess.ExitCode -ne 0) {
                 throw "Desktop silent uninstall failed with exit code $($uninstallProcess.ExitCode)"
             }
             Wait-Until { $null -eq (Get-WebCodexUninstallEntry) } 30 "Desktop uninstall entry remained after silent uninstall"
-            if ($installedDir) {
-                $desktopExe = Join-Path $installedDir "WebCodex.exe"
-                $runtimeDir = Join-Path $installedDir "webcodex-runtime"
-                Wait-Until {
-                    -not (Test-Path -LiteralPath $desktopExe) -and
-                    -not (Test-Path -LiteralPath $runtimeDir) -and
-                    -not (Test-Path -LiteralPath $uninstaller)
-                } 30 "Desktop installer-owned files remained after silent uninstall: $installedDir"
+
+            $desktopExe = Join-Path $installedDir "WebCodex.exe"
+            $runtimeDir = Join-Path $installedDir "webcodex-runtime"
+            Wait-Until {
+                -not (Test-Path -LiteralPath $desktopExe) -and
+                -not (Test-Path -LiteralPath $runtimeDir)
+            } 30 "Desktop installer-owned payload remained after silent uninstall: $installedDir"
+
+            if (Test-Path -LiteralPath $installedDir -PathType Container) {
+                $remaining = @(
+                    Get-ChildItem -LiteralPath $installedDir -Force -ErrorAction SilentlyContinue |
+                        Where-Object { $_.FullName -ne $uninstaller }
+                )
+                if ($remaining.Count -ne 0) {
+                    throw "Desktop installer-owned files remained after silent uninstall: $($remaining.Name -join ', ')"
+                }
+                if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+                    Remove-Item -LiteralPath $uninstaller -Force
+                }
+                Remove-Item -LiteralPath $installedDir -Force
+            }
+            if (Test-Path -LiteralPath $installedDir) {
+                throw "Desktop install directory remained after deterministic uninstall cleanup: $installedDir"
             }
         }
     }

@@ -5,6 +5,31 @@ use super::common::{
     wrapped_output_schema,
 };
 
+fn git_log_suggested_call_schema() -> Value {
+    suggested_tool_call_schema(
+        "git_log",
+        json!({
+            "type": "object",
+            "description": "Parser-ready git_log arguments for the next page of the same exact history snapshot.",
+            "additionalProperties": false,
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "head_commit": {
+                    "type": "string",
+                    "minLength": 40,
+                    "maxLength": 40,
+                    "pattern": "^[0-9a-f]{40}$"
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "skip": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
+            },
+            "required": ["project", "head_commit", "limit", "skip"]
+        }),
+        "Parser-ready advisory git_log call for the next page of the same exact commit snapshot. It grants no Project or Session authority.",
+    )
+}
+
 fn git_diff_hunks_recovery_arguments_schema() -> Value {
     json!({
         "type": "object",
@@ -293,6 +318,21 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         ])),
         "git_log" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Runtime project id.")),
+            (
+                "head_commit",
+                json!({
+                    "anyOf": [
+                        {
+                            "type": "string",
+                            "minLength": 40,
+                            "maxLength": 40,
+                            "pattern": "^[0-9a-f]{40}$"
+                        },
+                        {"type": "null"}
+                    ],
+                    "description": "Exact canonical 40-hex commit snapshot used for this page; null only for an unborn repository."
+                }),
+            ),
             ("limit", schema_type("integer", "Effective commit limit.")),
             ("skip", schema_type("integer", "Effective commit offset.")),
             ("count", schema_type("integer", "Returned commit count.")),
@@ -304,13 +344,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "next_skip",
                 nullable_schema(
                     "integer",
-                    "Exact skip value for the next page when another parser-ready page exists inside the bounded skip domain; null on the final page or when the 10000 skip ceiling prevents a safe forward page.",
+                    "Domain metadata for the next commit offset when safe forward progress exists inside the 10000 skip bound. Models should continue through suggested_call, which also carries the exact head_commit snapshot fence; null on the final page or at the skip ceiling.",
                 ),
             ),
             (
                 "commits",
                 array_schema(open_object_schema("Git commit summary."), "Recent commits."),
             ),
+            ("suggested_call", git_log_suggested_call_schema()),
         ])),
         "show_changes" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Runtime project id.")),

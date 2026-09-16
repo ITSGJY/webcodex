@@ -34,7 +34,7 @@ pub fn plugin_tool_input_schema() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 128,
-                "pattern": "^wc_pbind_[0-9a-f]{32}$",
+                "pattern": "^wc_pbind_[A-Za-z0-9_-]{21}[AQgw]$",
                 "description": "Opaque exact Runner/provider/tool/schema binding returned by describe. It is observation identity, not authority."
             },
             "arguments": {

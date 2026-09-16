@@ -6,6 +6,11 @@ fn read_project_artifact_uses_only_canonical_length_bound() {
     let spec = spec_named(&specs, "read_project_artifact");
     let props = spec.input_schema["properties"].as_object().unwrap();
     assert!(props.contains_key("length"));
+    let expected_sha256 = &props["expected_sha256"];
+    assert_eq!(expected_sha256["type"], "string");
+    assert_eq!(expected_sha256["minLength"], 64);
+    assert_eq!(expected_sha256["maxLength"], 64);
+    assert_eq!(expected_sha256["pattern"], "^[0-9a-f]{64}$");
     assert!(
         !props.contains_key("max_bytes"),
         "read_project_artifact must not advertise the retired max_bytes alias"

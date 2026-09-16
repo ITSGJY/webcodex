@@ -171,7 +171,7 @@ async fn read_project_artifact_metadata_allow_missing_routes_to_agent_file_op() 
 }
 
 #[tokio::test]
-async fn read_project_artifact_routes_to_agent_file_op() {
+async fn read_project_artifact_emits_parser_ready_snapshot_fenced_continuation() {
     let runtime = runtime_with_agent_project("artifact-read");
     register_agent(
         &runtime,
@@ -184,50 +184,200 @@ async fn read_project_artifact_routes_to_agent_file_op() {
     )
     .await;
     let project = agent_test_project_id("artifact-read");
+    let project_input = "agent-proj".to_string();
+    let sha256 = "c".repeat(64);
 
-    let task = tokio::spawn({
+    let first_task = tokio::spawn({
         let runtime = runtime.clone();
-        let project = project.clone();
         async move {
             runtime
                 .read_project_artifact(
-                    project,
+                    project_input,
                     "data.bin".to_string(),
                     None,
-                    Some(5),
-                    Some(7),
+                    Some(0),
+                    Some(4),
+                    None,
+                    None,
                     None,
                 )
                 .await
         }
     });
 
-    let req = wait_for_patch_agent_request(&runtime, "artifact-read").await;
-    assert_eq!(req.kind, "file_read_project_artifact");
-    assert!(req.command.is_empty());
-    assert!(req.stdin.is_none());
-    let payload: serde_json::Value =
-        serde_json::from_str(req.content.as_deref().expect("artifact payload")).unwrap();
+    let first_request = wait_for_patch_agent_request(&runtime, "artifact-read").await;
+    assert_eq!(first_request.kind, "file_read_project_artifact");
+    let first_payload: serde_json::Value =
+        serde_json::from_str(first_request.content.as_deref().expect("artifact payload")).unwrap();
     assert_eq!(
-        payload,
-        json!({"path":"data.bin","offset":5,"length":7,"max_file_bytes":MAX_PROJECT_ARTIFACT_BYTES})
+        first_payload,
+        json!({"path":"data.bin","offset":0,"length":4,"max_file_bytes":MAX_PROJECT_ARTIFACT_BYTES})
     );
-
+    let first_stdout = json!({
+        "path": "data.bin",
+        "mime_type": null,
+        "file_bytes": 8,
+        "sha256": sha256,
+        "offset": 0,
+        "bytes_returned": 4,
+        "content_base64": "YWJjZA==",
+        "next_offset": 4,
+        "truncated": true,
+        "eof": false,
+    })
+    .to_string();
     complete_patch_agent_request(
         &runtime,
         "artifact-read",
-        &req.request_id,
+        &first_request.request_id,
         0,
-        r#"{"path":"data.bin","mime_type":null,"file_bytes":12,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","offset":5,"bytes_returned":7,"content_base64":"ZmdoaWprbA==","next_offset":12,"truncated":false,"eof":true}"#,
+        &first_stdout,
         "",
     )
     .await;
+    let first = first_task.await.unwrap();
+    assert!(first.success, "{:?}", first.error);
+    let next = &first.output["suggested_call"];
+    assert_eq!(next["tool"], "read_project_artifact");
+    assert_eq!(next["arguments"]["project"], project);
+    assert_eq!(next["arguments"]["path"], "data.bin");
+    assert_eq!(next["arguments"]["encoding"], "base64");
+    assert_eq!(next["arguments"]["offset"], 4);
+    assert_eq!(next["arguments"]["length"], 4);
+    assert_eq!(next["arguments"]["expected_sha256"], sha256);
+    let next_call =
+        ToolCall::from_tool_name(next["tool"].as_str().unwrap(), next["arguments"].clone())
+            .expect("artifact suggested_call must be parser-ready");
+
+    let second_task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_file_tool(next_call, SessionTransport::Api, None, None)
+                .await
+        }
+    });
+    let second_request = wait_for_patch_agent_request(&runtime, "artifact-read").await;
+    let second_payload: serde_json::Value =
+        serde_json::from_str(second_request.content.as_deref().expect("artifact payload")).unwrap();
+    assert_eq!(second_payload["offset"], 4);
+    assert_eq!(second_payload["length"], 4);
+    assert_eq!(second_payload["expected_sha256"], sha256);
+    let second_stdout = json!({
+        "path": "data.bin",
+        "mime_type": null,
+        "file_bytes": 8,
+        "sha256": sha256,
+        "offset": 4,
+        "bytes_returned": 4,
+        "content_base64": "ZWZnaA==",
+        "next_offset": 8,
+        "truncated": false,
+        "eof": true,
+    })
+    .to_string();
+    complete_patch_agent_request(
+        &runtime,
+        "artifact-read",
+        &second_request.request_id,
+        0,
+        &second_stdout,
+        "",
+    )
+    .await;
+    let second = second_task.await.unwrap();
+    assert!(second.success, "{:?}", second.error);
+    assert_eq!(second.output["sha256"], sha256);
+    assert_eq!(second.output["offset"], 4);
+    assert_eq!(second.output["eof"], true);
+    assert!(second.output.get("suggested_call").is_none());
+}
+
+#[tokio::test]
+async fn read_project_artifact_snapshot_change_hides_digest_proof() {
+    let runtime = runtime_with_agent_project("artifact-read-stale");
+    register_agent(
+        &runtime,
+        "artifact-read-stale",
+        None,
+        RunnerCapabilities {
+            file_read: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("artifact-read-stale");
+    let expected_sha256 = "c".repeat(64);
+    let actual_sha256 = "d".repeat(64);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let expected_sha256 = expected_sha256.clone();
+        async move {
+            runtime
+                .read_project_artifact(
+                    project,
+                    "data.bin".to_string(),
+                    None,
+                    Some(4),
+                    Some(4),
+                    Some(expected_sha256),
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+
+    let request = wait_for_patch_agent_request(&runtime, "artifact-read-stale").await;
+    let payload: serde_json::Value =
+        serde_json::from_str(request.content.as_deref().expect("artifact payload")).unwrap();
+    assert_eq!(payload["expected_sha256"], expected_sha256);
+    let stdout = json!({
+        "path": "data.bin",
+        "file_bytes": 0,
+        "sha256": null,
+        "offset": 4,
+        "bytes_returned": 0,
+        "content_base64": "",
+        "next_offset": 0,
+        "truncated": false,
+        "eof": false,
+        "error": "artifact snapshot changed",
+        "error_kind": "snapshot_changed",
+        "expected_sha256": expected_sha256,
+        "actual_sha256": actual_sha256,
+    })
+    .to_string();
+    complete_patch_agent_request(
+        &runtime,
+        "artifact-read-stale",
+        &request.request_id,
+        0,
+        &stdout,
+        "",
+    )
+    .await;
+
     let result = task.await.unwrap();
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["offset"], 5);
-    assert_eq!(result.output["bytes_returned"], 7);
-    assert_eq!(result.output["content_base64"], "ZmdoaWprbA==");
-    assert_eq!(result.output["eof"], true);
+    assert!(!result.success);
+    assert_eq!(result.error.as_deref(), Some("artifact snapshot changed"));
+    assert_eq!(result.output["path"], "data.bin");
+    assert_eq!(result.output["error_kind"], "snapshot_changed");
+    assert_eq!(result.output["state_changed"], false);
+    for field in [
+        "expected_sha256",
+        "actual_sha256",
+        "sha256",
+        "content_base64",
+        "suggested_call",
+    ] {
+        assert!(
+            result.output.get(field).is_none(),
+            "{field}: {}",
+            result.output
+        );
+    }
 }
 
 #[tokio::test]
@@ -256,6 +406,8 @@ async fn read_project_artifact_mcp_image_routes_complete_bounded_remote_read() {
                 .read_project_artifact(
                     project,
                     "docs/images/remote.png".to_string(),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -327,6 +479,8 @@ async fn read_project_artifact_mcp_image_rejects_untrusted_remote_mime() {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                     Some(true),
                 )
                 .await
@@ -381,6 +535,7 @@ async fn read_project_artifact_image_mode_is_rejected_outside_mcp() {
                 encoding: None,
                 offset: None,
                 length: None,
+                expected_sha256: None,
                 as_image: Some(true),
             },
             SessionTransport::Api,

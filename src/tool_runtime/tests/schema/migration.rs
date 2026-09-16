@@ -64,7 +64,7 @@ fn plugin_tool_call_parser_is_typed_bounded_and_closed() {
         json!({"action":"list","unknown":true}),
         json!({"action":"list","plugin":"repo-tools"}),
         json!({"action":"call","binding":"wc_pbind_bad","arguments":{}}),
-        json!({"action":"call","binding":"wc_pbind_00000000000000000000000000000000"}),
+        json!({"action":"call","binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA"}),
         json!({"action":"describe","runner":"runner-a","plugin":"repo-tools"}),
     ] {
         assert!(
@@ -76,7 +76,7 @@ fn plugin_tool_call_parser_is_typed_bounded_and_closed() {
         "plugin_tool",
         json!({
             "action":"call",
-            "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+            "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
             "arguments":{}
         }),
     )

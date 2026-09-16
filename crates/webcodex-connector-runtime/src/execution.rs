@@ -789,8 +789,8 @@ mod service_tests {
         let root = project.to_string_lossy().into_owned();
         let task = db
             .start_connector_task(NewConnectorTask {
-                task_id: "wc_task_0123456789abcdef0123456789abcdef",
-                run_id: "wc_run_0123456789abcdef0123456789abcdef",
+                task_id: "wc_task_iavN7wEjRWeJq83v",
+                run_id: "wc_run_iavN7wEjRWeJq83v",
                 project_id: "wc_proj_1234567890",
                 workspace_id: "wc_ws_1234567890",
                 subject_id: "project:wc_pgrant_1111111111111111",

@@ -111,10 +111,7 @@ fn valid_application_id(application_id: &str) -> bool {
         return false;
     };
     application_id.len() <= MAX_APPLICATION_ID_BYTES
-        && suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && webcodex_core::compact::decode::<12>(suffix).is_some()
 }
 
 fn valid_display_id(display_id: &str) -> bool {
@@ -122,10 +119,7 @@ fn valid_display_id(display_id: &str) -> bool {
         return false;
     };
     display_id.len() <= MAX_DISPLAY_ID_BYTES
-        && suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && webcodex_core::compact::decode::<12>(suffix).is_some()
 }
 
 fn validate_input_text(text: &str) -> Result<usize, &'static str> {

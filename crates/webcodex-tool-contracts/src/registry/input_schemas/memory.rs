@@ -19,7 +19,7 @@ fn memory_key_schema() -> Value {
 fn expected_revision_schema() -> Value {
     json!({
         "type": "string",
-        "pattern": "^wc_memrev_[0-9a-f]{64}$",
+        "pattern": "^wc_memrev_[A-Za-z0-9_-]{43}$",
         "description": "Explicit Memory state revision / ETag CAS guard. It identifies the current incarnation generation, not only the current content definition."
     })
 }
@@ -53,7 +53,7 @@ pub fn memory_search_input_schema() -> Value {
             "tags": tags_schema(),
             "offset": {"type":"integer","minimum":0},
             "limit": {"type":"integer","minimum":1,"maximum":MAX_MEMORY_SEARCH_LIMIT},
-            "expected_catalog_revision": {"type":"string","pattern":"^wc_memcat_[0-9a-f]{64}$","description":"Optional catalog guard. A stale value fails with memory_catalog_changed rather than continuing an old offset."},
+            "expected_catalog_revision": {"type":"string","pattern":"^wc_memcat_[A-Za-z0-9_-]{43}$","description":"Optional catalog guard. A stale value fails with memory_catalog_changed rather than continuing an old offset."},
             "session_id": {"type":"string","description":"Optional explicit Workflow Session for metadata-only consequence recording. It grants no Memory authority."}
         },
         "required": ["project"],
@@ -125,12 +125,12 @@ pub fn memory_scope_purge_input_schema() -> Value {
         "properties": {
             "memory_scope_id": {
                 "type":"string",
-                "pattern":"^wc_memscope_[0-9a-f]{64}$",
+                "pattern":"^wc_memscope_[A-Za-z0-9_-]{43}$",
                 "description":"Opaque Control-owned project Memory scope identity from memory_scope_list. It contains no native root path."
             },
             "expected_catalog_revision": {
                 "type":"string",
-                "pattern":"^wc_memcat_[0-9a-f]{64}$",
+                "pattern":"^wc_memcat_[A-Za-z0-9_-]{43}$",
                 "description":"Required scope-content CAS fence from memory_scope_list. Any Memory add/update/delete/recreate makes a prior value stale."
             },
             "confirm": {

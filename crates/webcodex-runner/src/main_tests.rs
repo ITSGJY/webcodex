@@ -464,6 +464,18 @@ fn runner_recovery_context_accepts_server_validation_identity_metadata() {
 }
 
 #[test]
+fn runner_recovery_context_accepts_compact_session_base64url_alphabet() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "printf ok");
+    let context = request.job_context.as_mut().unwrap();
+    context.runtime_project_id = Some("agent:ws-client:demo".to_string());
+    context.workflow_session_id = Some("wc_sess_AAAAAAAA-AAAAAA_".to_string());
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+}
+
+#[test]
 fn runner_recovery_context_accepts_javascript_script_job() {
     let temp = tempfile::tempdir().unwrap();
     let script = runner_protocol::ShellScriptPayload {
@@ -1600,6 +1612,27 @@ fn managed_worktree_bootstrap_is_detached_registered_and_same_operation_recovers
     assert_eq!(first["outcome"], "managed_worktree_created");
     assert_eq!(first["registered"], true);
     let worktree = PathBuf::from(first["path"].as_str().unwrap());
+    assert_eq!(
+        worktree.file_name().unwrap().to_str().unwrap().len(),
+        "source-".len() + 8
+    );
+    assert!(!first["id"]
+        .as_str()
+        .unwrap()
+        .contains("11111111-1111-4111-8111-111111111111"));
+    let config = std::fs::read_to_string(registry.join(format!(
+        "{}.toml",
+        first["agent_project_id"].as_str().unwrap()
+    )))
+    .unwrap();
+    assert_eq!(
+        parse_runner_project_toml(&config)
+            .unwrap()
+            .managed_operation_id
+            .as_deref(),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+
     assert_ne!(
         worktree.canonicalize().unwrap(),
         source.canonicalize().unwrap()
@@ -1636,6 +1669,56 @@ fn managed_worktree_bootstrap_is_detached_registered_and_same_operation_recovers
     assert_eq!(recovered["outcome"], "managed_worktree_recovered");
     assert_eq!(recovered["registered"], false);
     assert_eq!(recovered["changed"], false);
+}
+
+#[test]
+fn managed_worktree_slug_collision_escalates_and_unknown_identity_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(tmp.path());
+    let operation = "11111111-1111-4111-8111-111111111111";
+    let request = managed_worktree_request(&source, serde_json::Value::Null, operation, None);
+    let first = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    let config_path = registry.join(format!(
+        "{}.toml",
+        first["agent_project_id"].as_str().unwrap()
+    ));
+    let mut project =
+        parse_runner_project_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    // Establish a different exact operation occupying this short slug.
+    project.managed_operation_id = Some("22222222-2222-4222-8222-222222222222".into());
+    std::fs::write(&config_path, toml::to_string(&project).unwrap()).unwrap();
+    let second = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    assert_ne!(first["path"], second["path"]);
+    assert_ne!(first["id"], second["id"]);
+    assert_eq!(
+        Path::new(second["path"].as_str().unwrap())
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .len(),
+        "source-".len() + 12
+    );
+    let recovery = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    assert_eq!(recovery["id"], second["id"]);
+    // An occupied path without a verifiable identity is not a collision hint.
+    std::fs::remove_file(config_path).unwrap();
+    assert_eq!(
+        project_err(handle_prepare_managed_worktree(
+            &policy, &registry, &request
+        )),
+        "managed_worktree_recovery_conflict"
+    );
 }
 
 #[test]

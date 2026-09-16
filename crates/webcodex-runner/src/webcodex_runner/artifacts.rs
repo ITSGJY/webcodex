@@ -1,5 +1,6 @@
 use super::files::sha256_hex_bytes;
 use super::output::{line_edit_stdout, CommandResult};
+use crate::apply_edits_shared::is_lowercase_hex_sha256 as is_hex_sha256;
 use crate::artifact_policy::MAX_MCP_IMAGE_BYTES;
 #[cfg(test)]
 use crate::runner_protocol::RunnerRequest;
@@ -296,6 +297,14 @@ fn read_error(path: Option<&str>, msg: impl Into<String>) -> Value {
         "eof": false,
         "error": msg.into(),
     })
+}
+
+fn read_snapshot_changed(path: &str, expected_sha256: &str, actual_sha256: &str) -> Value {
+    let mut output = read_error(Some(path), "artifact snapshot changed");
+    output["error_kind"] = json!("snapshot_changed");
+    output["expected_sha256"] = json!(expected_sha256);
+    output["actual_sha256"] = json!(actual_sha256);
+    output
 }
 
 pub(crate) fn handle_artifact_file_operation(
@@ -796,6 +805,19 @@ fn handle_read_project_artifact(
         Ok(root) => root,
         Err(e) => return line_edit_stdout(read_error(Some(path), e), start),
     };
+    let expected_sha256 = match payload.get("expected_sha256") {
+        None => None,
+        Some(Value::String(value)) if is_hex_sha256(value) => Some(value.as_str()),
+        _ => {
+            return line_edit_stdout(
+                read_error(
+                    Some(path),
+                    "expected_sha256 must be a lowercase 64-character hex digest",
+                ),
+                start,
+            )
+        }
+    };
     let target = match resolve_existing_target_in_project_root(resolved, &root) {
         Ok(target) => target,
         Err(e) => {
@@ -867,6 +889,15 @@ fn handle_read_project_artifact(
             return line_edit_stdout(read_error(Some(path), format!("read failed: {e}")), start)
         }
     };
+    let actual_sha256 = sha256_hex_bytes(&data);
+    if let Some(expected_sha256) = expected_sha256 {
+        if actual_sha256 != expected_sha256 {
+            return line_edit_stdout(
+                read_snapshot_changed(path, expected_sha256, &actual_sha256),
+                start,
+            );
+        }
+    }
     let mime_type = if mcp_image {
         match magic_mime(&data) {
             Some(mime @ ("image/png" | "image/jpeg" | "image/webp")) => Some(mime.to_string()),
@@ -910,7 +941,7 @@ fn handle_read_project_artifact(
             "path": path,
             "mime_type": mime_type,
             "file_bytes": file_bytes,
-            "sha256": sha256_hex_bytes(&data),
+            "sha256": actual_sha256,
             "offset": offset,
             "bytes_returned": segment.len(),
             "content_base64": general_purpose::STANDARD.encode(segment),

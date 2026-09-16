@@ -389,7 +389,7 @@ fn suggested_read_files_arguments_schema() -> Value {
             },
             "session_id": {
                 "type": "string",
-                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
                 "description": "Original explicit business Workflow Session id, present only when the triggering read_files call supplied one."
             },
             "with_line_numbers": {"type": "boolean"},

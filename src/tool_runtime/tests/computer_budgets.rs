@@ -5,7 +5,7 @@ use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const DISPLAY_ID: &str = "display_0123456789abcdef0123456789abcdef";
+const DISPLAY_ID: &str = "display_iavN7wEjRWeJq83v";
 
 fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data)

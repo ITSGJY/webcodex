@@ -542,13 +542,13 @@ async fn project_and_operator_skill_catalog_union_is_fresh_conflict_safe_and_pac
     .await;
     let project_a = crate::tool_runtime::runner_project_runtime_id(client_id, "a");
     let project_b = crate::tool_runtime::runner_project_runtime_id(client_id, "b");
-    let package_a = format!("wc_skillpkg_{}", "a".repeat(64));
-    let package_b = format!("wc_skillpkg_{}", "b".repeat(64));
+    let package_a = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
+    let package_b = "wc_skillpkg_u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s".to_string();
     let definition = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
     let operator = Arc::new(Mutex::new(FakeOperatorSkillState {
         configured: None,
         managed: Some(FakeManagedSkillState {
-            skill_id: format!("wc_skill_{}", "1".repeat(32)),
+            skill_id: "wc_skill_EREREREREREREREREREREQ".to_string(),
             skill_key: "operator-demo".to_string(),
             name: "duplicate".to_string(),
             description: "Operator-installed guidance".to_string(),
@@ -682,11 +682,11 @@ async fn project_configured_and_managed_skills_share_one_conflict_safe_catalog()
     )
     .await;
     let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
-    let configured_id = format!("wc_skill_{}", "2".repeat(32));
-    let managed_id = format!("wc_skill_{}", "3".repeat(32));
+    let configured_id = "wc_skill_IiIiIiIiIiIiIiIiIiIiIg".to_string();
+    let managed_id = "wc_skill_MzMzMzMzMzMzMzMzMzMzMw".to_string();
     let configured_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let managed_revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    let managed_package = format!("wc_skillpkg_{}", "a".repeat(64));
+    let managed_package = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
         configured: Some(FakeConfiguredSkillState {
             skill_id: configured_id.clone(),
@@ -809,7 +809,7 @@ async fn configured_skill_exact_read_uses_unified_resolve_then_read() {
     )
     .await;
     let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
-    let configured_id = format!("wc_skill_{}", "2".repeat(32));
+    let configured_id = "wc_skill_IiIiIiIiIiIiIiIiIiIiIg".to_string();
     let configured_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
         configured: Some(FakeConfiguredSkillState {
@@ -852,7 +852,7 @@ async fn configured_skill_exact_read_uses_unified_resolve_then_read() {
         json!({
             "project": project,
             "skill_id": configured_id,
-            "expected_package_revision": format!("wc_skillpkg_{}", "f".repeat(64)),
+            "expected_package_revision": "wc_skillpkg___________________________________________8".to_string(),
         }),
         sources,
     )
@@ -889,9 +889,9 @@ async fn managed_skill_exact_read_uses_unified_resolve_then_read() {
     )
     .await;
     let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
-    let managed_id = format!("wc_skill_{}", "3".repeat(32));
+    let managed_id = "wc_skill_MzMzMzMzMzMzMzMzMzMzMw".to_string();
     let managed_revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    let managed_package = format!("wc_skillpkg_{}", "a".repeat(64));
+    let managed_package = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
         configured: None,
         managed: Some(FakeManagedSkillState {
@@ -948,10 +948,10 @@ async fn exact_skill_resolution_fails_closed_on_duplicate_target_across_sources(
     )
     .await;
     let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
-    let duplicate_id = format!("wc_skill_{}", "7".repeat(32));
+    let duplicate_id = "wc_skill_d3d3d3d3d3d3d3d3d3d3dw".to_string();
     let configured_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let managed_revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    let managed_package = format!("wc_skillpkg_{}", "a".repeat(64));
+    let managed_package = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
         configured: Some(FakeConfiguredSkillState {
             skill_id: duplicate_id.clone(),
@@ -1023,7 +1023,7 @@ async fn exact_skill_resolution_fails_closed_when_applicable_source_is_unavailab
     let configured_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
         configured: Some(FakeConfiguredSkillState {
-            skill_id: format!("wc_skill_{}", "9".repeat(32)),
+            skill_id: "wc_skill_mZmZmZmZmZmZmZmZmZmZmQ".to_string(),
             name: "configured-unavailable".to_string(),
             description: "Configured unavailable".to_string(),
             definition_revision: configured_revision.to_string(),
@@ -1033,11 +1033,11 @@ async fn exact_skill_resolution_fails_closed_when_applicable_source_is_unavailab
             next_definition_revision_after_probe: None,
         }),
         managed: Some(FakeManagedSkillState {
-            skill_id: format!("wc_skill_{}", "8".repeat(32)),
+            skill_id: "wc_skill_iIiIiIiIiIiIiIiIiIiIiA".to_string(),
             skill_key: "unused-managed".to_string(),
             name: "unused-managed".to_string(),
             description: "Unused managed guidance".to_string(),
-            package_revision: format!("wc_skillpkg_{}", "b".repeat(64)),
+            package_revision: "wc_skillpkg_u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s".to_string(),
             definition_revision: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
                 .to_string(),
             resource_text: "unused managed resource".to_string(),
@@ -1098,7 +1098,7 @@ async fn configured_exact_read_pins_probe_revision_across_resource_read() {
     )
     .await;
     let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
-    let configured_id = format!("wc_skill_{}", "2".repeat(32));
+    let configured_id = "wc_skill_IiIiIiIiIiIiIiIiIiIiIg".to_string();
     let revision_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let revision_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
@@ -1350,7 +1350,7 @@ async fn project_skill_exact_read_request_fanout_is_characterized() {
         json!({
             "project": project,
             "skill_id": skill_id,
-            "expected_package_revision": format!("wc_skillpkg_{}", "f".repeat(64)),
+            "expected_package_revision": "wc_skillpkg___________________________________________8".to_string(),
         }),
         true,
     )

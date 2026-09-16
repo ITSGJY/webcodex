@@ -11,7 +11,7 @@ fn wait_source_schema() -> Value {
         "properties": {
             "ordinal":{"type":"integer","minimum":0,"maximum":7},
             "kind":{"type":"string","const":"agent_task_terminal"},
-            "task_id":{"type":"string","pattern":"^wc_agent_task_[0-9a-f]{32}$","description":"Exact source identity only; no inherited Task authority."}
+            "task_id":{"type":"string","pattern":"^wc_agent_task_[A-Za-z0-9_-]{16}$","description":"Exact source identity only; no inherited Task authority."}
         },
         "required":["ordinal","kind","task_id"]
     })
@@ -23,8 +23,8 @@ fn wait_match_schema() -> Value {
         "properties": {
             "sequence":{"type":"integer","minimum":1,"maximum":8},
             "kind":{"type":"string","const":"agent_task_terminal"},
-            "task_id":{"type":"string","pattern":"^wc_agent_task_[0-9a-f]{32}$"},
-            "task_attempt_id":{"type":"string","pattern":"^wc_agent_task_attempt_[0-9a-f]{32}$"},
+            "task_id":{"type":"string","pattern":"^wc_agent_task_[A-Za-z0-9_-]{16}$"},
+            "task_attempt_id":{"type":"string","pattern":"^wc_agent_task_attempt_[A-Za-z0-9_-]{16}$"},
             "terminal_task_state":{"type":"string","enum":["succeeded","failed"]},
             "occurred_at_unix_ms":schema_type("integer","Authoritative source terminal transition timestamp. The Wait stores no terminal result/reason body.")
         },
@@ -36,8 +36,8 @@ fn wait_schema() -> Value {
     json!({
         "type":"object","additionalProperties":false,
         "properties": {
-            "wait_id":{"type":"string","pattern":"^wc_agent_wait_[0-9a-f]{32}$"},
-            "target_agent_id":{"type":"string","pattern":"^wc_dagent_[0-9a-f]{32}$"},
+            "wait_id":{"type":"string","pattern":"^wc_agent_wait_[A-Za-z0-9_-]{16}$"},
+            "target_agent_id":{"type":"string","pattern":"^wc_dagent_[A-Za-z0-9_-]{16}$"},
             "state":{"type":"string","enum":["waiting","triggered","resumed","cancelled"]},
             "revision":{"type":"integer","minimum":1},
             "created_at_unix_ms":schema_type("integer","Wait creation time."),

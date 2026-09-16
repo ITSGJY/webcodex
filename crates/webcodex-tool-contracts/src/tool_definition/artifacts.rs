@@ -149,7 +149,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Bounded chunk inspection API for a project artifact. Returns base64 for one small segment plus full-file sha256/MIME metadata. If the goal is to deliver the complete file to ChatGPT/host/user, do not loop over base64 chunks; prefer export_project_artifact instead.",
+        "Bounded chunk inspection API for a project artifact. Returns base64 for one small segment plus full-file sha256/MIME metadata. A truncated ranged read emits one parser-ready suggested_call that carries the observed full-file sha256 as expected_sha256, so continuation either reads the same exact content incarnation or fails closed with snapshot_changed before returning changed bytes; do not manually translate next_offset or sha256 bookkeeping. If the goal is to deliver the complete file to ChatGPT/host/user, do not loop over base64 chunks; prefer export_project_artifact instead.",
         read_project_artifact_input_schema,
     ),
     model_spec(

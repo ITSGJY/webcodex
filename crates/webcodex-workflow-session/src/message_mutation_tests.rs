@@ -1111,7 +1111,7 @@ fn malformed_persisted_closure_metadata_is_not_replay_authority() {
     );
     persisted.insert(
         "supersedes_message_id".to_string(),
-        Value::String("wc_msg_evicted_but_syntactically_valid".to_string()),
+        Value::String("wc_msg_aaaaaaaaaaaaaaaa".to_string()),
     );
     std::fs::write(&ledger, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 
@@ -1121,7 +1121,7 @@ fn malformed_persisted_closure_metadata_is_not_replay_authority() {
     assert!(retained.superseded_by_message_id.is_none());
     assert_eq!(
         retained.supersedes_message_id.as_deref(),
-        Some("wc_msg_evicted_but_syntactically_valid")
+        Some("wc_msg_aaaaaaaaaaaaaaaa")
     );
     assert_eq!(retained.message, "retained despite malformed metadata");
 }

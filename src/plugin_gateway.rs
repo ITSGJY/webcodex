@@ -53,7 +53,7 @@ impl PluginGatewayRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let binding = loop {
-            let candidate = format!("wc_pbind_{}", uuid::Uuid::new_v4().simple());
+            let candidate = format!("wc_pbind_{}", webcodex_core::compact::random_suffix::<16>());
             if !store.values.contains_key(&candidate) {
                 break candidate;
             }
@@ -1127,11 +1127,7 @@ fn required_binding(value: Option<&str>) -> Result<&str, GatewayError> {
             "binding is not a valid opaque Plugin binding",
         ));
     };
-    if random.len() != 32
-        || !random
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if webcodex_core::compact::decode::<16>(random).is_none() {
         return Err(GatewayError::local(
             "invalid_arguments",
             "binding is not a valid opaque Plugin binding",
@@ -1381,7 +1377,7 @@ mod tests {
             .any(|action| action == "check"));
         assert_eq!(
             spec["inputSchema"]["properties"]["binding"]["pattern"],
-            "^wc_pbind_[0-9a-f]{32}$"
+            "^wc_pbind_[A-Za-z0-9_-]{21}[AQgw]$"
         );
         assert!(spec["description"]
             .as_str()

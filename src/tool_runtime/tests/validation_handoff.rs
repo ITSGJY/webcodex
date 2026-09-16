@@ -50,20 +50,20 @@ async fn wait_for_runner_request(
 }
 
 fn assert_agent_observation_upgrades_without_changing_snapshot(
-    job_id: &str,
-    legacy_token: &str,
+    _job_id: &str,
+    baseline_token: &str,
     cursor_token: &str,
 ) {
     use crate::job_observation::JobObservationToken;
 
-    let legacy = JobObservationToken::parse_bound(legacy_token, job_id)
+    let baseline = JobObservationToken::parse(baseline_token)
         .expect("handoff token should bind the Runner Job");
-    let cursor = JobObservationToken::parse_bound(cursor_token, job_id)
+    let cursor = JobObservationToken::parse(cursor_token)
         .expect("observed token should bind the Runner Job");
-    assert!(legacy.is_legacy());
-    assert!(!cursor.is_legacy());
-    assert_eq!(cursor.epoch, legacy.epoch);
-    assert_eq!(cursor.revision, legacy.revision);
+    assert!(baseline.requires_baseline());
+    assert!(!cursor.requires_baseline());
+    assert_eq!(cursor.binding, baseline.binding);
+    assert_eq!(cursor.revision, baseline.revision);
 }
 
 async fn complete_sync_shell_lifecycle(

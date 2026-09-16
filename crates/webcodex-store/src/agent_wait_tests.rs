@@ -233,7 +233,7 @@ fn wait_source_authority_is_independent_and_foreign_task_is_existence_hidden() {
             wait_input(
                 &alice_agent,
                 &endpoint,
-                &[format!("wc_agent_task_{}", "f".repeat(32))],
+                &["wc_agent_task_________________".to_string()],
                 "wait-authority-missing",
             ),
         )
@@ -612,7 +612,12 @@ fn wait_creation_enforces_selector_agent_and_endpoint_bounds() {
     assert_eq!(empty.code(), "invalid_agent_wait_events");
 
     let nine = (0..9)
-        .map(|index| format!("wc_agent_task_{index:032x}"))
+        .map(|index| {
+            format!(
+                "wc_agent_task_{}",
+                webcodex_core::compact::encode(&(index as u128).to_be_bytes()[4..])
+            )
+        })
         .collect::<Vec<_>>();
     let oversized = db
         .create_agent_wait(

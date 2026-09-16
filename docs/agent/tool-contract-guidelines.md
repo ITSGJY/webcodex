@@ -61,6 +61,26 @@ still the default because silently accepting an unknown name can hide a typo.
 Low-friction design means making the **known contract** forgiving where semantics
 are unchanged, not turning every input object into an open bag.
 
+### Batch predetermined observations; keep adaptive work sequential
+
+One model decision may request several observations when they are already known
+to be needed, tightly related, and an existing primitive naturally supports the
+batch. Examples include several related `read_files` ranges, independent search
+queries, or a short bounded `run_shell` chain of predetermined observations.
+Result-dependent follow-ups stay sequential so the next call can incorporate the
+new evidence. Do not preload unrelated data or combine permission, mutation,
+validation, commit, publish, deploy, or restart boundaries merely to reduce call
+count.
+
+Inspection should narrow before it expands. Known symbols/tests/regions favor
+bounded targeted reads and related-range batching. Broad discovery should prefer
+files/count/small low-context search projections followed by targeted reads.
+`run_process` remains the natural path for one native executable with literal
+argv; `run_shell` is first-class for shell grammar or a short tightly related
+chain, and a bounded deterministic Python heredoc is appropriate when one small
+program expresses one coherent transformation more reliably than many mechanical
+edits. None of these rules means “shell first” or weakens specialized semantics.
+
 ## 2. Mechanical repair should be server-owned
 
 Do not spend a model turn on a repair WebCodex can prove locally.

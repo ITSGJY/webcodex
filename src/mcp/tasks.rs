@@ -77,9 +77,9 @@ fn mcp_task_timestamp(timestamp: i64) -> String {
 }
 
 fn mcp_task_id_is_valid(task_id: &str) -> bool {
-    task_id.strip_prefix("wc_exec_").is_some_and(|suffix| {
-        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+    task_id
+        .strip_prefix("wc_exec_")
+        .is_some_and(|suffix| webcodex_core::compact::decode::<12>(suffix).is_some())
 }
 
 fn mcp_task_status(execution: &ConnectorExecution) -> &'static str {

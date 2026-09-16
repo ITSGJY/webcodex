@@ -472,7 +472,7 @@ fn add_context_projection_to_output_shape(
                             json!({
                                 "type": "object",
                                 "properties": {
-                                    "session_id": {"type": "string", "pattern": "^wc_sess_[A-Za-z0-9_]+$"}
+                                    "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
                                 },
                                 "required": ["session_id"],
                                 "additionalProperties": false
@@ -552,7 +552,7 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
             crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD.to_string(),
             json!({
                 "type": "string",
-                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
                 "description": "Optional explicit Workflow Session used only to record this call and trusted collaboration provenance. Separate from any tool business Session input; grants no authority; removed before concrete parsing."
             }),
         );
@@ -563,7 +563,7 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
                 "maxItems": crate::tool_runtime::sessions::MAX_TOOL_CALL_ACK_MESSAGE_IDS,
                 "items": {
                     "type": "string",
-                    "pattern": "^wc_msg_[A-Za-z0-9_]+$"
+                    "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
                 },
                 "description": "Proves the current model context still retains the listed open ACK-required Session messages. Repeat while retained. If later omitted, unresolved ACK-required guidance may be surfaced again. ACK neither resolves messages nor grants authority or gates execution."
             }),
@@ -576,7 +576,7 @@ pub(super) fn add_stateless_workflow_recorder_metadata(
                 "properties": {
                     "message_id": {
                         "type": "string",
-                        "pattern": "^wc_msg_[A-Za-z0-9_]+$"
+                        "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
                     },
                     "resolution": {
                         "type": "string",
@@ -991,6 +991,8 @@ pub(super) async fn handle_list(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HostFileImportTrustReason {
     Trusted,
+    TrustedLoopbackApiToken,
+    LoopbackApiTokenTrustRequiresLoopback,
     MissingConfig,
     MissingDatabase,
     MissingAuth,
@@ -1006,6 +1008,10 @@ impl HostFileImportTrustReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::Trusted => "trusted",
+            Self::TrustedLoopbackApiToken => "trusted_loopback_api_token",
+            Self::LoopbackApiTokenTrustRequiresLoopback => {
+                "loopback_api_token_trust_requires_loopback"
+            }
             Self::MissingConfig => "missing_config",
             Self::MissingDatabase => "missing_database",
             Self::MissingAuth => "missing_auth",
@@ -1092,6 +1098,22 @@ pub(super) fn mcp_host_file_import_trust_decision_from_state(
     let Some(auth) = auth else {
         return base;
     };
+    if auth.kind == crate::auth::AuthKind::ApiToken
+        && auth.token_kind.as_deref() == Some("user")
+        && config.oauth2.trust_loopback_api_token_mcp_file_import
+    {
+        if config.is_loopback_bound() {
+            return HostFileImportTrustDecision {
+                trust: HostFileImportTrust::TrustedMcpHostFile,
+                reason: HostFileImportTrustReason::TrustedLoopbackApiToken,
+                ..base
+            };
+        }
+        return HostFileImportTrustDecision {
+            reason: HostFileImportTrustReason::LoopbackApiTokenTrustRequiresLoopback,
+            ..base
+        };
+    }
     if !auth.is_oauth_token() {
         return HostFileImportTrustDecision {
             reason: HostFileImportTrustReason::NotOAuthToken,
@@ -1301,14 +1323,7 @@ pub(super) fn strip_stateless_ack_session_message_ids(
             ));
         };
         let value = value.trim();
-        let valid = value.strip_prefix("wc_msg_").is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .as_bytes()
-                    .iter()
-                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        });
-        if !valid {
+        if !webcodex_core::workflow_session_contract::is_valid_session_message_id(value) {
             return Err(format!(
                 "field '{}' must contain only valid wc_msg_* ids",
                 crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD
@@ -1349,14 +1364,7 @@ pub(super) fn strip_stateless_session_message_resolution(
         return Err("session_message_resolution.message_id must be a wc_msg_* string".to_string());
     };
     let message_id = message_id.trim().to_string();
-    let valid_message_id = message_id.strip_prefix("wc_msg_").is_some_and(|suffix| {
-        !suffix.is_empty()
-            && suffix
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    });
-    if !valid_message_id {
+    if !webcodex_core::workflow_session_contract::is_valid_session_message_id(&message_id) {
         return Err(
             "session_message_resolution.message_id must be a valid wc_msg_* id".to_string(),
         );

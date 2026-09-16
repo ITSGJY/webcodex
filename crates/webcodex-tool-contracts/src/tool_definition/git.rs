@@ -193,7 +193,9 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
             super::ToolAuditPolicy::TYPED_CANONICAL.context(
                 super::ToolAuditContextPolicy::Fields(&[
                     super::ToolAuditResultField::value("commits"),
+                    super::ToolAuditResultField::value("head_commit"),
                     super::ToolAuditResultField::value("next_skip"),
+                    super::ToolAuditResultField::value("suggested_call"),
                     super::ToolAuditResultField::value("truncated"),
                 ]),
             ),
@@ -214,7 +216,7 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Return bounded structured recent git commit history for a project. When truncated, next_skip is the exact parser-ready offset for the next page when it can advance within the existing 10000 skip bound; null means no safe forward page is available. Retained-tail or malformed source records fail closed; retry with a smaller limit. Offset paging assumes history is unchanged between calls. Does not return commit bodies or modify the worktree.",
+        "Return bounded structured recent git commit history for a project. The first page resolves current HEAD to one exact 40-hex head_commit and reads that commit snapshot; later pages may supply the same head_commit so branch movement or rewrites cannot drift the traversal. When truncated and bounded forward progress is available, suggested_call is the sole parser-ready continuation and carries project, exact head_commit, effective limit, next skip, and Session identity when present. next_skip remains domain metadata only; null means the final page or the existing 10000 skip bound prevents a safe forward page. If the exact commit snapshot is no longer available, fail closed rather than falling back to current HEAD. Retained-tail or malformed source records also fail closed. Does not return commit bodies or modify the worktree.",
         git_log_input_schema,
     ))),
 ];

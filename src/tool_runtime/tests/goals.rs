@@ -439,7 +439,7 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
 
 #[test]
 fn goal_tool_calls_and_audit_keep_goal_identity_distinct_and_private_text_out_of_logs() {
-    let goal_id = format!("wc_goal_{}", "0".repeat(32));
+    let goal_id = "wc_goal_AAAAAAAAAAAAAAAA".to_string();
     let call = ToolCall::from_tool_name(
         "update_goal",
         json!({
@@ -518,8 +518,8 @@ fn goal_tool_calls_and_audit_keep_goal_identity_distinct_and_private_text_out_of
     assert!(ToolCall::from_tool_name(
         "associate_goal_agent_task",
         json!({
-            "goal_id": format!("wc_goal_{}", "1".repeat(32)),
-            "task_id": format!("wc_agent_task_{}", "2".repeat(32)),
+            "goal_id": "wc_goal_ERERERERERERERER".to_string(),
+            "task_id": "wc_agent_task_IiIiIiIiIiIiIiIi".to_string(),
             "idempotency_key": "link"
         })
     )
@@ -566,7 +566,7 @@ fn goal_runtime_crud_replay_and_exact_read_hide_foreign_existence() {
     assert_eq!(changed.output["error_kind"], "goal_idempotency_conflict");
 
     let foreign = runtime.get_goal(Some(&alice), goal_id.clone());
-    let missing = runtime.get_goal(Some(&alice), format!("wc_goal_{}", "f".repeat(32)));
+    let missing = runtime.get_goal(Some(&alice), "wc_goal_________________".to_string());
     assert!(!foreign.success);
     assert!(!missing.success);
     assert_eq!(foreign.output["error_kind"], "goal_not_found");
@@ -656,7 +656,7 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
 
     let foreign = runtime.goal_plan_state(Some(&alice), goal_id.clone()).await;
     let missing = runtime
-        .goal_plan_state(Some(&alice), format!("wc_goal_{}", "f".repeat(32)))
+        .goal_plan_state(Some(&alice), "wc_goal_________________".to_string())
         .await;
     assert!(!foreign.success);
     assert!(!missing.success);

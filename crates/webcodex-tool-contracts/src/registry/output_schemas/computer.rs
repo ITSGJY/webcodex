@@ -61,7 +61,7 @@ fn application_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "application_id": {"type": "string", "pattern": "^application_[0-9a-f]{32}$", "maxLength": 128},
+            "application_id": {"type": "string", "pattern": "^application_[A-Za-z0-9_-]{16}$", "maxLength": 128},
             "display_name": {"type": "string", "minLength": 1, "maxLength": 256}
         },
         "required": ["application_id", "display_name"]
@@ -73,7 +73,7 @@ fn display_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128},
+            "display_id": {"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128},
             "width": {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
             "height": {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
             "primary": {"type": "boolean"}
@@ -213,7 +213,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "application_id",
-                json!({"type": "string", "pattern": "^application_[0-9a-f]{32}$", "maxLength": 128}),
+                json!({"type": "string", "pattern": "^application_[A-Za-z0-9_-]{16}$", "maxLength": 128}),
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
@@ -447,7 +447,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "display_id",
-                json!({"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128}),
+                json!({"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128}),
             ),
             (
                 "snapshot_generation",
@@ -582,7 +582,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
                 (
                     "display_id",
-                    json!({"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128}),
+                    json!({"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128}),
                 ),
                 (
                     "snapshot_generation",
@@ -644,7 +644,7 @@ fn computer_suggested_recovery_schema() -> Value {
                     "additionalProperties": false,
                     "properties": {
                         "client_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                        "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128}
+                        "display_id": {"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128}
                     },
                     "required": ["client_id", "display_id"]
                 }),

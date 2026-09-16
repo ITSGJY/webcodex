@@ -11,7 +11,7 @@ use webcodex_store::{
     ConnectorTaskStoreError, Database, NewConnectorResult, NewConnectorTask,
 };
 
-const TASK_ID: &str = "wc_task_f123456789abcdef0123456789abcdef";
+const TASK_ID: &str = "wc_task_iavN7wEjRWeJq83v";
 const RESULT_ID: &str = "wc_result_f123456789abcdef";
 const SUBJECT: &str = "user:owner";
 
@@ -82,12 +82,7 @@ fn fixture(finish: bool) -> Fixture {
     .unwrap();
     let manager = WorkspaceManager::new(&context).unwrap();
     let prepared = manager
-        .prepare(
-            &context,
-            TASK_ID,
-            "wc_run_f123456789abcdef0123456789abcdef",
-            false,
-        )
+        .prepare(&context, TASK_ID, "wc_run_iavN7wEjRWeJq83v", false)
         .unwrap();
     let task = db
         .start_connector_task(NewConnectorTask {
@@ -344,8 +339,8 @@ fn finalization_failure_is_recovered_once_after_reopen() {
 
 #[test]
 fn unrecoverable_accept_is_quarantined_while_other_intents_recover_and_runtime_starts() {
-    const SECOND_TASK_ID: &str = "wc_task_e123456789abcdef0123456789abcdef";
-    const SECOND_RUN_ID: &str = "wc_run_e123456789abcdef0123456789abcdef";
+    const SECOND_TASK_ID: &str = "wc_task_AAAAAAAAAAAAAAAC";
+    const SECOND_RUN_ID: &str = "wc_run_AAAAAAAAAAAAAAAC";
     const SECOND_RESULT_ID: &str = "wc_result_e123456789abcdef";
 
     let fx = fixture(true);
@@ -875,7 +870,7 @@ fn reviewable_tasks_report_unread_guidance_until_the_model_claims_it() {
         rusqlite::params![
             "wc_evt_unread_test",
             TASK_ID,
-            "wc_run_f123456789abcdef0123456789abcdef",
+            "wc_run_iavN7wEjRWeJq83v",
             next_sequence,
             json!({ "message": "look at the lexer", "source": "host" }).to_string(),
         ],

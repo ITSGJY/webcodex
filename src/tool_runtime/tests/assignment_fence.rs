@@ -115,7 +115,7 @@ async fn e3_assignment_tool_round_trip_stale_projection_and_fresh_fence() {
         .as_str()
         .expect("assignment fence")
         .to_string();
-    assert!(old_fence.starts_with("wsa1_"));
+    assert!(old_fence.starts_with("wsa2_"));
 
     let wrong_token_domain = call(
         &runtime,
@@ -125,7 +125,7 @@ async fn e3_assignment_tool_round_trip_stale_projection_and_fresh_fence() {
             "message_id": todo_id,
             "answer": "must reject observation-token domain",
             "completion_key": "e3-tool-wrong-token-domain",
-            "expected_assignment_fence": format!("wsm1_{}", "A".repeat(43))
+            "expected_assignment_fence": format!("wsm2_{}", "A".repeat(43))
         }),
         &auth,
     )
@@ -201,7 +201,7 @@ async fn e3_assignment_tool_round_trip_stale_projection_and_fresh_fence() {
         .as_str()
         .expect("fresh durable assignment fence")
         .to_string();
-    assert!(fresh.starts_with("wsa1_"));
+    assert!(fresh.starts_with("wsa2_"));
     assert_ne!(fresh, old_fence);
 
     let completed = call(
@@ -239,11 +239,11 @@ fn e3_assignment_schema_parser_scope_local_coding_and_audit_are_synchronized() {
     );
     assert_eq!(
         get.output_schema["properties"]["output"]["properties"]["assignment_fence"]["maxLength"],
-        48
+        27
     );
     assert_eq!(
         get.output_schema["properties"]["output"]["properties"]["assignment_fence"]["pattern"],
-        "^wsa1_[A-Za-z0-9_-]{43}$"
+        "^wsa2_[A-Za-z0-9_-]{22}$"
     );
     let complete = specs
         .iter()
@@ -251,7 +251,7 @@ fn e3_assignment_schema_parser_scope_local_coding_and_audit_are_synchronized() {
         .expect("complete_session_message public spec");
     assert_eq!(
         complete.input_schema["properties"]["expected_assignment_fence"]["maxLength"],
-        48
+        27
     );
     assert!(complete.input_schema["required"]
         .as_array()
@@ -283,7 +283,7 @@ fn e3_assignment_schema_parser_scope_local_coding_and_audit_are_synchronized() {
         .to_string()
         .contains("expected_assignment_fence"));
 
-    let raw_fence = "wsa1_PRIVATE_FENCE_MUST_NOT_PERSIST";
+    let raw_fence = "wsa2_PRIVATE_FENCE_MUST_NOT_PERSIST";
     let completion_call = ToolCall::from_tool_name(
         "complete_session_message",
         json!({

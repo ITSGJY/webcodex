@@ -21,7 +21,7 @@ fn goal_summary_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "goal_id": {"type": "string", "pattern": "^wc_goal_[0-9a-f]{32}$", "description": "Canonical durable Goal id; identity only, never authority."},
+            "goal_id": {"type": "string", "pattern": "^wc_goal_[A-Za-z0-9_-]{16}$", "description": "Canonical durable Goal id; identity only, never authority."},
             "title": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Bounded Goal title."},
             "lifecycle": lifecycle_schema(),
             "revision": {"type": "integer", "minimum": 1, "description": "Monotonic authoritative Goal revision."},
@@ -45,7 +45,7 @@ fn correlation_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "kind": {"type": "string", "enum": ["agent_task", "workflow_session"]},
-            "reference_id": {"type": "string", "pattern": "^(wc_agent_task_[0-9a-f]{32}|wc_sess_[0-9a-f]{32})$", "maxLength": 46, "description": "Exact correlated durable identity. It is not a credential and cannot be dereferenced without that domain's normal authorization."},
+            "reference_id": {"type": "string", "pattern": "^(wc_agent_task_[A-Za-z0-9_-]{16}|wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32}))$", "maxLength": 46, "description": "Exact correlated durable identity. It is not a credential and cannot be dereferenced without that domain's normal authorization."},
             "created_at_unix_ms": schema_type("integer", "Correlation creation time.")
         },
         "required": ["kind", "reference_id", "created_at_unix_ms"]
@@ -107,7 +107,7 @@ fn goal_plan_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "version": {"type": "integer", "const": 1, "description": "Backward-compatible Goal Plan presentation projection version; live activity is an additive observation field."},
-            "goal_id": {"type": "string", "pattern": "^wc_goal_[0-9a-f]{32}$", "description": "Exact durable Goal identity used for refresh/rehydration and app-only polling. Identity is never authority."},
+            "goal_id": {"type": "string", "pattern": "^wc_goal_[A-Za-z0-9_-]{16}$", "description": "Exact durable Goal identity used for refresh/rehydration and app-only polling. Identity is never authority."},
             "title": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Bounded Goal title."},
             "objective": {"type": "string", "minLength": 1, "maxLength": 8192, "description": "Bounded authoritative Goal objective; the Store enforces the same 8192-byte UTF-8 ceiling."},
             "lifecycle": lifecycle_schema(),

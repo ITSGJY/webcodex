@@ -249,13 +249,18 @@ item errors, or one shared absolute deadline expires. It never returns an
 `updated` wake reason: at the deadline `wait.outcome=timeout` can coexist with
 `changed=true`. Item errors take precedence over terminal, then timeout.
 
-Canonical execution handoffs suggest `wait_secs=100, wake_on=terminal`. This is
-a maximum wait, so terminal completion wakes immediately. Any missing token
-still gives an immediate baseline, and omitting `wait_secs` gives an immediate
-observation. Each Job waiter advances a private opaque cursor on non-terminal
-updates; final bounded deltas always use the caller's original token. Waiters
-use canonical Notify/revision rechecks, without a periodic polling heartbeat;
-updates neither recreate other Jobs' waiters nor extend the batch deadline.
+Canonical execution handoffs still expose the exact `wait_secs=100,
+wake_on=terminal` parser-ready continuation. Its behavioral meaning is
+**dependency-blocked wait**: use it when the next useful action actually depends
+on terminal outcome. When useful independent work remains, retain that exact Job
+identity/continuation, continue the independent work, and observe later; do not
+repeatedly poll a running Job merely to keep it visible. The 100 seconds is a
+maximum, so terminal completion wakes immediately. Any missing token still gives
+an immediate baseline, and omitting `wait_secs` gives an immediate observation.
+Each Job waiter advances a private opaque cursor on non-terminal updates; final
+bounded deltas always use the caller's original token. Waiters use canonical
+Notify/revision rechecks, without a periodic polling heartbeat; updates neither
+recreate other Jobs' waiters nor extend the batch deadline.
 
 Workflow Session records retain every `observe_jobs` interaction for audit and
 validation evidence. Runtime Console treats these calls as observation

@@ -3,14 +3,14 @@ use webcodex_core::coding_agent::{
     CODING_AGENT_MAX_CONFIG_OPTIONS, CODING_AGENT_TIMEOUT_MAX_SECS, CODING_AGENT_TIMEOUT_MIN_SECS,
 };
 
-const AGENT_ID_PATTERN: &str = "^wc_dagent_[0-9a-f]{32}$";
-const TASK_ID_PATTERN: &str = "^wc_agent_task_[0-9a-f]{32}$";
-const ATTEMPT_ID_PATTERN: &str = "^wc_agent_task_attempt_[0-9a-f]{32}$";
-const ATTEMPT_FENCE_PATTERN: &str = "^wc_agent_task_fence_[0-9a-f]{32}$";
-const WAKE_ID_PATTERN: &str = "^wc_wake_[0-9a-f]{32}$";
-const WAKE_CONSUME_TOKEN_PATTERN: &str = "^wc_wake_consume_[0-9a-f]{32}$";
-const CONVERSATION_ID_PATTERN: &str = "^wc_conv_[0-9a-f]{32}$";
-const MESSAGE_ID_PATTERN: &str = "^wc_cmsg_[0-9a-f]{32}$";
+const AGENT_ID_PATTERN: &str = "^wc_dagent_[A-Za-z0-9_-]{16}$";
+const TASK_ID_PATTERN: &str = "^wc_agent_task_[A-Za-z0-9_-]{16}$";
+const ATTEMPT_ID_PATTERN: &str = "^wc_agent_task_attempt_[A-Za-z0-9_-]{16}$";
+const ATTEMPT_FENCE_PATTERN: &str = "^wc_agent_task_fence_[A-Za-z0-9_-]{21}[AQgw]$";
+const WAKE_ID_PATTERN: &str = "^wc_wake_[A-Za-z0-9_-]{16}$";
+const WAKE_CONSUME_TOKEN_PATTERN: &str = "^wc_wake_consume_[A-Za-z0-9_-]{21}[AQgw]$";
+const CONVERSATION_ID_PATTERN: &str = "^wc_conv_[A-Za-z0-9_-]{16}$";
+const MESSAGE_ID_PATTERN: &str = "^wc_cmsg_[A-Za-z0-9_-]{16}$";
 
 fn canonical_id(pattern: &str, description: &str) -> Value {
     json!({"type": "string", "pattern": pattern, "description": description})

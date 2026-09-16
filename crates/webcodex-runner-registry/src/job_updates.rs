@@ -24,7 +24,6 @@ use crate::DetachedInitiatorIdentity;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use uuid::Uuid;
 use webcodex_core::runner_operation::{
     RunnerInvocationMetadata, RunnerJobOperation, RunnerJobProcessOperation,
     RunnerJobScriptOperation, RunnerJobShellOperation, RunnerJobValidationOperation,
@@ -175,7 +174,7 @@ fn frozen_shell_job_log_projection(
         let (stderr, next_stderr_line, _, stderr_truncated) =
             select_log_lines(&job.stderr, since_stderr_line, tail_lines);
         let mut view = job_view(job);
-        view.observation_token = webcodex_core::job_observation::JobObservationToken::new_legacy(
+        view.observation_token = webcodex_core::job_observation::JobObservationToken::new_baseline(
             job.job_id.clone(),
             job.observation.epoch.to_string(),
             job.observation.revision.load(Ordering::Relaxed),
@@ -205,10 +204,11 @@ fn frozen_shell_job_log_projection(
         );
     }
 
-    let epoch_matches = after.is_none_or(|token| token.epoch == job.observation.epoch.as_ref());
+    let epoch_matches =
+        after.is_none_or(|token| token.matches_parent(&job.job_id, &job.observation.epoch));
     let base_mode = match after {
         None => webcodex_core::job_observation::JobLogSelectionMode::Baseline,
-        Some(token) if token.is_legacy() || !epoch_matches => {
+        Some(token) if token.requires_baseline() || !epoch_matches => {
             webcodex_core::job_observation::JobLogSelectionMode::Reset
         }
         Some(token) => webcodex_core::job_observation::JobLogSelectionMode::Delta {
@@ -219,7 +219,7 @@ fn frozen_shell_job_log_projection(
     };
     let stderr_mode = match after {
         None => webcodex_core::job_observation::JobLogSelectionMode::Baseline,
-        Some(token) if token.is_legacy() || !epoch_matches => {
+        Some(token) if token.requires_baseline() || !epoch_matches => {
             webcodex_core::job_observation::JobLogSelectionMode::Reset
         }
         Some(token) => webcodex_core::job_observation::JobLogSelectionMode::Delta {
@@ -636,7 +636,25 @@ fn detached_job_id_for_key(
     hasher.update(initiator.as_stable_principal().as_bytes());
     hasher.update(b"\0");
     hasher.update(key.as_bytes());
-    Ok(format!("detached_{:x}", hasher.finalize()))
+    Ok(format!(
+        "detached_{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    ))
+}
+
+// Caller holds the owning registry lock until insertion; never replace an
+// unrelated Job, even when a candidate collides.
+pub(crate) fn allocate_job_id<T>(
+    jobs: &HashMap<String, T>,
+    mut generate: impl FnMut() -> String,
+) -> Result<String, String> {
+    for _ in 0..16 {
+        let candidate = generate();
+        if !jobs.contains_key(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err("job_id_allocation_exhausted".to_string())
 }
 
 impl RunnerRegistry {
@@ -870,6 +888,7 @@ impl RunnerRegistry {
         } else {
             None
         };
+        let mut inner = self.inner.lock().await;
         let job_id = match detached_idempotency_key {
             Some(key) => detached_job_id_for_key(
                 detached_initiator.ok_or_else(|| {
@@ -878,7 +897,9 @@ impl RunnerRegistry {
                 })?,
                 key,
             )?,
-            None => Uuid::new_v4().to_string(),
+            None => allocate_job_id(&inner.jobs_by_id, || {
+                format!("wc_job_{}", webcodex_core::compact::random_suffix::<12>())
+            })?,
         };
         let validation_step_names = validation_steps
             .iter()
@@ -955,7 +976,6 @@ impl RunnerRegistry {
             },
             RunnerOperation::Job(job_operation),
         )?;
-        let mut inner = self.inner.lock().await;
         let Some(runner) = inner.runners.get(&client_id) else {
             return Err(format!("unknown shell client: {}", client_id));
         };
@@ -1781,7 +1801,7 @@ impl RunnerRegistry {
         validate_id(job_id, "job_id")?;
         let after = after_observation_token
             .map(|value| {
-                webcodex_core::job_observation::JobObservationToken::parse_bound(value, job_id)
+                webcodex_core::job_observation::JobObservationToken::parse(value)
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
@@ -1802,7 +1822,8 @@ impl RunnerRegistry {
             }
             let revision = job.observation.revision.load(Ordering::Relaxed);
             let changed = after.as_ref().is_some_and(|token| {
-                token.epoch != job.observation.epoch.as_ref() || token.revision != revision
+                !token.matches_parent(&job.job_id, &job.observation.epoch)
+                    || token.revision != revision
             });
             let terminal = job.lifecycle.is_terminal();
             if wait_secs.is_none() || after.is_none() || changed || terminal {
@@ -1849,7 +1870,8 @@ impl RunnerRegistry {
             }
             let revision = job.observation.revision.load(Ordering::Relaxed);
             let changed = after.as_ref().is_some_and(|token| {
-                token.epoch != job.observation.epoch.as_ref() || token.revision != revision
+                !token.matches_parent(&job.job_id, &job.observation.epoch)
+                    || token.revision != revision
             });
             let terminal = job.lifecycle.is_terminal();
             if changed || terminal {
@@ -1895,7 +1917,8 @@ impl RunnerRegistry {
                 }
                 let revision = job.observation.revision.load(Ordering::Relaxed);
                 let changed = after.as_ref().is_some_and(|token| {
-                    token.epoch != job.observation.epoch.as_ref() || token.revision != revision
+                    !token.matches_parent(&job.job_id, &job.observation.epoch)
+                        || token.revision != revision
                 });
                 let terminal = job.lifecycle.is_terminal();
                 let wait = JobLogWait {

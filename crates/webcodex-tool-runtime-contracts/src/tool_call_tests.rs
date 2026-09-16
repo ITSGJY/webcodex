@@ -43,10 +43,10 @@ fn from_tool_name_parses_unit_tools_with_empty_object() {
 #[test]
 fn heartbeat_agent_task_attempt_parses_optional_active_turn_proof() {
     let base = json!({
-        "task_id": format!("wc_agent_task_{}", "1".repeat(32)),
-        "attempt_id": format!("wc_agent_task_attempt_{}", "2".repeat(32)),
-        "assignee_agent_id": format!("wc_dagent_{}", "3".repeat(32)),
-        "attempt_fence": format!("wc_agent_task_fence_{}", "4".repeat(32)),
+        "task_id": "wc_agent_task_ERERERERERERERER".to_string(),
+        "attempt_id": "wc_agent_task_attempt_IiIiIiIiIiIiIiIi".to_string(),
+        "assignee_agent_id": "wc_dagent_MzMzMzMzMzMzMzMz".to_string(),
+        "attempt_fence": "wc_agent_task_fence_RERERERERERERERERERERA".to_string(),
         "attempt_controller_generation": 7,
     });
     let ordinary = ToolCall::from_tool_name("heartbeat_agent_task_attempt", base.clone()).unwrap();
@@ -60,8 +60,9 @@ fn heartbeat_agent_task_attempt_parses_optional_active_turn_proof() {
     ));
 
     let mut with_proof = base;
-    with_proof["active_turn_wake_id"] = json!(format!("wc_wake_{}", "5".repeat(32)));
-    with_proof["active_turn_consume_token"] = json!(format!("wc_wake_consume_{}", "6".repeat(32)));
+    with_proof["active_turn_wake_id"] = json!("wc_wake_VVVVVVVVVVVVVVVV".to_string());
+    with_proof["active_turn_consume_token"] =
+        json!("wc_wake_consume_ZmZmZmZmZmZmZmZmZmZmZg".to_string());
     let renewed = ToolCall::from_tool_name("heartbeat_agent_task_attempt", with_proof).unwrap();
     assert!(matches!(
         renewed,
@@ -75,13 +76,13 @@ fn heartbeat_agent_task_attempt_parses_optional_active_turn_proof() {
 
 #[test]
 fn agent_wait_calls_parse_closed_selectors_and_keep_audit_payload_free() {
-    const PRIVATE_TASK: &str = "wc_agent_task_abcdefabcdefabcdefabcdefabcdefab";
+    const PRIVATE_TASK: &str = "wc_agent_task_ze-rze-rze-rze-r";
     const PRIVATE_KEY: &str = "PRIVATE_WAIT_KEY_MUST_NOT_PERSIST";
     let call = ToolCall::from_tool_name(
         "wait_for_agent_events",
         json!({
-            "agent_id": "wc_dagent_0123456789abcdef0123456789abcdef",
-            "endpoint_id": "wc_endpoint_0123456789abcdef0123456789abcdef",
+            "agent_id": "wc_dagent_iavN7wEjRWeJq83v",
+            "endpoint_id": "wc_endpoint_iavN7wEjRWeJq83v",
             "expected_controller_generation": 4,
             "events": [{"kind":"agent_task_terminal","task_id":PRIVATE_TASK}],
             "idempotency_key": PRIVATE_KEY,
@@ -105,13 +106,13 @@ fn agent_wait_calls_parse_closed_selectors_and_keep_audit_payload_free() {
 
     let read = ToolCall::from_tool_name(
         "read_agent_wait",
-        json!({"wait_id": format!("wc_agent_wait_{}", "6".repeat(32))}),
+        json!({"wait_id": "wc_agent_wait_ZmZmZmZmZmZmZmZm".to_string()}),
     )
     .unwrap();
     assert!(matches!(read, ToolCall::ReadAgentWait { .. }));
     let state = ToolCall::from_tool_name(
         "agent_wait_state",
-        json!({"wait_id": format!("wc_agent_wait_{}", "6".repeat(32))}),
+        json!({"wait_id": "wc_agent_wait_ZmZmZmZmZmZmZmZm".to_string()}),
     )
     .unwrap();
     assert!(matches!(state, ToolCall::AgentWaitState { .. }));
@@ -220,7 +221,7 @@ fn ssh_resource_parses_as_canonical_gateway_with_closed_action_vocabulary() {
         "ssh_resource",
         json!({
             "action": "register",
-            "binding": "wc_sbind_0123456789abcdef0123456789abcdef",
+            "binding": "wc_sbind_ASNFZ4mrze8BI0VniavN7w",
             "name": "spe",
             "target": "root@spe",
             "default_cwd": "/root/git"
@@ -863,7 +864,7 @@ fn from_tool_name_rejects_retired_inspection_tools_and_parses_retained_git_tools
 #[test]
 fn continuation_endpoint_rotation_has_canonical_and_legacy_tool_names() {
     let args = json!({
-        "agent_id": format!("wc_dagent_{}", "a".repeat(32)),
+        "agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
         "host": "ChatGPT",
         "client_attachment_id": "window-a",
         "idempotency_key": "rotate-endpoint-1"
@@ -1289,7 +1290,7 @@ fn from_tool_name_parses_finish_coding_task_workspace_projection_flag() {
 
 #[test]
 fn observe_session_messages_tool_call_and_audit_are_bounded() {
-    let raw_token = "wsm1:wc_sess_demo:1";
+    let raw_token = "wsm2_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let call = ToolCall::from_tool_name(
         "observe_session_messages",
         json!({
@@ -1349,7 +1350,7 @@ fn observe_session_messages_tool_call_and_audit_are_bounded() {
         "observe_session_messages",
         json!({
             "session_id": "wc_sess_demo",
-            "after_observation_token": "x".repeat(193)
+            "after_observation_token": "x".repeat(webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN + 1)
         }),
     );
     assert!(oversized.is_err());
@@ -1770,8 +1771,8 @@ fn create_project_rejects_retired_allow_existing_empty_with_migration_hint() {
 fn agent_continuation_bind_parses_required_view_fence_and_omits_it_from_audit() {
     let binding_id = format!("wc_host_binding_{}", "a0".repeat(16));
     let mut args = json!({
-        "agent_id": format!("wc_dagent_{}", "a".repeat(32)),
-        "endpoint_id": format!("wc_endpoint_{}", "b".repeat(32)),
+        "agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
+        "endpoint_id": "wc_endpoint_u7u7u7u7u7u7u7u7".to_string(),
         "expected_controller_generation": 1,
         "binding_id": binding_id,
     });

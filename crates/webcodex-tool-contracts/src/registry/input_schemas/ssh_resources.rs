@@ -20,7 +20,7 @@ pub fn ssh_resource_input_schema() -> Value {
             },
             "binding": {
                 "type": "string",
-                "pattern": "^wc_sbind_[0-9a-f]{32}$",
+                "pattern": "^wc_sbind_[A-Za-z0-9_-]{21}[AQgw]$",
                 "description": "Opaque exact Runner + registry revision observation returned by list. Required for register/remove; never grants authority by itself."
             },
             "name": {

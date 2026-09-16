@@ -149,7 +149,7 @@ fn canonical_observation(
         "recovery_state": null,
         "recovery_reason_code": null,
         "recovery_reason": null,
-        "observation_token": format!("wjob1:a:{job_id}:fixture_epoch:7"),
+        "observation_token": crate::job_observation::JobObservationToken::new_baseline(job_id, "fixture_epoch", 7).unwrap().encode(),
         "log_delta_status": log_delta_status,
         "stdout_delta_reset": false,
         "stderr_delta_reset": false,
@@ -305,7 +305,7 @@ fn observe_jobs_tool_call_enforces_batch_and_scalar_bounds() {
     )
     .is_err());
 
-    let max_token = "x".repeat(192);
+    let max_token = "x".repeat(crate::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN);
     assert!(ToolCall::from_tool_name(
         "observe_jobs",
         json!({"items": [{"job_id": "job", "after_observation_token": max_token}]})
@@ -313,7 +313,14 @@ fn observe_jobs_tool_call_enforces_batch_and_scalar_bounds() {
     .is_ok());
     assert!(ToolCall::from_tool_name(
         "observe_jobs",
-        json!({"items": [{"job_id": "job", "after_observation_token": "x".repeat(193)}]})
+        json!({
+            "items": [{
+                "job_id": "job",
+                "after_observation_token": "x".repeat(
+                    crate::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN + 1
+                )
+            }]
+        })
     )
     .is_err());
 
@@ -467,7 +474,7 @@ fn observe_jobs_schema_catalog_permission_and_audit_are_public_and_token_safe() 
         .iter()
         .any(|name| name == "observe_jobs"));
 
-    let opaque = "wjob1:a:job:private_epoch_body:7";
+    let opaque = "wj3_privateepochbody.7.0.0";
     let call = ToolCall::ObserveJobs {
         items: vec![item("job", Some(opaque.to_string()))],
         tail_lines: 40,
@@ -1308,7 +1315,7 @@ async fn observe_jobs_terminal_transition_wakes_shared_wait() {
 
 #[test]
 fn observe_jobs_session_sanitizer_removes_nested_token_bodies() {
-    let opaque = "wjob1:a:job:opaque-private-body:123";
+    let opaque = "wj3_privateepochbody.3f.0.0";
     let summary = super::super::sessions::session_input_summary_for_tool(
         "observe_jobs",
         &json!({

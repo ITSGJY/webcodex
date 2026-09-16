@@ -26,7 +26,7 @@ pub use context::{
 pub use contracts::*;
 pub use projections::{
     approval_projection, durable_task_review_projection, result_projection, store_error_outcome,
-    validate_opaque_id,
+    validate_opaque_id, validate_result_id, validate_task_id,
 };
 pub use runtime::ConnectorRuntime;
 pub use wire_models::{TaskCancelInput, TaskReviewInput};

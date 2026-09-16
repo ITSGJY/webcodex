@@ -43,7 +43,7 @@ pub fn computer_launch_application_input_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact macOS or Windows Runner client_id that produced the application_id."},
-            "application_id": {"type": "string", "pattern": "^application_[0-9a-f]{32}$", "maxLength": 128, "description": "Fresh opaque process-local application_id returned by computer_list_applications."}
+            "application_id": {"type": "string", "pattern": "^application_[A-Za-z0-9_-]{16}$", "maxLength": 128, "description": "Fresh opaque process-local application_id returned by computer_list_applications."}
         },
         "required": ["client_id", "application_id"]
     })
@@ -227,7 +227,7 @@ pub fn computer_snapshot_display_input_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id that produced the display_id."},
-            "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128, "description": "Fresh opaque process-local display_id returned by computer_list_displays."},
+            "display_id": {"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128, "description": "Fresh opaque process-local display_id returned by computer_list_displays."},
             "max_width": {"type": "integer", "minimum": 1, "description": "Optional upper bound on encoded output width. Values above 4096 are clamped to 4096. Never upscales."},
             "max_height": {"type": "integer", "minimum": 1, "description": "Optional upper bound on encoded output height. Values above 4096 are clamped to 4096. Never upscales."}
         },
@@ -241,7 +241,7 @@ pub fn computer_pointer_input_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "client_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Exact Runner client_id that produced the display snapshot."},
-            "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128, "description": "Exact opaque process-local display_id bound to snapshot_generation."},
+            "display_id": {"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128, "description": "Exact opaque process-local display_id bound to snapshot_generation."},
             "snapshot_generation": {"type": "integer", "minimum": 1, "maximum": 4294967295u64, "description": "Latest unspent successful full-display snapshot generation for this display."},
             "x": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Display-local source-space x coordinate; must be less than the bound snapshot source_width."},
             "y": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Display-local source-space y coordinate; must be less than the bound snapshot source_height."}

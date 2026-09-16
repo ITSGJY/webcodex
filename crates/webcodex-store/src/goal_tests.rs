@@ -161,7 +161,7 @@ fn exact_read_hides_foreign_existence_and_updates_fail_closed() {
 
     let foreign_error = db.read_goal(&foreign, &goal_id).unwrap_err();
     assert_eq!(foreign_error.code(), "goal_not_found");
-    let missing = format!("{GOAL_ID_PREFIX}{}", "f".repeat(32));
+    let missing = format!("{GOAL_ID_PREFIX}{}", "f".repeat(16));
     let missing_error = db.read_goal(&foreign, &missing).unwrap_err();
     assert_eq!(missing_error.code(), "goal_not_found");
 
@@ -218,7 +218,7 @@ fn correlations_are_bounded_explicit_identity_only_and_replayed() {
     let owner = principal('d');
     let created = db.create_goal_at(&owner, input("corr-create"), T0).unwrap();
     let goal_id = created.goal.summary.goal_id;
-    let task_id = format!("wc_agent_task_{}", "1".repeat(32));
+    let task_id = "wc_agent_task_ERERERERERERERER".to_string();
     let session_id = format!("wc_sess_{}", "2".repeat(32));
 
     let task_link = db
@@ -267,7 +267,7 @@ fn correlations_are_bounded_explicit_identity_only_and_replayed() {
             &owner,
             &goal_id,
             GoalCorrelationKind::WorkflowSession,
-            &format!("wc_sess_{}", "3".repeat(32)),
+            &format!("wc_sess_{}", webcodex_core::compact::random_suffix::<12>()),
             "session-link",
             T0 + 4,
         )
@@ -275,7 +275,10 @@ fn correlations_are_bounded_explicit_identity_only_and_replayed() {
     assert_eq!(changed_reuse.code(), "goal_idempotency_conflict");
 
     for ordinal in 0..(MAX_GOAL_CORRELATIONS - 2) {
-        let reference_id = format!("wc_agent_task_{ordinal:032x}");
+        let reference_id = format!(
+            "wc_agent_task_{}",
+            webcodex_core::compact::encode(&(ordinal as u128).to_be_bytes()[4..])
+        );
         let key = format!("capacity-link-{ordinal}");
         db.associate_goal_reference_at(
             &owner,
@@ -294,7 +297,7 @@ fn correlations_are_bounded_explicit_identity_only_and_replayed() {
             &owner,
             &goal_id,
             GoalCorrelationKind::AgentTask,
-            &format!("wc_agent_task_{}", "f".repeat(32)),
+            &"wc_agent_task_________________".to_string(),
             "capacity-overflow",
             T0 + 100,
         )
@@ -365,7 +368,10 @@ fn bounds_and_unknown_persisted_lifecycle_fail_closed() {
                  ) VALUES (?1, 'agent_task', ?2, ?3)",
                 rusqlite::params![
                     overlinked.goal.summary.goal_id,
-                    format!("wc_agent_task_{ordinal:032x}"),
+                    format!(
+                        "wc_agent_task_{}",
+                        webcodex_core::compact::encode(&(ordinal as u128).to_be_bytes()[4..])
+                    ),
                     T0 + ordinal,
                 ],
             )

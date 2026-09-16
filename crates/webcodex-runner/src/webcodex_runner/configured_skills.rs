@@ -550,8 +550,10 @@ fn configured_skill_id(root: &Path, package_name: &str) -> String {
     hasher.update(configured_skill_root_identity(root).as_bytes());
     hasher.update(b"\0");
     hasher.update(package_name.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    format!("wc_skill_{}", &digest[..32])
+    format!(
+        "wc_skill_{}",
+        webcodex_core::compact::encode(&hasher.finalize()[..16])
+    )
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

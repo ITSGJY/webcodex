@@ -179,7 +179,7 @@ fn write_project_skill(root: &Path, package: &str, name: &str, description: &str
 
 fn startup_plugin_catalog_fixture() -> ProjectPluginCatalog {
     ProjectPluginCatalog {
-        catalog_revision: format!("wc_plugcat_{}", "a".repeat(64)),
+        catalog_revision: format!("wc_plugcat_{}", webcodex_core::compact::encode([0xaa; 32])),
         total_count: 1,
         entries: vec![ProjectPluginCatalogEntry {
             plugin: "repo-context".to_string(),
@@ -833,7 +833,7 @@ fn valid_work_on_project_projection_input() -> serde_json::Value {
     json!({
         "detail": "standard",
         "session": {
-            "session_id": "wc_sess_projection",
+            "session_id": "wc_sess_0123456789abcdef",
             "continuation": "created",
             "execution_context": {},
         },
@@ -975,7 +975,10 @@ fn work_on_project_schema_and_registration() {
         crate::tool_runtime::sessions::MAX_CODING_INSTRUCTION_CHARS
     );
     assert_eq!(props["session_id"]["type"], "string");
-    assert_eq!(props["session_id"]["pattern"], "^wc_sess_[A-Za-z0-9_]+$");
+    assert_eq!(
+        props["session_id"]["pattern"],
+        "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+    );
     assert_eq!(props["include_project_instructions"]["type"], "boolean");
     assert_eq!(props["include_project_instructions"]["default"], true);
     assert_eq!(props["include_workflow_guidance"]["type"], "boolean");
@@ -1299,7 +1302,7 @@ async fn work_on_project_extension_catalog_includes_runner_local_configured_skil
     )
     .await;
     let auth = bootstrap_auth_context();
-    let configured_id = format!("wc_skill_{}", "2".repeat(32));
+    let configured_id = "wc_skill_IiIiIiIiIiIiIiIiIiIiIg".to_string();
     let configured_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let (result, requests) = dispatch_startup_with_configured_skill_catalog(
         &runtime,
@@ -1370,7 +1373,7 @@ async fn work_on_project_plugin_extension_uses_project_catalog_without_binding_o
     assert_eq!(plugins["status"], "available");
     assert_eq!(
         plugins["catalog_revision"],
-        format!("wc_plugcat_{}", "a".repeat(64))
+        format!("wc_plugcat_{}", webcodex_core::compact::encode([0xaa; 32]))
     );
     assert_eq!(plugins["total_count"], 1);
     assert_eq!(plugins["returned_count"], 1);
@@ -1567,7 +1570,7 @@ fn work_on_project_projection_emits_typed_window_session_correlation() {
     );
     assert_eq!(correlation.workflow_sessions.len(), 1);
     let link = &correlation.workflow_sessions[0];
-    assert_eq!(link.session_id, "wc_sess_projection");
+    assert_eq!(link.session_id, "wc_sess_0123456789abcdef");
     assert_eq!(link.project.as_deref(), Some("agent:wop:demo"));
     assert_eq!(
         link.relation,
@@ -1796,15 +1799,17 @@ async fn work_on_project_without_session_id_always_creates_fresh_session() {
     assert!(model_protocol["session_message_ack"]
         .as_str()
         .is_some_and(|value| value.contains("ack_session_message_ids")));
-    assert!(
-        result.output["workflow"]["roles"]["implementation_owner"]["guidance"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item
-                .as_str()
-                .is_some_and(|value| value.contains("reuse the same assertion_name")))
-    );
+    let workflow = &result.output["workflow"];
+    assert!(workflow["guidance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item
+            .as_str()
+            .is_some_and(|value| value.contains("Reuse assertion_name"))));
+    assert!(workflow["roles"]
+        .as_object()
+        .is_some_and(|roles| !roles.contains_key("implementation_owner")));
     assert!(result.output["instructions"].is_object());
     for hidden in [
         "runtime_status",
@@ -2687,7 +2692,7 @@ async fn path_source_unknown_session_fails_before_registration() {
             client_id,
             &project_path,
             "unknown must not fall back",
-            Some("wc_sess_unknown"),
+            Some("wc_sess_fedcba9876543210"),
         ),
         "unknown-a1b2c3d4",
         &project_path,
@@ -3061,7 +3066,11 @@ async fn work_on_project_failures_never_create_or_fall_back() {
     let unknown = dispatch_coding_call_in_window(
         &runtime,
         "wop-fail",
-        work_on_project_call(&project_a, "must not create", Some("wc_sess_missing")),
+        work_on_project_call(
+            &project_a,
+            "must not create",
+            Some("wc_sess_1111111111111111"),
+        ),
         Some(&auth),
         "wop-fail-window",
     )

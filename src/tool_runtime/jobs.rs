@@ -2605,7 +2605,7 @@ mod recovery_projection_tests {
             recovered_after_server_restart: true,
             reconciled_at: Some(3),
             recovery_reason_code: Some("runner_recovery_deadline_exceeded".to_string()),
-            observation_token: Some("wjob1:a:job-1:0123456789abcdef:4".to_string()),
+            observation_token: Some("wj3_abcdefghijklmnop.4.0.0".to_string()),
             last_update_seq: Some(4),
             stdout_retained_from_line: Some(1),
             stderr_retained_from_line: Some(1),

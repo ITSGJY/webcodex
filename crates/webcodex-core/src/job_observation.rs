@@ -1,196 +1,102 @@
+use sha2::{Digest, Sha256};
 use std::fmt;
 
-const LEGACY_TOKEN_PREFIX: &str = "wjob1";
-const TOKEN_V2_PREFIX: &str = "wj2a";
-pub const MAX_JOB_OBSERVATION_TOKEN_LEN: usize = 192;
-const MAX_JOB_ID_LEN: usize = 80;
-const MAX_EPOCH_LEN: usize = 64;
+const TOKEN_PREFIX: &str = "wj3_";
+pub const MAX_JOB_OBSERVATION_TOKEN_LEN: usize = 62;
 
-/// Opaque, Job-bound model observation state.
-///
-/// Legacy `wjob1` tokens have no log cursor proof. Current `wj2*` tokens carry
-/// the next absolute stdout/stderr line that an automatic delta observation
-/// should inspect. These cursors are observation state only: they are not
-/// execution identity, authority, idempotency, or Runner protocol sequence.
+/// Observation state, never execution identity or authority. A 96-bit digest
+/// binds the exact Job and registry generation without repeating either ID.
+/// Paired zero cursors mean no log receipt (lifecycle/explicit-page views).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobObservationToken {
-    pub job_id: String,
-    pub epoch: String,
+    pub binding: String,
     pub revision: u64,
     pub stdout_cursor: Option<u64>,
     pub stderr_cursor: Option<u64>,
 }
 
+fn observation_binding(job_id: &str, epoch: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"webcodex/job-observation-binding/v3\0");
+    hash.update((epoch.len() as u64).to_be_bytes());
+    hash.update(epoch.as_bytes());
+    hash.update(job_id.as_bytes());
+    crate::compact::encode(&hash.finalize()[..12])
+}
+
 impl JobObservationToken {
     pub fn new(
-        job_id: impl Into<String>,
-        epoch: impl Into<String>,
+        job_id: impl AsRef<str>,
+        epoch: impl AsRef<str>,
         revision: u64,
         stdout_cursor: u64,
         stderr_cursor: u64,
     ) -> Result<Self, JobObservationTokenError> {
-        Self::build(
-            job_id.into(),
-            epoch.into(),
+        if stdout_cursor == 0 || stderr_cursor == 0 {
+            return Err(JobObservationTokenError::Malformed);
+        }
+        Ok(Self {
+            binding: observation_binding(job_id.as_ref(), epoch.as_ref()),
             revision,
-            Some(stdout_cursor),
-            Some(stderr_cursor),
-        )
+            stdout_cursor: Some(stdout_cursor),
+            stderr_cursor: Some(stderr_cursor),
+        })
     }
 
-    pub fn new_legacy(
-        job_id: impl Into<String>,
-        epoch: impl Into<String>,
+    pub fn new_baseline(
+        job_id: impl AsRef<str>,
+        epoch: impl AsRef<str>,
         revision: u64,
     ) -> Result<Self, JobObservationTokenError> {
-        Self::build(job_id.into(), epoch.into(), revision, None, None)
-    }
-
-    fn build(
-        job_id: String,
-        epoch: String,
-        revision: u64,
-        stdout_cursor: Option<u64>,
-        stderr_cursor: Option<u64>,
-    ) -> Result<Self, JobObservationTokenError> {
-        if stdout_cursor.is_some() != stderr_cursor.is_some() {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        if stdout_cursor.is_some_and(|cursor| cursor == 0)
-            || stderr_cursor.is_some_and(|cursor| cursor == 0)
-        {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        let token = Self {
-            job_id,
-            epoch,
+        Ok(Self {
+            binding: observation_binding(job_id.as_ref(), epoch.as_ref()),
             revision,
-            stdout_cursor,
-            stderr_cursor,
-        };
-        validate_component(&token.job_id, MAX_JOB_ID_LEN)?;
-        validate_component(&token.epoch, MAX_EPOCH_LEN)?;
-        if token.encode().len() > MAX_JOB_OBSERVATION_TOKEN_LEN {
-            return Err(JobObservationTokenError::Oversized);
-        }
-        Ok(token)
+            stdout_cursor: None,
+            stderr_cursor: None,
+        })
     }
 
-    pub fn parse(value: &str) -> Result<Self, JobObservationTokenError> {
-        if value.is_empty() || !value.is_ascii() {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        if value.len() > MAX_JOB_OBSERVATION_TOKEN_LEN {
-            return Err(JobObservationTokenError::Oversized);
-        }
-        if value.starts_with("wjob1:") {
-            Self::parse_legacy(value)
-        } else {
-            Self::parse_v2(value)
-        }
+    pub fn matches_parent(&self, job_id: &str, epoch: &str) -> bool {
+        self.binding == observation_binding(job_id, epoch)
     }
 
-    fn parse_legacy(value: &str) -> Result<Self, JobObservationTokenError> {
-        let mut parts = value.split(':');
-        if parts.next() != Some(LEGACY_TOKEN_PREFIX) {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        if parts.next() != Some("a") {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        let job_id = parts
-            .next()
-            .ok_or(JobObservationTokenError::Malformed)?
-            .to_string();
-        let epoch = parts
-            .next()
-            .ok_or(JobObservationTokenError::Malformed)?
-            .to_string();
-        let revision = parse_decimal(parts.next().ok_or(JobObservationTokenError::Malformed)?)?;
-        if parts.next().is_some() {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        let token = Self::build(job_id, epoch, revision, None, None)?;
-        if token.encode() != value {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        Ok(token)
-    }
-
-    fn parse_v2(value: &str) -> Result<Self, JobObservationTokenError> {
-        let mut parts = value.split(':');
-        if parts.next() != Some(TOKEN_V2_PREFIX) {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        let job_id = parts
-            .next()
-            .ok_or(JobObservationTokenError::Malformed)?
-            .to_string();
-        let epoch = parts
-            .next()
-            .ok_or(JobObservationTokenError::Malformed)?
-            .to_string();
-        let revision = parse_base36(parts.next().ok_or(JobObservationTokenError::Malformed)?)?;
-        let stdout_cursor = parse_base36(parts.next().ok_or(JobObservationTokenError::Malformed)?)?;
-        let stderr_cursor = parse_base36(parts.next().ok_or(JobObservationTokenError::Malformed)?)?;
-        if parts.next().is_some() {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        let token = Self::build(
-            job_id,
-            epoch,
-            revision,
-            Some(stdout_cursor),
-            Some(stderr_cursor),
-        )?;
-        if token.encode() != value {
-            return Err(JobObservationTokenError::Malformed);
-        }
-        Ok(token)
-    }
-
-    pub fn parse_bound(value: &str, job_id: &str) -> Result<Self, JobObservationTokenError> {
-        let token = Self::parse(value)?;
-        if token.job_id != job_id {
-            return Err(JobObservationTokenError::WrongJob);
-        }
-        Ok(token)
-    }
-
-    pub fn is_legacy(&self) -> bool {
+    pub fn requires_baseline(&self) -> bool {
         self.stdout_cursor.is_none()
     }
 
-    pub fn encode(&self) -> String {
-        match (self.stdout_cursor, self.stderr_cursor) {
-            (Some(stdout_cursor), Some(stderr_cursor)) => format!(
-                "{}:{}:{}:{}:{}:{}",
-                TOKEN_V2_PREFIX,
-                self.job_id,
-                self.epoch,
-                encode_base36(self.revision),
-                encode_base36(stdout_cursor),
-                encode_base36(stderr_cursor),
-            ),
-            (None, None) => format!(
-                "{LEGACY_TOKEN_PREFIX}:a:{}:{}:{}",
-                self.job_id, self.epoch, self.revision
-            ),
-            _ => unreachable!("Job observation cursors are both present or both absent"),
+    pub fn parse(value: &str) -> Result<Self, JobObservationTokenError> {
+        if value.len() > MAX_JOB_OBSERVATION_TOKEN_LEN {
+            return Err(JobObservationTokenError::Oversized);
         }
+        let mut parts = value
+            .strip_prefix(TOKEN_PREFIX)
+            .ok_or(JobObservationTokenError::Malformed)?
+            .split('.');
+        let binding = parts.next().ok_or(JobObservationTokenError::Malformed)?;
+        crate::compact::decode::<12>(binding).ok_or(JobObservationTokenError::Malformed)?;
+        let revision = parse_base36(parts.next().ok_or(JobObservationTokenError::Malformed)?)?;
+        let stdout = parse_base36(parts.next().ok_or(JobObservationTokenError::Malformed)?)?;
+        let stderr = parse_base36(parts.next().ok_or(JobObservationTokenError::Malformed)?)?;
+        if parts.next().is_some() || (stdout == 0) != (stderr == 0) {
+            return Err(JobObservationTokenError::Malformed);
+        }
+        Ok(Self {
+            binding: binding.to_string(),
+            revision,
+            stdout_cursor: (stdout != 0).then_some(stdout),
+            stderr_cursor: (stderr != 0).then_some(stderr),
+        })
     }
-}
 
-fn parse_decimal(value: &str) -> Result<u64, JobObservationTokenError> {
-    if value.is_empty()
-        || (value.len() > 1 && value.starts_with('0'))
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(JobObservationTokenError::Malformed);
+    pub fn encode(&self) -> String {
+        format!(
+            "{TOKEN_PREFIX}{}.{}.{}.{}",
+            self.binding,
+            encode_base36(self.revision),
+            encode_base36(self.stdout_cursor.unwrap_or(0)),
+            encode_base36(self.stderr_cursor.unwrap_or(0))
+        )
     }
-    value
-        .parse::<u64>()
-        .map_err(|_| JobObservationTokenError::Malformed)
 }
 
 fn encode_base36(mut value: u64) -> String {
@@ -225,19 +131,6 @@ fn parse_base36(value: &str) -> Result<u64, JobObservationTokenError> {
         parsed.checked_mul(36)?.checked_add(digit)
     });
     parsed.ok_or(JobObservationTokenError::Malformed)
-}
-
-fn validate_component(value: &str, max_len: usize) -> Result<(), JobObservationTokenError> {
-    if value.is_empty() || value.len() > max_len {
-        return Err(JobObservationTokenError::Malformed);
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(JobObservationTokenError::Malformed);
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,15 +273,13 @@ pub fn combined_delta_status(
 pub enum JobObservationTokenError {
     Malformed,
     Oversized,
-    WrongJob,
 }
 
 impl fmt::Display for JobObservationTokenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Malformed => "invalid after_observation_token: malformed opaque Job token",
-            Self::Oversized => "invalid after_observation_token: token exceeds 192 bytes",
-            Self::WrongJob => "invalid after_observation_token: token belongs to a different Job",
+            Self::Oversized => "invalid after_observation_token: token exceeds 62 bytes",
         })
     }
 }
@@ -398,87 +289,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn observation_token_v2_round_trips_canonically_with_independent_cursors() {
-        let token = JobObservationToken::new(
-            "11111111-2222-3333-4444-555555555555",
-            "0123456789abcdef0123456789abcdef",
-            42,
-            101,
-            21,
-        )
-        .unwrap();
-        let encoded = token.encode();
-        assert!(encoded.starts_with("wj2a:"));
-        assert!(encoded.len() <= MAX_JOB_OBSERVATION_TOKEN_LEN);
-        assert_eq!(JobObservationToken::parse(&encoded).unwrap(), token);
-        assert_eq!(
-            JobObservationToken::parse(&encoded).unwrap().encode(),
-            encoded
-        );
+    fn compact_cursor_binding_and_length() {
+        let token =
+            JobObservationToken::new("wc_job_abcdefghijklmnop", "registry", 42, 101, 21).unwrap();
+        assert_eq!(token.encode().len(), 28);
+        assert_eq!(JobObservationToken::parse(&token.encode()).unwrap(), token);
+        assert!(token.matches_parent("wc_job_abcdefghijklmnop", "registry"));
+        assert!(!token.matches_parent("wc_job_other_parent_id", "registry"));
+        assert!(!token.matches_parent("wc_job_abcdefghijklmnop", "restart"));
         assert_eq!(token.stdout_cursor, Some(101));
         assert_eq!(token.stderr_cursor, Some(21));
-    }
-
-    #[test]
-    fn observation_token_v2_maximum_components_fit_exact_existing_bound() {
-        let token = JobObservationToken::new(
-            "j".repeat(MAX_JOB_ID_LEN),
-            "e".repeat(MAX_EPOCH_LEN),
-            u64::MAX,
-            u64::MAX,
-            u64::MAX,
-        )
-        .unwrap();
-        assert_eq!(token.encode().len(), MAX_JOB_OBSERVATION_TOKEN_LEN);
-        assert_eq!(JobObservationToken::parse(&token.encode()).unwrap(), token);
-    }
-
-    #[test]
-    fn observation_token_v2_rejects_wrong_binding_and_noncanonical_integers() {
-        let encoded = JobObservationToken::new("job-one", "0123456789abcdef", 36, 101, 21)
+        let max = JobObservationToken::new("job", "epoch", u64::MAX, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(max.encode().len(), MAX_JOB_OBSERVATION_TOKEN_LEN);
+        assert_eq!(JobObservationToken::parse(&max.encode()).unwrap(), max);
+        let baseline = JobObservationToken::new_baseline("job", "epoch", 1).unwrap();
+        assert!(JobObservationToken::parse(&baseline.encode())
             .unwrap()
-            .encode();
-        assert_eq!(
-            JobObservationToken::parse_bound(&encoded, "job-two"),
-            Err(JobObservationTokenError::WrongJob)
-        );
-        for malformed in [
-            "wj2a:job:epoch:01:1:1",
-            "wj2a:job:epoch:1:01:1",
-            "wj2a:job:epoch:1:1:01",
-            "wj2a:job:epoch:A:1:1",
-            "wj2a:job:epoch:1:1",
-            "wj2a:job:epoch:1:1:1:extra",
-            "wj2x:job:epoch:1:1:1",
-            "wj2l:job:epoch:1:1:1",
-            "wj2a:job:epoch:1:0:1",
-            "wj2a:job:epoch:1:1:0",
+            .requires_baseline());
+    }
+
+    #[test]
+    fn cursor_rejects_noncanonical_or_malformed_state() {
+        for bad in [
+            "01.1.1",
+            "1.01.1",
+            "1.1.01",
+            "A.1.1",
+            "1.1",
+            "1.1.1.extra",
+            "1.0.1",
+            "1.1.0",
+            "1.-1.1",
         ] {
             assert_eq!(
-                JobObservationToken::parse(malformed),
-                Err(JobObservationTokenError::Malformed),
-                "{malformed}"
+                JobObservationToken::parse(&format!("wj3_abcdefghijklmnop.{bad}")),
+                Err(JobObservationTokenError::Malformed)
             );
         }
+        for bad in [
+            "",
+            "wj3_invalid.1.1.1",
+            "wj3_abcdefghijklmn+p.1.1.1",
+            "wj3_abcdefghijklmnop=.1.1.1",
+        ] {
+            assert!(JobObservationToken::parse(bad).is_err());
+        }
         assert_eq!(
-            JobObservationToken::parse(&"x".repeat(MAX_JOB_OBSERVATION_TOKEN_LEN + 1)),
+            JobObservationToken::parse(&"x".repeat(63)),
             Err(JobObservationTokenError::Oversized)
-        );
-    }
-
-    #[test]
-    fn legacy_observation_token_remains_canonical_and_has_no_cursor_proof() {
-        let legacy = JobObservationToken::new_legacy("job-one", "0123456789abcdef", 1).unwrap();
-        let encoded = legacy.encode();
-        assert_eq!(encoded, "wjob1:a:job-one:0123456789abcdef:1");
-        let parsed = JobObservationToken::parse(&encoded).unwrap();
-        assert!(parsed.is_legacy());
-        assert_eq!(parsed.stdout_cursor, None);
-        assert_eq!(parsed.stderr_cursor, None);
-        assert_eq!(parsed.encode(), encoded);
-        assert_eq!(
-            JobObservationToken::parse("wjob1:l:job:epoch:01"),
-            Err(JobObservationTokenError::Malformed)
         );
     }
 

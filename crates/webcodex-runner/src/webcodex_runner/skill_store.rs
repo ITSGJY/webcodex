@@ -311,8 +311,10 @@ impl SkillStore {
         hasher.update(self.namespace.as_bytes());
         hasher.update(b"\0");
         hasher.update(skill_key.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        format!("wc_skill_{}", &digest[..32])
+        format!(
+            "wc_skill_{}",
+            webcodex_core::compact::encode(&hasher.finalize()[..16])
+        )
     }
 
     fn list_skill_keys(&self) -> Result<Vec<String>, String> {
@@ -497,7 +499,10 @@ impl SkillStore {
             hasher.update((version.package_revision.len() as u64).to_be_bytes());
             hasher.update(version.package_revision.as_bytes());
         }
-        format!("wc_skillstate_{:x}", hasher.finalize())
+        format!(
+            "wc_skillstate_{}",
+            webcodex_core::compact::encode(hasher.finalize())
+        )
     }
 
     fn namespace_revision(&self, descriptors: &[RunnerSkillDescriptor]) -> String {
@@ -521,7 +526,10 @@ impl SkillStore {
                 hasher.update(value.as_bytes());
             }
         }
-        format!("wc_skillstore_{:x}", hasher.finalize())
+        format!(
+            "wc_skillstore_{}",
+            webcodex_core::compact::encode(hasher.finalize())
+        )
     }
 
     pub(super) fn list_active(&self) -> Result<ManagedSkillCatalogSnapshot, String> {
@@ -1693,7 +1701,10 @@ fn compute_package_revision(files: &BTreeMap<String, Vec<u8>>) -> String {
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
-    format!("wc_skillpkg_{:x}", hasher.finalize())
+    format!(
+        "wc_skillpkg_{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    )
 }
 
 fn snapshot_installed_package(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
@@ -1920,11 +1931,10 @@ fn validate_management_common(skill_key: &str, idempotency_key: &str) -> Result<
 }
 
 fn valid_runtime_skill_id(value: &str) -> bool {
-    value.len() == "wc_skill_".len() + 32
-        && value.starts_with("wc_skill_")
-        && value["wc_skill_".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    value
+        .strip_prefix("wc_skill_")
+        .and_then(webcodex_core::compact::decode::<16>)
+        .is_some()
 }
 
 fn hash_install_intent(
@@ -2450,7 +2460,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let stale_expected = format!("wc_skillstate_{}", "f".repeat(64));
+        let stale_expected =
+            "wc_skillstate___________________________________________8".to_string();
         let prepared_intent = hash_simple_intent(
             "activate",
             &["demo", &installed.package_revision, &stale_expected],
@@ -3078,7 +3089,9 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let next = SkillActiveState {
             schema_version: STORE_SCHEMA_VERSION,
-            active_package_revision: Some(format!("wc_skillpkg_{}", "a".repeat(64))),
+            active_package_revision: Some(
+                "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string(),
+            ),
         };
         assert!(store.write_state(skill, &next).is_err());
         assert_eq!(

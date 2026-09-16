@@ -1874,7 +1874,9 @@ impl ToolRuntime {
         }
 
         if include_recent_commits {
-            let result = self.git_log(project.to_string(), Some(5), None).await;
+            let result = self
+                .git_log(project.to_string(), None, Some(5), None, None)
+                .await;
             if result.success {
                 output["recent_commits"] = result
                     .output

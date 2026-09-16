@@ -712,7 +712,7 @@ fn skill_read_body_and_catalog_descriptions_never_enter_durable_session_ledger()
         true,
         &json!({
             "project": project,
-            "catalog_revision": "wc_skillcat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "catalog_revision": "wc_skillcat_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo",
             "total_count": 1,
             "returned_count": 1,
             "truncated": false,
@@ -730,7 +730,7 @@ fn skill_read_body_and_catalog_descriptions_never_enter_durable_session_ledger()
         "skill_read_file",
         &json!({
             "project": project,
-            "skill_id": "wc_skill_0123456789abcdef0123456789abcdef",
+            "skill_id": "wc_skill_ASNFZ4mrze8BI0VniavN7w",
             "path": "SKILL.md",
             "start_line": 1,
             "limit": 20
@@ -742,9 +742,9 @@ fn skill_read_body_and_catalog_descriptions_never_enter_durable_session_ledger()
         true,
         &json!({
             "project": project,
-            "skill_id": "wc_skill_0123456789abcdef0123456789abcdef",
+            "skill_id": "wc_skill_ASNFZ4mrze8BI0VniavN7w",
             "definition_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "package_revision": "wc_skillpkg_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "package_revision": "wc_skillpkg_zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw",
             "path": "SKILL.md",
             "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "text": private_body,
@@ -763,9 +763,8 @@ fn skill_read_body_and_catalog_descriptions_never_enter_durable_session_ledger()
     assert!(!raw.contains(private_body));
     assert!(!raw.contains(private_description));
     assert!(!raw.contains("\"skills\""));
-    assert!(raw.contains("wc_skill_0123456789abcdef0123456789abcdef"));
-    assert!(raw
-        .contains("wc_skillpkg_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"));
+    assert!(raw.contains("wc_skill_ASNFZ4mrze8BI0VniavN7w"));
+    assert!(raw.contains("wc_skillpkg_zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw"));
     assert!(raw.contains("returned_lines"));
     assert!(raw.contains("catalog_revision"));
 
@@ -789,12 +788,13 @@ fn memory_body_summary_query_and_tags_never_enter_durable_session_ledger_or_reco
     let private_summary = "PRIVATE_MEMORY_SUMMARY_MUST_NOT_PERSIST";
     let private_body = "PRIVATE_MEMORY_BODY_MUST_NOT_PERSIST";
     let private_tag = "PRIVATE_MEMORY_TAG_MUST_NOT_PERSIST";
-    let memory_id = "wc_mem_0123456789abcdef0123456789abcdef";
-    let revision = format!("wc_memrev_{}", "a".repeat(64));
-    let catalog_revision = format!("wc_memcat_{}", "b".repeat(64));
+    let memory_id = "wc_mem_iavN7wEjRWeJq83v";
+    let revision = format!("wc_memrev_{}", webcodex_core::compact::encode([0xaa; 32]));
+    let catalog_revision = format!("wc_memcat_{}", webcodex_core::compact::encode([0xbb; 32]));
     let private_principal_digest = format!("wc_memprincipal_{}", "c".repeat(64));
-    let scope_id = format!("wc_memscope_{}", "d".repeat(64));
-    let private_root_fingerprint = format!("wc_memroot_{}", "e".repeat(64));
+    let scope_id = format!("wc_memscope_{}", webcodex_core::compact::encode([0xdd; 32]));
+    let private_root_fingerprint =
+        format!("wc_memroot_{}", webcodex_core::compact::encode([0xee; 32]));
     let private_native_root = "/PRIVATE/NATIVE/MEMORY/ROOT";
 
     let set_args = super::super::ToolCall::MemorySet {
@@ -1643,9 +1643,9 @@ fn console_list_orders_recent_activity_first_with_deterministic_session_id_ties(
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");
     let project = "agent:eval:ordering";
-    let older = "wc_sess_order_old";
-    let tie_a = "wc_sess_order_tie_a";
-    let tie_z = "wc_sess_order_tie_z";
+    let older = "wc_sess_0000000000000000";
+    let tie_a = "wc_sess_aaaaaaaaaaaaaaaa";
+    let tie_z = "wc_sess_zzzzzzzzzzzzzzzz";
 
     let seed = persistent_store(ledger.clone());
     let seed_older = seed.start_session(Some(project.to_string()), Some("older".to_string()));

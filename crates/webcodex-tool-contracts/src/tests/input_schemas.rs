@@ -684,6 +684,18 @@ fn tool_specs_optional_fields_are_not_required() {
 }
 
 #[test]
+fn git_log_head_commit_schema_requires_exact_40_hex() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "git_log");
+    let head = &spec.input_schema["properties"]["head_commit"];
+    assert_eq!(head["type"], "string");
+    assert_eq!(head["minLength"], 40);
+    assert_eq!(head["maxLength"], 40);
+    assert_eq!(head["pattern"], "^[0-9A-Fa-f]{40}$");
+    assert!(!required_fields(spec).contains(&"head_commit".to_string()));
+}
+
+#[test]
 fn tool_specs_covers_expected_tool_set() {
     let names = registered_tool_names();
     for expected in [
@@ -806,11 +818,11 @@ fn heartbeat_agent_task_attempt_active_turn_proof_is_paired_and_server_timed() {
     }
     assert_eq!(
         heartbeat.input_schema["properties"]["active_turn_wake_id"]["pattern"],
-        "^wc_wake_[0-9a-f]{32}$"
+        "^wc_wake_[A-Za-z0-9_-]{16}$"
     );
     assert_eq!(
         heartbeat.input_schema["properties"]["active_turn_consume_token"]["pattern"],
-        "^wc_wake_consume_[0-9a-f]{32}$"
+        "^wc_wake_consume_[A-Za-z0-9_-]{21}[AQgw]$"
     );
     assert_eq!(heartbeat.input_schema["allOf"].as_array().unwrap().len(), 2);
     let properties = heartbeat.input_schema["properties"].as_object().unwrap();
@@ -829,25 +841,27 @@ fn heartbeat_agent_task_attempt_active_turn_proof_is_paired_and_server_timed() {
     }
 
     let base = json!({
-        "task_id": format!("wc_agent_task_{}", "1".repeat(32)),
-        "attempt_id": format!("wc_agent_task_attempt_{}", "2".repeat(32)),
-        "assignee_agent_id": format!("wc_dagent_{}", "3".repeat(32)),
-        "attempt_fence": format!("wc_agent_task_fence_{}", "4".repeat(32)),
+        "task_id": "wc_agent_task_ERERERERERERERER".to_string(),
+        "attempt_id": "wc_agent_task_attempt_IiIiIiIiIiIiIiIi".to_string(),
+        "assignee_agent_id": "wc_dagent_MzMzMzMzMzMzMzMz".to_string(),
+        "attempt_fence": "wc_agent_task_fence_RERERERERERERERERERERA".to_string(),
         "attempt_controller_generation": 7,
     });
     assert!(test_support::validate_schema_instance(&base, &heartbeat.input_schema).is_ok());
 
     let mut wake_only = base.clone();
-    wake_only["active_turn_wake_id"] = json!(format!("wc_wake_{}", "5".repeat(32)));
+    wake_only["active_turn_wake_id"] = json!("wc_wake_VVVVVVVVVVVVVVVV".to_string());
     assert!(test_support::validate_schema_instance(&wake_only, &heartbeat.input_schema).is_err());
 
     let mut token_only = base.clone();
-    token_only["active_turn_consume_token"] = json!(format!("wc_wake_consume_{}", "6".repeat(32)));
+    token_only["active_turn_consume_token"] =
+        json!("wc_wake_consume_ZmZmZmZmZmZmZmZmZmZmZg".to_string());
     assert!(test_support::validate_schema_instance(&token_only, &heartbeat.input_schema).is_err());
 
     let mut paired = base.clone();
-    paired["active_turn_wake_id"] = json!(format!("wc_wake_{}", "5".repeat(32)));
-    paired["active_turn_consume_token"] = json!(format!("wc_wake_consume_{}", "6".repeat(32)));
+    paired["active_turn_wake_id"] = json!("wc_wake_VVVVVVVVVVVVVVVV".to_string());
+    paired["active_turn_consume_token"] =
+        json!("wc_wake_consume_ZmZmZmZmZmZmZmZmZmZmZg".to_string());
     assert!(test_support::validate_schema_instance(&paired, &heartbeat.input_schema).is_ok());
 
     for forbidden in ["lease_ms", "duration_ms", "expires_at_unix_ms"] {
@@ -866,13 +880,13 @@ fn agent_continuation_bind_requires_canonical_view_fence_without_model_exposure(
         .unwrap();
     assert_eq!(
         bind.input_schema["properties"]["binding_id"]["pattern"],
-        "^wc_host_binding_[0-9a-f]{32}$"
+        "^wc_host_binding_[A-Za-z0-9_-]{21}[AQgw]$"
     );
     let mut args = json!({
-        "agent_id": format!("wc_dagent_{}", "a".repeat(32)),
-        "endpoint_id": format!("wc_endpoint_{}", "b".repeat(32)),
+        "agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
+        "endpoint_id": "wc_endpoint_u7u7u7u7u7u7u7u7".to_string(),
         "expected_controller_generation": 1,
-        "binding_id": format!("wc_host_binding_{}", "a0".repeat(16)),
+        "binding_id": format!("wc_host_binding_{}", webcodex_core::compact::encode([0xa0; 16])),
     });
     assert!(test_support::validate_schema_instance(&args, &bind.input_schema).is_ok());
     for invalid in [

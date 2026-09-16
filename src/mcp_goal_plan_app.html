@@ -37,7 +37,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 <script>
 (() => {
   "use strict";
-  const GOAL_ID = /^wc_goal_[0-9a-f]{32}$/;
+  const GOAL_ID = /^wc_goal_[A-Za-z0-9_-]{16}$/;
   const APP_PROTOCOL = "2026-01-26";
   const LIFECYCLES = new Set(["active", "completed", "cancelled"]);
   const ACTIVITY_STATES = new Set(["active", "attention_needed", "unobserved", "not_applicable"]);

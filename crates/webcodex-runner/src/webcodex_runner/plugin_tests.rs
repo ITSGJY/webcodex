@@ -326,7 +326,7 @@ fn project_catalog_bounds_aggregate_wire_response_without_losing_total() {
             annotations: PluginSelectionAnnotations::default(),
         })
         .collect();
-    let revision = format!("wc_plugcat_{}", "a".repeat(64));
+    let revision = format!("wc_plugcat_{}", webcodex_core::compact::encode([0xaa; 32]));
     let full = ProjectPluginCatalog {
         catalog_revision: revision.clone(),
         total_count: entries.len(),

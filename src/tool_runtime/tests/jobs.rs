@@ -2561,7 +2561,7 @@ async fn job_log_wait_accepts_canonical_max_before_job_lookup() {
 #[test]
 fn retired_job_log_parser_rejects_former_inputs() {
     let token =
-        crate::job_observation::JobObservationToken::new_legacy("abc", "0123456789abcdef", 7)
+        crate::job_observation::JobObservationToken::new_baseline("abc", "0123456789abcdef", 7)
             .unwrap()
             .encode();
     for args in [

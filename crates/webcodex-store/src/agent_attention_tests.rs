@@ -663,7 +663,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
         Some(attempt_id.as_str())
     );
 
-    let bogus_event_id = format!("wc_attention_event_{}", "f".repeat(32));
+    let bogus_event_id = "wc_attention_event_________________".to_string();
     db.conn_for_tests()
         .execute(
             "UPDATE wc_agent_wakes SET source_event_id = ?2 WHERE wake_id = ?1",
@@ -829,7 +829,7 @@ fn legacy_wake_schema_migration_preserves_existing_task_wake() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("legacy-wake.db");
     let owner = principal('8');
-    let legacy_wake_id = format!("{AGENT_WAKE_ID_PREFIX}{}", "a".repeat(32));
+    let legacy_wake_id = format!("{AGENT_WAKE_ID_PREFIX}{}", "a".repeat(16));
     let (assignee, task_id, attempt_id) = {
         let db = Database::open(&path).unwrap();
         let assignee = create_agent(&db, &owner, "legacy-worker");

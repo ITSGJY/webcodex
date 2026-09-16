@@ -373,13 +373,20 @@ fn file_read_project_artifact_reads_binary_chunks() {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes[..4])
     );
 
+    let observed_sha256 = first["sha256"].as_str().unwrap().to_string();
     let second = line_edit_json(handle_file_request(
         &policy,
         &json_file_op_request(
             tmp.path(),
             "file_read_project_artifact",
             "data.bin",
-            serde_json::json!({"path": "data.bin", "offset": 4, "length": 20, "max_file_bytes": 1024}),
+            serde_json::json!({
+                "path": "data.bin",
+                "offset": 4,
+                "length": 20,
+                "max_file_bytes": 1024,
+                "expected_sha256": observed_sha256,
+            }),
         ),
     ));
     assert_eq!(second["sha256"], first["sha256"]);
@@ -406,6 +413,85 @@ fn file_read_project_artifact_reads_binary_chunks() {
     assert_eq!(at_eof["next_offset"], bytes.len());
     assert_eq!(at_eof["truncated"], false);
     assert_eq!(at_eof["eof"], true);
+}
+
+#[test]
+fn file_read_project_artifact_same_size_replacement_fails_snapshot_before_returning_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let path = "same-size.bin";
+    let original = b"abcdefgh";
+    let replacement = b"ABCDEFGH";
+    assert_eq!(original.len(), replacement.len());
+    std::fs::write(tmp.path().join(path), original).unwrap();
+
+    let first = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact",
+            path,
+            serde_json::json!({"path": path, "offset": 0, "length": 4, "max_file_bytes": 1024}),
+        ),
+    ));
+    let expected_sha256 = first["sha256"].as_str().unwrap().to_string();
+    assert_eq!(first["truncated"], true);
+
+    std::fs::write(tmp.path().join(path), replacement).unwrap();
+    let changed = line_edit_json(handle_file_request(
+        &policy,
+        &json_file_op_request(
+            tmp.path(),
+            "file_read_project_artifact",
+            path,
+            serde_json::json!({
+                "path": path,
+                "offset": 4,
+                "length": 4,
+                "max_file_bytes": 1024,
+                "expected_sha256": expected_sha256,
+            }),
+        ),
+    ));
+    assert_eq!(changed["error_kind"], "snapshot_changed");
+    assert_eq!(changed["expected_sha256"], expected_sha256);
+    assert_ne!(changed["actual_sha256"], expected_sha256);
+    assert_eq!(changed["file_bytes"], 0);
+    assert_eq!(changed["bytes_returned"], 0);
+    assert_eq!(changed["content_base64"], "");
+    assert!(changed["sha256"].is_null());
+}
+
+#[test]
+fn file_read_project_artifact_rejects_invalid_expected_sha256_without_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let path = "invalid-fence.bin";
+    std::fs::write(tmp.path().join(path), b"abcdefgh").unwrap();
+    for invalid in ["abc".to_string(), "A".repeat(64)] {
+        let output = line_edit_json(handle_file_request(
+            &policy,
+            &json_file_op_request(
+                tmp.path(),
+                "file_read_project_artifact",
+                path,
+                serde_json::json!({
+                    "path": path,
+                    "offset": 0,
+                    "length": 4,
+                    "max_file_bytes": 1024,
+                    "expected_sha256": invalid,
+                }),
+            ),
+        ));
+        assert!(output["error"]
+            .as_str()
+            .unwrap()
+            .contains("expected_sha256"));
+        assert_eq!(output["bytes_returned"], 0);
+        assert_eq!(output["content_base64"], "");
+        assert!(output["sha256"].is_null());
+    }
 }
 
 #[test]

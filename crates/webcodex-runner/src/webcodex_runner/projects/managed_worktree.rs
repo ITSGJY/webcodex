@@ -24,6 +24,48 @@ use crate::{ok_cmd, CommandResult};
 
 const MANAGED_WORKTREE_GIT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The slug is routing text, not recovery identity. Only a registered exact
+/// operation establishes whether an occupied path is ours or a collision.
+fn choose_managed_destination(
+    root: &Path,
+    source: &Path,
+    operation_id: &str,
+    projects: &[RunnerProjectFile],
+) -> Result<PathBuf, &'static str> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"webcodex/managed-worktree-routing/v1\0");
+    hash.update(operation_id.as_bytes());
+    let digest = format!("{:x}", hash.finalize());
+    for length in [8, 12, 16, 24, 32, 48, 64] {
+        let candidate = root.join(format!(
+            "{}-{}",
+            sanitized_project_basename(source),
+            &digest[..length]
+        ));
+        match std::fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Err(_) => return Err("managed_worktree_recovery_conflict"),
+            Ok(_) => {}
+        }
+        let existing =
+            canonicalize_existing(&candidate).map_err(|_| "managed_worktree_recovery_conflict")?;
+        let matches = projects_matching_canonical_path(projects, &existing);
+        let [project] = matches.as_slice() else {
+            return Err("managed_worktree_recovery_conflict");
+        };
+        let other = project
+            .managed_operation_id
+            .as_deref()
+            .filter(|id| project.managed_worktree && uuid::Uuid::parse_str(id).is_ok())
+            .ok_or("managed_worktree_recovery_conflict")?;
+        if other == operation_id {
+            return Ok(candidate);
+        }
+    }
+    Err("managed_worktree_recovery_conflict")
+}
+
 fn managed_worktree_error(
     start: Instant,
     error_kind: &'static str,
@@ -671,11 +713,22 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             Some(source_dirty),
         );
     }
-    let destination = managed_root.join(format!(
-        "{}-{}",
-        sanitized_project_basename(&source_root),
-        operation_id
-    ));
+    let destination =
+        match load_project_files_for_path_resolution(project_registry_dir).and_then(|projects| {
+            choose_managed_destination(&managed_root, &source_root, operation_id, &projects)
+        }) {
+            Ok(path) => path,
+            Err(error) => {
+                return managed_worktree_error(
+                    start,
+                    error,
+                    false,
+                    Some(&base_ref),
+                    Some(&base_sha),
+                    Some(source_dirty),
+                )
+            }
+        };
     let mut created_worktree = false;
     let canonical_worktree = if destination.exists() {
         let Ok(existing) = canonicalize_existing(&destination) else {

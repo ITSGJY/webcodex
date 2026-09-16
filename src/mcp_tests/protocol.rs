@@ -176,7 +176,7 @@ async fn mcp_legacy_protocol_does_not_expose_tasks_extension_methods() {
             rpc(
                 method,
                 Some(Value::from(62)),
-                json!({ "taskId": "wc_exec_ffffffffffffffffffffffffffffffff" }),
+                json!({ "taskId": "wc_exec_________________" }),
             ),
             None,
         )
@@ -225,7 +225,10 @@ async fn mcp_stateless_tools_list_uses_2026_result_shape() {
             let ack = &read_files["inputSchema"]["properties"]["ack_session_message_ids"];
             assert_eq!(ack["type"], "array");
             assert_eq!(ack["maxItems"], 8);
-            assert_eq!(ack["items"]["pattern"], "^wc_msg_[A-Za-z0-9_]+$");
+            assert_eq!(
+                ack["items"]["pattern"],
+                "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+            );
             let description = ack["description"].as_str().unwrap();
             assert!(description.contains("current model context still retains"));
             assert!(description.contains("ACK neither resolves"));
@@ -233,7 +236,7 @@ async fn mcp_stateless_tools_list_uses_2026_result_shape() {
             assert_eq!(resolution["type"], "object");
             assert_eq!(
                 resolution["properties"]["message_id"]["pattern"],
-                "^wc_msg_[A-Za-z0-9_]+$"
+                "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
             );
             assert_eq!(resolution["properties"]["resolution"]["minLength"], 1);
             assert_eq!(

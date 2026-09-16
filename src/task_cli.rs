@@ -677,7 +677,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let command = parse(&[
             "approve".to_string(),
-            "wc_task_0123456789abcdef0123456789abcdef".to_string(),
+            "wc_task_iavN7wEjRWeJq83v".to_string(),
             "wc_apr_0123456789abcdef0123456789abcdef".to_string(),
             "--root".to_string(),
             root.path().to_string_lossy().to_string(),
@@ -692,7 +692,7 @@ mod tests {
     fn rejects_list_only_flags_on_decisions() {
         let error = parse(&[
             "accept".to_string(),
-            "wc_task_0123456789abcdef0123456789abcdef".to_string(),
+            "wc_task_iavN7wEjRWeJq83v".to_string(),
             "--json".to_string(),
         ])
         .unwrap_err();
@@ -701,7 +701,7 @@ mod tests {
 
     #[test]
     fn reject_takes_an_optional_reason_and_other_decisions_do_not() {
-        let task_id = "wc_task_0123456789abcdef0123456789abcdef".to_string();
+        let task_id = "wc_task_iavN7wEjRWeJq83v".to_string();
         let command = parse(&[
             "reject".to_string(),
             task_id.clone(),
@@ -765,8 +765,8 @@ mod tests {
             now: 1,
         })
         .unwrap();
-        let task_id = "wc_task_4123456789abcdef0123456789abcdef";
-        let run_id = "wc_run_4123456789abcdef0123456789abcdef";
+        let task_id = "wc_task_iavN7wEjRWeJq83v";
+        let run_id = "wc_run_iavN7wEjRWeJq83v";
         let prepared = webcodex_connector_runtime::workspace::root_test_support::prepare(
             &manager, &context, task_id, run_id, false,
         )
@@ -844,8 +844,8 @@ mod tests {
             ConnectorResultDecisionStatus::Accepted
         );
 
-        let abandoned_task_id = "wc_task_5123456789abcdef0123456789abcdef";
-        let abandoned_run_id = "wc_run_5123456789abcdef0123456789abcdef";
+        let abandoned_task_id = "wc_task_javN7wEjRWeJq83v";
+        let abandoned_run_id = "wc_run_javN7wEjRWeJq83v";
         let prepared = webcodex_connector_runtime::workspace::root_test_support::prepare(
             &manager,
             &context,

@@ -120,11 +120,13 @@ pub fn valid_lower_sha256(value: &str) -> bool {
 pub fn valid_package_revision(value: &str) -> bool {
     value
         .strip_prefix("wc_skillpkg_")
-        .is_some_and(valid_lower_sha256)
+        .and_then(crate::compact::decode::<32>)
+        .is_some()
 }
 
 pub fn valid_state_revision(value: &str) -> bool {
     value
         .strip_prefix("wc_skillstate_")
-        .is_some_and(valid_lower_sha256)
+        .and_then(crate::compact::decode::<32>)
+        .is_some()
 }

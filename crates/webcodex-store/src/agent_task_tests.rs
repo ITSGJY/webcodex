@@ -2584,7 +2584,7 @@ fn source_conversation_is_correlation_only_and_foreign_exact_ids_are_existence_h
         )
         .unwrap();
     let foreign_error = db.read_agent_task(&foreign, &task_id).unwrap_err();
-    let missing_id = format!("{AGENT_TASK_ID_PREFIX}{}", "f".repeat(32));
+    let missing_id = format!("{AGENT_TASK_ID_PREFIX}{}", "f".repeat(16));
     let missing_error = db.read_agent_task(&foreign, &missing_id).unwrap_err();
     assert_eq!(foreign_error.code(), "agent_task_not_found");
     assert_eq!(foreign_error.code(), missing_error.code());
@@ -2613,7 +2613,10 @@ fn random_fence_and_stale_controller_generation_fail_closed() {
     let assignee = agent(&db, &owner, "fence-agent");
     let task_id = create_assigned_task(&db, &owner, &assignee, "fence-task");
     let started = start(&db, &owner, &task_id, &assignee, "fence-start", T0 + 90);
-    let random_fence = format!("{AGENT_TASK_ATTEMPT_FENCE_PREFIX}{}", "0".repeat(32));
+    let random_fence = format!(
+        "{AGENT_TASK_ATTEMPT_FENCE_PREFIX}{}",
+        webcodex_core::compact::encode([0x00; 16])
+    );
     let fence_error = db
         .heartbeat_agent_task_attempt_at(
             &owner,
@@ -3096,8 +3099,11 @@ fn ordinary_heartbeat_stays_short_and_non_a4b_proof_cannot_upgrade() {
         heartbeat.attempt.lease_expires_at_unix_ms
     );
 
-    let fake_wake = format!("wc_wake_{}", "d".repeat(32));
-    let fake_token = format!("{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}", "e".repeat(32));
+    let fake_wake = "wc_wake_3d3d3d3d3d3d3d3d".to_string();
+    let fake_token = format!(
+        "{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}",
+        webcodex_core::compact::encode([0xee; 16])
+    );
     let before_invalid_proof = attempt_lease_expires_at(&db, &started.attempt.attempt_id);
     assert_eq!(
         db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
@@ -3239,7 +3245,10 @@ fn active_turn_proof_rejects_every_unconsumed_task_wake_state() {
             now + 1,
         )
         .unwrap();
-    let fake_token = format!("{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}", "a".repeat(32));
+    let fake_token = format!(
+        "{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}",
+        webcodex_core::compact::encode([0xaa; 16])
+    );
     assert_eq!(
         db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
             &owner,
@@ -3325,8 +3334,11 @@ fn active_turn_proof_fails_closed_for_wrong_identity_authority_and_controller_lo
     )
     .unwrap();
     let lease_before = attempt_lease_expires_at(&db, &fixture.task_attempt_id);
-    let wrong_wake = format!("wc_wake_{}", "f".repeat(32));
-    let wrong_token = format!("{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}", "f".repeat(32));
+    let wrong_wake = "wc_wake_________________".to_string();
+    let wrong_token = format!(
+        "{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}",
+        webcodex_core::compact::encode([0xff; 16])
+    );
     for (wake_id, token) in [
         (wrong_wake.as_str(), fixture.consume_token.as_str()),
         (fixture.wake_id.as_str(), wrong_token.as_str()),
@@ -3364,7 +3376,10 @@ fn active_turn_proof_fails_closed_for_wrong_identity_authority_and_controller_lo
         .code(),
         "agent_task_not_found"
     );
-    let wrong_fence = format!("{AGENT_TASK_ATTEMPT_FENCE_PREFIX}{}", "0".repeat(32));
+    let wrong_fence = format!(
+        "{AGENT_TASK_ATTEMPT_FENCE_PREFIX}{}",
+        webcodex_core::compact::encode([0x00; 16])
+    );
     assert_eq!(
         db.heartbeat_agent_task_attempt_with_active_turn_proof_at(
             &owner,
@@ -3804,7 +3819,7 @@ fn endpoint_consume_failures_and_expired_source_never_promote_or_revive_attempt(
     let fixture = dispatched_endpoint_takeover_fixture(&db, &owner, "stale-takeover", started_at);
     let initial_lease = fixture.initial_lease_expires_at_unix_ms;
 
-    let wrong_endpoint = format!("wc_endpoint_{}", "f".repeat(32));
+    let wrong_endpoint = "wc_endpoint_________________".to_string();
     assert!(db
         .consume_agent_wake_at(
             &owner,
@@ -3837,7 +3852,7 @@ fn endpoint_consume_failures_and_expired_source_never_promote_or_revive_attempt(
         initial_lease
     );
 
-    let wrong_token = format!("wc_wake_consume_{}", "e".repeat(32));
+    let wrong_token = "wc_wake_consume_7u7u7u7u7u7u7u7u7u7u7g".to_string();
     assert_eq!(
         db.consume_agent_wake_at(
             &owner,

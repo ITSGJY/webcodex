@@ -996,14 +996,18 @@ pub(super) fn model_next_action(
     }
 }
 
-pub(super) fn validate_task_id(task_id: &str) -> Result<(), &'static str> {
+pub fn validate_task_id(task_id: &str) -> Result<(), &'static str> {
     let suffix = task_id.strip_prefix("wc_task_").unwrap_or_default();
-    if suffix.len() != 32
-        || !suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if webcodex_core::compact::decode::<12>(suffix).is_none() {
         return Err("task_id must be the opaque wc_task_* id returned by task_start");
+    }
+    Ok(())
+}
+
+pub fn validate_result_id(result_id: &str) -> Result<(), &'static str> {
+    let suffix = result_id.strip_prefix("wc_result_").unwrap_or_default();
+    if webcodex_core::compact::decode::<12>(suffix).is_none() {
+        return Err("result_id must be the opaque wc_result_* id returned by task_finish");
     }
     Ok(())
 }

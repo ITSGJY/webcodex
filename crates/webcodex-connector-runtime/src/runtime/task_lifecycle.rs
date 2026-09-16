@@ -723,25 +723,38 @@ impl ConnectorRuntime {
                 }
             };
         let validation = validation_projection(check_execution.as_ref());
-        let result_id = format!("wc_result_{}", uuid::Uuid::new_v4().simple());
-        let mut cursor = match self.db.finish_connector_task(
-            &task.task_id,
-            &self.context.project_id,
-            subject_id,
-            NewConnectorResult {
-                result_id: &result_id,
-                summary: input.summary.trim(),
-                patch_artifact: captured.patch_artifact.as_deref(),
-                patch_sha256: captured.patch_sha256.as_deref(),
-                patch_bytes: captured.patch_bytes,
-                changed_paths: &captured.changed_paths,
-                validation: &validation,
-                warnings: &captured.warnings,
-            },
-            now,
-        ) {
-            Ok(cursor) => cursor,
-            Err(error) => return store_error_outcome(error, Some(&task)),
+        let mut allocation_attempt = 0;
+        let (result_id, mut cursor) = loop {
+            let result_id = format!(
+                "wc_result_{}",
+                webcodex_core::compact::random_suffix::<12>()
+            );
+            let cursor = match self.db.finish_connector_task(
+                &task.task_id,
+                &self.context.project_id,
+                subject_id,
+                NewConnectorResult {
+                    result_id: &result_id,
+                    summary: input.summary.trim(),
+                    patch_artifact: captured.patch_artifact.as_deref(),
+                    patch_sha256: captured.patch_sha256.as_deref(),
+                    patch_bytes: captured.patch_bytes,
+                    changed_paths: &captured.changed_paths,
+                    validation: &validation,
+                    warnings: &captured.warnings,
+                },
+                now,
+            ) {
+                Ok(cursor) => cursor,
+                Err(error)
+                    if error.is_generated_identity_collision() && allocation_attempt < 15 =>
+                {
+                    allocation_attempt += 1;
+                    continue;
+                }
+                Err(error) => return store_error_outcome(error, Some(&task)),
+            };
+            break (result_id, cursor);
         };
         drop(task_guard);
         let cleanup_warning = if task.isolated {

@@ -6380,7 +6380,15 @@ fn git_read_commands_are_non_mutating_and_log_is_bounded() {
     assert!(log.contains("--skip 7"));
 
     for forbidden in [
-        "apply", "commit", "checkout", "reset", "push", "stash", "merge", "rebase", "rm ",
+        "git apply",
+        "git commit",
+        "git checkout",
+        "git reset",
+        "git push",
+        "git stash",
+        "git merge",
+        "git rebase",
+        "git rm ",
     ] {
         assert!(
             !log.contains(forbidden),

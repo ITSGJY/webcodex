@@ -124,10 +124,11 @@ impl ToolRuntime {
             ToolCall::ReadProjectArtifact {
                 project,
                 path,
-                session_id: _,
+                session_id,
                 encoding,
                 offset,
                 length,
+                expected_sha256,
                 as_image,
             } => {
                 if as_image == Some(true) && !matches!(transport, SessionTransport::Mcp) {
@@ -135,8 +136,17 @@ impl ToolRuntime {
                         "as_image is only supported over MCP; omit it to use the existing chunked artifact response",
                     )
                 } else {
-                    self.read_project_artifact(project, path, encoding, offset, length, as_image)
-                        .await
+                    self.read_project_artifact(
+                        project,
+                        path,
+                        encoding,
+                        offset,
+                        length,
+                        expected_sha256,
+                        session_id,
+                        as_image,
+                    )
+                    .await
                 }
             }
             ToolCall::ArtifactUploadBegin {

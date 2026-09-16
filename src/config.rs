@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -401,6 +402,11 @@ pub struct OAuth2Config {
     /// Exact server-generated OAuth client IDs whose active registrations may
     /// use the ChatGPT MCP host-file import path. Empty by default.
     pub trusted_mcp_file_client_ids: Vec<String>,
+    /// Whether a loopback-bound Server may trust ChatGPT MCP host-file rewrites
+    /// authenticated with a normal user API token. This is intended for local
+    /// OpenAI Secure Tunnel setups where `tunnel-client` injects the API token.
+    /// Default `false`; non-loopback binds are never eligible.
+    pub trust_loopback_api_token_mcp_file_import: bool,
     /// Exact project grant active for a project-first OAuth share session.
     /// Unset on managed/self-hosted OAuth servers.
     pub project_share_grant_id: Option<String>,
@@ -420,6 +426,7 @@ impl Default for OAuth2Config {
             require_pkce: true,
             shared_key_bridge_enabled: false,
             trusted_mcp_file_client_ids: Vec::new(),
+            trust_loopback_api_token_mcp_file_import: false,
             project_share_grant_id: None,
             project_share_session_id: None,
         }
@@ -485,6 +492,8 @@ impl OAuth2Config {
                     client_ids
                 })
                 .unwrap_or_default();
+        let trust_loopback_api_token_mcp_file_import =
+            env_flag("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT").unwrap_or(false);
         let project_share_grant_id = std::env::var("WEBCODEX_OAUTH2_PROJECT_SHARE_GRANT_ID")
             .ok()
             .map(|value| value.trim().to_string())
@@ -502,6 +511,7 @@ impl OAuth2Config {
             require_pkce,
             shared_key_bridge_enabled,
             trusted_mcp_file_client_ids,
+            trust_loopback_api_token_mcp_file_import,
             project_share_grant_id,
             project_share_session_id,
         }
@@ -519,6 +529,18 @@ impl Config {
             max_text_size: 2 * 1024 * 1024,
             oauth2: OAuth2Config::from_env(),
         }
+    }
+
+    pub(crate) fn is_loopback_bound(&self) -> bool {
+        self.addr
+            .parse::<SocketAddr>()
+            .map(|address| address.ip().is_loopback())
+            .unwrap_or_else(|_| {
+                self.addr
+                    .strip_prefix("localhost:")
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .is_some()
+            })
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -665,6 +687,24 @@ mod tests {
     }
 
     #[test]
+    fn loopback_binding_detection_is_strict() {
+        let mut config = (*crate::test_support::test_config(None)).clone();
+        for addr in ["127.0.0.1:8090", "[::1]:8090", "localhost:8090"] {
+            config.addr = addr.to_string();
+            assert!(config.is_loopback_bound(), "{addr} must be loopback");
+        }
+        for addr in [
+            "0.0.0.0:8090",
+            "[::]:8090",
+            "192.168.1.10:8090",
+            "localhost",
+        ] {
+            config.addr = addr.to_string();
+            assert!(!config.is_loopback_bound(), "{addr} must not be loopback");
+        }
+    }
+
+    #[test]
     fn oauth2_config_defaults_to_disabled() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.remove("WEBCODEX_SHARED_KEY_ENABLED");
@@ -679,6 +719,7 @@ mod tests {
         env.remove("WEBCODEX_OAUTH2_REQUIRE_PKCE");
         env.remove("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE");
         env.remove("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS");
+        env.remove("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT");
 
         let cfg = OAuth2Config::from_env();
         assert!(!cfg.enabled);
@@ -689,6 +730,7 @@ mod tests {
         assert!(cfg.require_pkce);
         assert!(!cfg.shared_key_bridge_enabled);
         assert!(cfg.trusted_mcp_file_client_ids.is_empty());
+        assert!(!cfg.trust_loopback_api_token_mcp_file_import);
     }
 
     #[test]
@@ -701,6 +743,7 @@ mod tests {
         env.set("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS", "600");
         env.set("WEBCODEX_OAUTH2_REQUIRE_PKCE", "false");
         env.set("WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE", "true");
+        env.set("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT", "true");
         let trusted_a = format!("wc_client_{}", "a".repeat(64));
         let trusted_b = format!("wc_client_{}", "b".repeat(64));
         env.set(
@@ -720,6 +763,7 @@ mod tests {
         assert!(!cfg.require_pkce);
         assert!(cfg.shared_key_bridge_enabled);
         assert_eq!(cfg.trusted_mcp_file_client_ids, vec![trusted_a, trusted_b]);
+        assert!(cfg.trust_loopback_api_token_mcp_file_import);
 
         env.remove("WEBCODEX_OAUTH2_ENABLED");
         env.remove("WEBCODEX_OAUTH2_ISSUER");
@@ -728,6 +772,7 @@ mod tests {
         env.remove("WEBCODEX_OAUTH2_AUTH_CODE_TTL_SECS");
         env.remove("WEBCODEX_OAUTH2_REQUIRE_PKCE");
         env.remove("WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS");
+        env.remove("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT");
     }
 
     #[test]

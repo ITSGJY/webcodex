@@ -133,7 +133,10 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
                     panic!("stateless recorder metadata missing for {}", tool["name"])
                 });
             assert_eq!(recorder["type"], "string");
-            assert_eq!(recorder["pattern"], "^wc_sess_[A-Za-z0-9_]+$");
+            assert_eq!(
+                recorder["pattern"],
+                "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+            );
             let description = recorder["description"].as_str().unwrap();
             assert!(description.contains("record this call"));
             assert!(description.contains("trusted collaboration provenance"));
@@ -148,7 +151,10 @@ async fn mcp_tools_list_returns_same_names_as_runtime() {
                 ack["maxItems"],
                 crate::tool_runtime::sessions::MAX_TOOL_CALL_ACK_MESSAGE_IDS
             );
-            assert_eq!(ack["items"]["pattern"], "^wc_msg_[A-Za-z0-9_]+$");
+            assert_eq!(
+                ack["items"]["pattern"],
+                "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+            );
             let ack_description = ack["description"].as_str().unwrap();
             assert!(ack_description.contains("current model context still retains"));
             assert!(ack_description.contains("Repeat while retained"));
@@ -825,17 +831,23 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
 fn stateless_ack_wrapper_normalizes_and_is_removed_before_concrete_tool_parsing() {
     let mut arguments = json!({
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: [
-            "wc_msg_beta",
-            "wc_msg_beta",
-            "wc_msg_alpha"
+            "wc_msg_abcd-efgh_ijklmn",
+            "wc_msg_abcd-efgh_ijklmn",
+            "wc_msg_0123456789abcdef"
         ]
     });
     let normalized = strip_stateless_ack_session_message_ids(&mut arguments).unwrap();
-    assert_eq!(normalized, vec!["wc_msg_beta", "wc_msg_alpha"]);
+    assert_eq!(
+        normalized,
+        vec!["wc_msg_abcd-efgh_ijklmn", "wc_msg_0123456789abcdef"]
+    );
     assert!(arguments
         .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD)
         .is_none());
-    assert_eq!(normalized, vec!["wc_msg_beta", "wc_msg_alpha"]);
+    assert_eq!(
+        normalized,
+        vec!["wc_msg_abcd-efgh_ijklmn", "wc_msg_0123456789abcdef"]
+    );
     crate::tool_runtime::ToolCall::from_tool_name("list_tools", arguments)
         .expect("wrapper ACK metadata must be gone before concrete parsing");
 
@@ -856,14 +868,14 @@ fn stateless_ack_wrapper_normalizes_and_is_removed_before_concrete_tool_parsing(
 fn stateless_message_resolution_wrapper_is_validated_and_removed_before_concrete_parsing() {
     let mut arguments = json!({
         crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
-            "message_id": "wc_msg_beta",
+            "message_id": "wc_msg_abcd-efgh_ijklmn",
             "resolution": "  handled in the current model turn  "
         }
     });
     let resolution = strip_stateless_session_message_resolution(&mut arguments)
         .unwrap()
         .expect("message resolution wrapper");
-    assert_eq!(resolution.message_id, "wc_msg_beta");
+    assert_eq!(resolution.message_id, "wc_msg_abcd-efgh_ijklmn");
     assert_eq!(resolution.resolution, "handled in the current model turn");
     assert!(arguments
         .get(crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD)
@@ -1051,9 +1063,9 @@ fn stateless_invocation_metadata_stays_typed_and_business_arguments_stay_clean()
         "project": "proj",
         "items": [{"path": "src/lib.rs"}],
         crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_adapter",
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_alpha"],
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_abcd-efgh_ijklmn"],
         crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
-            "message_id": "wc_msg_alpha",
+            "message_id": "wc_msg_abcd-efgh_ijklmn",
             "resolution": "handled"
         },
         crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: ["webcodex.workflow"],
@@ -1075,7 +1087,10 @@ fn stateless_invocation_metadata_stays_typed_and_business_arguments_stay_clean()
     };
 
     assert_eq!(recording_session_id.as_deref(), Some("wc_sess_adapter"));
-    assert_eq!(metadata.ack_session_message_ids, vec!["wc_msg_alpha"]);
+    assert_eq!(
+        metadata.ack_session_message_ids,
+        vec!["wc_msg_abcd-efgh_ijklmn"]
+    );
     assert_eq!(metadata.context_request, vec!["webcodex.workflow"]);
     assert_eq!(
         metadata.ack_session_context_revision,

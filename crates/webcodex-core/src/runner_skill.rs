@@ -363,11 +363,9 @@ impl RunnerSkillReadResponse {
 }
 
 pub fn valid_runner_skill_id(value: &str) -> bool {
-    value.len() == "wc_skill_".len() + 32
-        && value.starts_with("wc_skill_")
-        && value["wc_skill_".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value
+        .strip_prefix("wc_skill_")
+        .is_some_and(|suffix| crate::compact::decode::<16>(suffix).is_some())
 }
 
 pub fn normalize_runner_skill_resource_path(path: &str) -> Result<String, &'static str> {
@@ -412,7 +410,7 @@ mod tests {
 
     fn configured() -> RunnerSkillDescriptor {
         RunnerSkillDescriptor::Configured {
-            skill_id: format!("wc_skill_{}", "a".repeat(32)),
+            skill_id: "wc_skill_qqqqqqqqqqqqqqqqqqqqqg".to_string(),
             name: "configured".to_string(),
             description: "configured guidance".to_string(),
             definition_revision: "b".repeat(64),
@@ -421,11 +419,11 @@ mod tests {
 
     fn managed() -> RunnerSkillDescriptor {
         RunnerSkillDescriptor::Managed {
-            skill_id: format!("wc_skill_{}", "c".repeat(32)),
+            skill_id: "wc_skill_zMzMzMzMzMzMzMzMzMzMzA".to_string(),
             skill_key: "managed".to_string(),
             name: "managed".to_string(),
             description: "managed guidance".to_string(),
-            package_revision: format!("wc_skillpkg_{}", "d".repeat(64)),
+            package_revision: "wc_skillpkg_3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0".to_string(),
             definition_revision: "e".repeat(64),
         }
     }
@@ -434,8 +432,10 @@ mod tests {
     fn request_family_round_trips_all_runtime_and_management_operations() {
         let configured_id = configured().skill_id().to_string();
         let managed_id = managed().skill_id().to_string();
-        let package_revision = format!("wc_skillpkg_{}", "f".repeat(64));
-        let state_revision = format!("wc_skillstate_{}", "a".repeat(64));
+        let package_revision =
+            "wc_skillpkg___________________________________________8".to_string();
+        let state_revision =
+            "wc_skillstate_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
         let requests = vec![
             RunnerSkillRequest::List,
             RunnerSkillRequest::Resolve {
@@ -523,7 +523,9 @@ mod tests {
             path: "SKILL.md".to_string(),
             start_line: 1,
             limit: 1,
-            expected_package_revision: Some(format!("wc_skillpkg_{}", "f".repeat(64))),
+            expected_package_revision: Some(
+                "wc_skillpkg___________________________________________8".to_string(),
+            ),
             expected_definition_revision: None,
         };
         assert!(request.validate().is_err());

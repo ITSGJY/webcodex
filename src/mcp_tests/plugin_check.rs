@@ -167,7 +167,7 @@ async fn plugin_check_tool_spec_and_argument_contract_fail_closed_before_dispatc
     let auth = plugin_auth(true);
     for extra in [
         json!({"tool":"search_symbol"}),
-        json!({"binding":"wc_pbind_0123456789abcdef0123456789abcdef"}),
+        json!({"binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w"}),
         json!({"arguments":{}}),
     ] {
         let outcome =

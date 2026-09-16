@@ -640,6 +640,21 @@ pub enum ConnectorTaskStoreError {
 }
 
 impl ConnectorTaskStoreError {
+    /// Retry only a generated identity collision, never an operation-id conflict
+    /// or another business/constraint failure. Failed transactions roll back.
+    pub fn is_generated_identity_collision(&self) -> bool {
+        let Self::Storage(error) = self else {
+            return false;
+        };
+        matches!(error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, Some(message)))
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                    && matches!(message.as_str(),
+                        "UNIQUE constraint failed: wc_tasks.id"
+                        | "UNIQUE constraint failed: wc_runs.id"
+                        | "UNIQUE constraint failed: wc_task_results.id"))
+    }
+
     pub fn decision(code: &'static str, message: impl Into<String>) -> Self {
         Self::Decision(code, message.into())
     }
@@ -2319,7 +2334,12 @@ impl Database {
                     "only an interrupted task without a Result can be abandoned".to_string(),
                 )
             })?;
-        let result_id = new_id("wc_result");
+        let result_id = super::communication::allocate_identity(
+            &tx,
+            "wc_result_",
+            "SELECT EXISTS(SELECT 1 FROM wc_task_results WHERE id = ?1)",
+        )
+        .map_err(|error| ConnectorTaskStoreError::Storage(anyhow::anyhow!(error)))?;
         let warnings = vec!["interrupted workspace changes were discarded locally"];
         tx.execute(
             "INSERT INTO wc_task_results

@@ -3238,11 +3238,7 @@ fn validate_detached_recovery_context(
     }
     if let Some(session_id) = context.workflow_session_id.as_deref() {
         if context.runtime_project_id.is_none()
-            || session_id.len() > 128
-            || !session_id.starts_with("wc_sess_")
-            || !session_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !webcodex_core::workflow_session_contract::is_valid_session_id(session_id)
         {
             return Err("detached Job recovery Workflow Session is invalid".to_string());
         }
@@ -3426,11 +3422,7 @@ fn validate_runner_job_context_operation(
     }
     if let Some(session_id) = context.workflow_session_id.as_deref() {
         if context.runtime_project_id.is_none()
-            || session_id.len() > 128
-            || !session_id.starts_with("wc_sess_")
-            || !session_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !webcodex_core::workflow_session_contract::is_valid_session_id(session_id)
         {
             return Err("job recovery context workflow_session_id is invalid".to_string());
         }

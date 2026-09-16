@@ -1,14 +1,14 @@
 use serde_json::{json, Value};
 
-const AGENT_ID_PATTERN: &str = "^wc_dagent_[0-9a-f]{32}$";
-const ENDPOINT_ID_PATTERN: &str = "^wc_endpoint_[0-9a-f]{32}$";
-const CONVERSATION_ID_PATTERN: &str = "^wc_conv_[0-9a-f]{32}$";
-const MESSAGE_ID_PATTERN: &str = "^wc_cmsg_[0-9a-f]{32}$";
-const DELIVERY_ID_PATTERN: &str = "^wc_delivery_[0-9a-f]{32}$";
-const WAKE_ID_PATTERN: &str = "^wc_wake_[0-9a-f]{32}$";
-const WAKE_CONSUME_TOKEN_PATTERN: &str = "^wc_wake_consume_[0-9a-f]{32}$";
-const WAKE_ATTEMPT_ID_PATTERN: &str = "^wc_wake_attempt_[0-9a-f]{32}$";
-const HOST_BINDING_ID_PATTERN: &str = "^wc_host_binding_[0-9a-f]{32}$";
+const AGENT_ID_PATTERN: &str = "^wc_dagent_[A-Za-z0-9_-]{16}$";
+const ENDPOINT_ID_PATTERN: &str = "^wc_endpoint_[A-Za-z0-9_-]{16}$";
+const CONVERSATION_ID_PATTERN: &str = "^wc_conv_[A-Za-z0-9_-]{16}$";
+const MESSAGE_ID_PATTERN: &str = "^wc_cmsg_[A-Za-z0-9_-]{16}$";
+const DELIVERY_ID_PATTERN: &str = "^wc_delivery_[A-Za-z0-9_-]{16}$";
+const WAKE_ID_PATTERN: &str = "^wc_wake_[A-Za-z0-9_-]{16}$";
+const WAKE_CONSUME_TOKEN_PATTERN: &str = "^wc_wake_consume_[A-Za-z0-9_-]{21}[AQgw]$";
+const WAKE_ATTEMPT_ID_PATTERN: &str = "^wc_wake_attempt_[A-Za-z0-9_-]{16}$";
+const HOST_BINDING_ID_PATTERN: &str = "^wc_host_binding_[A-Za-z0-9_-]{21}[AQgw]$";
 
 fn bounded_string(description: &str, max_length: usize) -> Value {
     json!({

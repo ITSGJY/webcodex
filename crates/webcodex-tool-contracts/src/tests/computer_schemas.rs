@@ -420,7 +420,7 @@ fn computer_snapshot_dimension_budget_schemas_accept_oversized_positive_values_o
             "computer_snapshot_display",
             json!({
                 "client_id": "special",
-                "display_id": "display_0123456789abcdef0123456789abcdef"
+                "display_id": "display_iavN7wEjRWeJq83v"
             }),
         ),
         (

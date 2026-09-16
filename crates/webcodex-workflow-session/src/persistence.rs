@@ -20,7 +20,7 @@ use super::model::{
     SessionMessage, SessionRecord, StoredSession, DEFAULT_MAX_MESSAGES_PER_SESSION,
     EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS,
     MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS,
-    MESSAGE_ID_PREFIX, SESSION_LEDGER_VERSION,
+    SESSION_LEDGER_VERSION,
 };
 use super::query::{is_valid_completion_id, validate_message_tags};
 use super::util::{
@@ -758,22 +758,14 @@ pub fn sanitize_persisted_event(mut event: SessionEvent, session_id: &str) -> Op
 }
 
 fn is_valid_persisted_message_id(message_id: &str) -> bool {
-    message_id
-        .strip_prefix(MESSAGE_ID_PREFIX)
-        .is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .as_bytes()
-                    .iter()
-                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        })
+    webcodex_core::workflow_session_contract::is_valid_session_message_id(message_id)
 }
 
 pub fn sanitize_persisted_message(
     mut message: SessionMessage,
     session_id: &str,
 ) -> Option<SessionMessage> {
-    if message.session_id != session_id || !message.message_id.starts_with(MESSAGE_ID_PREFIX) {
+    if message.session_id != session_id || !is_valid_persisted_message_id(&message.message_id) {
         return None;
     }
     message.message = bound_chars(message.message.trim(), MAX_MESSAGE_CHARS);
@@ -789,7 +781,7 @@ pub fn sanitize_persisted_message(
         .filter(|value| *value > 0 && message.requires_ack);
     message.reply_to = message.reply_to.and_then(|reply_to| {
         let reply_to = reply_to.trim().to_string();
-        reply_to.starts_with(MESSAGE_ID_PREFIX).then_some(reply_to)
+        is_valid_persisted_message_id(&reply_to).then_some(reply_to)
     });
     message.author_session_id = message.author_session_id.and_then(|author_session_id| {
         let author_session_id = author_session_id.trim().to_string();
@@ -797,9 +789,7 @@ pub fn sanitize_persisted_message(
     });
     message.resolved_by_message_id = message.resolved_by_message_id.and_then(|message_id| {
         let message_id = message_id.trim().to_string();
-        message_id
-            .starts_with(MESSAGE_ID_PREFIX)
-            .then_some(message_id)
+        is_valid_persisted_message_id(&message_id).then_some(message_id)
     });
     message.superseded_by_message_id = message.superseded_by_message_id.and_then(|message_id| {
         let message_id = message_id.trim().to_string();

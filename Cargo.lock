@@ -5204,7 +5204,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "uuid",
+ "webcodex-core",
  "windows",
  "windows-sys 0.61.2",
  "xcap",
@@ -5236,6 +5236,8 @@ dependencies = [
 name = "webcodex-core"
 version = "0.4.1"
 dependencies = [
+ "base64",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "sha2",
@@ -5360,6 +5362,7 @@ dependencies = [
 name = "webcodex-tool-contracts"
 version = "0.4.1"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
  "webcodex-core",

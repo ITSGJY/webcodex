@@ -17,7 +17,7 @@ pub fn skill_list_input_schema() -> Value {
             "query": {"type": "string", "maxLength": MAX_SKILL_QUERY_CHARS, "description": "Optional bounded case-insensitive substring filter over Skill name and description only."},
             "offset": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SKILL_LIST_LIMIT},
-            "expected_catalog_revision": {"type": "string", "pattern": "^wc_skillcat_[0-9a-f]{64}$", "description": "Optional catalog revision guard. If current discovery differs, the call fails with skill_catalog_changed rather than continuing an old offset."},
+            "expected_catalog_revision": {"type": "string", "pattern": "^wc_skillcat_[A-Za-z0-9_-]{43}$", "description": "Optional catalog revision guard. If current discovery differs, the call fails with skill_catalog_changed rather than continuing an old offset."},
             "session_id": {"type": "string", "description": "Optional explicit Workflow Session for this tool call. No implicit current-Session fallback is used."}
         },
         "required": ["project"],
@@ -50,7 +50,7 @@ pub fn skill_install_input_schema() -> Value {
             "expected_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "idempotency_key": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_STORE_IDEMPOTENCY_KEY_CHARS},
             "activate": {"type": "boolean", "default": false},
-            "expected_state_revision": {"type": "string", "pattern": "^wc_skillstate_[0-9a-f]{64}$", "description": "CAS guard required when activating into an existing logical Skill state."},
+            "expected_state_revision": {"type": "string", "pattern": "^wc_skillstate_[A-Za-z0-9_-]{43}$", "description": "CAS guard required when activating into an existing logical Skill state."},
             "session_id": {"type": "string"}
         },
         "required": ["project", "skill_key", "artifact_path", "expected_artifact_sha256", "idempotency_key"],
@@ -64,8 +64,8 @@ fn skill_state_mutation_schema() -> Value {
         "properties": {
             "project": {"type": "string", "minLength": 1},
             "skill_key": {"type": "string", "minLength": 1, "maxLength": MAX_OPERATOR_SKILL_KEY_CHARS, "pattern": "^[A-Za-z0-9._-]+$"},
-            "package_revision": {"type": "string", "pattern": "^wc_skillpkg_[0-9a-f]{64}$"},
-            "expected_state_revision": {"type": "string", "pattern": "^wc_skillstate_[0-9a-f]{64}$"},
+            "package_revision": {"type": "string", "pattern": "^wc_skillpkg_[A-Za-z0-9_-]{43}$"},
+            "expected_state_revision": {"type": "string", "pattern": "^wc_skillstate_[A-Za-z0-9_-]{43}$"},
             "idempotency_key": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_STORE_IDEMPOTENCY_KEY_CHARS},
             "session_id": {"type": "string"}
         },
@@ -87,12 +87,12 @@ pub fn skill_read_file_input_schema() -> Value {
         "type": "object",
         "properties": {
             "project": {"type": "string", "minLength": 1, "description": "Required authorized runtime Project id."},
-            "skill_id": {"type": "string", "pattern": "^wc_skill_[0-9a-f]{32}$", "description": "Opaque Skill identity returned by skills.catalog or skill_list; it selects one exact source/package without exposing native Runner paths."},
+            "skill_id": {"type": "string", "pattern": "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$", "description": "Opaque Skill identity returned by skills.catalog or skill_list; it selects one exact source/package without exposing native Runner paths."},
             "path": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_RESOURCE_PATH_CHARS, "description": "Skill-package-relative UTF-8 text resource path. Defaults to SKILL.md; absolute paths and traversal are forbidden."},
             "start_line": {"type": "integer", "minimum": 1},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SKILL_READ_LINES},
             "expected_definition_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional SKILL.md content digest guard. A mismatch fails with skill_definition_changed and does not return resource text."},
-            "expected_package_revision": {"type": "string", "pattern": "^wc_skillpkg_[0-9a-f]{64}$", "description": "Operator-installed Skills only. Pins the current active immutable package revision; stale values fail with skill_package_changed before resource text is returned."},
+            "expected_package_revision": {"type": "string", "pattern": "^wc_skillpkg_[A-Za-z0-9_-]{43}$", "description": "Operator-installed Skills only. Pins the current active immutable package revision; stale values fail with skill_package_changed before resource text is returned."},
             "session_id": {"type": "string", "description": "Optional explicit Workflow Session for this tool call. No implicit current-Session fallback is used."}
         },
         "required": ["project", "skill_id"],

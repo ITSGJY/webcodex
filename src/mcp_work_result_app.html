@@ -47,7 +47,7 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
 (() => {
   "use strict";
   const APP_PROTOCOL = "2026-01-26";
-  const SESSION_ID = /^wc_sess_[A-Za-z0-9_]+$/;
+  const SESSION_ID = /^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$/;
   const STATE_VERSION = /^wr1_[0-9a-f]{64}$/;
   const CALL_TIMEOUT_MS = 10000;
   const MAX_PROJECT = 512;
