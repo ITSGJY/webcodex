@@ -34,7 +34,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "total_count": 1,
         "truncated": false
     });
-    let targets_audit = action_audit_output_for_tool("computer_list_targets", &targets_output);
+    let targets_audit = action_audit_output_for_tool("computer_observe", &targets_output);
     assert_eq!(
         targets_audit,
         serde_json::json!({"count": 1, "total_count": 1, "truncated": false})
@@ -56,7 +56,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "count": 1,
         "truncated": false
     });
-    let list_audit = action_audit_output_for_tool("computer_list_windows", &list_output);
+    let list_audit = action_audit_output_for_tool("computer_observe", &list_output);
     assert_eq!(
         list_audit,
         serde_json::json!({"count": 1, "truncated": false})
@@ -82,7 +82,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "file_bytes": 12345,
         "content_base64": "SUPER_SECRET_SCREENSHOT_BYTES"
     });
-    let snapshot_audit = action_audit_output_for_tool("computer_snapshot", &snapshot_output);
+    let snapshot_audit = action_audit_output_for_tool("computer_observe", &snapshot_output);
     let snapshot_serialized = serde_json::to_string(&snapshot_audit).unwrap();
     assert_eq!(snapshot_audit["surface_id"], "surface_safe");
     assert_eq!(snapshot_audit["width"], 900);
@@ -101,7 +101,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "text": "REST_AUDIT_SECRET",
         "value": "REST_AUDIT_SECRET"
     });
-    let text_audit = action_audit_output_for_tool("computer_input_text", &text_output);
+    let text_audit = action_audit_output_for_tool("computer_control", &text_output);
     let text_serialized = serde_json::to_string(&text_audit).unwrap();
     assert_eq!(text_audit["surface_id"], "surface_safe");
     assert_eq!(text_audit["element_id"], "element_safe");

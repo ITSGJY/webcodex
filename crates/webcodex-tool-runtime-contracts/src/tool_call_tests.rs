@@ -13,7 +13,6 @@ use webcodex_workflow_session as sessions;
 fn from_tool_name_parses_unit_tools_without_arguments() {
     for name in [
         "list_tools",
-        "computer_list_targets",
         "list_projects",
         "list_runners",
         "runtime_status",
@@ -23,7 +22,6 @@ fn from_tool_name_parses_unit_tools_without_arguments() {
             matches!(
                 call,
                 ToolCall::ListTools { .. }
-                    | ToolCall::ComputerListTargets
                     | ToolCall::ListProjects { .. }
                     | ToolCall::ListRunners { .. }
                     | ToolCall::RuntimeStatus { .. }

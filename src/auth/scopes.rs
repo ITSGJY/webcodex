@@ -33,6 +33,21 @@ pub(crate) fn is_agent_scope(scope: &str) -> bool {
     AGENT_SCOPES.contains(&scope)
 }
 
+/// Scopes that require an explicit principal even when legacy unauthenticated
+/// runtime-tool access is otherwise preserved.
+pub(crate) fn scope_requires_explicit_unauthenticated_authority(scope: &str) -> bool {
+    matches!(
+        scope,
+        SCOPE_ADMIN
+            | SCOPE_MEMORY_READ
+            | SCOPE_MEMORY_MANAGE
+            | SCOPE_PLUGIN_INSPECT
+            | SCOPE_PLUGIN_INVOKE
+            | SCOPE_PLUGIN_MANAGE
+            | SCOPE_SSH_LOCAL
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Scope validation
 // ---------------------------------------------------------------------------
@@ -656,12 +671,12 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
             (
-                "computer_list_windows",
+                "computer_observe",
                 OAuthToolScopePolicy::Require(SCOPE_COMPUTER_READ),
             ),
             (
-                "computer_snapshot",
-                OAuthToolScopePolicy::Require(SCOPE_COMPUTER_READ),
+                "computer_control",
+                OAuthToolScopePolicy::RequireAny(&[SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_LAUNCH]),
             ),
             (
                 "computer_save_snapshot",
@@ -740,11 +755,9 @@ mod tests {
             "artifact_upload_finish",
             "artifact_upload_abort",
             "apply_unified_diff",
-            "computer_list_windows",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
-            "computer_snapshot",
+            "computer_observe",
+            "computer_control",
+            "computer_save_snapshot",
             "run_shell",
             "cargo_test",
         ] {

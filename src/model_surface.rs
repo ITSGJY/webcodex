@@ -549,24 +549,8 @@ mod tests {
             .map(|spec| spec.name.as_str())
             .collect::<Vec<_>>();
         for name in [
-            "computer_list_targets",
-            "computer_list_windows",
-            "computer_list_displays",
-            "computer_list_applications",
-            "computer_launch_application",
-            "computer_accessibility_status",
-            "computer_accessibility_tree",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
+            "computer_observe",
             "computer_control",
-            "computer_scroll_to_element",
-            "computer_key_input",
-            "computer_pointer_move",
-            "computer_pointer_click",
-            "computer_input_text",
-            "computer_snapshot",
-            "computer_snapshot_display",
             "computer_save_snapshot",
         ] {
             assert!(
@@ -584,6 +568,40 @@ mod tests {
             assert!(
                 !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&name),
                 "{name} must not expand project_connector"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_computer_tool_names_are_not_model_visible() {
+        let names = registered_tool_specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<std::collections::HashSet<_>>();
+        for legacy in [
+            "computer_list_targets",
+            "computer_list_windows",
+            "computer_list_displays",
+            "computer_list_applications",
+            "computer_launch_application",
+            "computer_accessibility_status",
+            "computer_accessibility_tree",
+            "computer_find_elements",
+            "computer_element_state",
+            "computer_activate_window",
+            "computer_scroll_to_element",
+            "computer_key_input",
+            "computer_input_text",
+            "computer_pointer_move",
+            "computer_pointer_click",
+            "computer_read_clipboard",
+            "computer_write_clipboard",
+            "computer_snapshot",
+            "computer_snapshot_display",
+        ] {
+            assert!(
+                !names.contains(legacy),
+                "legacy Computer tool leaked: {legacy}"
             );
         }
     }

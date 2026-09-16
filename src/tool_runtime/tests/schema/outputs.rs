@@ -1,9 +1,8 @@
 use super::*;
 
 #[test]
-fn computer_launch_application_output_schema_has_closed_native_platforms() {
-    let schema =
-        crate::tool_runtime::registry::output_schema_for_tool("computer_launch_application");
+fn computer_control_output_schema_has_closed_native_platforms() {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("computer_control");
     let validate = |value: &Value| {
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &schema)
     };
@@ -29,8 +28,8 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
                 "state_changed": false,
                 "execution_state": "not_started",
                 "suggested_call": {
-                    "tool": "computer_list_applications",
-                    "arguments": {"client_id": "msi"}
+                    "tool": "computer_observe",
+                    "arguments": {"action": "applications", "client_id": "msi"}
                 }
             }),
         ),
@@ -38,7 +37,7 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
     .unwrap();
     validate(&stale).unwrap();
     let mut legacy_recovery_tool = stale.clone();
-    legacy_recovery_tool["output"]["recovery_tool"] = json!("computer_list_applications");
+    legacy_recovery_tool["output"]["recovery_tool"] = json!("computer_observe");
     assert!(validate(&legacy_recovery_tool).is_err());
     assert!(schema["properties"]["output"]["properties"]
         .get("recovery_tool")

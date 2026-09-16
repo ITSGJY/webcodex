@@ -119,7 +119,7 @@ pub(super) fn mcp_computer_app_resources_list(domain: Option<&str>) -> Value {
         "resources": [{
             "uri": MCP_COMPUTER_UI_RESOURCE_URI,
             "name": "WebCodex Computer",
-            "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders the native computer_snapshot image.",
+            "description": "Minimal read-only WebCodex Computer screenshot card that performs only the standard MCP Apps handshake and renders native images returned by computer_observe snapshot actions.",
             "mimeType": MCP_UI_RESOURCE_MIME_TYPE,
             "_meta": mcp_computer_app_resource_meta(domain)
         }]
@@ -502,11 +502,14 @@ pub(super) enum McpSnapshotResourceKind {
 }
 
 impl McpSnapshotResourceKind {
-    pub(super) fn from_tool_name(tool_name: &str) -> Option<Self> {
-        match tool_name {
-            "computer_snapshot" => Some(Self::Window),
-            "computer_snapshot_display" => Some(Self::Display),
-            _ => None,
+    pub(super) fn from_result(tool_name: &str, output: &Value) -> Option<Self> {
+        if tool_name != "computer_observe" || output.get("content_base64").is_none() {
+            return None;
+        }
+        if output.get("display_id").is_some() {
+            Some(Self::Display)
+        } else {
+            Some(Self::Window)
         }
     }
 
@@ -720,7 +723,7 @@ pub(super) fn mcp_runtime_tool_result_with_snapshot_resource(
     snapshot_caller: Option<McpArtifactExportCallerBinding>,
 ) -> Value {
     let native_image_requested = as_image_requested
-        || matches!(tool_name, "computer_snapshot" | "computer_snapshot_display");
+        || (tool_name == "computer_observe" && result.output.get("content_base64").is_some());
     if native_image_requested && result.success {
         match mcp_native_image_tool_result(tool_name, &mut result, snapshot_caller) {
             Ok(value) => return value,
@@ -779,24 +782,23 @@ pub(super) fn mcp_native_image_tool_result(
     if detected != Some(mime_type.as_str()) {
         return Err("image MIME does not match decoded content".to_string());
     }
-    let image_label = if tool_name == "computer_snapshot" {
-        result
+    let snapshot_kind = McpSnapshotResourceKind::from_result(tool_name, &result.output);
+    let image_label = match snapshot_kind {
+        Some(McpSnapshotResourceKind::Window) => result
             .output
             .pointer("/surface/surface_id")
             .and_then(Value::as_str)
-            .unwrap_or("desktop surface")
-    } else if tool_name == "computer_snapshot_display" {
-        result
+            .unwrap_or("desktop surface"),
+        Some(McpSnapshotResourceKind::Display) => result
             .output
             .get("display_id")
             .and_then(Value::as_str)
-            .unwrap_or("full display")
-    } else {
-        result
+            .unwrap_or("full display"),
+        None => result
             .output
             .get("path")
             .and_then(Value::as_str)
-            .unwrap_or("project image")
+            .unwrap_or("project image"),
     };
     let file_bytes = result
         .output
@@ -811,7 +813,7 @@ pub(super) fn mcp_native_image_tool_result(
         .get("sha256")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let metadata_text = if matches!(tool_name, "computer_snapshot" | "computer_snapshot_display") {
+    let metadata_text = if snapshot_kind.is_some() {
         let width = result
             .output
             .get("width")
@@ -839,7 +841,7 @@ pub(super) fn mcp_native_image_tool_result(
     let structured_output = result.output.clone();
 
     let snapshot_link = snapshot_caller
-        .zip(McpSnapshotResourceKind::from_tool_name(tool_name))
+        .zip(snapshot_kind)
         .map(|(caller, kind)| {
             let client_id = result
                 .output
@@ -1712,7 +1714,7 @@ pub(super) fn prepare_tool_call(
     };
     let snapshot_resource_caller = if stateless_2026
         && model_surface.supports_operator_extensions()
-        && matches!(tool_name, "computer_snapshot" | "computer_snapshot_display")
+        && tool_name == "computer_observe"
     {
         mcp_artifact_export_caller_binding(auth).ok()
     } else {
@@ -1744,7 +1746,7 @@ pub(super) fn adapt_tool_result(
         ));
     }
     if artifact_presentation == ProjectArtifactPresentationMode::Image
-        || matches!(tool_name, "computer_snapshot" | "computer_snapshot_display")
+        || tool_name == "computer_observe"
     {
         return McpResourceToolResultAdaptation::Framed(
             mcp_runtime_tool_result_with_snapshot_resource(

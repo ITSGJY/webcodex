@@ -505,6 +505,12 @@ impl ToolAuditResultField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAuditSemanticResultPolicy {
+    /// Project heterogeneous Computer observation results into the same sparse,
+    /// privacy-preserving metadata retained by the pre-gateway read tools.
+    ComputerObservation,
+    /// Project heterogeneous Computer control results into the sparse lifecycle
+    /// metadata retained by the pre-gateway effect tools.
+    ComputerControl,
     /// Summarize coding-agent event kinds and body byte counts without retaining
     /// any event body or provider message content.
     CodingAgentObservation,
@@ -1252,8 +1258,6 @@ bool_policy_modifier!(
     requires_artifact_upload_path_binding,
     requires_artifact_upload_path_binding
 );
-
-bool_policy_modifier!(unit_arguments, unit_arguments);
 
 bool_policy_modifier!(
     requires_explicit_business_session,

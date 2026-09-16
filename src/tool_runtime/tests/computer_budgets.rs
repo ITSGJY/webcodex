@@ -1,5 +1,6 @@
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerResultRequest};
+use crate::tool_runtime::tool_call::ComputerObserveToolCall;
 use crate::tool_runtime::ToolCall;
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
@@ -37,12 +38,12 @@ async fn computer_display_snapshot_clamps_budget_before_runner_and_validates_eff
         async move {
             runtime
                 .dispatch_computer_tool(
-                    ToolCall::ComputerSnapshotDisplay {
+                    ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
                         client_id: client_id.to_string(),
                         display_id: DISPLAY_ID.to_string(),
                         max_width: Some(10_000),
                         max_height: Some(u32::MAX),
-                    },
+                    }),
                     Some(&auth),
                 )
                 .await

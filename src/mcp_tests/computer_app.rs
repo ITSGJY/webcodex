@@ -90,38 +90,28 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
         panic!("expected UI-enabled tools/list");
     };
     let tools = tools["result"]["tools"].as_array().unwrap();
-    let snapshot = tools
+    let observe = tools
         .iter()
-        .find(|tool| tool["name"] == "computer_snapshot")
-        .unwrap();
-    assert!(snapshot.get("_meta").is_none());
-    let display_snapshot = tools
-        .iter()
-        .find(|tool| tool["name"] == "computer_snapshot_display")
-        .unwrap();
-    assert!(display_snapshot.get("_meta").is_none());
-    let list_windows = tools
-        .iter()
-        .find(|tool| tool["name"] == "computer_list_windows")
-        .unwrap();
-    assert!(list_windows.get("_meta").is_none());
+        .find(|tool| tool["name"] == "computer_observe")
+        .expect("UI tools/list should expose the authorized read-only Computer gateway");
+    assert!(observe.get("_meta").is_none());
+    for legacy in [
+        "computer_snapshot",
+        "computer_snapshot_display",
+        "computer_list_windows",
+    ] {
+        assert!(!tools.iter().any(|tool| tool["name"] == legacy));
+    }
 
     let compact =
         mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, true, true);
-    let compact_snapshot = compact["tools"]
+    let compact_observe = compact["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "computer_snapshot")
+        .find(|tool| tool["name"] == "computer_observe")
         .unwrap();
-    assert!(compact_snapshot.get("_meta").is_none());
-    let compact_display_snapshot = compact["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tool| tool["name"] == "computer_snapshot_display")
-        .unwrap();
-    assert!(compact_display_snapshot.get("_meta").is_none());
+    assert!(compact_observe.get("_meta").is_none());
 
     let resources = handle_mcp_request(
         &runtime,
@@ -280,7 +270,7 @@ async fn mcp_2026_computer_app_is_minimal_handshake_and_snapshot_only() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "computer_snapshot")
+        .find(|tool| tool["name"] == "computer_observe")
         .unwrap();
     assert!(snapshot.get("_meta").is_none());
 
@@ -352,7 +342,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
 
     for generation in 1..=4u64 {
         let framed = mcp_runtime_tool_result_with_snapshot_resource(
-            "computer_snapshot_display",
+            "computer_observe",
             false,
             ToolResult::ok(json!({
                 "client_id": "msi",
@@ -446,7 +436,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
     let window_auth = snapshot_auth("snapshot-window-owner", false);
     let window_caller = mcp_artifact_export_caller_binding(Some(&window_auth)).unwrap();
     let window = mcp_runtime_tool_result_with_snapshot_resource(
-        "computer_snapshot",
+        "computer_observe",
         false,
         ToolResult::ok(json!({
             "client_id": "mini",
@@ -488,11 +478,11 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
 fn mcp_computer_snapshot_output_schema_matches_native_image_framing() {
     let runtime_spec = registered_tool_specs()
         .into_iter()
-        .find(|spec| spec.name == "computer_snapshot")
-        .expect("computer_snapshot runtime spec");
+        .find(|spec| spec.name == "computer_observe")
+        .expect("computer_observe runtime spec");
     let runtime_properties = runtime_spec.output_schema["properties"]["output"]["properties"]
         .as_object()
-        .expect("runtime computer_snapshot output properties");
+        .expect("runtime computer_observe output properties");
     assert!(runtime_properties.contains_key("content_base64"));
     assert!(!runtime_properties.contains_key("content_delivery"));
 
@@ -506,11 +496,11 @@ fn mcp_computer_snapshot_output_schema_matches_native_image_framing() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "computer_snapshot")
-            .expect("MCP computer_snapshot descriptor");
+            .find(|tool| tool["name"] == "computer_observe")
+            .expect("MCP computer_observe descriptor");
         let properties = tool["outputSchema"]["properties"]["output"]["properties"]
             .as_object()
-            .expect("MCP computer_snapshot output properties");
+            .expect("MCP computer_observe output properties");
         assert!(!properties.contains_key("content_base64"));
         assert_eq!(properties["content_delivery"]["type"], "string");
         assert_eq!(properties["content_delivery"]["const"], "mcp_image");
