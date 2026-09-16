@@ -245,7 +245,7 @@
           "reason": "The 2025-11-25 tools/list wire schema rejects a WebCodex outputSchema that omits the required root type.",
           "evidence": "MCP 2025-11-25 Tool outputSchema wire schema; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "ececf4d2bd6e6309d77a640908419f8c8124c93a0dcc41701c6f361b6771273c"
+          "evidence_sha256": "633e7603d65e71cb89b4dc77d388e25e3306160b001dc2b2411c4a9709562006"
         }
       ],
       "expected_server_capabilities": {
@@ -497,7 +497,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "b76faa90c503520992faac5ee3e81c11fa174de69d97e1bfdc977759e91daf0f"
+          "evidence_sha256": "a8ac03871432cc0afcb1c24d0df149cb1c162fa989f0dd806294f7cd069b8bd4"
         },
         {
           "scenario": "server-stateless",
@@ -515,7 +515,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "d54d3cc76357dd0289e936526cdced33478df35af58bfbe516084dfd8a478207"
+          "evidence_sha256": "8bda1e39d0e9d45f5c39f16903533b068a7a7b73ba83590b2b769275246209f4"
         },
         {
           "scenario": "server-stateless",

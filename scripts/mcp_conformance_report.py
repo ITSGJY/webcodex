@@ -56,13 +56,53 @@ class Classification:
         return (self.scenario, self.check_id)
 
 
+def _normalize_evidence_value(value: Any) -> Any:
+    """Remove only known referee noise while preserving diagnostic semantics."""
+
+    if isinstance(value, list):
+        return [_normalize_evidence_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    # Wire-schema violations include the complete offending JSON-RPC message.
+    # That payload can change whenever an unrelated tool description/schema
+    # changes even though the actual schema violation is identical. Keep the
+    # violation context/errors/spec version, but omit the redundant full message.
+    wire_schema_violation = (
+        isinstance(value.get("origin"), str)
+        and isinstance(value.get("context"), str)
+        and isinstance(value.get("errors"), list)
+        and isinstance(value.get("specVersion"), str)
+        and isinstance(value.get("message"), dict)
+    )
+
+    normalized: dict[str, Any] = {}
+    for field, item in value.items():
+        if wire_schema_violation and field == "message":
+            continue
+        # The pinned stateless referee uses Date.now() as request IDs for some
+        # diagnostic probes. Those millisecond-epoch IDs are run-specific and do
+        # not describe the protocol failure. Fixed/small JSON-RPC IDs remain part
+        # of the fingerprint so meaningful response-shape changes still surface.
+        if (
+            field == "id"
+            and value.get("jsonrpc") == "2.0"
+            and isinstance(item, int)
+            and not isinstance(item, bool)
+            and abs(item) >= 1_000_000_000_000
+        ):
+            continue
+        normalized[field] = _normalize_evidence_value(item)
+    return normalized
+
+
 def check_evidence_sha256(check: dict[str, Any]) -> str:
     """Hash stable failure evidence while excluding timestamps and verbose logs."""
 
     payload: dict[str, Any] = {}
     for field in ("errorMessage", "details", "metadata"):
         if field in check:
-            payload[field] = check.get(field)
+            payload[field] = _normalize_evidence_value(check.get(field))
     if not payload:
         payload = {
             "name": check.get("name"),

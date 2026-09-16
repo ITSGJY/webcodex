@@ -135,8 +135,8 @@ It covers all-skipped output, missing/empty/INFO-only scenarios, unknown statuse
 abnormal referee exits, scored and not-scored infrastructure failures, changed
 status/evidence for an existing check ID, capability-advertisement drift,
 ambiguous duplicate non-success check IDs, harness-pin mismatch, placeholder evidence, new scored
-failures, informational non-success reporting, stale classifications, and
-rejection of broad masks.
+failures, informational non-success reporting, stale classifications, volatile
+JSON-RPC request IDs, wire-schema payload drift, and rejection of broad masks.
 
 ## Raw evidence and review policy
 
@@ -151,8 +151,11 @@ Each profile retains:
 
 Baseline updates should be narrow. Add a classification only after reproducing
 and understanding the exact check, then record its observed status and evidence
-fingerprint. A changed fingerprint is a review prompt, not something to refresh
-mechanically. Remove the entry as soon as the check passes. Do not replace
+fingerprint. Fingerprints retain semantic diagnostics but normalize two known
+referee noise sources: millisecond-epoch JSON-RPC probe IDs and the complete
+offending message duplicated inside wire-schema violations (the violation context
+and errors remain hashed). A changed fingerprint is a review prompt, not something
+to refresh mechanically. Remove the entry as soon as the check passes. Do not replace
 multiple check IDs with a scenario-wide exception. The SEP-2164 `data.uri`
 finding is kept as an advisory SHOULD/WARNING rather than described as a MUST
 violation.

@@ -365,6 +365,107 @@ class ReportGateTests(unittest.TestCase):
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
 
+    def test_timestamp_jsonrpc_id_does_not_change_evidence(self) -> None:
+        expected = self.check(
+            "stream-probe",
+            "FAILURE",
+            error_message="diagnostic tool is unavailable",
+        )
+        expected["details"] = {
+            "untestable": True,
+            "response": {
+                "jsonrpc": "2.0",
+                "id": 1_789_000_000_001,
+                "error": {"code": -32602, "message": "tool unavailable"},
+            },
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["response"]["id"] = 1_789_000_000_999
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected, "missing_harness_fixture")])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertTrue(summary["gate_passed"])
+
+    def test_fixed_jsonrpc_id_change_still_requires_review(self) -> None:
+        expected = self.check(
+            "fixed-id-probe",
+            "FAILURE",
+            error_message="protocol assertion failed",
+        )
+        expected["details"] = {
+            "response": {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602}}
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["response"]["id"] = 2
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected)])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
+    def test_wire_schema_full_message_drift_does_not_change_evidence(self) -> None:
+        expected = self.check(
+            "wire-schema-valid",
+            "FAILURE",
+            error_message="Schema validation failed",
+        )
+        expected["details"] = {
+            "messagesValidated": 5,
+            "violations": [
+                {
+                    "origin": "implementation",
+                    "specVersion": "2025-11-25",
+                    "context": "stateful response to 'tools/list'",
+                    "errors": ["outputSchema: must have required property 'type'"],
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"tools": [{"name": "old-tool"}]},
+                    },
+                }
+            ],
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["violations"][0]["message"]["result"] = {
+            "tools": [{"name": "new-unrelated-tool", "description": "changed"}]
+        }
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected)])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertTrue(summary["gate_passed"])
+
+    def test_wire_schema_error_change_still_requires_review(self) -> None:
+        expected = self.check(
+            "wire-schema-valid",
+            "FAILURE",
+            error_message="Schema validation failed",
+        )
+        expected["details"] = {
+            "messagesValidated": 5,
+            "violations": [
+                {
+                    "origin": "implementation",
+                    "specVersion": "2025-11-25",
+                    "context": "stateful response to 'tools/list'",
+                    "errors": ["outputSchema: must have required property 'type'"],
+                    "message": {"jsonrpc": "2.0", "id": 1, "result": {}},
+                }
+            ],
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["violations"][0]["errors"] = [
+            "inputSchema: must have required property 'type'"
+        ]
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected)])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
     def test_connection_failure_cannot_hide_behind_fixture_classification(self) -> None:
         expected = self.check(
             "tools-call-simple-text",
