@@ -49,6 +49,7 @@ async fn local_coding_tools_list_returns_exact_ordered_surface() {
         "work_on_project",
         "read_files",
         "search_project_texts",
+        "project_artifact",
         "get_session_assignment",
         "complete_session_message",
         "apply_text_edits",
@@ -70,6 +71,9 @@ async fn local_coding_tools_list_returns_exact_ordered_surface() {
         "close_session_shell",
         "runtime_status",
         "tool_manifest",
+        "read_project_artifact_metadata",
+        "read_project_artifact",
+        "export_project_artifact",
         "workspace_checkpoint_create",
         "delete_project_files",
         "git_restore_paths",
@@ -565,11 +569,12 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
         compact_serialized_tools_bytes < full_serialized_tools_bytes,
         "Adaptive compact discovery must cost less than full schema discovery"
     );
-    // Measured on this surface with Stateless 2026 wrappers, fileParams, and
-    // MCP App metadata: compact=138,639 bytes; full=663,081 bytes. Keep ~18%
-    // headroom over the compact baseline while retaining a guard far below the
-    // full-schema context cost. This is a model schema-cost budget, not an MCP
-    // transport limit and not the tools/call stable-readable result ceiling.
+    // Measured after the unified artifact read surface with Stateless 2026
+    // wrappers, fileParams, and MCP App metadata: compact=163,449 bytes;
+    // full=771,291 bytes. Keep the existing 160 KiB guard fixed: future direct
+    // surface growth should reduce schema cost rather than raise this ceiling.
+    // This is a model schema-cost budget, not an MCP transport limit or the
+    // tools/call stable-readable result ceiling.
     const MAX_ADAPTIVE_RUNTIME_COMPACT_TOOLS_LIST_BYTES: usize = 160 * 1024;
     assert!(
         compact_serialized_tools_bytes <= MAX_ADAPTIVE_RUNTIME_COMPACT_TOOLS_LIST_BYTES,
@@ -608,7 +613,7 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
     for promoted in [
         "run_shell",
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "project_artifact",
         "present_work_result",
     ] {
         assert!(
@@ -618,7 +623,9 @@ async fn adaptive_runtime_tools_list_is_small_core_plus_gateway() {
     }
     for low_level_artifact in [
         "save_project_artifact",
+        "read_project_artifact_metadata",
         "read_project_artifact",
+        "export_project_artifact",
         "artifact_upload_begin",
     ] {
         assert!(

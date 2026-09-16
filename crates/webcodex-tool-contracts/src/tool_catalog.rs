@@ -211,6 +211,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
         name: TOOL_DISCOVERY_GROUP_FILE_TRANSFER,
         tools: &[
             "import_conversation_files_to_project",
+            "project_artifact",
             "export_project_artifact",
             "save_project_artifact",
             "read_project_artifact_metadata",
@@ -400,18 +401,16 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     },
     ToolRecommendedFlow {
         name: "file_transfer",
-        summary: "File transfer: host/conversation attachment -> import_conversation_files_to_project; project artifact -> export_project_artifact; caller-held bounded binary -> save_project_artifact/artifact_upload_*; bounded inspection -> read_project_artifact.",
-        manifest_purpose: "Use host-native transfer at the boundary: import_conversation_files_to_project moves current host attachments into a Project without model Base64; export_project_artifact returns an authenticated ResourceLink for complete project-to-host/user transfer. Use save_project_artifact or artifact_upload_* only when bounded binary data is already held by the caller, and read_project_artifact only for bounded inspection.",
+        summary: "Artifact boundary: host/conversation attachment -> import_conversation_files_to_project; Project -> model/host -> project_artifact. Use metadata for facts, inspect for one bounded segment, image for native MCP image delivery, and export for complete MCP ResourceLink delivery.",
+        manifest_purpose: "Keep directions explicit: import_conversation_files_to_project is the Host-to-Project write boundary. project_artifact is the preferred Project-to-model/host read facade: metadata observes artifact facts, inspect reads one bounded snapshot-fenced segment, image uses supported native MCP image delivery, and export uses an authenticated ResourceLink for complete transfer. Do not loop inspect chunks to transfer a whole file. save_project_artifact/artifact_upload_* remain for caller-held binary writes.",
         tools: &[
             "import_conversation_files_to_project",
-            "export_project_artifact",
+            "project_artifact",
             "save_project_artifact",
             "artifact_upload_begin",
             "artifact_upload_chunk",
             "artifact_upload_finish",
             "artifact_upload_abort",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
         ],
     },
     ToolRecommendedFlow {
@@ -518,6 +517,7 @@ pub const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
     "list_project_files",
     "search_project_texts",
     "read_files",
+    "project_artifact",
     // LSP navigation
     "lsp_status",
     "document_symbols",
@@ -567,6 +567,7 @@ pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "project_overview",
     "search_project_texts",
     "read_files",
+    "project_artifact",
     // Distinct semantic navigation capabilities remain useful even though they
     // are long-tail Adaptive gateway targets.
     "document_symbols",
@@ -650,14 +651,12 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
         purpose: "Move files across the host/Project boundary without routing complete binary payloads through model text.",
         tools: &[
             "import_conversation_files_to_project",
-            "export_project_artifact",
+            "project_artifact",
             "save_project_artifact",
             "artifact_upload_begin",
             "artifact_upload_chunk",
             "artifact_upload_finish",
             "artifact_upload_abort",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
         ],
     },
     ToolManifestIntent {

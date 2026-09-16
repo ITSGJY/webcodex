@@ -315,7 +315,7 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
     for (name, expected_rank) in [
         ("rotate_agent_continuation_endpoint", 19),
         ("import_conversation_files_to_project", 55),
-        ("export_project_artifact", 56),
+        ("project_artifact", 56),
         ("run_detached_process", 72),
         ("run_shell", 75),
         ("observe_jobs", 80),
@@ -344,6 +344,7 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         "apply_patch",
         "save_project_artifact",
         "read_project_artifact",
+        "export_project_artifact",
         "artifact_upload_begin",
         "artifact_upload_chunk",
         "artifact_upload_finish",

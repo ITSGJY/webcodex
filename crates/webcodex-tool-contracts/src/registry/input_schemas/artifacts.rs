@@ -97,6 +97,64 @@ pub fn export_project_artifact_input_schema() -> Value {
     ])
 }
 
+pub fn project_artifact_input_schema() -> Value {
+    let mut schema = object_schema(with_optional_session_id(vec![
+        ("project", "string", "Runner-registered project id.", true),
+        ("path", "string", "Project-relative artifact path.", true),
+        (
+            "action",
+            "string",
+            "metadata, inspect, image, or export.",
+            true,
+        ),
+        (
+            "allow_missing",
+            "boolean",
+            "metadata only; missing => exists=false.",
+            false,
+        ),
+        (
+            "offset",
+            "integer",
+            "inspect only; byte offset (default 0).",
+            false,
+        ),
+        (
+            "length",
+            "integer",
+            "inspect only; bytes (default 32768, max 65536).",
+            false,
+        ),
+        (
+            "expected_sha256",
+            "string",
+            "inspect only; 64-char lowercase SHA-256 fence.",
+            false,
+        ),
+    ]));
+    schema["properties"]["session_id"]["description"] =
+        Value::from("Optional compatible wc_sess_* Workflow Session id.");
+    schema["properties"]["action"]["enum"] = json!(["metadata", "inspect", "image", "export"]);
+    schema["properties"]["expected_sha256"]["minLength"] = Value::from(64);
+    schema["properties"]["expected_sha256"]["maxLength"] = Value::from(64);
+    schema["properties"]["expected_sha256"]["pattern"] = Value::from("^[0-9a-f]{64}$");
+    schema["allOf"] = json!([
+        {
+            "if": {"required": ["allow_missing"]},
+            "then": {"properties": {"action": {"const": "metadata"}}}
+        },
+        {
+            "if": {"anyOf": [
+                {"required": ["offset"]},
+                {"required": ["length"]},
+                {"required": ["expected_sha256"]}
+            ]},
+            "then": {"properties": {"action": {"const": "inspect"}}}
+        }
+    ]);
+    schema
+}
+
 pub fn read_project_artifact_metadata_input_schema() -> Value {
     object_schema(with_optional_session_id(vec![
         ("project", "string", "Runner-registered project id.", true),

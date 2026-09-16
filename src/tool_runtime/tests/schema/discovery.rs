@@ -1796,9 +1796,15 @@ async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
         ),
         (
             ModelSurface::AdaptiveRuntime,
-            "export_project_artifact",
+            "project_artifact",
             "direct",
             None,
+        ),
+        (
+            ModelSurface::AdaptiveRuntime,
+            "export_project_artifact",
+            "gateway",
+            Some("call_runtime_tool"),
         ),
         (
             ModelSurface::AdaptiveRuntime,

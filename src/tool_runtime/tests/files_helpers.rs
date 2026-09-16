@@ -2,7 +2,7 @@
 
 use super::super::files::*;
 use super::super::sessions::SessionTransport;
-use super::super::ToolCall;
+use super::super::{ProjectArtifactAction, ToolCall};
 use super::support::*;
 use crate::runner_protocol::RunnerCapabilities;
 use serde_json::json;
@@ -710,4 +710,186 @@ async fn artifact_upload_tools_route_to_agent_file_ops() {
     let result = abort_task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["aborted"], true);
+}
+
+#[tokio::test]
+async fn project_artifact_metadata_routes_to_canonical_runner_operation() {
+    let runtime = runtime_with_agent_project("project-artifact-meta");
+    register_agent(
+        &runtime,
+        "project-artifact-meta",
+        None,
+        RunnerCapabilities {
+            file_read: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("project-artifact-meta");
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .dispatch_file_tool(
+                    ToolCall::ProjectArtifact {
+                        project,
+                        path: "artifacts/smoke/missing.artifact".to_string(),
+                        action: ProjectArtifactAction::Metadata,
+                        session_id: None,
+                        allow_missing: Some(true),
+                        offset: None,
+                        length: None,
+                        expected_sha256: None,
+                    },
+                    SessionTransport::Api,
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+
+    let req = wait_for_patch_agent_request(&runtime, "project-artifact-meta").await;
+    assert_eq!(req.kind, "file_read_project_artifact_metadata");
+    let payload: serde_json::Value =
+        serde_json::from_str(req.content.as_deref().expect("artifact payload")).unwrap();
+    assert_eq!(payload["path"], "artifacts/smoke/missing.artifact");
+    assert_eq!(payload["allow_missing"], true);
+    assert_eq!(payload["max_bytes"], MAX_PROJECT_ARTIFACT_BYTES);
+    assert!(payload.get("action").is_none());
+
+    complete_patch_agent_request(
+        &runtime,
+        "project-artifact-meta",
+        &req.request_id,
+        0,
+        r#"{"path":"artifacts/smoke/missing.artifact","exists":false,"missing":true}"#,
+        "",
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["exists"], false);
+}
+
+#[tokio::test]
+async fn project_artifact_inspect_reuses_runner_read_and_keeps_unified_continuation() {
+    let runtime = runtime_with_agent_project("project-artifact-inspect");
+    register_agent(
+        &runtime,
+        "project-artifact-inspect",
+        None,
+        RunnerCapabilities {
+            file_read: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id("project-artifact-inspect");
+    let sha256 = "c".repeat(64);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .dispatch_file_tool(
+                    ToolCall::ProjectArtifact {
+                        project,
+                        path: "data.bin".to_string(),
+                        action: ProjectArtifactAction::Inspect,
+                        session_id: None,
+                        allow_missing: None,
+                        offset: Some(0),
+                        length: Some(4),
+                        expected_sha256: None,
+                    },
+                    SessionTransport::Api,
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+
+    let req = wait_for_patch_agent_request(&runtime, "project-artifact-inspect").await;
+    assert_eq!(req.kind, "file_read_project_artifact");
+    let payload: serde_json::Value =
+        serde_json::from_str(req.content.as_deref().expect("artifact payload")).unwrap();
+    assert_eq!(
+        payload,
+        json!({"path":"data.bin","offset":0,"length":4,"max_file_bytes":MAX_PROJECT_ARTIFACT_BYTES})
+    );
+    let stdout = json!({
+        "path": "data.bin",
+        "mime_type": null,
+        "file_bytes": 8,
+        "sha256": sha256,
+        "offset": 0,
+        "bytes_returned": 4,
+        "content_base64": "YWJjZA==",
+        "next_offset": 4,
+        "truncated": true,
+        "eof": false,
+    })
+    .to_string();
+    complete_patch_agent_request(
+        &runtime,
+        "project-artifact-inspect",
+        &req.request_id,
+        0,
+        &stdout,
+        "",
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    let next = &result.output["suggested_call"];
+    assert_eq!(next["tool"], "project_artifact");
+    assert_eq!(next["arguments"]["action"], "inspect");
+    assert_eq!(next["arguments"]["project"], project);
+    assert_eq!(next["arguments"]["path"], "data.bin");
+    assert_eq!(next["arguments"]["offset"], 4);
+    assert_eq!(next["arguments"]["length"], 4);
+    assert_eq!(next["arguments"]["expected_sha256"], sha256);
+    assert!(next["arguments"].get("encoding").is_none());
+    let parsed = ToolCall::from_tool_name("project_artifact", next["arguments"].clone())
+        .expect("unified artifact continuation must stay parser-ready");
+    assert!(matches!(
+        parsed,
+        ToolCall::ProjectArtifact {
+            action: ProjectArtifactAction::Inspect,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn project_artifact_mcp_only_delivery_modes_fail_closed_outside_mcp() {
+    for action in [ProjectArtifactAction::Image, ProjectArtifactAction::Export] {
+        let result = test_runtime()
+            .dispatch_file_tool(
+                ToolCall::ProjectArtifact {
+                    project: "agent:missing:missing".to_string(),
+                    path: "artifacts/smoke/file.bin".to_string(),
+                    action,
+                    session_id: None,
+                    allow_missing: None,
+                    offset: None,
+                    length: None,
+                    expected_sha256: None,
+                },
+                SessionTransport::Api,
+                None,
+                None,
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "unsupported_transport");
+        assert_eq!(result.output["required_transport"], "mcp");
+        assert_eq!(result.output["action"], action.as_str());
+    }
 }

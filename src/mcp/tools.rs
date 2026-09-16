@@ -917,9 +917,14 @@ pub(super) fn mcp_runtime_tool_result(
     if tool_name == "export_project_artifact" {
         return mcp_runtime_tool_result_fallback(result);
     }
+    let artifact_presentation = if as_image_requested {
+        resources::ProjectArtifactPresentationMode::Image
+    } else {
+        resources::ProjectArtifactPresentationMode::None
+    };
     match resources::adapt_tool_result(
         tool_name,
-        as_image_requested,
+        artifact_presentation,
         result,
         resources::McpResourceToolCallContext::default(),
     ) {
@@ -1962,25 +1967,32 @@ pub(super) async fn handle_call(
     // shared ToolRuntime kernel; preserve those failed attempts in generic
     // telemetry without creating a second record for normal kernel calls.
     let mut pre_kernel_model_ergonomics = ModelErgonomicsTimer::start(&params.name);
-    let resource_tool_call =
-        match resources::prepare_tool_call(&params.name, stateless_2026, model_surface, auth) {
-            Ok(context) => context,
-            Err(error) => {
-                if error.records_model_ergonomics_failure() {
-                    if let (Some(slot), Some(timer)) = (
-                        model_ergonomics_out.as_deref_mut(),
-                        pre_kernel_model_ergonomics.take(),
-                    ) {
-                        *slot = Some(
-                            timer
-                                .finish()
-                                .record_for_pre_result_failure("invalid_arguments"),
-                        );
-                    }
+    let artifact_presentation =
+        resources::project_artifact_presentation_mode(&params.name, &params.arguments);
+    let resource_tool_call = match resources::prepare_tool_call(
+        &params.name,
+        artifact_presentation,
+        stateless_2026,
+        model_surface,
+        auth,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            if error.records_model_ergonomics_failure() {
+                if let (Some(slot), Some(timer)) = (
+                    model_ergonomics_out.as_deref_mut(),
+                    pre_kernel_model_ergonomics.take(),
+                ) {
+                    *slot = Some(
+                        timer
+                            .finish()
+                            .record_for_pre_result_failure("invalid_arguments"),
+                    );
                 }
-                return McpOutcome::BadRequest(rpc_error(id, -32602, error.message()));
             }
-        };
+            return McpOutcome::BadRequest(rpc_error(id, -32602, error.message()));
+        }
+    };
     let mut session_id = match strip_recording_session_id(&mut params.arguments) {
         Ok(session_id) => session_id,
         Err(message) => {
@@ -2120,8 +2132,6 @@ pub(super) async fn handle_call(
     if let Some(lc) = lifecycle.as_deref() {
         lc.capture_payload("effective_arguments", &params.arguments);
     }
-    let as_image_requested = params.name == "read_project_artifact"
-        && params.arguments.get("as_image").and_then(Value::as_bool) == Some(true);
     let outcome = runtime
         .call_tool_with_invocation_metadata(
             KernelToolCallRequest {
@@ -2211,7 +2221,7 @@ pub(super) async fn handle_call(
     }
     let mut result = match resources::adapt_tool_result(
         &params.name,
-        as_image_requested,
+        artifact_presentation,
         result,
         resource_tool_call,
     ) {

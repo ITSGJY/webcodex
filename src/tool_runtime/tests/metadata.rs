@@ -2183,7 +2183,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         "search_project_texts",
         "read_files",
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "project_artifact",
         "show_changes",
         "apply_text_edits",
         "apply_unified_diff",
