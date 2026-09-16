@@ -55,26 +55,26 @@ if [ -z "$WORK_ROOT" ] || [ -z "$HARNESS_DIR" ] || [ -z "$REPORT_ROOT" ]; then
 fi
 mkdir -p "$WORK_ROOT"
 
-fixture_group_alive() {
-  [ -n "$fixture_pid" ] && kill -0 -- "-$fixture_pid" 2>/dev/null
+fixture_alive() {
+  [ -n "$fixture_pid" ] && kill -0 "$fixture_pid" 2>/dev/null
 }
 
 stop_fixture() {
   [ -n "$fixture_pid" ] || return 0
   touch "$fixture_dir/stop" 2>/dev/null || true
   for _ in $(seq 1 50); do
-    if ! fixture_group_alive; then break; fi
+    if ! fixture_alive; then break; fi
     sleep 0.1
   done
-  if fixture_group_alive; then
-    kill -TERM -- "-$fixture_pid" 2>/dev/null || true
+  if fixture_alive; then
+    kill -TERM "$fixture_pid" 2>/dev/null || true
   fi
   for _ in $(seq 1 50); do
-    if ! fixture_group_alive; then break; fi
+    if ! fixture_alive; then break; fi
     sleep 0.1
   done
-  if fixture_group_alive; then
-    kill -KILL -- "-$fixture_pid" 2>/dev/null || true
+  if fixture_alive; then
+    kill -KILL "$fixture_pid" 2>/dev/null || true
   fi
   wait "$fixture_pid" 2>/dev/null || true
   fixture_pid=""
@@ -204,20 +204,15 @@ fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/webcodex-mcp-conformance.XXXXXX")"
 url_file="$fixture_dir/url"
 stop_file="$fixture_dir/stop"
 fixture_log="$REPORT_ROOT/fixture.log"
-if ! command -v setsid >/dev/null 2>&1; then
-  echo "MCP conformance fixture supervision requires setsid" >&2
-  exit 2
-fi
-setsid env \
-  WEBCODEX_MCP_CONFORMANCE_URL_FILE="$url_file" \
-  WEBCODEX_MCP_CONFORMANCE_STOP_FILE="$stop_file" \
+WEBCODEX_MCP_CONFORMANCE_URL_FILE="$url_file" \
+WEBCODEX_MCP_CONFORMANCE_STOP_FILE="$stop_file" \
   cargo test --locked -p webcodex --lib mcp_conformance_fixture_server -- --ignored --nocapture \
   >"$fixture_log" 2>&1 &
 fixture_pid=$!
 
 ready_deadline=$((SECONDS + 60))
 while [ ! -s "$url_file" ]; do
-  if ! fixture_group_alive; then
+  if ! fixture_alive; then
     echo "MCP conformance fixture exited before publishing its URL" >&2
     tail -80 "$fixture_log" >&2 || true
     exit 1
