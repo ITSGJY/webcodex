@@ -1,0 +1,672 @@
+{
+  "schema_version": 2,
+  "harness_commit": "7169291ec0b68eb370fddcd9947313ab0d5e4156",
+  "profiles": {
+    "2025-11-25": {
+      "classifications": [
+        {
+          "scenario": "completion-complete",
+          "check_id": "completion-complete",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "3fb31b87a162a1318b40f9d1ddee34b892156f5d42e865bb31a78e9cbb2fa5e3"
+        },
+        {
+          "scenario": "logging-set-level",
+          "check_id": "logging-set-level",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "2eea842958ca1c21934dbf7f31c526278313834d87d01c77b24d28e2ea1d7f17"
+        },
+        {
+          "scenario": "prompts-get-embedded-resource",
+          "check_id": "prompts-get-embedded-resource",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "69302e542bba424021834142e01875b229b97440c67eedbc4b671b87ed03640d"
+        },
+        {
+          "scenario": "prompts-get-simple",
+          "check_id": "prompts-get-simple",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "69302e542bba424021834142e01875b229b97440c67eedbc4b671b87ed03640d"
+        },
+        {
+          "scenario": "prompts-get-with-args",
+          "check_id": "prompts-get-with-args",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "69302e542bba424021834142e01875b229b97440c67eedbc4b671b87ed03640d"
+        },
+        {
+          "scenario": "prompts-get-with-image",
+          "check_id": "prompts-get-with-image",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "69302e542bba424021834142e01875b229b97440c67eedbc4b671b87ed03640d"
+        },
+        {
+          "scenario": "prompts-list",
+          "check_id": "prompts-list",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "500284cbe8b04997354d450cc6004d54c245c404c89baa1d45e8f657bda7ff6b"
+        },
+        {
+          "scenario": "resources-list",
+          "check_id": "resources-list",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "940374420a5847d2786704f3964d1f6a9b6f93d45d5caca7c867109789721091"
+        },
+        {
+          "scenario": "resources-subscribe",
+          "check_id": "resources-subscribe",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "6fa45e84678894951bba5b600f36e0eeb6fa9f4760bc4e54aa7aa4fd03caa465"
+        },
+        {
+          "scenario": "resources-unsubscribe",
+          "check_id": "resources-unsubscribe",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "6fa45e84678894951bba5b600f36e0eeb6fa9f4760bc4e54aa7aa4fd03caa465"
+        },
+        {
+          "scenario": "tools-call-with-logging",
+          "check_id": "tools-call-with-logging",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "2eea842958ca1c21934dbf7f31c526278313834d87d01c77b24d28e2ea1d7f17"
+        },
+        {
+          "scenario": "dns-rebinding-protection",
+          "check_id": "localhost-host-rebinding-rejected",
+          "classification": "genuine_protocol_failure",
+          "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
+          "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "55fef6d01afbb12e2235724cc78cef53e13ad7b61fb8b387d4b260c19ce74b89"
+        },
+        {
+          "scenario": "elicitation-sep1034-defaults",
+          "check_id": "elicitation-sep1034-general",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named elicitation reference tool that is absent from the product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "5ab028bbd3467c6dc5fd5c8bd1c19af5732391da6e7c6543737d21962039db54"
+        },
+        {
+          "scenario": "elicitation-sep1330-enums",
+          "check_id": "elicitation-sep1330-general",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named elicitation reference tool that is absent from the product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "6043343fce6e7d657c351276e50c1092274ab5679572e2cfbac15397db729633"
+        },
+        {
+          "scenario": "resources-read-binary",
+          "check_id": "resources-read-binary",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The legacy 2025-11-25 WebCodex surface does not advertise/implement the resources capability exercised by this scenario.",
+          "evidence": "MCP 2025-11-25 resources capability is optional; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "5ec605e03cf3cb3c48dae40d35358da3caffebcba8576ed4050cc206d0a12327"
+        },
+        {
+          "scenario": "resources-read-text",
+          "check_id": "resources-read-text",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The legacy 2025-11-25 WebCodex surface does not advertise/implement the resources capability exercised by this scenario.",
+          "evidence": "MCP 2025-11-25 resources capability is optional; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "5ec605e03cf3cb3c48dae40d35358da3caffebcba8576ed4050cc206d0a12327"
+        },
+        {
+          "scenario": "resources-templates-read",
+          "check_id": "resources-templates-read",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The legacy 2025-11-25 WebCodex surface does not advertise/implement the resources capability exercised by this scenario.",
+          "evidence": "MCP 2025-11-25 resources capability is optional; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "5ec605e03cf3cb3c48dae40d35358da3caffebcba8576ed4050cc206d0a12327"
+        },
+        {
+          "scenario": "tools-call-audio",
+          "check_id": "tools-call-audio",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "f52ab456f88f932ae8fbda66972454a1eb01e97650550de960ce5f78d251eafe"
+        },
+        {
+          "scenario": "tools-call-elicitation",
+          "check_id": "tools-call-elicitation",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "2e5b0ff0322968f3f71159940edc711a62a8570ff5b807d17060695f40b921e2"
+        },
+        {
+          "scenario": "tools-call-embedded-resource",
+          "check_id": "tools-call-embedded-resource",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "f176191f243db4cde3281c36d431c051330aaf8bed2317c4bfc271b0ab17c7c3"
+        },
+        {
+          "scenario": "tools-call-error",
+          "check_id": "tools-call-error",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "d8d28432df8232f95c5c7333cca717383761bb2b129649f67e146129d55d9c55"
+        },
+        {
+          "scenario": "tools-call-image",
+          "check_id": "tools-call-image",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "c0890e33c4952cdc08d213615d387110ea067aaf22584bae4d2e148a5600be1c"
+        },
+        {
+          "scenario": "tools-call-mixed-content",
+          "check_id": "tools-call-mixed-content",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "ff8a525bfad910a6a1f4e61cbcf35fbec589c12f2535ae97d5645d6caba447bf"
+        },
+        {
+          "scenario": "tools-call-sampling",
+          "check_id": "tools-call-sampling",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "aeb68fd319a9a0cbe7fbca2bdd0dbb45542d26dabeb0a3e69adb37fc577e958c"
+        },
+        {
+          "scenario": "tools-call-simple-text",
+          "check_id": "tools-call-simple-text",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "6f37fcae0bde7d34f8b91e1d59d0bf416c0a019609405abd666754a41be912d7"
+        },
+        {
+          "scenario": "tools-call-with-progress",
+          "check_id": "tools-call-with-progress",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "13c6bda80dd58f68b3634d402f12edc750b996f695b5e913db59da14a7acfaae"
+        }
+      ],
+      "expected_server_capabilities": {
+        "tools": {
+          "listChanged": false
+        }
+      }
+    },
+    "2026-07-28": {
+      "classifications": [
+        {
+          "scenario": "caching",
+          "check_id": "sep-2549-prompts-list-caching-hints",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The cacheable endpoint belongs to an optional capability that the current WebCodex surface does not implement.",
+          "evidence": "SEP-2549 applies when the corresponding optional endpoint exists; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "7af406127f9e0edb58db00d3c7a974c4a64e9dc2eb966779a6de918741a9f5f8"
+        },
+        {
+          "scenario": "caching",
+          "check_id": "sep-2549-resources-templates-list-caching-hints",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The cacheable endpoint belongs to an optional capability that the current WebCodex surface does not implement.",
+          "evidence": "SEP-2549 applies when the corresponding optional endpoint exists; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "e3fb42ce657d615df87789d7f92cc5b379ed29c676d48cd6f60f27515347ec75"
+        },
+        {
+          "scenario": "caching",
+          "check_id": "sep-2549-resources-read-caching-hints",
+          "classification": "missing_harness_fixture",
+          "reason": "resources/read caching could not be exercised because the fixture exposed no reference resource to read.",
+          "evidence": "SEP-2549 caching scenario result from first GitHub Actions conformance baseline raw report",
+          "expected_status": "SKIPPED",
+          "evidence_sha256": "e8e86cdaa5319e85265044f35b33d006da90dbab5ee709fd55269c6e9892d0d0"
+        },
+        {
+          "scenario": "completion-complete",
+          "check_id": "completion-complete",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "662966f5250ef4190d1d1dfa6f5b05348cf61d995e15b8a435240872b3273ae1"
+        },
+        {
+          "scenario": "prompts-get-embedded-resource",
+          "check_id": "prompts-get-embedded-resource",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "9b485366f340ecc7b0a03461e3949fac498d9d362fffbdde82d0fcc5f0a7b224"
+        },
+        {
+          "scenario": "prompts-get-simple",
+          "check_id": "prompts-get-simple",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "9b485366f340ecc7b0a03461e3949fac498d9d362fffbdde82d0fcc5f0a7b224"
+        },
+        {
+          "scenario": "prompts-get-with-args",
+          "check_id": "prompts-get-with-args",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "9b485366f340ecc7b0a03461e3949fac498d9d362fffbdde82d0fcc5f0a7b224"
+        },
+        {
+          "scenario": "prompts-get-with-image",
+          "check_id": "prompts-get-with-image",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "9b485366f340ecc7b0a03461e3949fac498d9d362fffbdde82d0fcc5f0a7b224"
+        },
+        {
+          "scenario": "prompts-list",
+          "check_id": "prompts-list",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This protocol capability is optional and is not advertised/implemented by the current WebCodex MCP surface.",
+          "evidence": "MCP server capability model plus first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "96a058e400b47135503f462d35b6865092c786aee626904bcfd88ffa4f51aa02"
+        },
+        {
+          "scenario": "dns-rebinding-protection",
+          "check_id": "localhost-host-rebinding-rejected",
+          "classification": "genuine_protocol_failure",
+          "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
+          "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "56f4a8d9b0ea3df7f9ad8f42edb3f6dc249c7f119daa83c9ca4da22bd8f86b16"
+        },
+        {
+          "scenario": "input-required-result-basic-elicitation",
+          "check_id": "sep-2322-elicitation-incomplete",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "8df152cebc4b7699b9222a681b6cb490cc5bc116f0666b05a01b7f07919a20d1"
+        },
+        {
+          "scenario": "input-required-result-basic-list-roots",
+          "check_id": "sep-2322-list-roots-incomplete",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "bcfe48b990672771a1512a70fa61adcc4fc71ce23ffa8d9a633af203db8309e5"
+        },
+        {
+          "scenario": "input-required-result-basic-sampling",
+          "check_id": "sep-2322-sampling-incomplete",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "469d38b05459eccad7e149170cbbd56e6f9d28c9d46d80f8ced6e2f317adf4fc"
+        },
+        {
+          "scenario": "input-required-result-capability-check",
+          "check_id": "sep-2322-respect-client-capabilities",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "dbf49040d276400f78f24ba726743e1cc7628dee7ddd6cd252a12dfcdb4b2632"
+        },
+        {
+          "scenario": "input-required-result-ignore-extra-params",
+          "check_id": "sep-2322-ignore-unexpected-params",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "WARNING",
+          "evidence_sha256": "de2c48d4f6018bc152772b53c9fb420f9cb6ba85cd0155c45e4daf348bf21d2e"
+        },
+        {
+          "scenario": "input-required-result-missing-input-response",
+          "check_id": "sep-2322-missing-response-rerequests",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "WARNING",
+          "evidence_sha256": "e6fd1be79feba098d507c9f3d21453d995503479cbcc91d09c33fbf331721e66"
+        },
+        {
+          "scenario": "input-required-result-multi-round",
+          "check_id": "sep-2322-multi-round-r1",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "3afcf29210ae83e39892a28ac859e41baac1ab6838e5ad869bd193f08cfd505b"
+        },
+        {
+          "scenario": "input-required-result-multiple-input-requests",
+          "check_id": "sep-2322-multiple-inputs-incomplete",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "c6775d26e7f2bcf767c6208b388b25716ffff91803b33ef8263aac4472e2ab29"
+        },
+        {
+          "scenario": "input-required-result-request-state",
+          "check_id": "sep-2322-request-state-incomplete",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "db44366f4b2663c8dd18a73b5d243e0201429acc0e80605a95ca278ddd92aa87"
+        },
+        {
+          "scenario": "input-required-result-result-type",
+          "check_id": "sep-2322-result-type-included",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "8df152cebc4b7699b9222a681b6cb490cc5bc116f0666b05a01b7f07919a20d1"
+        },
+        {
+          "scenario": "input-required-result-tampered-state",
+          "check_id": "sep-2322-reject-tampered-state",
+          "classification": "missing_harness_fixture",
+          "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
+          "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "ae62de054b2a479f9f52a8d06482d068dac60854ce75e4f0fb84580995a826d1"
+        },
+        {
+          "scenario": "input-required-result-non-tool-request",
+          "check_id": "sep-2322-non-tool-incomplete",
+          "classification": "optional_capability_not_implemented",
+          "reason": "This MRTR probe uses prompts/get, but the current WebCodex surface does not implement the optional prompts capability.",
+          "evidence": "SEP-2322 non-tool request scenario plus server capability model; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "19847c48286d6012d963b8274997698a9c1a9cdfb53fc7f9980729303d5c62bc"
+        },
+        {
+          "scenario": "resources-read-binary",
+          "check_id": "resources-read-binary",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario expects reference resource content/URIs that the product MCP surface does not provide.",
+          "evidence": "Pinned resource conformance fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "ccebe9670fc81aa853c549c9017baa7d88a371fd5d4625e1726b0a542aefec69"
+        },
+        {
+          "scenario": "resources-read-text",
+          "check_id": "resources-read-text",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario expects reference resource content/URIs that the product MCP surface does not provide.",
+          "evidence": "Pinned resource conformance fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "2b815566ba4173981dcb12f46ea1ab73bff3b373796d1d152107023e3efa15f7"
+        },
+        {
+          "scenario": "resources-templates-read",
+          "check_id": "resources-templates-read",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario expects reference resource content/URIs that the product MCP surface does not provide.",
+          "evidence": "Pinned resource conformance fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "ae122f912511f271c31f53fee8245c1dde3acfcff41c5db301341055cc9917e0"
+        },
+        {
+          "scenario": "sep-2164-resource-not-found",
+          "check_id": "sep-2164-data-uri",
+          "classification": "genuine_protocol_failure",
+          "reason": "The resource-not-found error omits the recommended data.uri echo.",
+          "evidence": "SEP-2164 resource-not-found error data; first GitHub Actions conformance baseline raw report",
+          "expected_status": "WARNING",
+          "evidence_sha256": "03e182c64ad2607c2749b90609cbf22dc87eda95ae0951f9c7a4c2f1227aabe0"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-http-server-no-independent-requests-on-stream",
+          "classification": "missing_harness_fixture",
+          "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
+          "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "7b694b9546c9ffc28b7018bb47ad1b35eb71982e0e07cf5d238a8b5b07f28f70"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-missing-capability-http-400",
+          "classification": "missing_harness_fixture",
+          "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
+          "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "00318fb6a220abec56b408ee72fa031253a43ec35e93d0247bd7f49f3f0ce1e3"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-server-no-log-without-loglevel",
+          "classification": "missing_harness_fixture",
+          "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
+          "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "5802de50b88da05f1deb16702e8a9fc63de9536f2ed3b5455691a6d31adf23d1"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-server-rejects-undeclared-capability",
+          "classification": "missing_harness_fixture",
+          "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
+          "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "54fb37a17716a6faa4e20eba8bbceb73fa4cf5b7c0ede03c4fc3c950642b6ad0"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-request-meta-invalid-missing-meta",
+          "classification": "genuine_protocol_failure",
+          "reason": "The request is rejected with WebCodex header-mismatch code -32020 instead of the required -32602 Invalid params.",
+          "evidence": "SEP-2575 request metadata validation; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "f72e87a4dcd615f71164cc3d3a94bc2e9a8db5fd4da6364c1379115262c62a15"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-request-meta-invalid-missing-protocol-version",
+          "classification": "genuine_protocol_failure",
+          "reason": "The request is rejected with WebCodex header-mismatch code -32020 instead of the required -32602 Invalid params.",
+          "evidence": "SEP-2575 request metadata validation; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "453717c56bda626408c987bb9e6c8dd5c2582e1523481557197a85f3169fc463"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-server-honors-notification-filter",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The referee marked this check not applicable because WebCodex did not advertise the related subscription/listChanged capability.",
+          "evidence": "SEP-2575 check details from first GitHub Actions conformance baseline raw report",
+          "expected_status": "SKIPPED",
+          "evidence_sha256": "3526c6b7099730a5aa95fcdb13c9a9256c97a831c6adf4a6fcea428948faedc1"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-server-sends-prompts-list-changed-on-subscription",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The referee marked this check not applicable because WebCodex did not advertise the related subscription/listChanged capability.",
+          "evidence": "SEP-2575 check details from first GitHub Actions conformance baseline raw report",
+          "expected_status": "SKIPPED",
+          "evidence_sha256": "bc64f7ce41051860e4ea6a058fa1fc33182b920635312562fa174807df371b2c"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-server-sends-subscription-ack",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The referee marked this check not applicable because WebCodex did not advertise the related subscription/listChanged capability.",
+          "evidence": "SEP-2575 check details from first GitHub Actions conformance baseline raw report",
+          "expected_status": "SKIPPED",
+          "evidence_sha256": "3526c6b7099730a5aa95fcdb13c9a9256c97a831c6adf4a6fcea428948faedc1"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-server-sends-tools-list-changed-on-subscription",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The referee marked this check not applicable because WebCodex did not advertise the related subscription/listChanged capability.",
+          "evidence": "SEP-2575 check details from first GitHub Actions conformance baseline raw report",
+          "expected_status": "SKIPPED",
+          "evidence_sha256": "9b3210383e2285dfff82e29bfce618a0124128dac675e6d498f11495e20af5f6"
+        },
+        {
+          "scenario": "server-stateless",
+          "check_id": "sep-2575-server-tags-subscription-id",
+          "classification": "optional_capability_not_implemented",
+          "reason": "The referee marked this check not applicable because WebCodex did not advertise the related subscription/listChanged capability.",
+          "evidence": "SEP-2575 check details from first GitHub Actions conformance baseline raw report",
+          "expected_status": "SKIPPED",
+          "evidence_sha256": "3526c6b7099730a5aa95fcdb13c9a9256c97a831c6adf4a6fcea428948faedc1"
+        },
+        {
+          "scenario": "tools-call-audio",
+          "check_id": "tools-call-audio",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "14101eaa646a4d704365cc1088cffb01fd1e9c022de157cd12ee830ef70e9432"
+        },
+        {
+          "scenario": "tools-call-embedded-resource",
+          "check_id": "tools-call-embedded-resource",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "3381f09b48c05f0a3a98644c1b0851a4aab608cb471d1fde932b44d351c2c283"
+        },
+        {
+          "scenario": "tools-call-error",
+          "check_id": "tools-call-error",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "ceda82cecaf90be4000fbb2601518a3f0fa3b6f960b6fe242a9cd050f350eda9"
+        },
+        {
+          "scenario": "tools-call-image",
+          "check_id": "tools-call-image",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "5da82959f8874a71170b8a9d221b37e0cd7a53ef978f27f2555fb1f6438848f8"
+        },
+        {
+          "scenario": "tools-call-mixed-content",
+          "check_id": "tools-call-mixed-content",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "99afc685f8f53a330164573619be79f552c87dfc138d1aa311187d75569b644a"
+        },
+        {
+          "scenario": "tools-call-simple-text",
+          "check_id": "tools-call-simple-text",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "d68ec286ab9f5950928708ded11dc1023f1a1e488c318c0ee2b57e9a93f764c5"
+        },
+        {
+          "scenario": "tools-call-with-progress",
+          "check_id": "tools-call-with-progress",
+          "classification": "missing_harness_fixture",
+          "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
+          "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
+          "expected_status": "FAILURE",
+          "evidence_sha256": "21f7c05843f8c02dfaebdb1a8f25b23b9ec413c1cccc100b3267f756d450c994"
+        }
+      ],
+      "expected_server_capabilities": {
+        "resources": {
+          "listChanged": false,
+          "subscribe": false
+        },
+        "tools": {
+          "listChanged": false
+        }
+      }
+    }
+  },
+  "supplemental_findings": [
+    {
+      "id": "2026-streamed-resource-cache-hints",
+      "classification": "genuine_protocol_failure",
+      "evidence": "src/mcp_tests/artifact_export.rs::http_mcp_artifact_export_resources_read_streams_valid_json_blob",
+      "summary": "The streamed artifact resources/read result currently omits ttlMs and cacheScope. This baseline records the finding but does not change production framing."
+    },
+    {
+      "id": "2026-completed-task-nested-result-type",
+      "classification": "genuine_protocol_failure",
+      "evidence": "src/mcp_tests/project_connector.rs::http_project_connector_2026_tasks_poll_durable_execution_across_reopen",
+      "summary": "A completed Connector Task currently embeds its original tool result without resultType. This baseline records the finding but does not change production framing."
+    }
+  ]
+}

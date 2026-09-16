@@ -198,6 +198,37 @@ jobs:
             explicit_resume_advanced_compatibility_schema_and_metadata_are_retained \
             http_project_connector_lists_and_dispatches_only_canonical_capabilities
 
+  mcp-conformance:
+    # Dated MCP wire evidence is independent from ordinary unit/integration tests.
+    # The script pins the external referee and rejects missing or silently skipped
+    # coverage; known failures require exact check-level classification.
+    needs: contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-ci
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check conformance report gate
+        run: python3 scripts/tests/test_mcp_conformance_report.py
+      - name: Run pinned MCP dated-revision baseline
+        run: bash scripts/mcp_conformance.sh
+      - name: Upload MCP conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-conformance-${{ github.sha }}
+          path: target/mcp-conformance/reports
+          if-no-files-found: ignore
+          retention-days: 7
+
   test-linux-rust:
     # Complete Linux Rust coverage is mandatory before merge, including owner PRs.
     # Start it immediately in parallel with contract/frontend work; the stable
@@ -760,7 +791,7 @@ jobs:
           require_lane desktop "$NEEDS_DESKTOP" "$DESKTOP_RESULT"
 
   test-native:
-    needs: [contract, changes, test-docker-server, test-macos, test-windows]
+    needs: [contract, changes, mcp-conformance, test-docker-server, test-macos, test-windows]
     # Stable branch-protection context: daily native aggregates and the path-aware
     # Server image smoke must resolve according to classifier policy.
     if: always()
@@ -772,13 +803,14 @@ jobs:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           NEEDS_DOCKER: ${{ needs.changes.outputs.needs_docker }}
+          MCP_CONFORMANCE_RESULT: ${{ needs.mcp-conformance.result }}
           DOCKER_RESULT: ${{ needs.test-docker-server.result }}
           MACOS_RESULT: ${{ needs.test-macos.result }}
           WINDOWS_RESULT: ${{ needs.test-windows.result }}
         run: |
           set -euo pipefail
-          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT docker=$DOCKER_RESULT macos=$MACOS_RESULT windows=$WINDOWS_RESULT needs_docker=$NEEDS_DOCKER"
-          if [ "$CHANGES_RESULT" != success ] || [ "$CONTRACT_RESULT" != success ]; then
+          echo "changes=$CHANGES_RESULT contract=$CONTRACT_RESULT mcp_conformance=$MCP_CONFORMANCE_RESULT docker=$DOCKER_RESULT macos=$MACOS_RESULT windows=$WINDOWS_RESULT needs_docker=$NEEDS_DOCKER"
+          if [ "$CHANGES_RESULT" != success ] || [ "$CONTRACT_RESULT" != success ] || [ "$MCP_CONFORMANCE_RESULT" != success ]; then
             echo "CI policy or contract classification did not succeed" >&2
             exit 1
           fi
