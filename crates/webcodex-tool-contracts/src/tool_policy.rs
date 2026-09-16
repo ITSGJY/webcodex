@@ -10,8 +10,8 @@ use super::tool_definition::{
     ToolExecutionContract, ToolExecutionForm, ToolExplorationEvidence, ToolGptActionExposure,
     ToolOperatorExtensionFamily, ToolReviewEvidence, ToolSessionEvidencePolicy,
     ToolValidationIdentityKind, PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE,
-    PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
-    TOOL_CATEGORY_JOB,
+    PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION,
+    PERMISSION_RISK_WRITE, TOOL_CATEGORY_JOB,
 };
 
 impl ToolDefinition {
