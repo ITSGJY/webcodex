@@ -393,6 +393,8 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 如果启用 ChatGPT MCP host-file import，请把精确的 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`。重新创建 client 会生成新 id，因此应把更新这个设置作为一次显式 trust rotation。Client display name 与 redirect URI 不能替代该精确 client id。
 
+对于绑定到 loopback、并通过 OpenAI Secure Tunnel 以本机注入 user API token 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，可在该路径上信任 ChatGPT host-file rewrite。非 loopback bind 或非 user API credential 会忽略该 flag；network-accessible Server 应保持未设置。
+
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
 撤销 client。OAuth 使用 authorization-code 流程；动态 client 注册、OIDC 与
 device-code 流程未实现。宿主提供 `offline_access` 时保持勾选——它是协议级

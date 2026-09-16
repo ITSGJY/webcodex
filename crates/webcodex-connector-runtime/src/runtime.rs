@@ -749,54 +749,63 @@ impl ConnectorRuntime {
             }
         }
 
-        let task_id = format!("wc_task_{}", uuid::Uuid::new_v4().simple());
-        let run_id = format!("wc_run_{}", uuid::Uuid::new_v4().simple());
-        let non_writable = mode != "normal";
-        let prepared = match self
-            .prepare_connector_workspace(&task_id, &run_id, non_writable, auth)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(outcome) => return outcome,
-        };
-        let new_task = NewConnectorTask {
-            task_id: &task_id,
-            run_id: &run_id,
-            project_id: &self.context.project_id,
-            workspace_id: &self.context.workspace_id,
-            subject_id,
-            goal,
-            mode,
-            target_executor_ref: &self.context.executor_project,
-            execution_executor_ref: &prepared.execution_executor_ref,
-            target_root: &self.context.executor_root,
-            execution_root: &prepared.execution_root,
-            baseline_commit: prepared.baseline_commit.as_deref(),
-            baseline_tree: prepared.baseline_tree.as_deref(),
-            isolated: prepared.isolated,
-            now,
-        };
-        let stored = match window {
-            Some(window) => {
-                let window = window.clone();
-                self.db.start_connector_task_and_bind(
-                    new_task,
-                    connector_window_binding(&window, &fingerprint, now),
-                )
-            }
-            None => self.db.start_connector_task(new_task),
-        };
-        let task = match stored {
-            Ok(task) => task,
-            Err(error) => {
-                if let Some(cleanup) = self
-                    .workspace
-                    .discard_prepared(&self.context.executor_root, &prepared)
-                {
-                    tracing::warn!(cleanup = %cleanup, "failed to fully clean unpersisted workspace");
+        let mut allocation_attempt = 0;
+        let (task, prepared) = loop {
+            let task_id = format!("wc_task_{}", webcodex_core::compact::random_suffix::<12>());
+            let run_id = format!("wc_run_{}", webcodex_core::compact::random_suffix::<12>());
+            let non_writable = mode != "normal";
+            let prepared = match self
+                .prepare_connector_workspace(&task_id, &run_id, non_writable, auth)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(outcome) => return outcome,
+            };
+            let new_task = NewConnectorTask {
+                task_id: &task_id,
+                run_id: &run_id,
+                project_id: &self.context.project_id,
+                workspace_id: &self.context.workspace_id,
+                subject_id,
+                goal,
+                mode,
+                target_executor_ref: &self.context.executor_project,
+                execution_executor_ref: &prepared.execution_executor_ref,
+                target_root: &self.context.executor_root,
+                execution_root: &prepared.execution_root,
+                baseline_commit: prepared.baseline_commit.as_deref(),
+                baseline_tree: prepared.baseline_tree.as_deref(),
+                isolated: prepared.isolated,
+                now,
+            };
+            let stored = match window {
+                Some(window) => {
+                    let window = window.clone();
+                    self.db.start_connector_task_and_bind(
+                        new_task,
+                        connector_window_binding(&window, &fingerprint, now),
+                    )
                 }
-                return store_error_outcome(error, None);
-            }
+                None => self.db.start_connector_task(new_task),
+            };
+            let task = match stored {
+                Ok(task) => task,
+                Err(error) => {
+                    if let Some(cleanup) = self
+                        .workspace
+                        .discard_prepared(&self.context.executor_root, &prepared)
+                    {
+                        tracing::warn!(cleanup = %cleanup, "failed to fully clean unpersisted workspace");
+                        return store_error_outcome(error, None);
+                    }
+                    if error.is_generated_identity_collision() && allocation_attempt < 15 {
+                        allocation_attempt += 1;
+                        continue;
+                    }
+                    return store_error_outcome(error, None);
+                }
+            };
+            break (task, prepared);
         };
         let navigation = window.map(|window| {
             self.db

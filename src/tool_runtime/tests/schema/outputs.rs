@@ -7,7 +7,7 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
     let validate = |value: &Value| {
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &schema)
     };
-    let application_id = "application_0123456789abcdef0123456789abcdef";
+    let application_id = "application_iavN7wEjRWeJq83v";
     for platform in ["windows", "macos"] {
         let output =
             serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({

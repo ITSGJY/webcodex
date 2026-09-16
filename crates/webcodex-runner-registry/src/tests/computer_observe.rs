@@ -222,7 +222,7 @@ async fn computer_snapshot_display_preserves_large_native_image_response_stdout(
         .await
         .unwrap();
 
-    let payload = r#"{"display_id":"display_0123456789abcdef0123456789abcdef","max_width":null,"max_height":null}"#;
+    let payload = r#"{"display_id":"display_iavN7wEjRWeJq83v","max_width":null,"max_height":null}"#;
     let (request_id, response_rx) = registry
         .enqueue_computer(
             "computer-display-large".to_string(),

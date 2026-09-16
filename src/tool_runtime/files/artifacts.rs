@@ -198,6 +198,17 @@ fn artifact_policy_rejected_result(path: &str, message: String) -> ToolResult {
     )
 }
 
+fn artifact_snapshot_changed_result(path: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        "artifact snapshot changed",
+        json!({
+            "path": path,
+            "error_kind": "snapshot_changed",
+            "state_changed": false,
+        }),
+    )
+}
+
 fn validate_artifact_upload_id(upload_id: &str) -> Result<(), String> {
     if !upload_id.starts_with("wc_upload_") {
         return Err("upload_id must start with wc_upload_".to_string());
@@ -651,6 +662,8 @@ impl ToolRuntime {
         encoding: Option<String>,
         offset: Option<usize>,
         length: Option<usize>,
+        expected_sha256: Option<String>,
+        session_id: Option<String>,
         as_image: Option<bool>,
     ) -> ToolResult {
         if let Err(e) = validate_artifact_file_path(&path) {
@@ -659,6 +672,17 @@ impl ToolRuntime {
         let encoding = encoding.unwrap_or_else(|| "base64".to_string());
         if encoding != "base64" {
             return ToolResult::err("unsupported encoding; only 'base64' is currently supported");
+        }
+        if let Some(expected_sha256) = expected_sha256.as_deref() {
+            if !is_hex_sha256(expected_sha256) {
+                return ToolResult::err_with_output(
+                    "expected_sha256 must be a lowercase 64-char hex sha256 digest",
+                    json!({
+                        "path": path,
+                        "error_kind": "invalid_expected_sha256",
+                    }),
+                );
+            }
         }
         let as_image = as_image.unwrap_or(false);
         if as_image && (offset.is_some() || length.is_some()) {
@@ -681,10 +705,12 @@ impl ToolRuntime {
                 MAX_READ_PROJECT_ARTIFACT_LENGTH
             ));
         }
-        let proj = match self.resolve_project(&project).await {
-            Ok(p) => p,
-            Err(e) => return ToolResult::err(e),
+        let resolved = match self.resolve_project_input(&project).await {
+            Ok(resolved) => resolved,
+            Err(error) => return ToolResult::err(error),
         };
+        let resolved_project = resolved.resolved_id.clone();
+        let proj = resolved.config;
         let client_id = proj.client_id.clone();
         let mut payload = json!({
             "path": path.clone(),
@@ -696,10 +722,13 @@ impl ToolRuntime {
                 MAX_PROJECT_ARTIFACT_BYTES
             },
         });
+        if let Some(expected_sha256) = expected_sha256.as_deref() {
+            payload["expected_sha256"] = json!(expected_sha256);
+        }
         if as_image {
             payload["mcp_image"] = json!(true);
         }
-        let obj = match self
+        let mut obj = match self
             .run_runner_json_file_op(
                 client_id,
                 proj.path.clone(),
@@ -713,6 +742,9 @@ impl ToolRuntime {
             Ok(v) => v,
             Err(e) => return ToolResult::err(e),
         };
+        if obj.get("error_kind").and_then(Value::as_str) == Some("snapshot_changed") {
+            return artifact_snapshot_changed_result(&path);
+        }
         if let Some(err) = obj
             .get("error")
             .and_then(|e| e.as_str())
@@ -724,6 +756,11 @@ impl ToolRuntime {
                 error: Some(err),
             };
         }
+        if let Some(expected_sha256) = expected_sha256.as_deref() {
+            if obj.get("sha256").and_then(Value::as_str) != Some(expected_sha256) {
+                return artifact_snapshot_changed_result(&path);
+            }
+        }
         if as_image {
             if let Err(error) = validate_mcp_image_artifact_output(&obj) {
                 return ToolResult::err_with_output(
@@ -733,6 +770,47 @@ impl ToolRuntime {
                         "error_kind": "invalid_mcp_image_artifact",
                     }),
                 );
+            }
+            return ToolResult::ok(obj);
+        }
+        let observed_sha256 = obj.get("sha256").and_then(Value::as_str);
+        let observed_offset = obj.get("offset").and_then(Value::as_u64);
+        let bytes_returned = obj.get("bytes_returned").and_then(Value::as_u64);
+        let next_offset = obj.get("next_offset").and_then(Value::as_u64);
+        let file_bytes = obj.get("file_bytes").and_then(Value::as_u64);
+        let truncated = obj.get("truncated").and_then(Value::as_bool) == Some(true);
+        let eof = obj.get("eof").and_then(Value::as_bool);
+        let returned_path_matches = obj.get("path").and_then(Value::as_str) == Some(path.as_str());
+        let forward_progress = match (observed_offset, bytes_returned, next_offset, file_bytes) {
+            (Some(observed_offset), Some(bytes_returned), Some(next_offset), Some(file_bytes)) => {
+                returned_path_matches
+                    && eof == Some(false)
+                    && observed_offset == offset as u64
+                    && bytes_returned > 0
+                    && bytes_returned <= length as u64
+                    && observed_offset.checked_add(bytes_returned) == Some(next_offset)
+                    && next_offset > observed_offset
+                    && next_offset < file_bytes
+            }
+            _ => false,
+        };
+        if truncated && forward_progress {
+            if let (Some(observed_sha256), Some(next_offset)) = (observed_sha256, next_offset) {
+                if is_hex_sha256(observed_sha256) {
+                    let mut arguments = json!({
+                        "project": resolved_project,
+                        "path": path,
+                        "encoding": "base64",
+                        "offset": next_offset,
+                        "length": length,
+                        "expected_sha256": observed_sha256,
+                    });
+                    if let Some(session_id) = session_id.as_deref() {
+                        arguments["session_id"] = json!(session_id);
+                    }
+                    obj["suggested_call"] =
+                        SuggestedToolCall::new("read_project_artifact", arguments).to_value();
+                }
             }
         }
         ToolResult::ok(obj)

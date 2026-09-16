@@ -401,7 +401,15 @@ fn git_log_and_directory_listing_expose_parser_ready_next_pages() {
     assert!(git_log["next_skip"]["description"]
         .as_str()
         .unwrap()
-        .contains("Exact skip value"));
+        .contains("Domain metadata"));
+    let continuation = &git_log["suggested_call"]["properties"]["arguments"];
+    assert!(continuation["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "head_commit"));
+    assert_eq!(continuation["properties"]["head_commit"]["minLength"], 40);
+    assert_eq!(continuation["properties"]["head_commit"]["maxLength"], 40);
 
     let files = &spec_named(&specs, "list_project_files").output_schema["properties"]["output"]
         ["properties"];
@@ -678,7 +686,7 @@ fn read_continuation_output_schemas_accept_one_action_and_snapshot_truth() {
                 "read_revision": 3817291045227_u64, "start_line": 1, "limit": 100, "total_lines": 200,
                 "returned_lines": 50, "end_line": 50, "has_more": true, "budget_truncated": true}}],
         "output_truncated": true, "truncation_reason": "batch_response_budget",
-        "suggested_call": {"tool": "read_files", "arguments": {"project": "agent:oe:demo", "session_id": "wc_sess_demo",
+        "suggested_call": {"tool": "read_files", "arguments": {"project": "agent:oe:demo", "session_id": "wc_sess_abcdefghijklmnop",
             "items": [{"path": "src/0.rs", "start_line": 51, "limit": 50, "expected_read_revision": 3817291045227_u64}, {"path": "src/1.rs"}, {"path": "src/2.rs", "start_line": 4, "limit": 20}]}}
     }});
     test_support::validate_schema_instance(&result, &schema).unwrap();
@@ -1542,12 +1550,41 @@ fn key_tool_output_schemas_include_expected_fields() {
         "next_offset",
         "truncated",
         "eof",
+        "suggested_call",
     ] {
         assert!(
             has_output_field("read_project_artifact", field),
             "read_project_artifact missing {field}"
         );
     }
+    let artifact_specs = registered_tool_specs();
+    let artifact_next = &spec_named(&artifact_specs, "read_project_artifact").output_schema
+        ["properties"]["output"]["properties"]["suggested_call"]["properties"]["arguments"];
+    assert_eq!(
+        artifact_next["required"],
+        json!([
+            "project",
+            "path",
+            "encoding",
+            "offset",
+            "length",
+            "expected_sha256"
+        ])
+    );
+    assert_eq!(artifact_next["properties"]["encoding"]["const"], "base64");
+    assert_eq!(
+        artifact_next["properties"]["expected_sha256"]["minLength"],
+        64
+    );
+    assert_eq!(
+        artifact_next["properties"]["expected_sha256"]["maxLength"],
+        64
+    );
+    assert_eq!(
+        artifact_next["properties"]["expected_sha256"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+
     let upload_progress_fields = [
         "path",
         "upload_id",
@@ -2560,10 +2597,10 @@ fn assert_outcome_model_schema_fields(output_props: &serde_json::Map<String, Val
 #[test]
 fn agent_wait_model_schema_separates_matches_from_durable_bookkeeping() {
     let specs = registered_tool_specs();
-    let wait_id = format!("wc_agent_wait_{}", "1".repeat(32));
+    let wait_id = "wc_agent_wait_ERERERERERERERER".to_string();
     let matched = serde_json::json!({
-        "task_id": format!("wc_agent_task_{}", "2".repeat(32)),
-        "task_attempt_id": format!("wc_agent_task_attempt_{}", "3".repeat(32)),
+        "task_id": "wc_agent_task_IiIiIiIiIiIiIiIi".to_string(),
+        "task_attempt_id": "wc_agent_task_attempt_MzMzMzMzMzMzMzMz".to_string(),
         "terminal_task_state": "succeeded"
     });
     for tool in [

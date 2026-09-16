@@ -165,12 +165,12 @@ pub fn get_session_assignment_input_schema() -> Value {
         "properties": {
             "session_id": {
                 "type": "string",
-                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
                 "description": "Required coordinator/business Workflow Session containing the exact todo."
             },
             "message_id": {
                 "type": "string",
-                "pattern": "^wc_msg_[A-Za-z0-9_]+$",
+                "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
                 "description": "Required exact open todo id. No implicit or recent-message inference is used."
             }
         },
@@ -185,7 +185,7 @@ pub fn observe_session_messages_input_schema() -> Value {
         "properties": {
             "session_id": {
                 "type": "string",
-                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
                 "description": "Required explicit Workflow Session whose message-state delta is observed."
             },
             "after_observation_token": {
@@ -258,9 +258,9 @@ pub fn complete_session_message_input_schema() -> Value {
             },
             "expected_assignment_fence": {
                 "type": "string",
-                "minLength": 48,
-                "maxLength": 48,
-                "pattern": "^wsa1_[A-Za-z0-9_-]{43}$",
+                "minLength": 27,
+                "maxLength": 27,
+                "pattern": "^wsa2_[A-Za-z0-9_-]{22}$",
                 "description": "Required semantic snapshot fence returned by get_session_assignment for this exact Session/todo. Pass it unchanged; assignment-local semantic changes fail closed before completion."
             },
             "tags": {
@@ -313,7 +313,7 @@ pub fn update_session_context_input_schema() -> Value {
             },
             "session_id": {
                 "type": "string",
-                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
                 "description": "Required explicit active, project-scoped Workflow Session id. Unknown ids fail without creating a Session."
             },
             "execution_context": session_execution_context_schema(
@@ -363,7 +363,7 @@ pub fn work_result_input_schema() -> Value {
             },
             "session_id": {
                 "type": "string",
-                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
                 "description": "Required exact project-scoped Workflow Session id. Identity is never inferred from current/recent Session, Window, transport, or credential context."
             }
         },

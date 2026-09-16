@@ -484,8 +484,8 @@ impl PluginManager {
             }
         }
         let catalog_revision = format!(
-            "{PLUGIN_PROJECT_CATALOG_REVISION_PREFIX}{:x}",
-            hasher.finalize()
+            "{PLUGIN_PROJECT_CATALOG_REVISION_PREFIX}{}",
+            webcodex_core::compact::encode(hasher.finalize())
         );
         bounded_project_catalog(catalog_revision, entries)
     }

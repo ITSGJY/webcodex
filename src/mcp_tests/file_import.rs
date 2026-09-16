@@ -688,6 +688,38 @@ fn mcp_file_import_trust_decision_reports_exact_failure_stage() {
     let not_oauth = mcp_host_file_import_trust_decision_from_state(&config, &db, Some(&api_auth));
     assert_eq!(not_oauth.reason, HostFileImportTrustReason::NotOAuthToken);
 
+    let mut loopback_api_token_config = (*test_config(Some("secret"))).clone();
+    loopback_api_token_config
+        .oauth2
+        .trust_loopback_api_token_mcp_file_import = true;
+    let mut user_api_auth = crate::auth::AuthContext::new(crate::auth::AuthKind::ApiToken);
+    user_api_auth.token_kind = Some("user".to_string());
+    let trusted_loopback = mcp_host_file_import_trust_decision_from_state(
+        &loopback_api_token_config,
+        &db,
+        Some(&user_api_auth),
+    );
+    assert_eq!(
+        trusted_loopback.reason,
+        HostFileImportTrustReason::TrustedLoopbackApiToken
+    );
+    assert_eq!(
+        trusted_loopback.trust,
+        HostFileImportTrust::TrustedMcpHostFile
+    );
+
+    loopback_api_token_config.addr = "0.0.0.0:8080".to_string();
+    let non_loopback = mcp_host_file_import_trust_decision_from_state(
+        &loopback_api_token_config,
+        &db,
+        Some(&user_api_auth),
+    );
+    assert_eq!(
+        non_loopback.reason,
+        HostFileImportTrustReason::LoopbackApiTokenTrustRequiresLoopback
+    );
+    assert_eq!(non_loopback.trust, HostFileImportTrust::Untrusted);
+
     let mut missing_id = mcp_import_oauth_auth(&client.client_id);
     missing_id.allowed_client_id = None;
     assert_eq!(
@@ -907,6 +939,87 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
     let serialized = serde_json::to_string(&body).unwrap();
     assert!(!serialized.contains(temporary_url));
     assert!(!serialized.contains("file_stateless_host_rewritten"));
+}
+
+#[test]
+fn loopback_api_token_mcp_file_import_saves_pptx_when_explicitly_enabled() {
+    run_mcp_import_in_large_stack_test_thread(
+        loopback_api_token_mcp_file_import_saves_pptx_when_explicitly_enabled_impl,
+    );
+}
+
+async fn loopback_api_token_mcp_file_import_saves_pptx_when_explicitly_enabled_impl() {
+    use sha2::{Digest, Sha256};
+
+    let _lock = lock_mcp_import_test().await;
+    let pptx = b"trusted-loopback-api-token-pptx".to_vec();
+    let expected_sha256 = format!("{:x}", Sha256::digest(&pptx));
+    let server = start_mcp_import_mock_server(mcp_import_http_response(
+        "200 OK",
+        &[("Content-Length", pptx.len().to_string())],
+        &pptx,
+    ))
+    .await;
+    let _network = McpImportNetworkOverride::set(server.base_url.clone());
+
+    let (_db_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_mcp_import_pat(&db, &user);
+    let project_tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_import_runtime(project_tmp.path(), Some("alice")).await;
+    let mut config = (*test_config(Some("secret"))).clone();
+    config.oauth2.trust_loopback_api_token_mcp_file_import = true;
+    let service = Service::new(build_test_router(Arc::new(config), db, runtime));
+    let agent = tokio::spawn(complete_mcp_import_save(registry, pptx.clone()));
+    let temporary_url = "https://download.example/temporary-secret-token/loopback-import.pptx";
+
+    let (status, body, _) = oauth_mcp_request(
+        &service,
+        &token,
+        "tools/call",
+        json!({
+            "name": "import_conversation_files_to_project",
+            "arguments": {
+                "project": "agent:importer:demo",
+                "openaiFileIdRefs": [{
+                    "download_url": temporary_url,
+                    "file_id": "file_loopback_host_rewritten",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "file_name": "source.pptx"
+                }],
+                "output_dir": "paper/export",
+                "targets": ["loopback-import.pptx"],
+                "overwrite": false
+            }
+        }),
+    )
+    .await;
+
+    let decision = take_last_mcp_host_file_import_trust_decision()
+        .expect("MCP import must evaluate host-file trust");
+    assert_eq!(
+        decision.reason,
+        HostFileImportTrustReason::TrustedLoopbackApiToken
+    );
+    assert_eq!(decision.trust, HostFileImportTrust::TrustedMcpHostFile);
+    tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+        .await
+        .expect("save_project_artifact fixture timed out")
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["result"]["isError"], false, "body: {body:?}");
+    let imported = &body["result"]["structuredContent"]["output"]["imported"][0];
+    assert_eq!(imported["path"], "paper/export/loopback-import.pptx");
+    assert_eq!(imported["bytes_written"], pptx.len());
+    assert_eq!(imported["sha256"], expected_sha256);
+    assert_eq!(
+        crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
+        1
+    );
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains(temporary_url));
+    assert!(!serialized.contains("file_loopback_host_rewritten"));
 }
 
 #[test]
@@ -1141,7 +1254,7 @@ async fn mcp_file_import_untrusted_callers_fail_before_dns_impl() {
     assert_eq!(status, StatusCode::OK, "body: {body:?}");
     assert_eq!(body["result"]["isError"], true);
     let serialized = serde_json::to_string(&body).unwrap();
-    assert!(serialized.contains("explicitly trusted OAuth MCP host-file rewrite"));
+    assert!(serialized.contains("explicitly trusted MCP host-file rewrite"));
     assert!(!serialized.contains(temporary_url));
     assert_eq!(
         crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
@@ -1155,7 +1268,7 @@ async fn mcp_file_import_untrusted_callers_fail_before_dns_impl() {
     assert_eq!(body["result"]["isError"], true);
     assert!(serde_json::to_string(&body)
         .unwrap()
-        .contains("explicitly trusted OAuth MCP host-file rewrite"));
+        .contains("explicitly trusted MCP host-file rewrite"));
     assert_eq!(
         crate::tool_runtime::conversation_import::import_test_dns_resolution_count(),
         0,

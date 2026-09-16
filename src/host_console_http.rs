@@ -3,7 +3,8 @@ use crate::connector_runtime::http::{render, runtime};
 use crate::connector_runtime::workspace::LocalResultDecision;
 use crate::connector_runtime::{
     approval_projection, result_projection, store_error_outcome, validate_opaque_id,
-    ConnectorCallOutcome, ConnectorRuntime, TaskCancelInput, TaskReviewInput,
+    validate_result_id, validate_task_id, ConnectorCallOutcome, ConnectorRuntime, TaskCancelInput,
+    TaskReviewInput,
 };
 use salvo::prelude::*;
 use serde::Deserialize;
@@ -187,7 +188,7 @@ async fn workflow_sessions(req: &mut Request, depot: &mut Depot, res: &mut Respo
 async fn workflow_session(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let (runtime, _) = prepare!(req, depot, res);
     let input = parse!(WorkflowSessionInput, req, res);
-    if validate_opaque_id(&input.session_id, "wc_sess_", "session_id").is_err() {
+    if !webcodex_core::workflow_session_contract::is_valid_session_id(&input.session_id) {
         return invalid(res, "invalid workflow session input");
     }
     match runtime.workflow_session_console_detail(&input.session_id, input.limit) {
@@ -207,9 +208,7 @@ async fn workflow_session(req: &mut Request, depot: &mut Depot, res: &mut Respon
 async fn task_review(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let (runtime, auth) = prepare!(req, depot, res);
     let input = parse!(TaskReviewInput, req, res);
-    if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err()
-        || input.max_events.is_some()
-    {
+    if validate_task_id(&input.task_id).is_err() || input.max_events.is_some() {
         return invalid(res, "invalid review input");
     }
     render(res, runtime.host_review(&auth, input).await);
@@ -284,7 +283,7 @@ async fn approval_decide(req: &mut Request, depot: &mut Depot, res: &mut Respons
         .as_deref()
         .map(str::trim)
         .filter(|reason| !reason.is_empty());
-    if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err()
+    if validate_task_id(&input.task_id).is_err()
         || validate_opaque_id(&input.approval_id, "wc_apr_", "approval_id").is_err()
         || reason.is_some_and(|reason| reason.len() > 500)
     {
@@ -312,10 +311,7 @@ async fn task_guide(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let (runtime, _) = prepare!(req, depot, res);
     let input = parse!(GuideInput, req, res);
     let message = input.message.trim();
-    if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err()
-        || message.is_empty()
-        || message.len() > 2000
-    {
+    if validate_task_id(&input.task_id).is_err() || message.is_empty() || message.len() > 2000 {
         return invalid(res, "guidance message must be 1..=2000 bytes");
     }
     render(res, runtime.host_guide(&input.task_id, message));
@@ -325,7 +321,7 @@ async fn task_guide(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 async fn task_cancel(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let (runtime, auth) = prepare!(req, depot, res);
     let input = parse!(TaskCancelInput, req, res);
-    if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err() {
+    if validate_task_id(&input.task_id).is_err() {
         return invalid(res, "invalid cancel input");
     }
     render(res, runtime.host_cancel(&auth, input).await);
@@ -337,13 +333,13 @@ async fn decide(req: &mut Request, depot: &Depot, res: &mut Response, accept: bo
     let result_valid = input
         .result_id
         .as_deref()
-        .is_none_or(|id| validate_opaque_id(id, "wc_result_", "result_id").is_ok());
+        .is_none_or(|id| validate_result_id(id).is_ok());
     let reason = input
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|reason| !reason.is_empty());
-    if validate_opaque_id(&input.task_id, "wc_task_", "task_id").is_err()
+    if validate_task_id(&input.task_id).is_err()
         || !result_valid
         || (accept && input.result_id.is_none())
         || reason.is_some_and(|reason| reason.len() > 500)
@@ -666,10 +662,7 @@ mod tests {
             );
         }
 
-        for session_id in [
-            &hidden.session_id,
-            "wc_sess_unknown000000000000000000000000",
-        ] {
+        for session_id in [&hidden.session_id, "wc_sess_ffffffffffffffff"] {
             let mut response = TestClient::post("http://127.0.0.1/console/workflow-session")
                 .add_header("host", "127.0.0.1", true)
                 .add_header("origin", "http://127.0.0.1", true)
@@ -746,7 +739,7 @@ mod tests {
         let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
         let auth = crate::connector_runtime::tests::auth("u1");
         let service = service(fixture.runtime.clone(), auth);
-        let task_id = "wc_task_0123456789abcdef0123456789abcdef";
+        let task_id = "wc_task_iavN7wEjRWeJq83v";
         let cases = [
             // An oversized reason never reaches the decision.
             (

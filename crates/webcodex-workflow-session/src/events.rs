@@ -891,7 +891,7 @@ pub fn sanitize_persistent_shell_event_evidence(
             && value.len() <= 96
             && value
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     });
     evidence.shell_state = evidence.shell_state.and_then(sanitize_shell_evidence_atom);
     evidence.execution_state = evidence
@@ -1396,6 +1396,23 @@ pub(super) fn persisted_cargo_test_zero_tests_run(
 #[cfg(test)]
 mod result_expectation_tests {
     use super::*;
+
+    #[test]
+    fn persistent_shell_evidence_accepts_compact_base64url_shell_id() {
+        let shell_id = "wc_shell_AAAAAAAA-AAAAAA_";
+        let evidence = persistent_shell_event_evidence_for_tool_result(
+            "session_shell_exec",
+            &json!({
+                "shell_id": shell_id,
+                "shell_state": "running",
+                "execution_state": "completed",
+                "command_started": true,
+                "command_completed": true
+            }),
+        )
+        .expect("session shell evidence");
+        assert_eq!(evidence.shell_id.as_deref(), Some(shell_id));
+    }
 
     #[test]
     fn result_expectation_session_shell_exec_reuses_shared_contract_without_exit_code_list() {

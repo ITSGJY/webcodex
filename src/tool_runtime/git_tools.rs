@@ -56,10 +56,14 @@ impl ToolRuntime {
             }
             ToolCall::GitLog {
                 project,
+                head_commit,
                 limit,
                 skip,
-                session_id: _,
-            } => self.git_log(project, limit, skip).await,
+                session_id,
+            } => {
+                self.git_log(project, head_commit, limit, skip, session_id)
+                    .await
+            }
             ToolCall::GitReviewSummary {
                 project,
                 base_commit,

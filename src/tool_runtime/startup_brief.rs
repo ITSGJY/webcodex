@@ -53,24 +53,24 @@ pub(crate) use webcodex_core::runtime_contract::{
 /// Stable model-facing coding/review semantics owned by WebCodex itself.
 ///
 /// This is intentionally not a project instruction source and is never stored
-/// as Session mode, capability, permission, or execution authority. Task text
-/// may name one of these roles; the projection only gives that phrase a stable
-/// meaning for the model conducting the pass.
+/// as Session mode, capability, permission, or execution authority. Ordinary
+/// implementation uses the default guidance; task text may explicitly request
+/// the independent review role, whose name only selects review behavior.
 pub(crate) fn builtin_coding_workflow_projection() -> Value {
     json!({
         "contract": BUILTIN_CODING_WORKFLOW_CONTRACT,
         "version": BUILTIN_CODING_WORKFLOW_VERSION,
         "authority": "model_guidance_only",
-        "role_selection": "Default guidance always applies; named roles only when requested. Neither grants authority.",
+        "role_selection": "Ordinary implementation uses default guidance. Use independent_review only for an explicit independent review pass. Roles never grant authority.",
         "guidance": [
-            "Follow host safety, user/project scope and rules; complete authorized work; ask only for missing requirements/authority; guidance grants no authority.",
-            "Verify Project/branch/HEAD/changes; read nested rules for changed paths; recover truncated instructions.",
-            "Preserve unrelated work. Push/publish/deploy/restart require explicit action and target.",
-            "Choose the simplest reliable primitive preserving correctness, authority, evidence, durability, recovery, and portability. Native commands are first-class for bounded work; specialize for added semantics.",
-            "Choose mutation by shape: apply_text_edits for local exact edits; whole-file writes; contextual patches; bounded deterministic Python/run_shell transforms. Respect path/permission/network authority.",
-            "Long validation + read-only inspection: short sync_wait_secs for same-execution Job handoff; avoid validation fanout. Mutation stales prior results; final source needs fresh validation.",
-            "For unknown outcome, inspect before retry. Always inspect the resulting diff and validate final source. Prefer cargo_fmt(check=false) instead of reproducing rustfmt edits manually. Apply model_protocol only where the exposed schema supports it.",
-            "Review diff; report evidence, limits, Jobs. finish_coding_task is advisory evidence, not proof."
+            "Follow host safety and user/project scope/rules; carry authorized work to concrete, reviewable completion. Ask only for missing requirements/authority; guidance grants no authority.",
+            "Verify Project/branch/HEAD/changes/nested rules. Recovery/compaction/exact Session resume is continuation: reuse still-current Git/read/validation/Job facts; revalidate changed snapshots/HEAD/worktree/instructions.",
+            "Preserve unrelated work; push/publish/deploy/restart need explicit action/target. If a user answer/Job/validation/result is not a dependency, continue independent work; wait only on real dependencies.",
+            "Ordinary implementation is default: map cross-layer changes end to end; use compiler/schema/exhaustiveness failures for gaps; minimize concepts, avoid speculative redesign.",
+            "Use the simplest sufficient primitive preserving correctness/authority/evidence/durability/recovery/portability. Native commands are first-class. Batch predetermined observations; adaptive follow-ups stay sequential; bounded deterministic Python/run_shell fits coherent transforms.",
+            "Known target: bounded targeted reads and related-range batching. Broad discovery: files/count/small-context search then targeted reads; predictable native rg is first-class.",
+            "Validation failure is evidence, not queue cleanliness. Fix blockers before dependent work; otherwise continue independent work. Reuse assertion_name on rerun; mutation stales evidence; outcome_unknown fails closed.",
+            "Long work keeps one execution/Job. Keep exact continuation; use wait_secs=100,wake_on=terminal only when blocked on terminal outcome, not for visibility. Final source needs diff review and sufficient fresh validation."
         ],
         "model_protocol": {
             "session_context_ack": "Checkpoint/recovery tools may expose session_context_revision. Echo the latest retained revision in ack_session_context_revision only where exposed; never invent it. If unknown, omit; use the advertised Session handoff recovery path. ACK is nonblocking.",
@@ -83,19 +83,11 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
             "normal_closeout": "Normal success: finish_coding_task(summary_only=true); full closeout only for unresolved evidence or handoff/debug."
         },
         "roles": {
-            "implementation_owner": {
-                "purpose": "Implement one coherent change end to end.",
-                "guidance": [
-                    "Map cross-layer changes end to end; use compiler/schema/exhaustiveness failures to find missing integration.",
-                    "Minimize concepts; fix concrete issues without speculative redesign.",
-                    "When intentionally rerunning the same logical validation, reuse the same assertion_name; do not rerun solely to clear stale historical validation evidence."
-                ]
-            },
             "independent_review": {
                 "purpose": "Review independently within task scope.",
                 "guidance": [
-                    "Challenge authority, bounds, malformed data, privacy, replay/races, timeouts, and fail-closed behavior.",
-                    "For review-only tasks, report concrete findings with file/line evidence and impact; do not edit. Fix only when the task authorizes corrections, with focused regression validation."
+                    "Challenge authority, bounds, malformed data, privacy, replay/races, timeouts, fail-closed behavior.",
+                    "For review-only tasks, report concrete file/line findings and impact; do not edit. Fix only when the task authorizes corrections, with focused regression validation."
                 ]
             }
         }
@@ -2095,11 +2087,14 @@ mod tests {
         });
         let extensions = StartupExtensions {
             skills: StartupSkillsCatalog::available(
-                format!("wc_skillcat_{}", "a".repeat(64)),
+                "wc_skillcat_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string(),
                 false,
                 (0..64)
                     .map(|index| StartupSkillEntry {
-                        skill_id: format!("wc_skill_{index:032x}"),
+                        skill_id: format!(
+                            "wc_skill_{}",
+                            webcodex_core::compact::encode(&(index as u128).to_be_bytes()[0..])
+                        ),
                         name: format!("skill-{index:02}"),
                         description: format!("skill-{index:02}-{}", "s".repeat(500)),
                         source_scope: "project".to_string(),
@@ -2109,7 +2104,7 @@ mod tests {
                     .collect(),
             ),
             plugins: StartupPluginsCatalog::available(
-                format!("wc_plugcat_{}", "b".repeat(64)),
+                format!("wc_plugcat_{}", webcodex_core::compact::encode([0xbb; 32])),
                 64,
                 (0..64)
                     .map(|index| StartupPluginEntry {

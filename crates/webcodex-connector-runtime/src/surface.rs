@@ -482,7 +482,7 @@ fn connector_output_schema() -> Value {
 fn task_id_schema() -> Value {
     json!({
         "type": "string",
-        "pattern": "^wc_task_[a-f0-9]{32}$",
+        "pattern": "^wc_task_[A-Za-z0-9_-]{16}$",
         "description": "Opaque id returned by task_start."
     })
 }

@@ -28,13 +28,25 @@ pub fn is_tool_call_expectation_metadata_field(field: &str) -> bool {
     TOOL_CALL_EXPECTATION_METADATA_FIELDS.contains(&field)
 }
 
-pub fn is_valid_session_id(session_id: &str) -> bool {
-    session_id.starts_with(SESSION_ID_PREFIX)
-        && session_id.len() > SESSION_ID_PREFIX.len()
-        && session_id
-            .as_bytes()
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+/// Session ledger compatibility is deliberately local to this domain.
+fn is_session_identity_suffix(suffix: &str) -> bool {
+    crate::compact::decode::<12>(suffix).is_some()
+        || (suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+pub fn is_valid_session_id(value: &str) -> bool {
+    value
+        .strip_prefix(SESSION_ID_PREFIX)
+        .is_some_and(is_session_identity_suffix)
+}
+
+pub fn is_valid_session_message_id(value: &str) -> bool {
+    value
+        .strip_prefix("wc_msg_")
+        .is_some_and(is_session_identity_suffix)
 }
 
 pub const SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON: &str =

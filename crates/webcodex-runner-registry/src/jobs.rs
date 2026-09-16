@@ -298,9 +298,9 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         reconciled_at: job.recovery.reconciled_at,
         recovery_reason_code: job.recovery.public_reason().map(str::to_string),
         // General lifecycle views do not project log bodies, so they retain a
-        // cursor-less legacy token. `job_log_for_auth` replaces this with a
-        // cursor-aware v2 token for its frozen returned log snapshot.
-        observation_token: webcodex_core::job_observation::JobObservationToken::new_legacy(
+        // cursor-less baseline token. `job_log_for_auth` replaces this with a
+        // cursor-aware token for its frozen returned log snapshot.
+        observation_token: webcodex_core::job_observation::JobObservationToken::new_baseline(
             job.job_id.clone(),
             job.observation.epoch.to_string(),
             job.observation

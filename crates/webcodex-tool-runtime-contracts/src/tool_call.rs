@@ -80,11 +80,7 @@ impl PluginToolCall {
             let Some(random) = binding.strip_prefix("wc_pbind_") else {
                 return Err("binding must be a valid opaque Plugin binding".to_string());
             };
-            if random.len() != 32
-                || !random
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
+            if webcodex_core::compact::decode::<16>(random).is_none() {
                 return Err("binding must be a valid opaque Plugin binding".to_string());
             }
         }
@@ -324,9 +320,9 @@ where
         .as_ref()
         .is_some_and(|token| token.len() > MAX_JOB_OBSERVATION_TOKEN_LEN)
     {
-        return Err(serde::de::Error::custom(
-            "after_observation_token must not exceed 192 bytes",
-        ));
+        return Err(serde::de::Error::custom(format!(
+            "after_observation_token must not exceed {MAX_JOB_OBSERVATION_TOKEN_LEN} bytes"
+        )));
     }
     Ok(token)
 }
@@ -985,6 +981,8 @@ pub enum ToolCall {
     /// Return bounded structured recent git commit history.
     GitLog {
         project: String,
+        #[serde(default)]
+        head_commit: Option<String>,
         #[serde(default)]
         limit: Option<usize>,
         #[serde(default)]
@@ -1940,6 +1938,8 @@ pub enum ToolCall {
         #[serde(default)]
         length: Option<usize>,
         #[serde(default)]
+        expected_sha256: Option<String>,
+        #[serde(default)]
         as_image: Option<bool>,
     },
 
@@ -2687,6 +2687,34 @@ fn reject_unknown_bounded_computer_fields(
     }
 }
 
+fn validate_read_project_artifact_expected_sha256(
+    name: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    if name != "read_project_artifact" {
+        return Ok(());
+    }
+    let Some(object) = arguments.as_object() else {
+        return Ok(());
+    };
+    let Some(value) = object.get("expected_sha256") else {
+        return Ok(());
+    };
+    let valid = value.as_str().is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid arguments for tool '{name}': expected_sha256 must be exactly 64 lowercase hexadecimal characters"
+        ))
+    }
+}
+
 fn validate_structured_validation_sync_wait(name: &str, arguments: &Value) -> Result<(), String> {
     if !matches!(name, "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test") {
         return Ok(());
@@ -2759,6 +2787,7 @@ impl ToolCall {
         validate_model_facing_assertion_name(name, &arguments)?;
         validate_model_facing_result_expectation(name, &arguments)?;
         validate_structured_validation_sync_wait(name, &arguments)?;
+        validate_read_project_artifact_expected_sha256(name, &arguments)?;
         if name == "apply_patch"
             && arguments
                 .as_object()

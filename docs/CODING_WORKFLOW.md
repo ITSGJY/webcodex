@@ -26,21 +26,14 @@ Use `work_on_project` for both a new coding task and an explicit continuation. W
 
 For ordinary use you do not need to reason about WebCodex's internal continuity or audit fields. Those are implementation/maintainer contracts.
 
-The built-in workflow includes default guidance for every task, even when no
-role is named: inspect the target and applicable rules, preserve existing work,
-complete authorized implementation, validate proportionally, observe existing
-Jobs instead of duplicating effects, and report evidence honestly. Use only
+The built-in default guidance is the ordinary implementation workflow. A normal
+“implement/fix/refactor” task needs no role name: carry authorized work to a
+concrete, reviewable completion, map cross-layer changes end to end, keep the
+design minimal, validate proportionally, and report evidence honestly. Use only
 tools and protocol fields supported by the current exposed schemas.
 
-Behavioral roles add emphasis to those defaults. They are expressed in the task
-instruction, not through a separate authority mechanism. For example:
-
-```text
-Use the implementation_owner guidance. Implement <task>, run focused validation,
-and review the resulting diff.
-```
-
-For an independent review:
+`independent_review` is the only optional named role because it changes behavior.
+Use it only when the task explicitly asks for an independent review pass:
 
 ```text
 Use the independent_review guidance. Review <change or commit> independently,
@@ -48,7 +41,8 @@ report concrete findings with file/line evidence and impact, and do not edit.
 ```
 
 To request corrections as well, explicitly add “fix concrete findings and run
-focused regression validation.” Naming a review role alone does not authorize edits.
+focused regression validation.” Naming a review role alone does not authorize edits,
+and no role ever grants authority.
 
 Guidance is delivered in tool results; it is not the client's system prompt and
 does not grant execution authority. Host instructions, the user's task,
@@ -58,7 +52,7 @@ Keep guidance enabled unless the current model context already retains it.
 
 ## Inspect before editing
 
-Prefer structured project search/read tools over shell commands when they express the task. Read only the files and ranges needed to understand the change, and preserve unrelated work already present in the workspace.
+Choose the simplest sufficient inspection primitive. If the symbol, test, or implementation region is already known, prefer bounded targeted ranges and batch several related ranges when they are predetermined. For broad discovery, first request a narrow projection such as files-with-matches, count, or a small bounded match set with little context, then read the relevant ranges. A small predictable known-scope native `rg` via `run_process`/`run_shell` is first-class.
 
 The bootstrap reads a fixed set of instruction entry points; it does not scan
 every subdirectory for rules. Before changing a path, inspect applicable nested
@@ -86,6 +80,8 @@ When a required validation is likely to outlast its synchronous grace and indepe
 
 When a test invocation must prove that tests actually ran, use `require_tests: true` or `min_tests: N`. These are request-scoped evidence assertions, not persistent Workflow Session requirements. If validator execution succeeds but the requested count cannot be satisfied or proven, closeout retains that invocation as an evidence gap rather than a code/test correctness failure. Otherwise, an exit-zero command that legitimately runs zero tests remains an execution result rather than proof of test coverage.
 
+Treat validation failures as evidence, not queue-cleanliness work. If a failure invalidates the current implementation direction or blocks dependent work, diagnose and fix it before continuing that dependent work. Otherwise keep the evidence visible and continue useful independent work; resolve or revalidate when a dependency or closeout requires it. Reuse the same `assertion_name` when intentionally rerunning the same logical assertion. Mutation makes relevant earlier evidence stale, and `outcome_unknown` remains fail-closed.
+
 Use shell/process escape hatches only when the structured validation surface cannot express the check.
 
 ## Review and closeout
@@ -96,7 +92,7 @@ Review the actual workspace/diff after editing and validation. Passing tests do 
 
 ## Long-running work
 
-A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Observe that Job rather than starting another copy. Recovery/continuation hints returned by a tool are guidance for the next explicit call; WebCodex does not silently retry an uncertain effect.
+A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Keep its exact Job identity and parser-ready continuation. If useful independent work remains, continue that work and observe the Job later; do not repeatedly poll a running Job merely to keep it visible. When the next useful action actually depends on the terminal result, use the provided bounded `wait_secs=100, wake_on=terminal` continuation. Recovery/continuation hints never authorize a retry of an uncertain effect.
 
 ## Manual multi-window collaboration
 

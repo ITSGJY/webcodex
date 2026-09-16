@@ -1584,7 +1584,7 @@ async fn connector_credential_cannot_cross_agent_auth_group() {
     setup(&other_options).unwrap();
     let wrong_project_credential =
         read_private_value(&other_state.join("credentials/connector-key")).unwrap();
-    let opaque_task_id = format!("wc_task_{}", "0".repeat(32));
+    let opaque_task_id = format!("wc_task_{}", "A".repeat(16));
 
     let calls = [
         ("/api/connector/readiness", serde_json::json!({})),
@@ -1966,8 +1966,8 @@ async fn console_review_and_accept_golden_path() {
     let fixture = authenticated_project_fixture().await;
     let task_id = seed_ready_console(
         &fixture,
-        "wc_task_aa11223344556677889900aabbccddee",
-        "wc_run_ca",
+        "wc_task_RFVmd4iZAKq7zN3u",
+        "wc_run_aaaaaaaaaaaaaaaa",
         2,
     );
 
@@ -2101,7 +2101,7 @@ async fn console_enforces_json_and_same_origin_guard() {
 
     let mut cross_origin = TestClient::post("http://localhost/api/console/result/accept")
         .bearer_auth(&fixture.credential)
-        .json(&serde_json::json!({ "task_id": "wc_task_aa11223344556677889900aabbccddee" }))
+        .json(&serde_json::json!({ "task_id": "wc_task_RFVmd4iZAKq7zN3u" }))
         .add_header("origin", "http://attacker.example", true)
         .send(&fixture.service)
         .await;
@@ -2148,8 +2148,8 @@ async fn console_accept_requires_result_id_and_stale_identity_has_no_effect() {
     let fixture = authenticated_project_fixture().await;
     let task_id = seed_ready_console(
         &fixture,
-        "wc_task_dd11223344556677889900aabbccddee",
-        "wc_run_cd",
+        "wc_task_RFVmd4iZAKq7zN3u",
+        "wc_run_bbbbbbbbbbbbbbbb",
         2,
     );
 
@@ -2167,7 +2167,7 @@ async fn console_accept_requires_result_id_and_stale_identity_has_no_effect() {
         &fixture,
         "/api/console/result/accept",
         &fixture.credential,
-        serde_json::json!({ "task_id": task_id, "result_id": "wc_result_stale00000" }),
+        serde_json::json!({ "task_id": task_id, "result_id": "wc_result_cccccccccccccccc" }),
     )
     .await;
     assert_eq!(stale_status, StatusCode::CONFLICT);

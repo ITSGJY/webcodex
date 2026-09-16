@@ -796,7 +796,7 @@ impl ToolRuntime {
             }
             (SessionTransport::Mcp, _) => {
                 return ToolResult::err(
-                    "import_conversation_files_to_project requires an explicitly trusted OAuth MCP host-file rewrite",
+                    "import_conversation_files_to_project requires an explicitly trusted MCP host-file rewrite",
                 );
             }
             (SessionTransport::Api, _) => {

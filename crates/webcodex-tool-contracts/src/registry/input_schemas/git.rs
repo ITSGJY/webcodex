@@ -214,8 +214,14 @@ pub fn git_diff_hunks_input_schema() -> Value {
 }
 
 pub fn git_log_input_schema() -> Value {
-    object_schema(with_optional_session_id(vec![
+    let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Runner-registered project id.", true),
+        (
+            "head_commit",
+            "string",
+            "Optional exact 40-hex commit snapshot fence. Omit on the first page so Runtime resolves the current HEAD; parser-ready suggested_call carries the observed commit on later pages.",
+            false,
+        ),
         (
             "limit",
             "integer",
@@ -228,5 +234,9 @@ pub fn git_log_input_schema() -> Value {
             "Number of recent commits to skip (default 0, clamped to 0..10000).",
             false,
         ),
-    ]))
+    ]));
+    schema["properties"]["head_commit"]["minLength"] = Value::from(40);
+    schema["properties"]["head_commit"]["maxLength"] = Value::from(40);
+    schema["properties"]["head_commit"]["pattern"] = Value::from("^[0-9A-Fa-f]{40}$");
+    schema
 }

@@ -1,6 +1,6 @@
 use crate::tool_runtime::git::{
-    collect_show_changes_untracked_previews_for_root, git_log_command, parse_show_changes_output,
-    show_changes_command, split_show_changes_stdout,
+    collect_show_changes_untracked_previews_for_root, git_log_command, git_log_command_at_head,
+    parse_show_changes_output, show_changes_command, split_show_changes_stdout,
 };
 use crate::tool_runtime::helpers::run_command_sync;
 use crate::tool_runtime::{
@@ -73,6 +73,21 @@ pub(in crate::tool_runtime::tests) fn git_log_stdout(
     assert_eq!(
         exit_code, 0,
         "git log helper command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
+}
+
+pub(in crate::tool_runtime::tests) fn git_log_stdout_at_head(
+    root: &Path,
+    head_commit: &str,
+    limit: usize,
+    skip: usize,
+) -> String {
+    let command = git_log_command_at_head(head_commit, limit, skip);
+    let (exit_code, stdout, stderr, _) = run_command_sync(&command, root, 30);
+    assert_eq!(
+        exit_code, 0,
+        "snapshot git log helper command failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     stdout
 }

@@ -57,7 +57,7 @@ async fn complete_plugin_catalog_request(
 
 fn plugin_catalog(entries: usize) -> ProjectPluginCatalog {
     ProjectPluginCatalog {
-        catalog_revision: format!("wc_plugcat_{}", "a".repeat(64)),
+        catalog_revision: format!("wc_plugcat_{}", webcodex_core::compact::encode([0xaa; 32])),
         total_count: entries,
         entries: (0..entries)
             .map(|index| ProjectPluginCatalogEntry {

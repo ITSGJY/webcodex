@@ -445,6 +445,13 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 If ChatGPT MCP host-file import is enabled, configure the exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`. Reprovisioning the client creates a new id, so update this setting as part of that explicit trust rotation. Client display names and redirect URIs are not substitutes for the configured client id.
 
+A separate local-only exception exists for an operator-controlled Server that is
+bound to loopback and reached through OpenAI Secure Tunnel with a locally
+injected user API token. Set
+`WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` to trust ChatGPT
+host-file rewrites on that path. The flag is ignored for non-loopback binds and
+for non-user API credentials; leave it unset on network-accessible Servers.
+
 List and revoke clients with `POST /api/oauth/clients/list` and
 `POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow;
 dynamic client registration, OIDC, and the device-code flow are not

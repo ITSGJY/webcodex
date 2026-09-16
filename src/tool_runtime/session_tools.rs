@@ -777,7 +777,6 @@ fn session_message_observation_error_result(
         }
         sessions::SessionMessageObservationError::MalformedToken
         | sessions::SessionMessageObservationError::OversizedToken
-        | sessions::SessionMessageObservationError::WrongSession
         | sessions::SessionMessageObservationError::FutureRevision => ToolResult::err_with_output(
             "invalid_session_message_observation_token",
             json!({

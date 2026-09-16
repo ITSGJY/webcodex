@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
 
-const GOAL_ID_PATTERN: &str = "^wc_goal_[0-9a-f]{32}$";
-const TASK_ID_PATTERN: &str = "^wc_agent_task_[0-9a-f]{32}$";
-const SESSION_ID_PATTERN: &str = "^wc_sess_[0-9a-f]{32}$";
+const GOAL_ID_PATTERN: &str = "^wc_goal_[A-Za-z0-9_-]{16}$";
+const TASK_ID_PATTERN: &str = "^wc_agent_task_[A-Za-z0-9_-]{16}$";
+const SESSION_ID_PATTERN: &str = "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$";
 
 fn canonical_id(pattern: &str, description: &str) -> Value {
     json!({"type": "string", "pattern": pattern, "description": description})

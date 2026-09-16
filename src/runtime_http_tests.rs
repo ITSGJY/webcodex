@@ -871,7 +871,7 @@ fn extract_tool_call_plugin_tool_preserves_provider_local_tool_inside_params() {
         "tool": "plugin_tool",
         "params": {
             "action": "call",
-            "binding": "wc_pbind_00000000000000000000000000000000",
+            "binding": "wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
             "arguments": {"path": "build/old.bin"}
         }
     }))
@@ -888,7 +888,7 @@ fn plugin_tool_api_trace_projection_hides_binding_and_raw_arguments() {
         "tool": "plugin_tool",
         "params": {
             "action": "call",
-            "binding": "wc_pbind_0123456789abcdef0123456789abcdef",
+            "binding": "wc_pbind_ASNFZ4mrze8BI0VniavN7w",
             "arguments": {"path": "private/target.txt", "secret": "must-not-leak"}
         },
         TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_plugin_record"
@@ -2026,7 +2026,7 @@ async fn session_tools_oauth_scope_policy() {
     assert_eq!(status, StatusCode::OK, "get_session_assignment: {body}");
     assert!(body["output"]["assignment_fence"]
         .as_str()
-        .is_some_and(|fence| fence.starts_with("wsa1_")));
+        .is_some_and(|fence| fence.starts_with("wsa2_")));
 
     let (status, body, challenge) = oauth_tools_call(
         &service,

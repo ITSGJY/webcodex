@@ -508,7 +508,7 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         );
     }
     assert!(
-        MCP_AGENT_CONTINUATION_APP_HTML.contains("^wc_dagent_[0-9a-f]{32}$"),
+        MCP_AGENT_CONTINUATION_APP_HTML.contains("^wc_dagent_[A-Za-z0-9_-]{16}$"),
         "App must validate the canonical durable Agent id prefix"
     );
     assert!(
@@ -679,7 +679,7 @@ async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fenc
     );
     let (endpoint, generation) = attach(&runtime, &owner, &agent, "continuation-window-endpoint");
     let raw_session = "production-openai-session-window-a";
-    let binding_id = format!("wc_host_binding_{}", "7".repeat(32));
+    let binding_id = "wc_host_binding_d3d3d3d3d3d3d3d3d3d3dw".to_string();
     let bind = handle_with_server_apps_enabled(
         &runtime,
         rpc(
@@ -751,7 +751,7 @@ async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fenc
         "host_binding_stale"
     );
 
-    let foreign_binding = format!("wc_host_binding_{}", "8".repeat(32));
+    let foreign_binding = "wc_host_binding_iIiIiIiIiIiIiIiIiIiIiA".to_string();
     let foreign_bind = handle_with_server_apps_enabled(
         &runtime,
         rpc(
@@ -889,7 +889,7 @@ fn restart_recovery_survives_published_projection_output_schema() {
         &agent,
         "continuation-schema-restart-endpoint",
     );
-    let binding_id = format!("wc_host_binding_{}", "b".repeat(32));
+    let binding_id = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let bind = runtime.agent_continuation_bind(
         Some(&owner),
         agent.clone(),
@@ -963,7 +963,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
     );
     let window =
         crate::client_window::ClientWindow::for_test("continuation-schema-successor-window");
-    let first_binding = format!("wc_host_binding_{}", "c".repeat(32));
+    let first_binding = "wc_host_binding_zMzMzMzMzMzMzMzMzMzMzA".to_string();
     let bound = runtime.agent_continuation_bind_for_window(
         Some(&owner),
         Some(&window),
@@ -995,7 +995,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
         agent.clone(),
         e1.clone(),
         g1,
-        format!("wc_host_binding_{}", "d".repeat(32)),
+        "wc_host_binding_3d3d3d3d3d3d3d3d3d3d3Q".to_string(),
     );
     assert!(first.success, "{:?}", first.output);
     let e2 = first.output["endpoint_recovery"]["replacement"]["endpoint_id"]
@@ -1023,7 +1023,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
         agent.clone(),
         e2.clone(),
         g2,
-        format!("wc_host_binding_{}", "e".repeat(32)),
+        "wc_host_binding_7u7u7u7u7u7u7u7u7u7u7g".to_string(),
     );
     assert!(second.success, "{:?}", second.output);
     assert_eq!(
@@ -1037,7 +1037,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
         agent,
         e1.clone(),
         g1,
-        format!("wc_host_binding_{}", "f".repeat(32)),
+        "wc_host_binding______________________w".to_string(),
     );
     assert!(
         old_selector_replay.success,
@@ -1082,7 +1082,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
 #[test]
 fn task_origin_wake_survives_published_bootstrap_output_schema() {
     let wake = json!({
-        "wake_id": format!("wc_wake_{}", "a".repeat(32)),
+        "wake_id": "wc_wake_qqqqqqqqqqqqqqqq".to_string(),
         "state": "pending",
         "revision": 1,
         "trigger_kind": "agent_task_attempt",
@@ -1090,8 +1090,8 @@ fn task_origin_wake_survives_published_bootstrap_output_schema() {
         "latest_message_id": null,
         "queued_delivery_count": null,
         "inbox_high_watermark": null,
-        "task_id": format!("wc_agent_task_{}", "b".repeat(32)),
-        "task_attempt_id": format!("wc_agent_task_attempt_{}", "c".repeat(32)),
+        "task_id": "wc_agent_task_u7u7u7u7u7u7u7u7".to_string(),
+        "task_attempt_id": "wc_agent_task_attempt_zMzMzMzMzMzMzMzM".to_string(),
     });
     let published = webcodex_tool_contracts::output_schema_for_tool("bootstrap_agent_conversation");
     let wake_schema = &published["properties"]["output"]["properties"]["wake"];
@@ -1104,7 +1104,7 @@ fn task_origin_wake_survives_published_bootstrap_output_schema() {
 
 #[tokio::test]
 async fn agent_continuation_app_protocol_uses_standard_result_without_model_projection_leaks() {
-    let binding_id = format!("wc_host_binding_{}", "a".repeat(32));
+    let binding_id = "wc_host_binding_qqqqqqqqqqqqqqqqqqqqqg".to_string();
     let (_temp, _db, runtime) = continuation_runtime(ModelSurface::AdaptiveRuntime);
     let owner = continuation_auth("continuation-owner");
     let foreign = continuation_auth("continuation-foreign");
@@ -1450,10 +1450,10 @@ async fn agent_continuation_hidden_kernel_entry_is_fail_closed_without_protocol_
                     ToolCallRequest {
                         tool_name: name.to_string(),
                         arguments: json!({
-                            "agent_id": format!("wc_dagent_{}", "a".repeat(32)),
-                            "endpoint_id": format!("wc_endpoint_{}", "b".repeat(32)),
+                            "agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
+                            "endpoint_id": "wc_endpoint_u7u7u7u7u7u7u7u7".to_string(),
                             "expected_controller_generation": 1,
-                            "binding_id": format!("wc_host_binding_{}", "a".repeat(32))
+                            "binding_id": "wc_host_binding_qqqqqqqqqqqqqqqqqqqqqg".to_string()
                         }),
                     },
                     ToolCallContext {

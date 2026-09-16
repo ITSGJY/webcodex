@@ -461,7 +461,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
             681,
             json!({
                 "action":"call",
-                "binding":"wc_pbind_00000000000000000000000000000000",
+                "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                 "arguments":{}
             }),
             crate::auth::SCOPE_PLUGIN_INVOKE,
@@ -504,7 +504,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_00000000000000000000000000000000",
+                    "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                     "arguments":{}
                 }
             }),
@@ -557,7 +557,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_00000000000000000000000000000000",
+                    "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                     "arguments":{}
                 }
             }),
@@ -644,7 +644,7 @@ async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+                    "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
                     "arguments":{"query":"must-not-run"},
                     "recording_session_id":session.session_id
                 }
@@ -679,7 +679,7 @@ async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider
         runtime.sessions.summary(&session.session_id, Some(100))
     );
     assert!(!ledger.contains("must-not-run"));
-    assert!(!ledger.contains("wc_pbind_0123456789abcdef0123456789abcdef"));
+    assert!(!ledger.contains("wc_pbind_ASNFZ4mrze8BI0VniavN7w"));
 }
 
 #[tokio::test]
@@ -827,7 +827,7 @@ async fn restricted_permission_denies_plugin_call_and_outer_direct_name_never_di
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+                    "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
                     "arguments":{"query":"must-not-run"}
                 }
             }),
@@ -1411,7 +1411,7 @@ async fn plugin_tool_list_argument_matrix_rejects_ambiguous_inputs_before_dispat
         ),
         (
             769,
-            json!({"action":"list","runner":"runner-a","binding":"wc_pbind_00000000000000000000000000000000"}),
+            json!({"action":"list","runner":"runner-a","binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA"}),
         ),
         (
             770,
@@ -1721,7 +1721,7 @@ async fn generic_runtime_plugin_governance_is_action_aware_and_records_one_api_l
         &invoke,
         json!({
             "action":"call",
-            "binding":"wc_pbind_00000000000000000000000000000000",
+            "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
             "arguments":{}
         }),
         None,
@@ -1937,7 +1937,7 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
     assert!(output["route"].get("via").is_none());
     assert_eq!(
         output["input_schema"]["properties"]["binding"]["pattern"],
-        "^wc_pbind_[0-9a-f]{32}$"
+        "^wc_pbind_[A-Za-z0-9_-]{21}[AQgw]$"
     );
     assert_eq!(output["authority"]["policy"], "require_any");
     let scopes = output["authority"]["scopes"]
@@ -1990,7 +1990,7 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
     }
     assert_eq!(
         stateless_gateway["inputSchema"]["properties"]["recording_session_id"]["pattern"],
-        "^wc_sess_[A-Za-z0-9_]+$"
+        "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
     );
 }
 

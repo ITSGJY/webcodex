@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::{self, Write};
-use uuid::Uuid;
 
 pub(crate) const DURABLE_AGENT_ID_PREFIX: &str = "wc_dagent_";
 pub(crate) const AGENT_ENDPOINT_ID_PREFIX: &str = "wc_endpoint_";
@@ -697,7 +696,11 @@ impl Database {
                 "Durable Agent capacity is exhausted",
             ));
         }
-        let agent_id = new_id(DURABLE_AGENT_ID_PREFIX);
+        let agent_id = allocate_identity(
+            &transaction,
+            DURABLE_AGENT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_identities WHERE agent_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_identities (
@@ -1063,7 +1066,11 @@ impl Database {
                 ],
             )
             .map_err(store_error)?;
-        let endpoint_id = new_id(AGENT_ENDPOINT_ID_PREFIX);
+        let endpoint_id = allocate_identity(
+            &transaction,
+            AGENT_ENDPOINT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_endpoints WHERE endpoint_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_endpoints (
@@ -1321,7 +1328,11 @@ impl Database {
                 "Another Endpoint generation already owns this Agent",
             ));
         }
-        let replacement_endpoint_id = new_id(AGENT_ENDPOINT_ID_PREFIX);
+        let replacement_endpoint_id = allocate_identity(
+            &transaction,
+            AGENT_ENDPOINT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_endpoints WHERE endpoint_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_endpoints (
@@ -1850,7 +1861,11 @@ impl Database {
         for agent_id in &agent_ids {
             require_agent_owner(&transaction, principal, agent_id)?;
         }
-        let conversation_id = new_id(CONVERSATION_ID_PREFIX);
+        let conversation_id = allocate_identity(
+            &transaction,
+            CONVERSATION_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_conversations WHERE conversation_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_conversations (
@@ -1874,7 +1889,11 @@ impl Database {
                     principal_kind, principal_digest, joined_at_unix_ms
                  ) VALUES (?1, ?2, 'human', NULL, ?3, ?4, ?5)",
                 params![
-                    new_id(CONVERSATION_PARTICIPANT_ID_PREFIX),
+                    allocate_identity(
+                        &transaction,
+                        CONVERSATION_PARTICIPANT_ID_PREFIX,
+                        "SELECT EXISTS(SELECT 1 FROM wc_conversation_participants WHERE participant_id = ?1)",
+                    )?,
                     conversation_id,
                     principal.kind,
                     principal.digest,
@@ -1890,7 +1909,11 @@ impl Database {
                         principal_kind, principal_digest, joined_at_unix_ms
                      ) VALUES (?1, ?2, 'agent', ?3, NULL, NULL, ?4)",
                     params![
-                        new_id(CONVERSATION_PARTICIPANT_ID_PREFIX),
+                        allocate_identity(
+                            &transaction,
+                            CONVERSATION_PARTICIPANT_ID_PREFIX,
+                            "SELECT EXISTS(SELECT 1 FROM wc_conversation_participants WHERE participant_id = ?1)",
+                        )?,
                         conversation_id,
                         agent_id,
                         now,
@@ -2360,7 +2383,11 @@ impl Database {
             ));
         }
         let now = now_unix_ms();
-        let message_id = new_id(CONVERSATION_MESSAGE_ID_PREFIX);
+        let message_id = allocate_identity(
+            &transaction,
+            CONVERSATION_MESSAGE_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_conversation_messages WHERE message_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_conversation_messages (
@@ -2379,7 +2406,11 @@ impl Database {
             )
             .map_err(store_error)?;
         for recipient_agent_id in &recipient_agent_ids {
-            let delivery_id = new_id(AGENT_DELIVERY_ID_PREFIX);
+            let delivery_id = allocate_identity(
+                &transaction,
+                AGENT_DELIVERY_ID_PREFIX,
+                "SELECT EXISTS(SELECT 1 FROM wc_agent_deliveries WHERE delivery_id = ?1)",
+            )?;
             transaction
                 .execute(
                     "INSERT INTO wc_agent_deliveries (
@@ -3421,11 +3452,7 @@ pub(super) fn validate_id(
     let suffix = value.strip_prefix(prefix).ok_or_else(|| {
         CommunicationStoreError::new(code, format!("Invalid canonical id: {value}"))
     })?;
-    if suffix.len() != 32
-        || !suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if webcodex_core::compact::decode::<12>(suffix).is_none() {
         return Err(CommunicationStoreError::new(
             code,
             format!("Invalid canonical id: {value}"),
@@ -3434,8 +3461,59 @@ pub(super) fn validate_id(
     Ok(())
 }
 
-pub(super) fn new_id(prefix: &str) -> String {
-    format!("{prefix}{}", Uuid::new_v4().simple())
+// The caller owns an IMMEDIATE transaction through insertion, so the check
+// and subsequent PK insert are atomic with respect to all other writers.
+pub(super) fn allocate_identity(
+    conn: &Connection,
+    prefix: &str,
+    exists_query: &str,
+) -> Result<String, CommunicationStoreError> {
+    allocate_identity_with(conn, exists_query, || {
+        format!("{prefix}{}", webcodex_core::compact::random_suffix::<12>())
+    })
+}
+
+pub(super) fn allocate_identity_with(
+    conn: &Connection,
+    exists_query: &str,
+    mut generate: impl FnMut() -> String,
+) -> Result<String, CommunicationStoreError> {
+    for _ in 0..16 {
+        let id = generate();
+        let occupied: bool = conn
+            .query_row(exists_query, [&id], |row| row.get(0))
+            .map_err(store_error)?;
+        if !occupied {
+            return Ok(id);
+        }
+    }
+    Err(CommunicationStoreError::new(
+        "identity_allocation_exhausted",
+        "Unable to allocate an unoccupied identity",
+    ))
+}
+
+pub(super) fn new_proof(prefix: &str) -> String {
+    format!("{prefix}{}", webcodex_core::compact::random_suffix::<16>())
+}
+
+pub(super) fn validate_proof(
+    value: &str,
+    prefix: &str,
+    code: &'static str,
+) -> Result<(), CommunicationStoreError> {
+    if value
+        .strip_prefix(prefix)
+        .and_then(webcodex_core::compact::decode::<16>)
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err(CommunicationStoreError::new(
+            code,
+            "Invalid canonical proof",
+        ))
+    }
 }
 
 struct Sha256Writer<'a>(&'a mut Sha256);

@@ -550,9 +550,10 @@ async fn observe_session_messages_rejects_malformed_oversized_wrong_session_and_
             .observe_messages(&second.session_id, Some(&token), None, None)
             .await
             .unwrap_err(),
-        SessionMessageObservationError::WrongSession
+        SessionMessageObservationError::MalformedToken
     );
     let future = encode_observation_token(&first.session_id, 1).unwrap();
+    assert_eq!(future.len(), 37);
     assert_eq!(
         store
             .observe_messages(&first.session_id, Some(&future), None, None)

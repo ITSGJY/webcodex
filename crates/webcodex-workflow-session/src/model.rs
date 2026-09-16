@@ -49,7 +49,7 @@ pub const DEFAULT_MAX_MESSAGES_PER_SESSION: usize = 200;
 pub const MAX_CODING_INSTRUCTION_CHARS: usize = 4000;
 pub const DEFAULT_MESSAGE_LIST_LIMIT: usize = 50;
 pub const MAX_MESSAGE_LIST_LIMIT: usize = 100;
-pub const MAX_SESSION_MESSAGE_OBSERVATION_TOKEN_LEN: usize = 192;
+pub const MAX_SESSION_MESSAGE_OBSERVATION_TOKEN_LEN: usize = 37;
 pub const MAX_MESSAGE_CHARS: usize = 8000;
 pub const MAX_MESSAGE_TAGS: usize = 16;
 pub const MAX_MESSAGE_TAG_CHARS: usize = 64;
@@ -1001,8 +1001,8 @@ pub struct SessionMessage {
 /// todo thread exceeds this bound the assignment read fails closed rather than
 /// returning an incomplete fence.
 pub const MAX_SESSION_ASSIGNMENT_DIRECT_REPLIES: usize = 16;
-/// `wsa1_` plus one base64url-no-pad SHA-256 semantic snapshot fingerprint.
-pub const MAX_SESSION_ASSIGNMENT_FENCE_LEN: usize = 48;
+/// `wsa2_` plus a base64url-no-pad 128-bit scoped semantic snapshot fingerprint.
+pub const MAX_SESSION_ASSIGNMENT_FENCE_LEN: usize = 27;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionAssignmentSnapshot {
@@ -1109,7 +1109,6 @@ pub enum SessionMessageObservationError {
     UnknownSession,
     MalformedToken,
     OversizedToken,
-    WrongSession,
     FutureRevision,
     InvalidObservationState,
 }

@@ -900,3 +900,43 @@ fn a4b_wake_schema_migration_preserves_inbox_wake_and_rebuilds_indexes() {
         "existing inbox Wake must remain the coalescing target after migration"
     );
 }
+
+#[test]
+fn explicit_activation_random_proof_replays_after_database_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("explicit-proof.db");
+    let db = Database::open(&path).unwrap();
+    let fixture = create_fixture(&db, '9');
+    let endpoint = attach_wake_endpoint(&db, &fixture, "chatgpt", "explicit-proof-endpoint");
+    post_to_receiver(&db, &fixture, "work", "explicit-proof-message");
+    let wake_id = wake_id_for(&db, &fixture.receiver_agent_id);
+    let activate = |db: &Database| {
+        db.accept_explicit_agent_wake_activation(
+            &fixture.owner,
+            &fixture.receiver_agent_id,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            &wake_id,
+            "explicit-proof-key",
+        )
+    };
+    let first = activate(&db).unwrap();
+    assert!(webcodex_core::compact::decode::<16>(
+        first
+            .consume_token
+            .strip_prefix("wc_wake_consume_")
+            .unwrap()
+    )
+    .is_some());
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    let replay = activate(&db).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(first.attempt_id, replay.attempt_id);
+    assert_eq!(first.consume_token, replay.consume_token);
+    db.conn_for_tests().execute("UPDATE wc_agent_wake_attempts SET consume_token_hash = 'corrupt' WHERE attempt_id = ?1", [&first.attempt_id]).unwrap();
+    assert_eq!(
+        activate(&db).unwrap_err().code(),
+        "invalid_activation_receipt"
+    );
+}

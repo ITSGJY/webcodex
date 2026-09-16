@@ -32,7 +32,8 @@ use webcodex_store::{ConnectorExecution, ConnectorTaskSnapshot, ConnectorTaskSto
 
 pub(crate) use webcodex_connector_runtime::{
     approval_projection, durable_task_review_projection, result_projection, validate_opaque_id,
-    ConnectorContext, LocalResultDecision, TaskCancelInput, TaskReviewInput,
+    validate_result_id, validate_task_id, ConnectorContext, LocalResultDecision, TaskCancelInput,
+    TaskReviewInput,
 };
 
 pub(crate) mod workspace {

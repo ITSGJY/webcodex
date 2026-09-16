@@ -240,7 +240,7 @@ async fn oauth2_native_plugin_catalog_and_call_require_explicit_plugin_scope() {
             "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
             "arguments": {
                 "action": "call",
-                "binding": "wc_pbind_00000000000000000000000000000000",
+                "binding": "wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                 "arguments": {"value": "hello"}
             }
         }),
@@ -1043,7 +1043,7 @@ async fn oauth2_pointer_tool_call_still_requires_display_scope_even_if_invoked_d
             "name": "computer_pointer_move",
             "arguments": {
                 "client_id": "missing-runner",
-                "display_id": "display_00000000000000000000000000000000",
+                "display_id": "display_AAAAAAAAAAAAAAAA",
                 "snapshot_generation": 1,
                 "x": 0,
                 "y": 0

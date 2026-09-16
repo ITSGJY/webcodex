@@ -1,6 +1,8 @@
 use super::agent_task::AgentTaskState;
 use super::agent_wake::{AGENT_WAKE_ID_PREFIX, WAKE_TRIGGER_ATTENTION_EVENT};
-use super::communication::{new_id, store_error, CommunicationPrincipal, CommunicationStoreError};
+use super::communication::{
+    allocate_identity, store_error, CommunicationPrincipal, CommunicationStoreError,
+};
 use super::goal::MAX_GOAL_CORRELATIONS;
 use super::Database;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -105,7 +107,11 @@ pub(super) fn create_agent_task_terminal_attention_in_transaction(
     }
 
     for goal_id in &goal_ids {
-        let event_id = new_id(AGENT_ATTENTION_EVENT_ID_PREFIX);
+        let event_id = allocate_identity(
+            &transaction,
+            AGENT_ATTENTION_EVENT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_attention_events WHERE event_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_attention_events (
@@ -127,7 +133,11 @@ pub(super) fn create_agent_task_terminal_attention_in_transaction(
                 ],
             )
             .map_err(store_error)?;
-        let wake_id = new_id(AGENT_WAKE_ID_PREFIX);
+        let wake_id = allocate_identity(
+            &transaction,
+            AGENT_WAKE_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_wakes (

@@ -111,7 +111,7 @@ pub fn read_project_artifact_metadata_input_schema() -> Value {
 }
 
 pub fn read_project_artifact_input_schema() -> Value {
-    object_schema(with_optional_session_id(vec![
+    let mut schema = object_schema(with_optional_session_id(vec![
         ("project", "string", "Runner-registered project id.", true),
         ("path", "string", "Project-relative artifact path.", true),
         (
@@ -132,7 +132,17 @@ pub fn read_project_artifact_input_schema() -> Value {
             "Optional chunk length in bytes; defaults to 32768 and cannot exceed 65536.",
             false,
         ),
-    ]))
+        (
+            "expected_sha256",
+            "string",
+            "Optional exact full-file snapshot fence. Normally do not invent or manually transfer it: Runtime carries the observed sha256 in parser-ready ranged-read continuation. If current content no longer matches, the read fails closed before changed bytes are returned.",
+            false,
+        ),
+    ]));
+    schema["properties"]["expected_sha256"]["minLength"] = Value::from(64);
+    schema["properties"]["expected_sha256"]["maxLength"] = Value::from(64);
+    schema["properties"]["expected_sha256"]["pattern"] = Value::from("^[0-9a-f]{64}$");
+    schema
 }
 
 pub fn artifact_upload_begin_input_schema() -> Value {

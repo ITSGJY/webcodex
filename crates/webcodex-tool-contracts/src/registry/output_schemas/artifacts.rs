@@ -1,8 +1,43 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, nullable_schema, open_object_schema, schema_type, wrapped_output_schema,
+    array_schema, nullable_schema, open_object_schema, schema_type, suggested_tool_call_schema,
+    wrapped_output_schema,
 };
+
+fn read_project_artifact_suggested_call_schema() -> Value {
+    suggested_tool_call_schema(
+        "read_project_artifact",
+        json!({
+            "type": "object",
+            "description": "Parser-ready next ranged read of the same exact full-file artifact incarnation.",
+            "additionalProperties": false,
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "encoding": {"type": "string", "const": "base64"},
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "expected_sha256": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                },
+                "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
+            },
+            "required": [
+                "project",
+                "path",
+                "encoding",
+                "offset",
+                "length",
+                "expected_sha256"
+            ]
+        }),
+        "Parser-ready advisory call for the next ranged read of the same exact artifact content snapshot. It grants no Project or Session authority.",
+    )
+}
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
@@ -275,7 +310,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "next_offset",
-                schema_type("integer", "Offset to use for the next chunk."),
+                schema_type(
+                    "integer",
+                    "Domain metadata for the next chunk offset. Models should continue through suggested_call, which also carries the observed full-file SHA-256 snapshot fence.",
+                ),
             ),
             (
                 "truncated",
@@ -284,6 +322,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "eof",
                 schema_type("boolean", "True when this chunk reaches end of file."),
+            ),
+            (
+                "suggested_call",
+                read_project_artifact_suggested_call_schema(),
             ),
         ])),
         _ => None,

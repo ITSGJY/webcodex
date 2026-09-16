@@ -356,7 +356,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
             false,
             ToolResult::ok(json!({
                 "client_id": "msi",
-                "display_id": "display_0123456789abcdef0123456789abcdef",
+                "display_id": "display_iavN7wEjRWeJq83v",
                 "snapshot_generation": generation,
                 "source_width": 1,
                 "source_height": 1,
@@ -451,7 +451,7 @@ async fn mcp_computer_snapshot_resource_links_are_unique_caller_bound_and_scope_
         ToolResult::ok(json!({
             "client_id": "mini",
             "surface": {
-                "surface_id": "surface_0123456789abcdef0123456789abcdef",
+                "surface_id": "surface_iavN7wEjRWeJq83v",
                 "application": "Microsoft Edge",
                 "title": "Snapshot test"
             },

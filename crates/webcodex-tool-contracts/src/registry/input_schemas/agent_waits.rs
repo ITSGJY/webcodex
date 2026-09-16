@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 
-const AGENT_ID_PATTERN: &str = "^wc_dagent_[0-9a-f]{32}$";
-const ENDPOINT_ID_PATTERN: &str = "^wc_endpoint_[0-9a-f]{32}$";
-const WAIT_ID_PATTERN: &str = "^wc_agent_wait_[0-9a-f]{32}$";
-const TASK_ID_PATTERN: &str = "^wc_agent_task_[0-9a-f]{32}$";
+const AGENT_ID_PATTERN: &str = "^wc_dagent_[A-Za-z0-9_-]{16}$";
+const ENDPOINT_ID_PATTERN: &str = "^wc_endpoint_[A-Za-z0-9_-]{16}$";
+const WAIT_ID_PATTERN: &str = "^wc_agent_wait_[A-Za-z0-9_-]{16}$";
+const TASK_ID_PATTERN: &str = "^wc_agent_task_[A-Za-z0-9_-]{16}$";
 
 fn id(pattern: &str, description: &str) -> Value {
     json!({"type":"string","pattern":pattern,"description":description})

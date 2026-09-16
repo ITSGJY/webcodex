@@ -31,7 +31,7 @@ const INSTANCE_A: &str = "instance-reconcile-a";
 const INSTANCE_B: &str = "instance-reconcile-b";
 const PROJECT_ID: &str = "demo";
 const RUNTIME_PROJECT_ID: &str = "agent:oe:demo";
-const SESSION_ID: &str = "wc_sess_job_reconciliation";
+const SESSION_ID: &str = "wc_sess_QGd6iAa67eC56FwA";
 
 fn reconciliation_capabilities() -> RunnerCapabilities {
     RunnerCapabilities {

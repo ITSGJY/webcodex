@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { app, flush, toolResult } from "./app_test_support.mjs";
 
 const plan = {
-  version: 1, goal_id: `wc_goal_${"1".repeat(32)}`, title: "Ship Goal",
+  version: 1, goal_id: `wc_goal_ERERERERERERERER`, title: "Ship Goal",
   objective: "Review and validate the Goal flow", lifecycle: "active", revision: 1,
   updated_at_unix_ms: 1000, terminal_at_unix_ms: null,
   agent_task_count: 0, workflow_session_count: 0,
@@ -91,7 +91,7 @@ for (const stage of ["initialize", "poll", "idle"]) {
         response = toolResult({ goal_plan: plan });
       }
       if (stage === "idle") await view.reply(pending, response);
-      const foreign = `wc_goal_${"2".repeat(32)}`;
+      const foreign = `wc_goal_IiIiIiIiIiIiIiIi`;
       if (first === "input") view.toolResult({ goal_plan: { ...plan, goal_id: foreign, title: "Foreign" } });
       else view.toolInput({ goal_id: foreign });
       const count = view.sent.length;
@@ -163,7 +163,7 @@ test("a conflicting nested CallToolResult still stops Goal polling", async () =>
   await view.initialize();
   view.toolInput(input);
   await view.reply(view.calls("goal_plan_state")[0], { result: toolResult({ goal_plan: {
-    ...plan, goal_id: `wc_goal_${"2".repeat(32)}`,
+    ...plan, goal_id: `wc_goal_IiIiIiIiIiIiIiIi`,
   } }) });
   assert.equal(view.nodes.status.textContent, "Invalid or conflicting Goal identity");
   assert.equal(view.timers.size, 0);
@@ -174,7 +174,7 @@ test("a conflicting authoritative Goal response stops polling", async () => {
   await view.initialize();
   view.toolInput(input);
   await view.reply(view.calls("goal_plan_state")[0], toolResult({ goal_plan: {
-    ...plan, goal_id: `wc_goal_${"2".repeat(32)}`,
+    ...plan, goal_id: `wc_goal_IiIiIiIiIiIiIiIi`,
   } }));
   assert.equal(view.nodes.status.textContent, "Invalid or conflicting Goal identity");
   assert.equal(view.timers.size, 0);
@@ -268,7 +268,7 @@ test("Goal rejects a different identity and ignores results after teardown", asy
   const view = app("mcp_goal_plan_app.html");
   await view.initialize();
   view.toolResult({ goal_plan: plan });
-  view.toolResult({ goal_plan: { ...plan, goal_id: `wc_goal_${"2".repeat(32)}`, title: "Foreign" } });
+  view.toolResult({ goal_plan: { ...plan, goal_id: `wc_goal_IiIiIiIiIiIiIiIi`, title: "Foreign" } });
   assert.equal(view.nodes.status.textContent, "Invalid or conflicting Goal identity");
   await view.teardown();
   view.toolResult({ goal_plan: { ...plan, title: "Late", revision: 2 } });

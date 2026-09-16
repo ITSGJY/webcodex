@@ -460,25 +460,18 @@ fn observation_outcome(
     })
 }
 
-const MESSAGE_OBSERVATION_TOKEN_PREFIX: &str = "wsm1_";
-const MESSAGE_OBSERVATION_BINDING_BYTES: usize = 16;
+const MESSAGE_OBSERVATION_TOKEN_PREFIX: &str = "wsm2_";
 const MESSAGE_OBSERVATION_REVISION_BYTES: usize = 8;
 const MESSAGE_OBSERVATION_TAG_BYTES: usize = 16;
-const MESSAGE_OBSERVATION_PAYLOAD_BYTES: usize = MESSAGE_OBSERVATION_BINDING_BYTES
-    + MESSAGE_OBSERVATION_REVISION_BYTES
-    + MESSAGE_OBSERVATION_TAG_BYTES;
+const MESSAGE_OBSERVATION_PAYLOAD_BYTES: usize =
+    MESSAGE_OBSERVATION_REVISION_BYTES + MESSAGE_OBSERVATION_TAG_BYTES;
 
 pub(super) fn encode_observation_token(
     session_id: &str,
     revision: u64,
 ) -> Result<String, SessionMessageObservationError> {
-    let binding = observation_digest(
-        b"webcodex.session-message-observation.binding.v1\0",
-        session_id,
-        &[],
-    );
     let mask = observation_digest(
-        b"webcodex.session-message-observation.mask.v1\0",
+        b"webcodex.session-message-observation.mask.v2\0",
         session_id,
         &[],
     );
@@ -488,12 +481,11 @@ pub(super) fn encode_observation_token(
         masked_revision[index] = byte ^ mask[index];
     }
     let tag = observation_digest(
-        b"webcodex.session-message-observation.tag.v1\0",
+        b"webcodex.session-message-observation.tag.v2\0",
         session_id,
         &masked_revision,
     );
     let mut payload = Vec::with_capacity(MESSAGE_OBSERVATION_PAYLOAD_BYTES);
-    payload.extend_from_slice(&binding[..MESSAGE_OBSERVATION_BINDING_BYTES]);
     payload.extend_from_slice(&masked_revision);
     payload.extend_from_slice(&tag[..MESSAGE_OBSERVATION_TAG_BYTES]);
     let token = format!(
@@ -525,24 +517,14 @@ fn parse_observation_token(
     if payload.len() != MESSAGE_OBSERVATION_PAYLOAD_BYTES {
         return Err(SessionMessageObservationError::MalformedToken);
     }
-    let expected_binding = observation_digest(
-        b"webcodex.session-message-observation.binding.v1\0",
-        session_id,
-        &[],
-    );
-    if payload[..MESSAGE_OBSERVATION_BINDING_BYTES]
-        != expected_binding[..MESSAGE_OBSERVATION_BINDING_BYTES]
-    {
-        return Err(SessionMessageObservationError::WrongSession);
-    }
-    let masked_start = MESSAGE_OBSERVATION_BINDING_BYTES;
+    let masked_start = 0;
     let masked_end = masked_start + MESSAGE_OBSERVATION_REVISION_BYTES;
     let masked_revision: [u8; MESSAGE_OBSERVATION_REVISION_BYTES] = payload
         [masked_start..masked_end]
         .try_into()
         .map_err(|_| SessionMessageObservationError::MalformedToken)?;
     let expected_tag = observation_digest(
-        b"webcodex.session-message-observation.tag.v1\0",
+        b"webcodex.session-message-observation.tag.v2\0",
         session_id,
         &masked_revision,
     );
@@ -550,7 +532,7 @@ fn parse_observation_token(
         return Err(SessionMessageObservationError::MalformedToken);
     }
     let mask = observation_digest(
-        b"webcodex.session-message-observation.mask.v1\0",
+        b"webcodex.session-message-observation.mask.v2\0",
         session_id,
         &[],
     );

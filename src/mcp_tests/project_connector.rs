@@ -78,8 +78,8 @@ fn seed_armed_mcp_execution(
         now: 10,
     })
     .unwrap();
-    let task_id = format!("wc_task_{}", uuid::Uuid::new_v4().simple());
-    let run_id = format!("wc_run_{}", uuid::Uuid::new_v4().simple());
+    let task_id = format!("wc_task_{}", webcodex_core::compact::random_suffix::<12>());
+    let run_id = format!("wc_run_{}", webcodex_core::compact::random_suffix::<12>());
     let root = project_root.to_string_lossy().into_owned();
     let task = db
         .start_connector_task(crate::db::NewConnectorTask {
@@ -1122,7 +1122,7 @@ async fn http_project_connector_2026_tasks_cancel_reuses_execution_cancellation(
     let repeated_body: Value = repeated_cancel.take_json().await.unwrap();
     assert_eq!(repeated_body["result"]["resultType"], "complete");
 
-    let unknown_task_id = "wc_exec_ffffffffffffffffffffffffffffffff";
+    let unknown_task_id = "wc_exec_________________";
     let mut missing = mcp_2026_task_request(
         &service,
         CONNECTOR_TEST_CREDENTIAL,

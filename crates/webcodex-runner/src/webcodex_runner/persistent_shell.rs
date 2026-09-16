@@ -1204,7 +1204,7 @@ mod tests {
             persistent_shell: Some(PersistentShellRequest {
                 action: action.to_string(),
                 shell_id: shell_id.to_string(),
-                workflow_session_id: "wc_sess_test".to_string(),
+                workflow_session_id: "wc_sess_n_gsG5blnjZHfyYD".to_string(),
                 runtime_project_id: "agent:agent-1:demo".to_string(),
                 cwd: None,
                 shell: Some("bash".to_string()),
@@ -1597,7 +1597,7 @@ mod windows_tests {
             persistent_shell: Some(PersistentShellRequest {
                 action: action.to_string(),
                 shell_id: shell_id.to_string(),
-                workflow_session_id: "wc_sess_windows".to_string(),
+                workflow_session_id: "wc_sess_x0hjuH0xLj6xHOl7".to_string(),
                 runtime_project_id: "agent:msi:demo".to_string(),
                 cwd: None,
                 shell: None,
@@ -1624,7 +1624,7 @@ mod windows_tests {
             "created_at": 0,
             "job_context": {
                 "runtime_project_id": "agent:msi:demo",
-                "workflow_session_id": "wc_sess_windows",
+                "workflow_session_id": "wc_sess_x0hjuH0xLj6xHOl7",
                 "ssh_resource": resource,
                 "project_cwd": ".",
                 "purpose": "other",
@@ -1635,7 +1635,7 @@ mod windows_tests {
             "persistent_shell": {
                 "action": action,
                 "shell_id": shell_id,
-                "workflow_session_id": "wc_sess_windows",
+                "workflow_session_id": "wc_sess_x0hjuH0xLj6xHOl7",
                 "runtime_project_id": "agent:msi:demo",
                 "cwd": null,
                 "shell": "bash",

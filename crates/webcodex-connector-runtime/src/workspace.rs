@@ -2027,7 +2027,7 @@ mod tests {
 
     fn task(context: &ConnectorContext, prepared: &PreparedWorkspace) -> ConnectorTaskSnapshot {
         ConnectorTaskSnapshot {
-            task_id: "wc_task_0123456789abcdef0123456789abcdef".to_string(),
+            task_id: "wc_task_iavN7wEjRWeJq83v".to_string(),
             run_id: prepared.run_id.clone(),
             project_id: context.project_id.clone(),
             workspace_id: context.workspace_id.clone(),
@@ -2053,7 +2053,7 @@ mod tests {
 
     fn result(task: &ConnectorTaskSnapshot, captured: &CapturedResult) -> ConnectorTaskResult {
         ConnectorTaskResult {
-            result_id: "wc_result_0123456789abcdef0123456789abcdef".to_string(),
+            result_id: "wc_result_iavN7wEjRWeJq83v".to_string(),
             task_id: task.task_id.clone(),
             run_id: task.run_id.clone(),
             summary: "updated readme".to_string(),
@@ -2078,8 +2078,8 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_0123456789abcdef0123456789abcdef",
-                "wc_run_0123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
@@ -2116,8 +2116,8 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_1123456789abcdef0123456789abcdef",
-                "wc_run_1123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
@@ -2149,8 +2149,8 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_2123456789abcdef0123456789abcdef",
-                "wc_run_2123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 true,
             )
             .unwrap();
@@ -2223,8 +2223,8 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_3123456789abcdef0123456789abcdef",
-                "wc_run_3123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
@@ -2251,8 +2251,8 @@ mod tests {
         let first = manager
             .prepare(
                 &context,
-                "wc_task_5123456789abcdef0123456789abcdef",
-                "wc_run_5123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
@@ -2268,8 +2268,8 @@ mod tests {
         let occupied = manager
             .prepare(
                 &context,
-                "wc_task_6123456789abcdef0123456789abcdef",
-                "wc_run_6123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap_err();
@@ -2288,8 +2288,8 @@ mod tests {
         let second = manager
             .prepare(
                 &context,
-                "wc_task_6123456789abcdef0123456789abcdef",
-                "wc_run_6123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
@@ -2324,8 +2324,8 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_a123456789abcdef0123456789abcdef",
-                "wc_run_a123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
@@ -2367,8 +2367,8 @@ mod tests {
         let error = manager
             .prepare(
                 &context,
-                "wc_task_b123456789abcdef0123456789abcdef",
-                "wc_run_b123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap_err();
@@ -2396,8 +2396,8 @@ mod tests {
         let error = manager
             .prepare(
                 &context,
-                "wc_task_c123456789abcdef0123456789abcdef",
-                "wc_run_c123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap_err();
@@ -2430,8 +2430,8 @@ mod tests {
         let error = manager
             .prepare(
                 &context,
-                "wc_task_d123456789abcdef0123456789abcdef",
-                "wc_run_d123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap_err();
@@ -2446,15 +2446,15 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_7123456789abcdef0123456789abcdef",
-                "wc_run_7123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
         let lease_path = workspace_lease_path(&manager.runs_root, WRITE_SLOT_NAME);
         fs::remove_file(&lease_path).unwrap();
         let preserved = ConnectorPreservedWorkspace {
-            task_id: "wc_task_7123456789abcdef0123456789abcdef".to_string(),
+            task_id: "wc_task_iavN7wEjRWeJq83v".to_string(),
             run_id: prepared.run_id.clone(),
             execution_root: prepared.execution_root.clone(),
             execution_executor_ref: prepared.execution_executor_ref.clone(),
@@ -2465,8 +2465,8 @@ mod tests {
         let occupied = manager
             .prepare(
                 &context,
-                "wc_task_8123456789abcdef0123456789abcdef",
-                "wc_run_8123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap_err();
@@ -2481,8 +2481,8 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_9123456789abcdef0123456789abcdef",
-                "wc_run_9123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();
@@ -2530,8 +2530,8 @@ mod tests {
         let prepared = manager
             .prepare(
                 &context,
-                "wc_task_a123456789abcdef0123456789abcdef",
-                "wc_run_a123456789abcdef0123456789abcdef",
+                "wc_task_iavN7wEjRWeJq83v",
+                "wc_run_iavN7wEjRWeJq83v",
                 false,
             )
             .unwrap();

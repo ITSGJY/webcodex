@@ -181,7 +181,11 @@ fn participant_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "participant_id": schema_type("string", "Canonical Conversation participant record id."),
+            "participant_id": {
+                "type": "string",
+                "pattern": "^wc_participant_[A-Za-z0-9_-]{16}$",
+                "description": "Canonical Conversation participant record id."
+            },
             "participant_kind": {"type": "string", "enum": ["human", "agent"]},
             "agent_id": nullable_string("Canonical Agent id for Agent participants."),
             "handle": nullable_string("Current Agent handle projection."),

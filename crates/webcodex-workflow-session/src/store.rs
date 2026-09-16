@@ -64,6 +64,10 @@ use super::util::{
     redact_and_bound_value,
 };
 
+#[cfg(test)]
+#[path = "identifier_tests.rs"]
+mod identifier_tests;
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     /// Shared session map and LRU metadata.
@@ -484,40 +488,44 @@ impl SessionStore {
                     .to_string(),
             );
         }
-        let session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
-        let now = now_ts();
-        let guards = SessionGuards::effective(opts.mode, opts.guards);
-        let owner_authority_fingerprint = opts.owner_authority_fingerprint.ok_or_else(|| {
-            "Workflow Session creation requires a canonical authority fingerprint".to_string()
-        })?;
-        let record = SessionRecord {
-            session_id: session_id.clone(),
-            project: opts.project,
-            owner_authority_fingerprint,
-            title: opts.title,
-            mode: opts.mode,
-            guards,
-            execution_context: opts.execution_context,
-            // Create always yields Active; only explicit close transitions later.
-            lifecycle: SessionLifecycle::Active,
-            created_at: now,
-            updated_at: now,
-            messages: VecDeque::new(),
-            events: VecDeque::new(),
-            events_observed: 0,
-            context_revision: 0,
-            materialized_validation_job_ids: VecDeque::new(),
-            message_observation_revision: 0,
-            message_observation_floor: 0,
-            message_observation_revisions: Default::default(),
-            assignment_history_floors: Default::default(),
-            assignment_history_tracking_complete: true,
-            completion_assignment_fence_fingerprints: Default::default(),
-            completion_assignment_fence_tracking_complete: true,
-            project_instructions: opts.project_instructions,
-        };
         let summary = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            let session_id = inner
+                .allocate_session_id(|| webcodex_core::compact::random_suffix::<12>())
+                .ok_or_else(|| "session_id_allocation_exhausted".to_string())?;
+            let now = now_ts();
+            let guards = SessionGuards::effective(opts.mode, opts.guards);
+            let owner_authority_fingerprint =
+                opts.owner_authority_fingerprint.ok_or_else(|| {
+                    "Workflow Session creation requires a canonical authority fingerprint"
+                        .to_string()
+                })?;
+            let record = SessionRecord {
+                session_id: session_id.clone(),
+                project: opts.project,
+                owner_authority_fingerprint,
+                title: opts.title,
+                mode: opts.mode,
+                guards,
+                execution_context: opts.execution_context,
+                // Create always yields Active; only explicit close transitions later.
+                lifecycle: SessionLifecycle::Active,
+                created_at: now,
+                updated_at: now,
+                messages: VecDeque::new(),
+                events: VecDeque::new(),
+                events_observed: 0,
+                context_revision: 0,
+                materialized_validation_job_ids: VecDeque::new(),
+                message_observation_revision: 0,
+                message_observation_floor: 0,
+                message_observation_revisions: Default::default(),
+                assignment_history_floors: Default::default(),
+                assignment_history_tracking_complete: true,
+                completion_assignment_fence_fingerprints: Default::default(),
+                completion_assignment_fence_tracking_complete: true,
+                project_instructions: opts.project_instructions,
+            };
             inner.insert_session(record)
         };
         self.persist_after_mutation();
@@ -546,7 +554,6 @@ impl SessionStore {
         };
         let explicit_resume = explicit_resume_session_id.is_some();
         let now = now_ts();
-        let new_session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let new_event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let requested_guards = SessionGuards::effective(request.mode, request.guards);
         let requested_execution_context = request
@@ -719,6 +726,9 @@ impl SessionStore {
                 if self.take_coding_continuity_fault() {
                     return Err(CodingSessionError::CommitFailed);
                 }
+                let new_session_id = inner
+                    .allocate_session_id(|| webcodex_core::compact::random_suffix::<12>())
+                    .ok_or(CodingSessionError::CommitFailed)?;
                 let execution_context = requested_execution_context.clone().unwrap_or_default();
                 let execution_context_changed = !execution_context.is_empty();
                 let event = coding_instruction_event(
@@ -2647,7 +2657,22 @@ impl SessionStoreInner {
     // --- create / lifecycle ---
 
     /// Sole map-insert path for a newly created session.
+    // Called under the store mutex; every fresh-session path uses this allocator.
+    pub(super) fn allocate_session_id(&self, mut suffix: impl FnMut() -> String) -> Option<String> {
+        for _ in 0..16 {
+            let id = format!("{SESSION_ID_PREFIX}{}", suffix());
+            if !self.sessions.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub(super) fn insert_session(&mut self, record: SessionRecord) -> SessionSummary {
+        assert!(
+            !self.sessions.contains_key(&record.session_id),
+            "Session allocation must not replace an existing ledger"
+        );
         let session_id = record.session_id.clone();
         self.sessions
             .insert(session_id.clone(), StoredSession::Hot(record));
@@ -2748,8 +2773,10 @@ impl SessionStoreInner {
             }
         }
         let now = now_ts();
+        let message_id =
+            allocate_message_id(record, || webcodex_core::compact::random_suffix::<12>())?;
         let message = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: input.kind,
@@ -2977,6 +3004,8 @@ impl SessionStoreInner {
             return Err(SessionMessageError::MessageNotOpen);
         }
 
+        let message_id =
+            allocate_message_id(record, || webcodex_core::compact::random_suffix::<12>())?;
         let original_revision = record
             .message_observation_revision
             .checked_add(1)
@@ -2987,7 +3016,7 @@ impl SessionStoreInner {
         record.message_observation_revision = replacement_revision;
         let now = now_ts();
         let replacement = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: original_snapshot.kind,
@@ -3301,6 +3330,8 @@ impl SessionStoreInner {
             });
         }
 
+        let message_id =
+            allocate_message_id(record, || webcodex_core::compact::random_suffix::<12>())?;
         let todo_revision = record
             .message_observation_revision
             .checked_add(1)
@@ -3312,7 +3343,7 @@ impl SessionStoreInner {
 
         let now = now_ts();
         let answer = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: super::model::SessionMessageKind::Answer,
@@ -3498,4 +3529,24 @@ impl SessionStoreInner {
         let record = self.sessions.get(session_id)?.hot()?;
         Some(summarize_record(record, limit, None))
     }
+}
+
+// No retained identity or historical retained link may silently retarget.
+pub(super) fn allocate_message_id(
+    record: &SessionRecord,
+    mut suffix: impl FnMut() -> String,
+) -> Result<String, SessionMessageError> {
+    for _ in 0..16 {
+        let id = format!("{MESSAGE_ID_PREFIX}{}", suffix());
+        if !record.messages.iter().any(|m| {
+            m.message_id == id
+                || m.reply_to.as_deref() == Some(&id)
+                || m.resolved_by_message_id.as_deref() == Some(&id)
+                || m.superseded_by_message_id.as_deref() == Some(&id)
+                || m.supersedes_message_id.as_deref() == Some(&id)
+        }) {
+            return Ok(id);
+        }
+    }
+    Err(SessionMessageError::InvalidObservationState)
 }

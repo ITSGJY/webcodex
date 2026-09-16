@@ -80,7 +80,7 @@ test_support = []
 [packages.webcodex-computer]
 layer = "leaf"
 role = "Platform-native computer-use primitives."
-normal = []
+normal = ["webcodex-core"]
 dev = []
 build = []
 test_support = []

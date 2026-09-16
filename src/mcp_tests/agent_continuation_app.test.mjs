@@ -10,12 +10,12 @@ const businessArgs = call => {
 };
 const assertAppCallId = call => assert.match(appCallId(call), /^wc_app_call_[0-9a-f]{16}_[1-9][0-9]{0,5}$/);
 const wake = {
-  wake_id: `wc_wake_${"4".repeat(32)}`, attempt_id: `wc_wake_attempt_${"5".repeat(32)}`,
+  wake_id: `wc_wake_RERERERERERERERE`, attempt_id: `wc_wake_attempt_VVVVVVVVVVVVVVVV`,
   state: "claimed", revision: 2, dispatch_observation: null,
   wait_id: null, wait_match_count: null, wait_match_sequence: null,
 };
 const projection = {
-  version: 1, agent_id: `wc_dagent_${"1".repeat(32)}`, endpoint_id: `wc_endpoint_${"2".repeat(32)}`,
+  version: 1, agent_id: `wc_dagent_ERERERERERERERER`, endpoint_id: `wc_endpoint_IiIiIiIiIiIiIiIi`,
   controller_generation: 1, display_name: "Reviewer", queued_delivery_count: 1,
   host_binding: { bound: true }, wake: { ...wake, state: "pending", revision: 1 },
   dispatch_observation: null, recovery: null,
@@ -24,9 +24,9 @@ const input = {
   agent_id: projection.agent_id, endpoint_id: projection.endpoint_id,
   expected_controller_generation: projection.controller_generation,
 };
-const waitId = `wc_agent_wait_${"6".repeat(32)}`;
-const waitTaskA = `wc_agent_task_${"7".repeat(32)}`;
-const waitTaskB = `wc_agent_task_${"8".repeat(32)}`;
+const waitId = `wc_agent_wait_ZmZmZmZmZmZmZmZm`;
+const waitTaskA = `wc_agent_task_d3d3d3d3d3d3d3d3`;
+const waitTaskB = `wc_agent_task_iIiIiIiIiIiIiIiI`;
 const waitingWait = {
   wait_id: waitId, target_agent_id: projection.agent_id, state: "waiting", revision: 1,
   created_at_unix_ms: 1000, updated_at_unix_ms: 1000,
@@ -133,7 +133,7 @@ test("Agent Wait card tracks waiting -> triggered -> resuming -> resumed without
     match_sequence: 1,
     matches: [{
       sequence: 1, kind: "agent_task_terminal", task_id: waitTaskA,
-      task_attempt_id: `wc_agent_task_attempt_${"9".repeat(32)}`,
+      task_attempt_id: `wc_agent_task_attempt_mZmZmZmZmZmZmZmZ`,
       terminal_task_state: "succeeded", occurred_at_unix_ms: 2000,
     }],
   };
@@ -208,7 +208,7 @@ for (const outcome of ["success", "error", "timeout"]) {
       assert.equal(view.nodes.status.textContent, outcome === "success"
         ? "Connecting…" : "Connection unavailable");
       if (outcome === "success") {
-        assert.match(bindingId(view), /^wc_host_binding_[0-9a-f]{32}$/);
+        assert.match(bindingId(view), /^wc_host_binding_[A-Za-z0-9_-]{21}[AQgw]$/);
         assertAppCallId(view.calls("agent_continuation_bind")[0]);
         assert.deepEqual(businessArgs(view.calls("agent_continuation_bind")[0]), { ...input, binding_id: bindingId(view) });
         const quiet = { ...projection, wake: null, queued_delivery_count: 0 };
@@ -253,8 +253,8 @@ for (const order of [
 }
 
 const conflicts = {
-  agent_id: `wc_dagent_${"a".repeat(32)}`,
-  endpoint_id: `wc_endpoint_${"b".repeat(32)}`,
+  agent_id: `wc_dagent_qqqqqqqqqqqqqqqq`,
+  endpoint_id: `wc_endpoint_u7u7u7u7u7u7u7u7`,
   controller_generation: 2,
 };
 for (const [field, value] of Object.entries(conflicts)) {
@@ -370,7 +370,7 @@ test("nonrecoverable business bind failure stays stopped after a late matching r
 
 const replacementOutput = (from = projection) => {
   const successor = {
-    ...from, endpoint_id: `wc_endpoint_${"3".repeat(32)}`,
+    ...from, endpoint_id: `wc_endpoint_MzMzMzMzMzMzMzMz`,
     controller_generation: from.controller_generation + 1,
     host_binding: { bound: false },
   };
@@ -616,7 +616,7 @@ test("input-only dispatch never displays its private binding or consume envelope
   const view = await boundView();
   await view.reply(view.calls("agent_continuation_state")[0], toolResult({ agent_continuation: projection }));
   await view.reply(view.calls("agent_continuation_wake_acquire")[0], toolResult({ wake }));
-  const consume_token = `wc_wake_consume_${"c".repeat(32)}`;
+  const consume_token = `wc_wake_consume_zMzMzMzMzMzMzMzMzMzMzA`;
   const automatic_message = `Exact test continuation consume_token=${consume_token}`;
   await view.reply(view.calls("agent_continuation_wake_prepare")[0], prepared(wake, automatic_message));
   assert.equal(hostMessages(view)[0].params.content[0].text, automatic_message);
@@ -740,7 +740,7 @@ test("finish failure keeps the old claim until its ACK is reconciled before acqu
   await view.reply(view.calls("agent_continuation_wake_finish").at(-1), rejected);
   await view.fireTimers(3000);
   await view.reply(view.calls("agent_continuation_wake_finish").at(-1), rejected);
-  const successor = { ...projection, wake: { ...projection.wake, wake_id: `wc_wake_${"6".repeat(32)}` } };
+  const successor = { ...projection, wake: { ...projection.wake, wake_id: `wc_wake_ZmZmZmZmZmZmZmZm` } };
   await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: successor }));
   assert.equal(view.calls("agent_continuation_wake_acquire").length, 1);
   await view.fireTimers(3000);
@@ -756,7 +756,7 @@ test("finish failure keeps the old claim until its ACK is reconciled before acqu
 test("all App coordination survives stripped ToolResult metadata through successor Wakes", async () => {
   const view = await boundView();
   for (let round = 0; round < 3; round++) {
-    const currentWake = { ...wake, wake_id: `wc_wake_${String(round + 6).repeat(32)}`, attempt_id: `wc_wake_attempt_${String(round + 6).repeat(32)}` };
+    const currentWake = { ...wake, wake_id: `wc_wake_${String(round + 6).repeat(16)}`, attempt_id: `wc_wake_attempt_${String(round + 6).repeat(16)}` };
     const currentProjection = { ...projection, wake: currentWake };
     await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: currentProjection }));
     await view.reply(view.calls("agent_continuation_wake_acquire").at(-1), toolResult({ wake: currentWake }));
@@ -1087,7 +1087,7 @@ for (const loss of ["timeout", "Host error", "malformed result"]) {
     view.toolInput(input);
     const first = view.calls("agent_continuation_bind")[0];
     const serverBinding = first.params.arguments.binding_id; // Server committed; reply is lost.
-    assert.match(serverBinding, /^wc_host_binding_[0-9a-f]{32}$/);
+    assert.match(serverBinding, /^wc_host_binding_[A-Za-z0-9_-]{21}[AQgw]$/);
     assertAppCallId(first);
     if (loss === "timeout") await view.fireTimers(10000);
     else if (loss === "Host error") await view.reject(first);
@@ -1182,7 +1182,7 @@ for (const loss of ["timeout", "missing", "wrong type", "blank", "oversized", "w
       if (loss === "wrong type") output.app_protocol.automatic_message = {};
       if (loss === "blank") output.app_protocol.automatic_message = "  ";
       if (loss === "oversized") output.app_protocol.automatic_message = "x".repeat(4097);
-      if (loss === "wrong Attempt") output.attempt_id = `wc_wake_attempt_${"e".repeat(32)}`;
+      if (loss === "wrong Attempt") output.attempt_id = `wc_wake_attempt_7u7u7u7u7u7u7u7u`;
       if (loss === "business failure") response.structuredContent.success = false;
       await view.reply(view.calls("agent_continuation_wake_prepare")[0], response);
     }
@@ -1258,7 +1258,7 @@ test("Agent Wait sparse reference still requires the exact durable target on App
   await view.reply(view.calls("agent_continuation_bind")[0], toolResult({ agent_continuation: quiet }));
   await view.reply(view.calls("agent_continuation_state").at(-1), toolResult({ agent_continuation: quiet }));
   await view.reply(view.calls("agent_wait_state").at(-1), toolResult({ agent_wait: {
-    ...waitingWait, target_agent_id: `wc_dagent_${"a".repeat(32)}`,
+    ...waitingWait, target_agent_id: `wc_dagent_qqqqqqqqqqqqqqqq`,
   } }));
   assert.equal(view.nodes.binding.textContent, "Unavailable");
   assert.equal(view.nodes.status.textContent, "Invalid or conflicting Wait identity");

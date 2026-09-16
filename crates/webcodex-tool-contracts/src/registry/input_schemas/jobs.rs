@@ -455,13 +455,13 @@ pub fn observe_jobs_input_schema() -> Value {
             "wait_secs": {
                 "type": "integer",
                 "minimum": 1,
-                "description": format!("Optional one shared bounded wait (a maximum), never a minimum sleep or multiplied by item count. Omission or any item without a token returns an immediate observation/baseline. Values above {MAX_JOB_OBSERVATION_WAIT_SECS} seconds are clamped to {MAX_JOB_OBSERVATION_WAIT_SECS}. With tokens, wake_on selects early wake behavior; updates never extend the deadline.")
+                "description": format!("Optional one shared bounded wait (a maximum), never a minimum sleep or multiplied by item count. Omission or any item without a token returns an immediate observation/baseline. Values above {MAX_JOB_OBSERVATION_WAIT_SECS} seconds are clamped to {MAX_JOB_OBSERVATION_WAIT_SECS}. With tokens, wake_on selects early wake behavior; updates never extend the deadline. The canonical {MAX_JOB_OBSERVATION_WAIT_SECS}-second terminal wait is for when further useful progress depends on terminal outcome; otherwise defer observation while independent work continues.")
             },
             "wake_on": {
                 "type": "string",
                 "enum": ["change", "terminal"],
                 "default": "change",
-                "description": "Bounded-wait wake policy. change (default) returns on any observable change. terminal coalesces non-terminal log/progress/activity changes until any Job is terminal, an item errors, or the shared deadline expires. Deadline returns timeout even when changed=true; deltas remain relative to the caller's original tokens. No token means immediate baseline; no wait_secs means immediate observation."
+                "description": "Bounded-wait wake policy. change (default) returns on any observable change. terminal coalesces non-terminal log/progress/activity changes until any Job is terminal, an item errors, or the shared deadline expires; use terminal waiting when dependent progress is blocked, not as an unconditional next call. Deadline returns timeout even when changed=true; deltas remain relative to the caller's original tokens. No token means immediate baseline; no wait_secs means immediate observation."
             }
         },
         "required": ["items"]

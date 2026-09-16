@@ -119,7 +119,7 @@ Derive it from canonical semantic/approval metadata. A simple projection is:
 `import_conversation_files_to_project` has two distinct legitimate host provenance paths:
 
 - GPT Action/OpenAI Action file-reference rewrite;
-- trusted OAuth MCP host-file rewrite.
+- trusted MCP host-file rewrite: normally an exact configured OAuth client, or the explicit loopback-only user-API-token exception for OpenAI Secure Tunnel.
 
 Authorization still comes from canonical ToolRuntime policy. Provenance is private adapter-derived metadata and selects the correct bounded download policy.
 

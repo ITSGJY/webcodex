@@ -10,7 +10,7 @@ fn tool_specs_git_log_schema() {
     assert_schema_fields!(
         props,
         "git_log input schema",
-        present: ["project", "limit", "skip", "session_id"]
+        present: ["project", "head_commit", "limit", "skip", "session_id"]
     );
     let output_props = spec.output_schema["properties"]["output"]["properties"]
         .as_object()
@@ -18,7 +18,17 @@ fn tool_specs_git_log_schema() {
     assert_schema_fields!(
         output_props,
         "git_log output schema",
-        present: ["project", "limit", "skip", "count", "truncated", "commits"]
+        present: [
+            "project",
+            "head_commit",
+            "limit",
+            "skip",
+            "count",
+            "truncated",
+            "next_skip",
+            "commits",
+            "suggested_call"
+        ]
     );
     assert!(
         spec.description.chars().count() <= crate::tool_runtime::MODEL_TOOL_DESCRIPTION_MAX_CHARS

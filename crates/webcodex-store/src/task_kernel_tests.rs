@@ -21,8 +21,8 @@ fn bind(db: &Database, subject: &str) {
 }
 
 fn start(db: &Database, subject: &str, goal: &str) -> ConnectorTaskSnapshot {
-    let task_id = new_id("wc_task");
-    let run_id = new_id("wc_run");
+    let task_id = format!("wc_task_{}", webcodex_core::compact::random_suffix::<12>());
+    let run_id = format!("wc_run_{}", webcodex_core::compact::random_suffix::<12>());
     db.start_connector_task(NewConnectorTask {
         task_id: &task_id,
         run_id: &run_id,
@@ -119,8 +119,8 @@ fn failed_initial_window_binding_rolls_back_task_run_and_event() {
     let (_temp, db) = database();
     bind(&db, "user:one");
     fail_window_context_inserts(&db);
-    let task_id = new_id("wc_task");
-    let run_id = new_id("wc_run");
+    let task_id = format!("wc_task_{}", webcodex_core::compact::random_suffix::<12>());
+    let run_id = format!("wc_run_{}", webcodex_core::compact::random_suffix::<12>());
     let root_sha256 = "a".repeat(64);
     let fingerprint = fingerprint(&root_sha256, "");
 
@@ -174,8 +174,8 @@ fn failed_initial_window_binding_rolls_back_task_run_and_event() {
 fn failed_continuation_binding_rolls_back_mode_workspace_and_instruction() {
     let (_temp, db) = database();
     bind(&db, "user:one");
-    let task_id = new_id("wc_task");
-    let run_id = new_id("wc_run");
+    let task_id = format!("wc_task_{}", webcodex_core::compact::random_suffix::<12>());
+    let run_id = format!("wc_run_{}", webcodex_core::compact::random_suffix::<12>());
     let root_sha256 = "b".repeat(64);
     let fingerprint = fingerprint(&root_sha256, "src");
     let task = db
@@ -362,8 +362,8 @@ fn malformed_persisted_read_only_isolated_task_cannot_continue() {
 fn new_inspect_task_is_rejected_before_persistence() {
     let (_temp, db) = database();
     bind(&db, "user:one");
-    let task_id = new_id("wc_task");
-    let run_id = new_id("wc_run");
+    let task_id = format!("wc_task_{}", webcodex_core::compact::random_suffix::<12>());
+    let run_id = format!("wc_run_{}", webcodex_core::compact::random_suffix::<12>());
     let error = db
         .start_connector_task(NewConnectorTask {
             task_id: &task_id,
@@ -1402,4 +1402,38 @@ fn a_truncated_applied_path_list_never_claims_to_be_complete() {
         "duplicates beyond the returned cap must not inflate the distinct total"
     );
     assert!(!applied.complete, "a truncated list claimed completeness");
+}
+
+#[test]
+fn only_generated_primary_key_collisions_are_retryable() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for table in ["wc_tasks", "wc_runs", "wc_task_results"] {
+        conn.execute_batch(&format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, operation_id TEXT UNIQUE); INSERT INTO {table} VALUES ('occupied', 'operation');")).unwrap();
+        let collision: ConnectorTaskStoreError = conn
+            .execute(
+                &format!("INSERT INTO {table} VALUES ('occupied', 'new')"),
+                [],
+            )
+            .unwrap_err()
+            .into();
+        assert!(collision.is_generated_identity_collision());
+        let operation: ConnectorTaskStoreError = conn
+            .execute(
+                &format!("INSERT INTO {table} VALUES ('new', 'operation')"),
+                [],
+            )
+            .unwrap_err()
+            .into();
+        assert!(!operation.is_generated_identity_collision());
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    assert!(
+        !ConnectorTaskStoreError::InvalidState("business failure".into())
+            .is_generated_identity_collision()
+    );
 }

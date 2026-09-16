@@ -20,7 +20,7 @@ use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
 use super::tool_inputs::{
     ApplyFileChangeInput, ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind,
 };
-use super::tool_result::ToolResult;
+use super::tool_result::{SuggestedToolCall, ToolResult};
 use super::{file_listing, permissions, project_instructions};
 use super::{SearchPatternMode, SearchResultMode, ToolRuntime};
 use crate::artifact_policy::{

@@ -284,7 +284,10 @@ fn bind_mcp_app(
     endpoint_id: &str,
     generation: i64,
 ) -> String {
-    let binding_id = format!("wc_host_binding_{}", uuid::Uuid::new_v4().simple());
+    let binding_id = format!(
+        "wc_host_binding_{}",
+        webcodex_core::compact::random_suffix::<16>()
+    );
     let result = runtime.agent_continuation_bind(
         None,
         agent_id.to_string(),
@@ -669,7 +672,7 @@ fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
         old_process_registration.output["error_kind"], "endpoint_not_attached_in_process",
         "a successor process cannot assume a pre-restart Host callback survived"
     );
-    let wrong_binding = format!("wc_host_binding_{}", "b".repeat(32));
+    let wrong_binding = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let wrong_state = runtime.agent_continuation_state(
         None,
         agent_b.clone(),
@@ -893,7 +896,7 @@ fn mcp_app_restart_recovery_fingerprint_fences_replaced_and_unbound_views() {
     );
     assert!(!stale_a.success);
     assert_eq!(stale_a.output["error_kind"], "host_binding_stale");
-    let wrong_view = format!("wc_host_binding_{}", "f".repeat(32));
+    let wrong_view = "wc_host_binding______________________w".to_string();
     let wrong = runtime.agent_continuation_state(
         None,
         agent.clone(),
@@ -986,7 +989,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
     let (endpoint, generation) = attach(&runtime, &agent, "restart-refresh-endpoint");
     let window_a = crate::client_window::ClientWindow::for_test("refresh-window-a");
     let window_b = crate::client_window::ClientWindow::for_test("refresh-window-b");
-    let mut old_binding = format!("wc_host_binding_{}", "a".repeat(32));
+    let mut old_binding = "wc_host_binding_qqqqqqqqqqqqqqqqqqqqqg".to_string();
     let initial = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1029,14 +1032,14 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         agent.clone(),
         endpoint.clone(),
         generation,
-        format!("wc_host_binding_{}", "9".repeat(32)),
+        "wc_host_binding_mZmZmZmZmZmZmZmZmZmZmQ".to_string(),
     );
     assert!(!same_process_stale.success);
     assert_eq!(
         same_process_stale.output["error_kind"],
         "host_binding_stale"
     );
-    old_binding = format!("wc_host_binding_{}", "1".repeat(32));
+    old_binding = "wc_host_binding_EREREREREREREREREREREQ".to_string();
     let same_process_refresh = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1143,7 +1146,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         "endpoint_not_attached_in_process"
     );
 
-    let refreshed_binding = format!("wc_host_binding_{}", "b".repeat(32));
+    let refreshed_binding = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let refreshed = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1167,7 +1170,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         foreign_window_state.output["error_kind"],
         "host_binding_stale"
     );
-    let foreign_window_binding = format!("wc_host_binding_{}", "c".repeat(32));
+    let foreign_window_binding = "wc_host_binding_zMzMzMzMzMzMzMzMzMzMzA".to_string();
     let foreign_window_bind = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_b),
@@ -1199,7 +1202,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
 
     // Missing Window metadata does not get the Window-continuity path. With the
     // fingerprint cleared by unbind, a new iframe fence remains stale.
-    let no_window_binding = format!("wc_host_binding_{}", "d".repeat(32));
+    let no_window_binding = "wc_host_binding_3d3d3d3d3d3d3d3d3d3d3Q".to_string();
     let no_window = runtime.agent_continuation_bind(
         None,
         agent.clone(),
@@ -1221,7 +1224,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         agent,
         endpoint,
         generation,
-        format!("wc_host_binding_{}", "e".repeat(32)),
+        "wc_host_binding_7u7u7u7u7u7u7u7u7u7u7g".to_string(),
     );
     assert!(!expired.success);
     assert_eq!(expired.output["error_kind"], "endpoint_expired");
@@ -1259,7 +1262,7 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
     );
     let window_a = crate::client_window::ClientWindow::for_test("expired-recovery-window-a");
     let window_b = crate::client_window::ClientWindow::for_test("expired-recovery-window-b");
-    let old_binding = format!("wc_host_binding_{}", "1".repeat(32));
+    let old_binding = "wc_host_binding_EREREREREREREREREREREQ".to_string();
     let bound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1348,14 +1351,14 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
         receiver.clone(),
         endpoint.clone(),
         generation,
-        format!("wc_host_binding_{}", "2".repeat(32)),
+        "wc_host_binding_IiIiIiIiIiIiIiIiIiIiIg".to_string(),
     );
     assert!(!foreign_window.success);
     assert_eq!(foreign_window.output["error_kind"], "host_binding_stale");
 
     // Reopening/refreshing the original Conversation creates a new iframe fence,
     // but the Host sideband still proves the same canonical Window.
-    let refreshed_binding = format!("wc_host_binding_{}", "3".repeat(32));
+    let refreshed_binding = "wc_host_binding_MzMzMzMzMzMzMzMzMzMzMw".to_string();
     let recovered = runtime.agent_continuation_recover_endpoint_for_window(
         None,
         Some(&window_a),
@@ -1439,7 +1442,7 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
         receiver.clone(),
         endpoint.clone(),
         generation,
-        format!("wc_host_binding_{}", "4".repeat(32)),
+        "wc_host_binding_RERERERERERERERERERERA".to_string(),
     );
     assert!(!replay_from_other_window.success);
     assert_eq!(
@@ -1447,7 +1450,7 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
         "communication_idempotency_conflict"
     );
 
-    let new_binding = format!("wc_host_binding_{}", "5".repeat(32));
+    let new_binding = "wc_host_binding_VVVVVVVVVVVVVVVVVVVVVQ".to_string();
     let rebound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1551,7 +1554,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
     );
     let (endpoint, generation) = attach(&runtime, &agent, "expired-restart-endpoint");
     let window = crate::client_window::ClientWindow::for_test("expired-restart-window");
-    let first_binding = format!("wc_host_binding_{}", "6".repeat(32));
+    let first_binding = "wc_host_binding_ZmZmZmZmZmZmZmZmZmZmZg".to_string();
     let bound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window),
@@ -1592,7 +1595,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
             .unwrap();
     }
     let runtime = runtime_with_db(reopened.clone());
-    let recovery_binding = format!("wc_host_binding_{}", "7".repeat(32));
+    let recovery_binding = "wc_host_binding_d3d3d3d3d3d3d3d3d3d3dw".to_string();
     let recovered = runtime.agent_continuation_recover_endpoint_for_window(
         None,
         Some(&window),
@@ -1634,7 +1637,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
         agent.clone(),
         endpoint,
         generation,
-        format!("wc_host_binding_{}", "8".repeat(32)),
+        "wc_host_binding_iIiIiIiIiIiIiIiIiIiIiA".to_string(),
     );
     assert!(replay.success, "{:?}", replay.output);
     assert_eq!(replay.output["replayed"], true);
@@ -1662,7 +1665,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
         stale_push.output["error_kind"],
         "endpoint_not_attached_in_process"
     );
-    let binding = format!("wc_host_binding_{}", "9".repeat(32));
+    let binding = "wc_host_binding_mZmZmZmZmZmZmZmZmZmZmQ".to_string();
     let rebound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window),
@@ -2116,7 +2119,7 @@ fn replacing_push_with_mcp_app_orders_same_generation_host_carriers() {
             receiver,
             endpoint,
             generation,
-            format!("wc_host_binding_{}", "b".repeat(32)),
+            "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string(),
         );
         tx.send(result).unwrap();
     });
@@ -2146,7 +2149,7 @@ fn replacing_push_with_mcp_app_orders_same_generation_host_carriers() {
         "replacing a carrier after its dispatch accepted path must preserve conservative post-fence uncertainty"
     );
 
-    let binding_id = format!("wc_host_binding_{}", "b".repeat(32));
+    let binding_id = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let acquired = acquire_mcp_app(
         &fixture.runtime,
         &fixture.receiver,
@@ -2506,7 +2509,7 @@ fn mcp_app_consume_ack_race_and_teardown_preserve_exact_wake_semantics() {
         fixture.receiver_endpoint.clone(),
         fixture.receiver_generation,
         wake_id.clone(),
-        "wc_wake_consume_00000000000000000000000000000000".to_string(),
+        "wc_wake_consume_AAAAAAAAAAAAAAAAAAAAAA".to_string(),
     );
     assert!(!wrong_token.success);
     let wrong_generation = fixture.runtime.consume_agent_wake(
@@ -2909,7 +2912,10 @@ fn explicit_activation_bootstrap_is_replayable_and_consumes_wake_separately() {
 #[test]
 fn mcp_app_binding_input_requires_canonical_view_fence() {
     let fixture = mcp_continuation_fixture("mcp-binding-input");
-    let valid = format!("wc_host_binding_{}", "a0".repeat(16));
+    let valid = format!(
+        "wc_host_binding_{}",
+        webcodex_core::compact::encode([0xa0; 16])
+    );
     for invalid in [
         String::new(),
         format!("wc_binding_{}", "a".repeat(32)),

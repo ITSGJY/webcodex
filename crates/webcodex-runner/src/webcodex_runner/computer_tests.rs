@@ -199,13 +199,13 @@ fn computer_text_input_payload_is_closed() {
 fn application_request_payloads_remain_closed() {
     assert!(ensure_exact_payload_fields(&serde_json::json!({"limit": 2}), &["limit"]).is_ok());
     assert!(ensure_exact_payload_fields(
-        &serde_json::json!({"application_id": "application_0123456789abcdef0123456789abcdef"}),
+        &serde_json::json!({"application_id": "application_iavN7wEjRWeJq83v"}),
         &["application_id"],
     )
     .is_ok());
     for extra in ["path", "argv", "cwd", "environment", "command", "url"] {
         let mut payload = serde_json::json!({
-            "application_id": "application_0123456789abcdef0123456789abcdef"
+            "application_id": "application_iavN7wEjRWeJq83v"
         });
         payload
             .as_object_mut()
@@ -219,7 +219,7 @@ fn application_request_payloads_remain_closed() {
 fn display_request_payloads_remain_closed() {
     assert!(ensure_exact_payload_fields(&serde_json::json!({"limit": 2}), &["limit"]).is_ok());
     let exact = serde_json::json!({
-        "display_id": "display_0123456789abcdef0123456789abcdef",
+        "display_id": "display_iavN7wEjRWeJq83v",
         "max_width": 800,
         "max_height": null,
     });
@@ -250,7 +250,7 @@ fn display_request_payloads_remain_closed() {
 #[test]
 fn pointer_request_payloads_remain_snapshot_fenced_and_closed() {
     let exact = serde_json::json!({
-        "display_id": "display_0123456789abcdef0123456789abcdef",
+        "display_id": "display_iavN7wEjRWeJq83v",
         "snapshot_generation": 7,
         "x": 10,
         "y": 20,

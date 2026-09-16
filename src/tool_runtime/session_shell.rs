@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 const SERVER_MAX_PERSISTENT_SHELLS: usize = 64;
 const SERVER_MAX_TERMINAL_SHELLS: usize = 128;
@@ -116,7 +115,10 @@ impl SessionShellRegistry {
             ));
         }
         let now = chrono::Utc::now().timestamp();
-        let shell_id = format!("wc_shell_{}", Uuid::new_v4().simple());
+        let shell_id = (0..16)
+            .map(|_| format!("wc_shell_{}", webcodex_core::compact::random_suffix::<12>()))
+            .find(|id| !state.records.contains_key(id))
+            .ok_or("persistent_shell_identity_allocation_exhausted")?;
         state.records.insert(
             shell_id.clone(),
             SessionShellRecord {

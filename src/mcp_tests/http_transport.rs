@@ -2118,7 +2118,7 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
         .as_str()
         .expect("baseline observation token")
         .to_string();
-    assert!(token0.starts_with("wsm1_"));
+    assert!(token0.starts_with("wsm2_"));
     assert!(token0.len() <= 192);
 
     let worker_summary = runtime.sessions.summary(&worker_id, Some(100)).unwrap();

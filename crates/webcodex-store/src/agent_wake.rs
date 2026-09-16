@@ -8,12 +8,12 @@ use super::agent_wait::{
 };
 use super::communication::lookup_idempotent_resource;
 use super::communication::{
-    digest_text, load_agent, new_id, now_unix_ms, read_conversation_in_connection,
-    record_idempotent_resource, require_current_endpoint, store_error,
-    validate_communication_principal, validate_id, validate_idempotency_key, AgentEndpointRecord,
-    CommunicationPrincipal, CommunicationStoreError, ConversationAccess, ConversationSummaryRecord,
-    DurableAgentIdentity, AGENT_ENDPOINT_ID_PREFIX, CONVERSATION_ID_PREFIX,
-    DURABLE_AGENT_ID_PREFIX,
+    allocate_identity, digest_text, load_agent, new_proof, now_unix_ms,
+    read_conversation_in_connection, record_idempotent_resource, require_current_endpoint,
+    store_error, validate_communication_principal, validate_id, validate_idempotency_key,
+    validate_proof, AgentEndpointRecord, CommunicationPrincipal, CommunicationStoreError,
+    ConversationAccess, ConversationSummaryRecord, DurableAgentIdentity, AGENT_ENDPOINT_ID_PREFIX,
+    CONVERSATION_ID_PREFIX, DURABLE_AGENT_ID_PREFIX,
 };
 use super::Database;
 use rusqlite::{
@@ -1091,9 +1091,13 @@ impl Database {
                 agent_id,
             )?;
         }
-        let attempt_id = new_id(AGENT_WAKE_ATTEMPT_ID_PREFIX);
-        let claim_fence = new_id(AGENT_WAKE_CLAIM_FENCE_PREFIX);
-        let consume_token = new_id(AGENT_WAKE_CONSUME_TOKEN_PREFIX);
+        let attempt_id = allocate_identity(
+            &transaction,
+            AGENT_WAKE_ATTEMPT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_wake_attempts WHERE attempt_id = ?1)",
+        )?;
+        let claim_fence = new_proof(AGENT_WAKE_CLAIM_FENCE_PREFIX);
+        let consume_token = new_proof(AGENT_WAKE_CONSUME_TOKEN_PREFIX);
         let claim_fence_hash = digest_text("webcodex.agent-wake.claim-fence.v1", &claim_fence);
         let consume_token_hash =
             digest_text("webcodex.agent-wake.consume-token.v1", &consume_token);
@@ -1237,7 +1241,7 @@ impl Database {
     ) -> Result<AgentWakePrepared, CommunicationStoreError> {
         validate_wake_mutation_ids(agent_id, endpoint_id, wake_id, attempt_id)?;
         validate_communication_principal(principal)?;
-        validate_id(
+        validate_proof(
             consume_token,
             AGENT_WAKE_CONSUME_TOKEN_PREFIX,
             "invalid_wake_consume_token",
@@ -1629,7 +1633,7 @@ impl Database {
         validate_id(agent_id, DURABLE_AGENT_ID_PREFIX, "invalid_agent_id")?;
         validate_id(endpoint_id, AGENT_ENDPOINT_ID_PREFIX, "invalid_endpoint_id")?;
         validate_id(wake_id, AGENT_WAKE_ID_PREFIX, "invalid_wake_id")?;
-        validate_id(
+        validate_proof(
             consume_token,
             AGENT_WAKE_CONSUME_TOKEN_PREFIX,
             "invalid_wake_consume_token",
@@ -2042,35 +2046,59 @@ impl Database {
             "webcodex.agent-wake.explicit-activation-request.v1",
             &format!("{agent_id}\0{endpoint_id}\0{expected_controller_generation}\0{wake_id}"),
         );
-        let consume_token_digest = digest_text(
-            "webcodex.agent-wake.explicit-activation-consume.v1",
-            &format!(
-                "{}\0{agent_id}\0{endpoint_id}\0{expected_controller_generation}\0{wake_id}\0{activation_idempotency_key}",
-                principal.digest
-            ),
-        );
-        let consume_token = format!(
-            "{AGENT_WAKE_CONSUME_TOKEN_PREFIX}{}",
-            &consume_token_digest[..32]
-        );
         let now = now_unix_ms();
         let mut conn = self.lock_connection(crate::StoreDomain::AgentWake);
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(store_error)?;
-        if let Some(attempt_id) = lookup_idempotent_resource(
+        if let Some(receipt) = lookup_idempotent_resource(
             &transaction,
             principal,
             OP_EXPLICIT_ACTIVATION,
             &activation_idempotency_key,
             &request_hash,
         )? {
+            let (attempt_id, consume_token): (String, String) = serde_json::from_str(&receipt)
+                .map_err(|_| {
+                    CommunicationStoreError::new(
+                        "invalid_activation_receipt",
+                        "Invalid explicit activation replay state",
+                    )
+                })?;
+            validate_id(
+                &attempt_id,
+                AGENT_WAKE_ATTEMPT_ID_PREFIX,
+                "invalid_attempt_id",
+            )?;
+            validate_proof(
+                &consume_token,
+                AGENT_WAKE_CONSUME_TOKEN_PREFIX,
+                "invalid_consume_token",
+            )?;
             let attempt = load_attempt(&transaction, &attempt_id)?.ok_or_else(|| {
                 CommunicationStoreError::new(
                     "wake_attempt_not_found",
                     "Explicit Agent Wake activation no longer exists",
                 )
             })?;
+            let expected_hash: String = transaction
+                .query_row(
+                    "SELECT consume_token_hash FROM wc_agent_wake_attempts WHERE attempt_id = ?1",
+                    [&attempt_id],
+                    |row| row.get(0),
+                )
+                .map_err(store_error)?;
+            if attempt.wake_id != wake_id
+                || attempt.endpoint_id != endpoint_id
+                || attempt.controller_generation != expected_controller_generation
+                || expected_hash
+                    != digest_text("webcodex.agent-wake.consume-token.v1", &consume_token)
+            {
+                return Err(CommunicationStoreError::new(
+                    "invalid_activation_receipt",
+                    "Explicit activation receipt does not match its attempt",
+                ));
+            }
             let wake = load_wake(&transaction, wake_id)?.ok_or_else(|| {
                 CommunicationStoreError::new("wake_not_found", "Agent Wake does not exist")
             })?;
@@ -2136,8 +2164,13 @@ impl Database {
                 "Resolve the Agent's already-dispatched Wake before accepting another",
             ));
         }
-        let attempt_id = new_id(AGENT_WAKE_ATTEMPT_ID_PREFIX);
-        let claim_fence = new_id(AGENT_WAKE_CLAIM_FENCE_PREFIX);
+        let attempt_id = allocate_identity(
+            &transaction,
+            AGENT_WAKE_ATTEMPT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_wake_attempts WHERE attempt_id = ?1)",
+        )?;
+        let consume_token = new_proof(AGENT_WAKE_CONSUME_TOKEN_PREFIX);
+        let claim_fence = new_proof(AGENT_WAKE_CLAIM_FENCE_PREFIX);
         let claim_fence_hash = digest_text("webcodex.agent-wake.claim-fence.v1", &claim_fence);
         let consume_token_hash =
             digest_text("webcodex.agent-wake.consume-token.v1", &consume_token);
@@ -2186,13 +2219,17 @@ impl Database {
                 "Agent Wake changed before explicit activation was accepted",
             ));
         }
+        // Persist this one exact random possession proof in the existing private
+        // idempotency receipt so a lost response/restart returns the same proof.
+        // Other delivery paths continue retaining only their proof hashes.
         record_idempotent_resource(
             &transaction,
             principal,
             OP_EXPLICIT_ACTIVATION,
             &activation_idempotency_key,
             &request_hash,
-            &attempt_id,
+            &serde_json::to_string(&(&attempt_id, &consume_token))
+                .expect("activation receipt serializes"),
             now,
         )?;
         let wake = load_wake(&transaction, wake_id)?.expect("activated Wake must exist");
@@ -2295,7 +2332,11 @@ pub(super) fn coalesce_agent_wake_for_delivery(
             .map_err(store_error)?;
         return Ok(wake_id);
     }
-    let wake_id = new_id(AGENT_WAKE_ID_PREFIX);
+    let wake_id = allocate_identity(
+        &transaction,
+        AGENT_WAKE_ID_PREFIX,
+        "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
+    )?;
     transaction
         .execute(
             "INSERT INTO wc_agent_wakes (
@@ -2823,7 +2864,7 @@ fn require_exact_claim(
     claim_fence: &str,
     consume_token: Option<&str>,
 ) -> Result<AgentWakeRecord, CommunicationStoreError> {
-    validate_id(
+    validate_proof(
         claim_fence,
         AGENT_WAKE_CLAIM_FENCE_PREFIX,
         "invalid_wake_claim_fence",

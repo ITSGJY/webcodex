@@ -551,16 +551,13 @@ pub fn validate_plugin_catalog_digest(value: &str) -> Result<(), String> {
 }
 
 pub fn validate_project_plugin_catalog_revision(value: &str) -> Result<(), String> {
-    let Some(hex) = value.strip_prefix(PLUGIN_PROJECT_CATALOG_REVISION_PREFIX) else {
+    let Some(encoded) = value.strip_prefix(PLUGIN_PROJECT_CATALOG_REVISION_PREFIX) else {
         return Err("project Plugin catalog revision has invalid namespace".to_string());
     };
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if crate::compact::decode::<32>(encoded).is_none() {
         return Err(
-            "project Plugin catalog revision must contain 64 lowercase hex digits".to_string(),
+            "project Plugin catalog revision must contain one canonical compact SHA-256 digest"
+                .to_string(),
         );
     }
     Ok(())

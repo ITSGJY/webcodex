@@ -26,29 +26,22 @@ work_on_project
 
 普通使用不需要理解 WebCodex 内部的 continuity/audit field；这些属于 implementation/maintainer contract。
 
-内置工作流为所有任务提供默认 guidance，不要求先指定角色：核对目标和适用规则、保留已有工作、完成已授权的实现、按改动范围验证、观察已有 Job 而不重复执行，以及如实报告证据。只使用当前暴露的 schema 支持的工具与协议字段。
+内置默认 guidance 本身就是普通 implementation workflow。正常的“implement/fix/refactor”任务不需要知道任何实现角色名：把已授权工作推进到具体、可评审的完成状态，端到端覆盖跨层改动，保持设计最小化，按范围验证，并如实报告证据。只使用当前暴露 schema 支持的工具与协议字段。
 
-Behavioral role 在默认原则上增加侧重点，写在 task instruction 里即可，例如实现任务：
-
-```text
-使用 implementation_owner guidance。实现 <任务>，运行聚焦 validation，
-并审查最终 diff。
-```
-
-独立评审：
+`independent_review` 是唯一保留的可选 named role，因为它确实改变行为。只有任务明确要求独立评审 pass 时才使用：
 
 ```text
 使用 independent_review guidance。独立评审 <改动或 commit>，
 报告有文件/行号证据和影响说明的具体发现，不修改文件。
 ```
 
-如果也希望修复，明确补充“修复具体发现，并运行聚焦回归验证”。单独指定评审角色不代表授权修改。
+如果也希望修复，明确补充“修复具体发现，并运行聚焦回归验证”。单独指定评审角色不代表授权修改，任何 role 都不会授予额外 authority。
 
 Guidance 通过工具结果交给客户端，不是客户端的 system prompt，也不会授予执行权限。Host 指令、用户任务、适用项目规则、认证和运行时安全策略仍然有效。返回 guidance 不等于模型已经读取、记住或遵守；只有当前模型上下文仍保留内容时才应关闭其返回。
 
 ## 编辑前先检查
 
-能够表达任务时，优先使用 structured project search/read，而不是 shell。只读取理解当前改动所需的文件和范围，并保留 workspace 中已经存在的无关工作。
+选择能够保持正确语义的最简单 inspection primitive。已经知道 symbol、test 或具体实现区域时，优先读取有界目标范围；多个相关范围在调用前已经确定时可以一起 batch。做 broad discovery 时，先用 files-with-matches、count 或少量低 context match 等窄 projection，再读取真正相关的范围。小型、已知 scope、输出可预测的 native `rg` 通过 `run_process`/`run_shell` 同样是一等路径。
 
 Bootstrap 只读取固定的几个指令入口，不会扫描所有子目录规则。修改某个路径前，需要检查适用的子目录指令，并补读相关缺失或被截断的规则内容。
 
@@ -74,6 +67,8 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 如果某次 test invocation 必须证明“测试确实执行了”，使用 `require_tests: true` 或 `min_tests: N`。它们是本次调用的 evidence assertion，不会自动变成 Workflow Session 的持久要求。如果 validator execution 成功，但请求的 test 数量未满足或无法证明，closeout 会把这次调用保留为 evidence gap，而不是代码/测试 correctness failure。否则，exit-zero 但合法运行零个 test 只是 execution result，并不能证明 test coverage。
 
+把 validation failure 当作 evidence，而不是必须立即清空的队列。如果失败说明当前实现方向无效，或者阻塞后续依赖工作，就先诊断修复；否则保留该 evidence，继续真正独立的工作，在依赖或 closeout 需要时再解决/重验。故意重跑同一个逻辑 assertion 时复用 `assertion_name`。Mutation 会让相关旧 evidence 变 stale，`outcome_unknown` 继续 fail closed。
+
 只有 structured validation 无法表达检查时，才使用 shell/process escape hatch。
 
 ## Review 与 closeout
@@ -84,7 +79,7 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## 长时间运行的工作
 
-命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。观察该 Job，不要再启动一个副本。Tool 返回的 recovery/continuation hint 只是下一次显式调用的 guidance；WebCodex 不会对不确定 effect 做隐藏 retry。
+命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 `wait_secs=100, wake_on=terminal` 有界等待 continuation。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
 
 ## 手动多窗口协作
 

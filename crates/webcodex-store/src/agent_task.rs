@@ -5,11 +5,11 @@ use super::agent_wake::{
     WAKE_TRIGGER_AGENT_TASK_ATTEMPT,
 };
 use super::communication::{
-    authorize_conversation_access, digest_json, digest_text, lookup_idempotent_resource, new_id,
-    now_unix_ms, record_idempotent_resource, store_error, validate_communication_principal,
-    validate_id, validate_idempotency_key, CommunicationPrincipal, CommunicationStoreError,
-    ConversationAccess, CONVERSATION_ID_PREFIX, CONVERSATION_MESSAGE_ID_PREFIX,
-    DURABLE_AGENT_ID_PREFIX,
+    allocate_identity, authorize_conversation_access, digest_json, digest_text,
+    lookup_idempotent_resource, new_proof, now_unix_ms, record_idempotent_resource, store_error,
+    validate_communication_principal, validate_id, validate_idempotency_key, validate_proof,
+    CommunicationPrincipal, CommunicationStoreError, ConversationAccess, CONVERSATION_ID_PREFIX,
+    CONVERSATION_MESSAGE_ID_PREFIX, DURABLE_AGENT_ID_PREFIX,
 };
 use super::Database;
 use rusqlite::{
@@ -774,7 +774,11 @@ impl Database {
             source_message_id.as_deref(),
         )?;
 
-        let task_id = new_id(AGENT_TASK_ID_PREFIX);
+        let task_id = allocate_identity(
+            &transaction,
+            AGENT_TASK_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_tasks WHERE task_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_tasks (
@@ -1163,8 +1167,12 @@ impl Database {
             .as_ref()
             .map(|attempt| attempt.attempt_number.saturating_add(1))
             .unwrap_or(1);
-        let attempt_id = new_id(AGENT_TASK_ATTEMPT_ID_PREFIX);
-        let attempt_fence = new_id(AGENT_TASK_ATTEMPT_FENCE_PREFIX);
+        let attempt_id = allocate_identity(
+            &transaction,
+            AGENT_TASK_ATTEMPT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_task_attempts WHERE attempt_id = ?1)",
+        )?;
+        let attempt_fence = new_proof(AGENT_TASK_ATTEMPT_FENCE_PREFIX);
         let lease_expires_at = now.saturating_add(DEFAULT_AGENT_TASK_ATTEMPT_LEASE_MS);
         transaction
             .execute(
@@ -1350,7 +1358,11 @@ impl Database {
             ));
         }
 
-        let wake_id = new_id(AGENT_WAKE_ID_PREFIX);
+        let wake_id = allocate_identity(
+            &transaction,
+            AGENT_WAKE_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_wakes (
@@ -1536,7 +1548,7 @@ impl Database {
                     AGENT_WAKE_ID_PREFIX,
                     "invalid_agent_task_active_turn_wake_id",
                 )?;
-                validate_id(
+                validate_proof(
                     consume_token,
                     AGENT_WAKE_CONSUME_TOKEN_PREFIX,
                     "invalid_agent_task_active_turn_consume_token",
@@ -3392,7 +3404,7 @@ fn validate_attempt_mutation_inputs(
         DURABLE_AGENT_ID_PREFIX,
         "invalid_agent_id",
     )?;
-    validate_id(
+    validate_proof(
         attempt_fence,
         AGENT_TASK_ATTEMPT_FENCE_PREFIX,
         "invalid_agent_task_attempt_fence",

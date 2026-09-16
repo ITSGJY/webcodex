@@ -197,6 +197,14 @@ Explicitly call `session_handoff_summary(session_id=...)` with its default compl
 
 All ACK states remain nonblocking for the original effect. ACK grants no authority, is not a delivery/read receipt, is not persisted as caller state, and is never inferred from connection, `openai/session`, `Mcp-Session-Id`, credentials, Project identity, elapsed time or hidden window state.
 
+Context recovery, compaction, and exact `work_on_project(session_id=...)` resume do
+not by themselves restart the coding task. After recovery, a model should reuse
+still-current verified Git state, reads, validation evidence, known Job ids, and
+implementation decisions instead of broad-scanning from scratch. Facts bound to
+a changed snapshot, HEAD/worktree, or instruction fingerprint must be re-observed.
+Workflow Session identity remains continuity/evidence identity only: it never
+proves that a fresh model context retained prior content.
+
 Legacy MCP, generic REST/GPT Actions/OpenAPI, and ProjectConnector remain non-capable. They still contribute checkpoint-capable model-facing consequences to durable `context_revision` history for later capable recovery, but expose no context continuity overlay. Their ordinary observations remain bounded ledger evidence without advancing the watermark. Capability is supplied explicitly by the adapter.
 
 Model ergonomics telemetry schema v5 retains eligibility, ACK presence, bounded continuity status, delta event count, truncation/loss flags and total serialized result bytes. `context_recovery_kind` is one of `none`, `delta`, `compact_hint`, `current_state`; incomplete deltas requiring explicit recovery count as `compact_hint` while retaining their event/loss metrics. `current_state` identifies an explicit recovered handoff. `context_recovery_bytes` measures the UTF-8 serialized object containing only the final `session_context_revision`, `session_continuity` and `session_recovery` projections (zero if absent); explicit handoff business content is measured by `serialized_result_bytes`, not counted twice as an overlay. Telemetry stores no revision values, Session ids, paths, commands, prompts, events or handoff bodies.

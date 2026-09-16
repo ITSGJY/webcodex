@@ -801,13 +801,7 @@ fn safe_string(value: Option<&Value>, max_chars: usize) -> Option<String> {
 }
 
 fn valid_runtime_message_id(message_id: &str) -> bool {
-    message_id.strip_prefix("wc_msg_").is_some_and(|suffix| {
-        !suffix.is_empty()
-            && suffix
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    })
+    webcodex_core::workflow_session_contract::is_valid_session_message_id(message_id)
 }
 
 fn session_message_mutation_error(
@@ -4817,7 +4811,7 @@ mod tests {
             &auth,
             WorkflowSessionMessagesInput {
                 project: "agent:missing:project".to_string(),
-                session_id: "wc_sess_missing".to_string(),
+                session_id: "wc_sess_missing000000000".to_string(),
                 limit: Some(20),
             },
         )
@@ -4841,7 +4835,7 @@ mod tests {
             &runtime_read_only,
             WorkflowSessionPostMessageInput {
                 project: "agent:missing:project".to_string(),
-                session_id: "wc_sess_missing".to_string(),
+                session_id: "wc_sess_missing000000000".to_string(),
                 kind: SessionMessageKind::Guidance,
                 priority: SessionMessagePriority::High,
                 message: "must not be injected by runtime:read".to_string(),
@@ -4894,7 +4888,7 @@ mod tests {
                 tags: vec!["answer-tag".to_string()],
                 priority: SessionMessagePriority::Normal,
                 completion_id: "a".repeat(64),
-                author_session_id: Some("wc_sess_worker".to_string()),
+                author_session_id: Some("wc_sess_worker0000000000".to_string()),
                 expected_assignment_fence: assignment_fence,
             })
             .unwrap();
@@ -5251,8 +5245,8 @@ mod tests {
                 &auth_a,
                 WorkflowSessionWithdrawMessageInput {
                     project: project_id.to_string(),
-                    session_id: "wc_sess_missing".to_string(),
-                    message_id: "wc_msg_missing".to_string(),
+                    session_id: "wc_sess_missing000000000".to_string(),
+                    message_id: "wc_msg_missing000000000".to_string(),
                 },
             )
             .await
@@ -5266,7 +5260,7 @@ mod tests {
                 WorkflowSessionWithdrawMessageInput {
                     project: project_id.to_string(),
                     session_id: session.session_id.clone(),
-                    message_id: "wc_msg_missing".to_string(),
+                    message_id: "wc_msg_missing000000000".to_string(),
                 },
             )
             .await
@@ -5382,8 +5376,8 @@ mod tests {
         )
         .json(&serde_json::json!({
             "project": "agent:missing:project",
-            "session_id": "wc_sess_missing",
-            "message_id": "wc_msg_missing",
+            "session_id": "wc_sess_missing000000000",
+            "message_id": "wc_msg_missing000000000",
             "unexpected": true,
         }))
         .send(&service)

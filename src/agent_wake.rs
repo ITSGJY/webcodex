@@ -128,16 +128,11 @@ pub(crate) enum McpAppBindingState {
 fn validate_mcp_app_binding_id(binding_id: &str) -> Result<(), CommunicationStoreError> {
     if !binding_id
         .strip_prefix(MCP_APP_BINDING_ID_PREFIX)
-        .is_some_and(|suffix| {
-            suffix.len() == 32
-                && suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
+        .is_some_and(|suffix| webcodex_core::compact::decode::<16>(suffix).is_some())
     {
         return Err(CommunicationStoreError::new(
             "invalid_host_binding_id",
-            "binding_id must be wc_host_binding_ followed by 32 lowercase hex characters",
+            "binding_id must be wc_host_binding_ followed by canonical base64url of 16 random bytes",
         ));
     }
     Ok(())

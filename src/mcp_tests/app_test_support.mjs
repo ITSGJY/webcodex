@@ -31,7 +31,7 @@ export function app(filename, { deliverToolMeta = true, deliverToolStructuredCon
     return id;
   }
   runInNewContext(script, {
-    document, parent, addEventListener, TextEncoder, crypto,
+    document, parent, addEventListener, TextEncoder, crypto, btoa,
     setTimeout: setTimer,
     clearTimeout: id => timers.delete(id),
     setInterval: (callback, delay) => setTimer(callback, delay, true),

@@ -245,9 +245,9 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "assignment_fence",
                 json!({
                     "type": "string",
-                    "minLength": 48,
-                    "maxLength": 48,
-                    "pattern": "^wsa1_[A-Za-z0-9_-]{43}$",
+                    "minLength": 27,
+                    "maxLength": 27,
+                    "pattern": "^wsa2_[A-Za-z0-9_-]{22}$",
                     "description": "Deterministic Session/todo-bound semantic snapshot fence. Pass unchanged as expected_assignment_fence; it is not an observation cursor, authority token, or completion key."
                 }),
             ),

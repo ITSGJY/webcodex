@@ -99,7 +99,12 @@ impl Database {
                 "execution kind and check plan do not match".to_string(),
             ));
         }
-        let execution_id = format!("wc_exec_{}", uuid::Uuid::new_v4().simple());
+        let execution_id = super::communication::allocate_identity(
+            &tx,
+            "wc_exec_",
+            "SELECT EXISTS(SELECT 1 FROM wc_executions WHERE id = ?1)",
+        )
+        .map_err(|error| ConnectorTaskStoreError::Storage(anyhow::anyhow!(error)))?;
         let check_plan = (kind == ConnectorExecutionKind::Check).then(|| check_plan.join(","));
         let check_recipe_json = check_recipe
             .map(serde_json::to_string)
