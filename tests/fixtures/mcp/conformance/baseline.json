@@ -110,7 +110,7 @@
           "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
           "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "a9ce6a3e09ef612a093679f8168ec4fb3fa2aca1297a5768620a6bc32f284b09"
+          "evidence_sha256": "55fef6d01afbb12e2235724cc78cef53e13ad7b61fb8b387d4b260c19ce74b89"
         },
         {
           "scenario": "elicitation-sep1034-defaults",
@@ -119,7 +119,7 @@
           "reason": "The upstream scenario requires a named elicitation reference tool that is absent from the product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "83d6fd31cb9a2b72c67b9770fb8061dbffa3bce28ee8b3010cddc583ff678321"
+          "evidence_sha256": "5ab028bbd3467c6dc5fd5c8bd1c19af5732391da6e7c6543737d21962039db54"
         },
         {
           "scenario": "elicitation-sep1330-enums",
@@ -128,7 +128,7 @@
           "reason": "The upstream scenario requires a named elicitation reference tool that is absent from the product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "26a3bf8993b0c55a57bb73ec0464c55409ab344b298c1247c272e037de824b35"
+          "evidence_sha256": "6043343fce6e7d657c351276e50c1092274ab5679572e2cfbac15397db729633"
         },
         {
           "scenario": "resources-read-binary",
@@ -164,7 +164,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "70365f79b9a6aa9469dbc6ab94bf8f24af5a0c801f76d7b34f5a81f0f4f1ae29"
+          "evidence_sha256": "f52ab456f88f932ae8fbda66972454a1eb01e97650550de960ce5f78d251eafe"
         },
         {
           "scenario": "tools-call-elicitation",
@@ -173,7 +173,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "1e7da23eb35ac8b41db36c90d516268f47bb337b0db0840e5c175a6ab4ce7aa7"
+          "evidence_sha256": "2e5b0ff0322968f3f71159940edc711a62a8570ff5b807d17060695f40b921e2"
         },
         {
           "scenario": "tools-call-embedded-resource",
@@ -182,7 +182,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "45387ed5643a97cb78461bdf8c85072032feb6dc1cbbc8ada48497d57827f8e9"
+          "evidence_sha256": "f176191f243db4cde3281c36d431c051330aaf8bed2317c4bfc271b0ab17c7c3"
         },
         {
           "scenario": "tools-call-error",
@@ -191,7 +191,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "c0a78aef84e5353a71161e750cf1688e0fdaaa937d5592fedb7547ecfd73a64c"
+          "evidence_sha256": "d8d28432df8232f95c5c7333cca717383761bb2b129649f67e146129d55d9c55"
         },
         {
           "scenario": "tools-call-image",
@@ -200,7 +200,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "d8b841aa282c1ff888eac2d3103399bab5d049971d628dc2225b49603fe3da99"
+          "evidence_sha256": "c0890e33c4952cdc08d213615d387110ea067aaf22584bae4d2e148a5600be1c"
         },
         {
           "scenario": "tools-call-mixed-content",
@@ -209,7 +209,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "a24ee9f4b00fa5402e4ab02d0fe49836b2292f0f3bf45760aa86050219719890"
+          "evidence_sha256": "ff8a525bfad910a6a1f4e61cbcf35fbec589c12f2535ae97d5645d6caba447bf"
         },
         {
           "scenario": "tools-call-sampling",
@@ -218,7 +218,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "9a95b1e3dd93a5c2ca1203d2f406135f08b19739f7a3ff29fbc2c6f3ea71d010"
+          "evidence_sha256": "aeb68fd319a9a0cbe7fbca2bdd0dbb45542d26dabeb0a3e69adb37fc577e958c"
         },
         {
           "scenario": "tools-call-simple-text",
@@ -227,7 +227,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "85a43c02a38ca393c7b6fd7740cdc6a204b62b051066a18f41019b9f23d6327c"
+          "evidence_sha256": "6f37fcae0bde7d34f8b91e1d59d0bf416c0a019609405abd666754a41be912d7"
         },
         {
           "scenario": "tools-call-with-progress",
@@ -236,16 +236,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "42e6639388cb452a7b6e336bf057634a1a0b2c6c9fd05fdbf566d2d6153f3c6d"
-        },
-        {
-          "scenario": "tools-list",
-          "check_id": "wire-schema-valid",
-          "classification": "genuine_protocol_failure",
-          "reason": "The 2025-11-25 tools/list wire schema rejects a WebCodex outputSchema that omits the required root type.",
-          "evidence": "MCP 2025-11-25 Tool outputSchema wire schema; first GitHub Actions conformance baseline raw report",
-          "expected_status": "FAILURE",
-          "evidence_sha256": "04ac9b7699a61e4970c6efdd1296dc61971f8097fa21e90873d6992f2e1d40ca"
+          "evidence_sha256": "13c6bda80dd58f68b3634d402f12edc750b996f695b5e913db59da14a7acfaae"
         }
       ],
       "expected_server_capabilities": {
@@ -344,7 +335,7 @@
           "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
           "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "318016600ed6861ea36888a269d82ca3105673a7d3d7e540c15b2ea493571b2c"
+          "evidence_sha256": "56f4a8d9b0ea3df7f9ad8f42edb3f6dc249c7f119daa83c9ca4da22bd8f86b16"
         },
         {
           "scenario": "input-required-result-basic-elicitation",
@@ -353,7 +344,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "18bdbb4b49ac7b1a73e056914b6627a1b3ffe9c36cd1c438b72c09a4be638f1b"
+          "evidence_sha256": "8df152cebc4b7699b9222a681b6cb490cc5bc116f0666b05a01b7f07919a20d1"
         },
         {
           "scenario": "input-required-result-basic-list-roots",
@@ -362,7 +353,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "09733701c42953223f9761ea327f831d5eef286a08e3807e2f2687ffafc45625"
+          "evidence_sha256": "bcfe48b990672771a1512a70fa61adcc4fc71ce23ffa8d9a633af203db8309e5"
         },
         {
           "scenario": "input-required-result-basic-sampling",
@@ -371,7 +362,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "a220d559b1a7050e97a4634952062d2c2eab238542450d87980f0c0aece9733e"
+          "evidence_sha256": "469d38b05459eccad7e149170cbbd56e6f9d28c9d46d80f8ced6e2f317adf4fc"
         },
         {
           "scenario": "input-required-result-capability-check",
@@ -380,7 +371,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "253ff0b64d1e6b62721dcd10c4d48f9df0dcd12648f406e7e96a15f19824d3e7"
+          "evidence_sha256": "dbf49040d276400f78f24ba726743e1cc7628dee7ddd6cd252a12dfcdb4b2632"
         },
         {
           "scenario": "input-required-result-ignore-extra-params",
@@ -389,7 +380,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "WARNING",
-          "evidence_sha256": "52a17049b7fa7e0e6e9d2654c9d42125aa6b79edde9ee4b37751e60f39bca83f"
+          "evidence_sha256": "de2c48d4f6018bc152772b53c9fb420f9cb6ba85cd0155c45e4daf348bf21d2e"
         },
         {
           "scenario": "input-required-result-missing-input-response",
@@ -416,7 +407,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "cba19b857b74e5a744f92234cd251678d0cf1ec67feb1563d4b3732a6536e4e3"
+          "evidence_sha256": "c6775d26e7f2bcf767c6208b388b25716ffff91803b33ef8263aac4472e2ab29"
         },
         {
           "scenario": "input-required-result-request-state",
@@ -425,7 +416,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "bb56f96f2a4741573281dd15c3af52bb3dce1dcf68d966b5eb36cff46aec2ae1"
+          "evidence_sha256": "db44366f4b2663c8dd18a73b5d243e0201429acc0e80605a95ca278ddd92aa87"
         },
         {
           "scenario": "input-required-result-result-type",
@@ -434,7 +425,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "18bdbb4b49ac7b1a73e056914b6627a1b3ffe9c36cd1c438b72c09a4be638f1b"
+          "evidence_sha256": "8df152cebc4b7699b9222a681b6cb490cc5bc116f0666b05a01b7f07919a20d1"
         },
         {
           "scenario": "input-required-result-tampered-state",
@@ -461,7 +452,7 @@
           "reason": "The upstream scenario expects reference resource content/URIs that the product MCP surface does not provide.",
           "evidence": "Pinned resource conformance fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "7efc3ca5577c0ceb01a87bc6dca89d81cb0dd380440005a6438951c2ed0ecaa2"
+          "evidence_sha256": "ccebe9670fc81aa853c549c9017baa7d88a371fd5d4625e1726b0a542aefec69"
         },
         {
           "scenario": "resources-read-text",
@@ -470,7 +461,7 @@
           "reason": "The upstream scenario expects reference resource content/URIs that the product MCP surface does not provide.",
           "evidence": "Pinned resource conformance fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "7efc3ca5577c0ceb01a87bc6dca89d81cb0dd380440005a6438951c2ed0ecaa2"
+          "evidence_sha256": "2b815566ba4173981dcb12f46ea1ab73bff3b373796d1d152107023e3efa15f7"
         },
         {
           "scenario": "resources-templates-read",
@@ -479,7 +470,7 @@
           "reason": "The upstream scenario expects reference resource content/URIs that the product MCP surface does not provide.",
           "evidence": "Pinned resource conformance fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "7efc3ca5577c0ceb01a87bc6dca89d81cb0dd380440005a6438951c2ed0ecaa2"
+          "evidence_sha256": "ae122f912511f271c31f53fee8245c1dde3acfcff41c5db301341055cc9917e0"
         },
         {
           "scenario": "sep-2164-resource-not-found",
@@ -497,7 +488,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "e7955d92d110e3187d92d1a199891c9e6a2bda2a880ba499f49e8bc8d1934c32"
+          "evidence_sha256": "7b694b9546c9ffc28b7018bb47ad1b35eb71982e0e07cf5d238a8b5b07f28f70"
         },
         {
           "scenario": "server-stateless",
@@ -515,7 +506,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "c5d626bc1ba209485e7961f24e1e9a1dbf1fcb30b900565bf45b99fb8af1da28"
+          "evidence_sha256": "5802de50b88da05f1deb16702e8a9fc63de9536f2ed3b5455691a6d31adf23d1"
         },
         {
           "scenario": "server-stateless",
@@ -524,7 +515,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "9b03051fab076a4266977ed4b87c04f57ac9ea8077e40474f6c4d72971a3ffd9"
+          "evidence_sha256": "54fb37a17716a6faa4e20eba8bbceb73fa4cf5b7c0ede03c4fc3c950642b6ad0"
         },
         {
           "scenario": "server-stateless",
@@ -596,7 +587,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "6f8af85c68030374f0172b2a48e00df300146d7e14f11a37050da19e52bd661b"
+          "evidence_sha256": "14101eaa646a4d704365cc1088cffb01fd1e9c022de157cd12ee830ef70e9432"
         },
         {
           "scenario": "tools-call-embedded-resource",
@@ -605,7 +596,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "847e62c211f21d7b531c72225355fd80ff2b99175ee64e59cc7a5cefa3263cbb"
+          "evidence_sha256": "3381f09b48c05f0a3a98644c1b0851a4aab608cb471d1fde932b44d351c2c283"
         },
         {
           "scenario": "tools-call-error",
@@ -614,7 +605,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "0fa33b84480756ee34f1cb755233ab4fb6de29371e34d623d218da344b0272aa"
+          "evidence_sha256": "ceda82cecaf90be4000fbb2601518a3f0fa3b6f960b6fe242a9cd050f350eda9"
         },
         {
           "scenario": "tools-call-image",
@@ -623,7 +614,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "eed3a72319705ab76276f68b868a9bfd7c32146fbf5de1fb5e207137f7df4764"
+          "evidence_sha256": "5da82959f8874a71170b8a9d221b37e0cd7a53ef978f27f2555fb1f6438848f8"
         },
         {
           "scenario": "tools-call-mixed-content",
@@ -632,7 +623,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "e7ba2d298b0f72354f1c2b8e3c01ae103ce371208df94b245c8779e5cd934b0e"
+          "evidence_sha256": "99afc685f8f53a330164573619be79f552c87dfc138d1aa311187d75569b644a"
         },
         {
           "scenario": "tools-call-simple-text",
@@ -641,7 +632,7 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "7e56ee1105a41b3e15bc7f1231ba28c9b69d8c905d7fa3a224b8f20766d1a5fc"
+          "evidence_sha256": "d68ec286ab9f5950928708ded11dc1023f1a1e488c318c0ee2b57e9a93f764c5"
         },
         {
           "scenario": "tools-call-with-progress",
@@ -650,10 +641,14 @@
           "reason": "The upstream scenario requires a named reference test tool that WebCodex intentionally does not expose in its product registry.",
           "evidence": "Pinned conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "fb6394b7f3c96a61167a0a89ea934533a154f990bfbcdf757be026706d8f20a7"
+          "evidence_sha256": "21f7c05843f8c02dfaebdb1a8f25b23b9ec413c1cccc100b3267f756d450c994"
         }
       ],
       "expected_server_capabilities": {
+        "resources": {
+          "listChanged": false,
+          "subscribe": false
+        },
         "tools": {
           "listChanged": false
         }
