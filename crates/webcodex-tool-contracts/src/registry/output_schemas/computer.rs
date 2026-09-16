@@ -159,8 +159,49 @@ fn snapshot_region_schema() -> Value {
     })
 }
 
+fn merged_gateway_output_schema(names: &[&str]) -> Value {
+    let mut merged = strict_computer_output_schema(vec![]);
+    for name in names {
+        let schema = raw_output_schema_for_tool(name).expect("Computer primitive output schema");
+        let source = schema["properties"]["output"]["properties"]
+            .as_object()
+            .expect("Computer primitive output properties");
+        let target = merged["properties"]["output"]["properties"]
+            .as_object_mut()
+            .expect("Computer gateway output properties");
+        for (key, value) in source {
+            target.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    merged
+}
+
 fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "computer_observe" => Some(merged_gateway_output_schema(&[
+            "computer_list_targets",
+            "computer_list_windows",
+            "computer_list_displays",
+            "computer_list_applications",
+            "computer_accessibility_status",
+            "computer_accessibility_tree",
+            "computer_find_elements",
+            "computer_element_state",
+            "computer_snapshot",
+            "computer_snapshot_display",
+            "computer_read_clipboard",
+        ])),
+        "computer_control" => Some(merged_gateway_output_schema(&[
+            "computer_launch_application",
+            "computer_activate_window",
+            "__computer_element_control",
+            "computer_scroll_to_element",
+            "computer_key_input",
+            "computer_input_text",
+            "computer_pointer_move",
+            "computer_pointer_click",
+            "computer_write_clipboard",
+        ])),
         "computer_list_targets" => Some(wrapped_output_schema(vec![
             (
                 "targets",
@@ -327,7 +368,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
-        "computer_control" => Some(wrapped_output_schema(vec![
+        "__computer_element_control" => Some(wrapped_output_schema(vec![
             (
                 "platform",
                 json!({"type": "string", "enum": ["macos", "windows"]}),
@@ -610,43 +651,45 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
 }
 
 fn computer_suggested_recovery_schema() -> Value {
-    let client_arguments = || {
+    let client_arguments = |action: &'static str| {
         json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "action": {"type": "string", "const": action},
                 "client_id": {"type": "string", "minLength": 1, "maxLength": 128}
             },
-            "required": ["client_id"]
+            "required": ["action", "client_id"]
         })
     };
     json!({
         "oneOf": [
             suggested_tool_call_schema(
-                "computer_list_windows",
-                client_arguments(),
+                "computer_observe",
+                client_arguments("windows"),
                 "Parser-ready advisory window re-observation using the exact Runner already owned by the failed Computer request. It grants no authority and is not an effect retry."
             ),
             suggested_tool_call_schema(
-                "computer_list_applications",
-                client_arguments(),
+                "computer_observe",
+                client_arguments("applications"),
                 "Parser-ready advisory application re-observation using the exact Runner already owned by the failed Computer request. It grants no authority and is not an effect retry."
             ),
             suggested_tool_call_schema(
-                "computer_list_displays",
-                client_arguments(),
+                "computer_observe",
+                client_arguments("displays"),
                 "Parser-ready advisory display re-observation using the exact Runner already owned by the failed Computer request. It grants no authority and is not an effect retry."
             ),
             suggested_tool_call_schema(
-                "computer_snapshot_display",
+                "computer_observe",
                 json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                        "action": {"type": "string", "const": "snapshot_display"},
                         "client_id": {"type": "string", "minLength": 1, "maxLength": 128},
                         "display_id": {"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128}
                     },
-                    "required": ["client_id", "display_id"]
+                    "required": ["action", "client_id", "display_id"]
                 }),
                 "Parser-ready advisory display snapshot re-observation. It intentionally omits the spent snapshot_generation and grants no retry authority."
             ),
@@ -675,14 +718,7 @@ fn apply_computer_recovery_contract(schema: &mut Value) {
         "reconcile_with".to_string(),
         json!({
             "type": "string",
-            "enum": [
-                "computer_find_elements",
-                "computer_list_windows",
-                "computer_list_applications",
-                "computer_list_displays",
-                "computer_snapshot_display",
-                "read_project_artifact_metadata"
-            ],
+            "enum": ["computer_observe", "read_project_artifact_metadata"],
             "description": "Non-actionable recovery family hint used only when a complete safe invocation cannot be proven. It is not execution authority."
         }),
     );

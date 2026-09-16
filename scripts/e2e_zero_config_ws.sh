@@ -696,7 +696,7 @@ elif [ "$EXPECTED_SURFACE" = "adaptive_runtime" ]; then
         fi
     done
     for tname in list_tools list_projects project_overview apply_patch run_script apply_unified_diff \
-        go_test validation_summary git_status goto_definition computer_list_windows \
+        go_test validation_summary git_status goto_definition computer_observe computer_control computer_save_snapshot \
         post_session_message coding_agent_start artifact_upload_begin; do
         if mcp_tool_present "$tname"; then
             adaptive_present=0

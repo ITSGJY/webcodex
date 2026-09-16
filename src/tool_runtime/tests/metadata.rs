@@ -14,6 +14,7 @@ use crate::tool_runtime::kernel::{
 use crate::tool_runtime::project_resolution::{
     ProjectKnowledgeSourceResolution, ProjectKnowledgeUnavailableReason,
 };
+use crate::tool_runtime::tool_call::ComputerObserveToolCall;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -281,6 +282,32 @@ async fn register_pointer_target_for_auth(
         .await
         .unwrap();
 }
+#[tokio::test]
+async fn computer_gateway_rejects_missing_exact_action_capability_before_dispatch() {
+    let runtime = test_runtime();
+    let auth = crate::auth::shared_key_context("computer-capability-fence");
+    register_pointer_target_for_auth(&runtime, "pointer-only", "Pointer Only", &auth).await;
+
+    let result = runtime
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
+                client_id: "pointer-only".to_string(),
+                display_id: "display_iavN7wEjRWeJq83v".to_string(),
+                max_width: None,
+                max_height: None,
+            }),
+            Some(&auth),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "capability_unavailable");
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("computer_display_observe"));
+}
+
 async fn register_clipboard_target_for_auth(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -3169,7 +3196,10 @@ async fn computer_list_targets_is_minimal_capability_filtered_and_auth_scoped() 
     .await;
 
     let result = runtime
-        .dispatch_with_auth(ToolCall::ComputerListTargets, Some(&shared_a))
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Targets),
+            Some(&shared_a),
+        )
         .await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["count"], 8);

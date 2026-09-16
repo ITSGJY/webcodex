@@ -75,16 +75,8 @@ pub use communication::{
     update_agent_identity_input_schema,
 };
 pub use computer::{
-    computer_accessibility_status_input_schema, computer_accessibility_tree_input_schema,
-    computer_activate_window_input_schema, computer_control_input_schema,
-    computer_element_state_input_schema, computer_find_elements_input_schema,
-    computer_input_text_input_schema, computer_key_input_input_schema,
-    computer_launch_application_input_schema, computer_list_applications_input_schema,
-    computer_list_displays_input_schema, computer_list_windows_input_schema,
-    computer_pointer_input_schema, computer_read_clipboard_input_schema,
-    computer_save_snapshot_input_schema, computer_scroll_to_element_input_schema,
-    computer_snapshot_display_input_schema, computer_snapshot_input_schema,
-    computer_write_clipboard_input_schema,
+    computer_control_input_schema, computer_observe_input_schema,
+    computer_save_snapshot_input_schema,
 };
 pub use discovery::{
     empty_input_schema, list_projects_input_schema, list_runners_input_schema,

@@ -1991,21 +1991,26 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
         );
     }
 
-    let suggested = output_schema_property(&specs, "computer_launch_application", "suggested_call");
+    let suggested = output_schema_property(&specs, "computer_control", "suggested_call");
     let variants = suggested["oneOf"]
         .as_array()
         .expect("Computer suggested_call oneOf");
-    for (tool, required) in [
-        ("computer_list_windows", vec!["client_id"]),
-        ("computer_list_applications", vec!["client_id"]),
-        ("computer_list_displays", vec!["client_id"]),
-        ("computer_snapshot_display", vec!["client_id", "display_id"]),
-        ("read_project_artifact_metadata", vec!["project", "path"]),
+    for (action, required) in [
+        ("windows", vec!["action", "client_id"]),
+        ("applications", vec!["action", "client_id"]),
+        ("displays", vec!["action", "client_id"]),
+        (
+            "snapshot_display",
+            vec!["action", "client_id", "display_id"],
+        ),
     ] {
         let variant = variants
             .iter()
-            .find(|variant| variant["properties"]["tool"]["const"] == tool)
-            .unwrap_or_else(|| panic!("missing Computer recovery target {tool}"));
+            .find(|variant| {
+                variant["properties"]["tool"]["const"] == "computer_observe"
+                    && variant["properties"]["arguments"]["properties"]["action"]["const"] == action
+            })
+            .unwrap_or_else(|| panic!("missing Computer recovery action {action}"));
         assert_eq!(
             variant["properties"]["arguments"]["required"],
             serde_json::json!(required)
@@ -2015,14 +2020,17 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
             false
         );
     }
+    assert!(variants.iter().any(|variant| {
+        variant["properties"]["tool"]["const"] == "read_project_artifact_metadata"
+    }));
 
-    let schema = output_schema_for_tool("computer_list_windows");
+    let schema = output_schema_for_tool("computer_observe");
     let canonical_recovery = json!({
         "success": false,
         "output": {
             "suggested_call": {
-                "tool": "computer_list_windows",
-                "arguments": {"client_id": "special"}
+                "tool": "computer_observe",
+                "arguments": {"action": "windows", "client_id": "special"}
             }
         },
         "error": "reobserve"
@@ -2037,7 +2045,7 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
     assert!(test_support::validate_schema_instance(&legacy, &schema).is_err());
 
     let mut duplicate_recovery_shape = canonical_recovery;
-    duplicate_recovery_shape["output"]["reconcile_with"] = json!("computer_list_windows");
+    duplicate_recovery_shape["output"]["reconcile_with"] = json!("computer_observe");
     assert!(test_support::validate_schema_instance(&duplicate_recovery_shape, &schema).is_err());
 }
 

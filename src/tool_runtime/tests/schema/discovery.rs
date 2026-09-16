@@ -1782,7 +1782,7 @@ async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
     for (surface, tool_name, availability, gateway_tool) in [
         (
             ModelSurface::LocalCoding,
-            "computer_snapshot",
+            "computer_observe",
             "unavailable",
             None,
         ),

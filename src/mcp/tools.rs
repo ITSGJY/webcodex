@@ -372,12 +372,12 @@ pub(super) fn project_connector_tools_list_payload_with_compact(compact: bool) -
     project_connector_tools_list_payload_for_auth(compact, None)
 }
 
-fn adapt_computer_snapshot_output_schema_for_mcp(spec: &mut ToolSpec) {
+fn adapt_computer_observe_output_schema_for_mcp(spec: &mut ToolSpec) {
     let properties = spec
         .output_schema
         .pointer_mut("/properties/output/properties")
         .and_then(Value::as_object_mut)
-        .expect("computer_snapshot output schema properties");
+        .expect("computer_observe output schema properties");
     properties.remove("content_base64");
     properties.insert(
         "content_delivery".to_string(),
@@ -831,11 +831,8 @@ fn log_agent_continuation_app_result(
 
 fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> Value {
     let tool_name = spec.name.clone();
-    if matches!(
-        tool_name.as_str(),
-        "computer_snapshot" | "computer_snapshot_display"
-    ) {
-        adapt_computer_snapshot_output_schema_for_mcp(&mut spec);
+    if tool_name == "computer_observe" {
+        adapt_computer_observe_output_schema_for_mcp(&mut spec);
     }
     if tool_name == "read_project_artifact" {
         if let Some(properties) = spec.input_schema["properties"].as_object_mut() {

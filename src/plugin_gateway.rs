@@ -10,6 +10,8 @@ pub(crate) use webcodex_core::plugin::*;
 use crate::auth::{AuthContext, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE};
 use crate::json_measurement::serialized_json_len;
 use crate::tool_runtime::sessions::SessionTransport;
+#[cfg(test)]
+use crate::tool_runtime::specialized::SpecializedAuthorityRequirement;
 use crate::tool_runtime::specialized::{
     SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
 };
@@ -1479,16 +1481,16 @@ mod tests {
             SpecializedEffect::Management
         );
         assert_eq!(
-            PluginOperation::Check.policy().required_scope,
-            SCOPE_PLUGIN_MANAGE
+            PluginOperation::Check.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_MANAGE)
         );
         assert!(!PluginOperation::Check.policy().write_like);
         assert!(PluginOperation::Check.policy().shell_like);
         assert!(PluginOperation::Reload.policy().write_like);
         assert!(PluginOperation::Reload.policy().shell_like);
         assert_eq!(
-            PluginOperation::Call.policy().required_scope,
-            SCOPE_PLUGIN_INVOKE
+            PluginOperation::Call.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_INVOKE)
         );
     }
 }

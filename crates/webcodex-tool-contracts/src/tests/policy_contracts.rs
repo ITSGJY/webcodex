@@ -264,19 +264,11 @@ fn tool_definitions_drive_session_and_permission_policy() {
     };
     use crate::tool_policy::lookup_tool_definition;
 
-    let text_input = lookup_tool_definition("computer_input_text").expect("computer input tool");
-    assert!(text_input.is_write_like());
-    assert!(text_input.requires_permission());
-    assert_eq!(text_input.metadata().risk, ToolRisk::ComputerControl);
-
-    let application_launch = lookup_tool_definition("computer_launch_application")
-        .expect("computer application launch tool");
-    assert!(application_launch.is_write_like());
-    assert!(application_launch.requires_permission());
-    assert_eq!(
-        application_launch.metadata().risk,
-        ToolRisk::ComputerControl
-    );
+    let computer_control =
+        lookup_tool_definition("computer_control").expect("computer control gateway");
+    assert!(computer_control.is_write_like());
+    assert!(computer_control.requires_permission());
+    assert_eq!(computer_control.metadata().risk, ToolRisk::ComputerControl);
 
     for (name, effect, risk) in [
         ("apply_patch", ToolEffect::Mutate, ToolRisk::ProjectWrite),
@@ -551,7 +543,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .filter(|definition| definition.uses_unit_arguments())
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
-    assert_eq!(unit_argument_tools, vec!["computer_list_targets"]);
+    assert!(unit_argument_tools.is_empty());
 
     let artifact_upload_path_binding_tools = tool_definitions()
         .filter(|definition| definition.requires_artifact_upload_path_binding())
@@ -601,8 +593,6 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("consume_agent_deliveries", PERMISSION_RISK_WRITE),
         ("consume_agent_wake", PERMISSION_RISK_WRITE),
         ("coding_agent_cancel", PERMISSION_RISK_WRITE),
-        ("computer_write_clipboard", PERMISSION_RISK_WRITE),
-        ("computer_pointer_click", PERMISSION_RISK_WRITE),
         ("computer_control", PERMISSION_RISK_WRITE),
         ("computer_key_input", PERMISSION_RISK_WRITE),
         ("update_session_context", PERMISSION_RISK_WRITE),

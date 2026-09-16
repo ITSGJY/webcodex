@@ -38,6 +38,8 @@ pub(crate) async fn try_dispatch_specialized_gateway(
         request.tool_name.as_str(),
         crate::plugin_gateway::PLUGIN_TOOL_NAME
             | crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME
+            | "computer_observe"
+            | "computer_control"
     ) {
         return None;
     }
@@ -75,6 +77,26 @@ pub(crate) async fn try_dispatch_specialized_gateway(
         )
         .await
         .map(|invocation| invocation.to_tool_result()),
+        ToolCall::ComputerObserve(call) => {
+            runtime
+                .invoke_computer_observe_gateway(
+                    call,
+                    context.session_id,
+                    context.auth,
+                    context.transport.into(),
+                )
+                .await
+        }
+        ToolCall::ComputerControl(call) => {
+            runtime
+                .invoke_computer_control_gateway(
+                    call,
+                    context.session_id,
+                    context.auth,
+                    context.transport.into(),
+                )
+                .await
+        }
         _ => unreachable!("specialized gateway name must parse to its canonical ToolCall"),
     };
     Some(match invocation {
@@ -128,6 +150,7 @@ pub(crate) async fn try_dispatch_specialized_gateway(
 pub(crate) enum SpecializedSource {
     Plugin,
     SshResource,
+    Computer,
 }
 
 impl SpecializedSource {
@@ -135,6 +158,7 @@ impl SpecializedSource {
         match self {
             Self::Plugin => "plugin",
             Self::SshResource => "ssh-resource",
+            Self::Computer => "computer",
         }
     }
 }
@@ -161,10 +185,43 @@ impl SpecializedEffect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpecializedAuthorityRequirement {
+    Scope(&'static str),
+    All(&'static [&'static str]),
+}
+
+impl SpecializedAuthorityRequirement {
+    pub(crate) fn first_missing(self, auth: Option<&AuthContext>) -> Option<&'static str> {
+        let scope_missing = |scope: &'static str| match auth {
+            Some(auth) => !auth.has_scope(scope),
+            None => crate::auth::scopes::scope_requires_explicit_unauthenticated_authority(scope),
+        };
+        match self {
+            Self::Scope(scope) => scope_missing(scope).then_some(scope),
+            Self::All(scopes) => scopes.iter().copied().find(|scope| scope_missing(*scope)),
+        }
+    }
+
+    fn audit_projection(self) -> Value {
+        match self {
+            Self::Scope(scope) => json!({"policy": "require", "scopes": [scope]}),
+            Self::All(scopes) => json!({"policy": "require_all", "scopes": scopes}),
+        }
+    }
+
+    fn description(self) -> String {
+        match self {
+            Self::Scope(scope) => scope.to_string(),
+            Self::All(scopes) => scopes.join(", "),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpecializedOperationPolicy {
     pub(crate) source: SpecializedSource,
     pub(crate) operation: &'static str,
-    pub(crate) required_scope: &'static str,
+    pub(crate) authority: SpecializedAuthorityRequirement,
     pub(crate) effect: SpecializedEffect,
     pub(crate) risk: &'static str,
     /// Management operations which mutate durable/local state are write-like.
@@ -180,10 +237,34 @@ impl SpecializedOperationPolicy {
         operation: &'static str,
         required_scope: &'static str,
     ) -> Self {
+        Self::read_with_authority(
+            source,
+            operation,
+            SpecializedAuthorityRequirement::Scope(required_scope),
+        )
+    }
+
+    pub(crate) fn read_all(
+        source: SpecializedSource,
+        operation: &'static str,
+        required_scopes: &'static [&'static str],
+    ) -> Self {
+        Self::read_with_authority(
+            source,
+            operation,
+            SpecializedAuthorityRequirement::All(required_scopes),
+        )
+    }
+
+    fn read_with_authority(
+        source: SpecializedSource,
+        operation: &'static str,
+        authority: SpecializedAuthorityRequirement,
+    ) -> Self {
         Self {
             source,
             operation,
-            required_scope,
+            authority,
             effect: SpecializedEffect::Read,
             risk: "specialized_read",
             write_like: false,
@@ -199,7 +280,7 @@ impl SpecializedOperationPolicy {
         Self {
             source,
             operation,
-            required_scope,
+            authority: SpecializedAuthorityRequirement::Scope(required_scope),
             effect: SpecializedEffect::LocalExecution,
             risk: "specialized_local_execution",
             write_like: false,
@@ -217,11 +298,45 @@ impl SpecializedOperationPolicy {
         Self {
             source,
             operation,
-            required_scope,
+            authority: SpecializedAuthorityRequirement::Scope(required_scope),
             effect: SpecializedEffect::Management,
             risk: "specialized_management",
             write_like,
             shell_like,
+        }
+    }
+
+    pub(crate) fn consequential_all(
+        source: SpecializedSource,
+        operation: &'static str,
+        required_scopes: &'static [&'static str],
+        risk: &'static str,
+    ) -> Self {
+        Self {
+            source,
+            operation,
+            authority: SpecializedAuthorityRequirement::All(required_scopes),
+            effect: SpecializedEffect::Management,
+            risk,
+            write_like: true,
+            shell_like: false,
+        }
+    }
+
+    pub(crate) fn consequential(
+        source: SpecializedSource,
+        operation: &'static str,
+        required_scope: &'static str,
+        risk: &'static str,
+    ) -> Self {
+        Self {
+            source,
+            operation,
+            authority: SpecializedAuthorityRequirement::Scope(required_scope),
+            effect: SpecializedEffect::Management,
+            risk,
+            write_like: true,
+            shell_like: false,
         }
     }
 
@@ -246,7 +361,7 @@ impl SpecializedOperationPolicy {
             "operation": self.operation,
             "effect": self.effect.as_str(),
             "risk": self.risk,
-            "required_scope": self.required_scope,
+            "authority": self.authority.audit_projection(),
             "permission_required": self.effect.consequential(),
         })
     }
@@ -297,14 +412,14 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         identity: &Value,
     ) -> Result<SpecializedInvocationPermit, SpecializedGovernanceDenial> {
-        if !auth.is_some_and(|auth| auth.has_scope(policy.required_scope)) {
+        if let Some(required_scope) = policy.authority.first_missing(auth) {
             return Err(SpecializedGovernanceDenial::Scope {
-                required_scope: policy.required_scope,
+                required_scope,
                 description: format!(
-                    "{} operation '{}' requires the {} scope",
+                    "{} operation '{}' requires scopes: {}",
                     policy.source.as_str(),
                     policy.operation,
-                    policy.required_scope
+                    policy.authority.description()
                 ),
             });
         }
@@ -475,6 +590,14 @@ mod tests {
                 .with_owner_authority_fingerprint(Some(fingerprint)),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn specialized_scope_checks_preserve_explicit_gateway_authority_without_auth() {
+        assert_eq!(
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_INSPECT).first_missing(None),
+            Some(SCOPE_PLUGIN_INSPECT)
+        );
     }
 
     #[tokio::test]

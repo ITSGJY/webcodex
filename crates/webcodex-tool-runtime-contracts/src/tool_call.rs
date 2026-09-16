@@ -459,7 +459,175 @@ impl HostFileImportProvenance {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ComputerObserveToolCall {
+    Targets,
+    Windows {
+        client_id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    Displays {
+        client_id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    Applications {
+        client_id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    AccessibilityStatus {
+        client_id: String,
+    },
+    AccessibilityTree {
+        client_id: String,
+        surface_id: String,
+        #[serde(default)]
+        max_depth: Option<usize>,
+        #[serde(default)]
+        max_nodes: Option<usize>,
+    },
+    FindElements {
+        client_id: String,
+        surface_id: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        subrole: Option<String>,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        focused: Option<bool>,
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ElementState {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+    },
+    SnapshotWindow {
+        client_id: String,
+        surface_id: String,
+        #[serde(default)]
+        region: Option<ComputerSnapshotRegion>,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
+    },
+    SnapshotDisplay {
+        client_id: String,
+        display_id: String,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
+    },
+    ReadClipboard {
+        client_id: String,
+    },
+}
+
+impl ComputerObserveToolCall {
+    pub const fn action_name(&self) -> &'static str {
+        match self {
+            Self::Targets => "targets",
+            Self::Windows { .. } => "windows",
+            Self::Displays { .. } => "displays",
+            Self::Applications { .. } => "applications",
+            Self::AccessibilityStatus { .. } => "accessibility_status",
+            Self::AccessibilityTree { .. } => "accessibility_tree",
+            Self::FindElements { .. } => "find_elements",
+            Self::ElementState { .. } => "element_state",
+            Self::SnapshotWindow { .. } => "snapshot_window",
+            Self::SnapshotDisplay { .. } => "snapshot_display",
+            Self::ReadClipboard { .. } => "read_clipboard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ComputerControlToolCall {
+    LaunchApplication {
+        client_id: String,
+        application_id: String,
+    },
+    ActivateWindow {
+        client_id: String,
+        surface_id: String,
+    },
+    Press {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+    },
+    Focus {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+    },
+    ScrollToElement {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+    },
+    Key {
+        client_id: String,
+        surface_id: String,
+        key: String,
+        #[serde(default)]
+        modifiers: Option<Vec<String>>,
+    },
+    InputText {
+        client_id: String,
+        surface_id: String,
+        element_id: String,
+        text: String,
+    },
+    PointerMove {
+        client_id: String,
+        display_id: String,
+        snapshot_generation: u32,
+        x: u32,
+        y: u32,
+    },
+    PointerClick {
+        client_id: String,
+        display_id: String,
+        snapshot_generation: u32,
+        x: u32,
+        y: u32,
+    },
+    WriteClipboard {
+        client_id: String,
+        text: String,
+    },
+}
+
+impl ComputerControlToolCall {
+    pub const fn action_name(&self) -> &'static str {
+        match self {
+            Self::LaunchApplication { .. } => "launch_application",
+            Self::ActivateWindow { .. } => "activate_window",
+            Self::Press { .. } => "press",
+            Self::Focus { .. } => "focus",
+            Self::ScrollToElement { .. } => "scroll_to_element",
+            Self::Key { .. } => "key",
+            Self::InputText { .. } => "input_text",
+            Self::PointerMove { .. } => "pointer_move",
+            Self::PointerClick { .. } => "pointer_click",
+            Self::WriteClipboard { .. } => "write_clipboard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ComputerSnapshotRegion {
     pub x: u32,
@@ -2151,164 +2319,11 @@ pub enum ToolCall {
         session_id: Option<String>,
     },
 
-    /// List caller-visible Runner targets that advertise a Computer observation capability.
-    ComputerListTargets,
+    /// Read-only Computer observation gateway. The closed action enum preserves exact per-action semantics.
+    ComputerObserve(ComputerObserveToolCall),
 
-    /// Enumerate bounded top-level windows on one exact Runner.
-    ComputerListWindows {
-        client_id: String,
-        #[serde(default)]
-        limit: Option<usize>,
-    },
-
-    /// Enumerate a bounded fresh set of installed applications on one exact Runner.
-    ComputerListApplications {
-        client_id: String,
-        #[serde(default)]
-        limit: Option<usize>,
-    },
-
-    /// Enumerate a bounded fresh set of exact full displays on one Runner.
-    ComputerListDisplays {
-        client_id: String,
-        #[serde(default)]
-        limit: Option<usize>,
-    },
-
-    /// Submit one exact native application launch using a fresh opaque discovery id.
-    ComputerLaunchApplication {
-        client_id: String,
-        application_id: String,
-    },
-
-    /// Read the exact Runner's macOS Accessibility trust status without prompting.
-    ComputerAccessibilityStatus {
-        client_id: String,
-    },
-
-    /// Inspect one exact previously listed macOS surface as a bounded AX tree.
-    ComputerAccessibilityTree {
-        client_id: String,
-        surface_id: String,
-        #[serde(default)]
-        max_depth: Option<usize>,
-        #[serde(default)]
-        max_nodes: Option<usize>,
-    },
-
-    /// Find a bounded set of semantic elements on one exact macOS surface.
-    ComputerFindElements {
-        client_id: String,
-        surface_id: String,
-        #[serde(default)]
-        role: Option<String>,
-        #[serde(default)]
-        subrole: Option<String>,
-        #[serde(default)]
-        label: Option<String>,
-        #[serde(default)]
-        focused: Option<bool>,
-        #[serde(default)]
-        enabled: Option<bool>,
-        #[serde(default)]
-        limit: Option<usize>,
-    },
-
-    /// Revalidate one exact observed element and return normalized read-only state.
-    ComputerElementState {
-        client_id: String,
-        surface_id: String,
-        element_id: String,
-    },
-
-    /// Activate and raise one exact previously observed macOS window surface.
-    ComputerActivateWindow {
-        client_id: String,
-        surface_id: String,
-    },
-
-    /// Perform one bounded control action on an exact registered AX element.
-    ComputerControl {
-        client_id: String,
-        surface_id: String,
-        element_id: String,
-        action: String,
-    },
-
-    /// Semantically scroll one exact registered AX element into view.
-    ComputerScrollToElement {
-        client_id: String,
-        surface_id: String,
-        element_id: String,
-    },
-
-    /// Post one closed navigation/action key to one exact already-focused window.
-    ComputerKeyInput {
-        client_id: String,
-        surface_id: String,
-        key: String,
-        #[serde(default)]
-        modifiers: Option<Vec<String>>,
-    },
-
-    /// Read bounded native plain Unicode text from the global clipboard.
-    ComputerReadClipboard {
-        client_id: String,
-    },
-
-    /// Replace the global clipboard with bounded native plain Unicode text.
-    ComputerWriteClipboard {
-        client_id: String,
-        text: String,
-    },
-
-    /// Move the native macOS or Windows pointer using one latest unspent full-display snapshot generation.
-    ComputerPointerMove {
-        client_id: String,
-        display_id: String,
-        snapshot_generation: u32,
-        x: u32,
-        y: u32,
-    },
-
-    /// Submit one native macOS or Windows single-left-click at a snapshot-fenced display-local coordinate.
-    ComputerPointerClick {
-        client_id: String,
-        display_id: String,
-        snapshot_generation: u32,
-        x: u32,
-        y: u32,
-    },
-
-    /// Set bounded text on an already-focused, empty exact registered AX text element.
-    ComputerInputText {
-        client_id: String,
-        surface_id: String,
-        element_id: String,
-        text: String,
-    },
-
-    /// Capture one opaque process-local window surface, optionally narrowed to a bounded region.
-    ComputerSnapshot {
-        client_id: String,
-        surface_id: String,
-        #[serde(default)]
-        region: Option<ComputerSnapshotRegion>,
-        #[serde(default)]
-        max_width: Option<u32>,
-        #[serde(default)]
-        max_height: Option<u32>,
-    },
-
-    /// Capture one exact previously discovered full display with optional downscale bounds.
-    ComputerSnapshotDisplay {
-        client_id: String,
-        display_id: String,
-        #[serde(default)]
-        max_width: Option<u32>,
-        #[serde(default)]
-        max_height: Option<u32>,
-    },
+    /// Effectful Computer control gateway. Exact action authority/capability is resolved before dispatch.
+    ComputerControl(ComputerControlToolCall),
 
     /// Capture one exact window snapshot and persist it directly as a create-only project artifact.
     ComputerSaveSnapshot {
@@ -2693,39 +2708,6 @@ fn reject_unknown_targeted_inventory_fields(
     }
 }
 
-fn reject_unknown_bounded_computer_fields(
-    tool_name: &str,
-    arguments: &Value,
-) -> Result<(), String> {
-    let allowed: &[&str] = match tool_name {
-        "computer_list_applications" | "computer_list_displays" => &["client_id", "limit"],
-        "computer_launch_application" => &["client_id", "application_id"],
-        "computer_snapshot_display" => &["client_id", "display_id", "max_width", "max_height"],
-        "computer_read_clipboard" => &["client_id"],
-        "computer_write_clipboard" => &["client_id", "text"],
-        "computer_pointer_move" | "computer_pointer_click" => {
-            &["client_id", "display_id", "snapshot_generation", "x", "y"]
-        }
-        _ => return Ok(()),
-    };
-    let Some(object) = arguments.as_object() else {
-        return Ok(());
-    };
-    let unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !allowed.contains(key))
-        .collect();
-    if unknown.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "invalid arguments for tool '{tool_name}': unknown field(s) {}",
-            unknown.join(", ")
-        ))
-    }
-}
-
 fn validate_project_artifact_arguments(name: &str, arguments: &Value) -> Result<(), String> {
     if name != "project_artifact" {
         return Ok(());
@@ -2954,19 +2936,6 @@ impl ToolCall {
         ) {
             reject_unknown_targeted_inventory_fields(name, &arguments)?;
         }
-        if matches!(
-            name,
-            "computer_list_applications"
-                | "computer_launch_application"
-                | "computer_list_displays"
-                | "computer_snapshot_display"
-                | "computer_read_clipboard"
-                | "computer_write_clipboard"
-                | "computer_pointer_move"
-                | "computer_pointer_click"
-        ) {
-            reject_unknown_bounded_computer_fields(name, &arguments)?;
-        }
         let mut wrapped = serde_json::Map::new();
         wrapped.insert(
             TOOL_CALL_TOOL_FIELD.to_string(),
@@ -3172,26 +3141,8 @@ impl ToolCall {
             Self::GotoDefinition { .. } => "goto_definition",
             Self::FindReferences { .. } => "find_references",
             Self::CallHierarchy { .. } => "call_hierarchy",
-            Self::ComputerListTargets => "computer_list_targets",
-            Self::ComputerListWindows { .. } => "computer_list_windows",
-            Self::ComputerListApplications { .. } => "computer_list_applications",
-            Self::ComputerListDisplays { .. } => "computer_list_displays",
-            Self::ComputerLaunchApplication { .. } => "computer_launch_application",
-            Self::ComputerAccessibilityStatus { .. } => "computer_accessibility_status",
-            Self::ComputerAccessibilityTree { .. } => "computer_accessibility_tree",
-            Self::ComputerFindElements { .. } => "computer_find_elements",
-            Self::ComputerElementState { .. } => "computer_element_state",
-            Self::ComputerActivateWindow { .. } => "computer_activate_window",
-            Self::ComputerControl { .. } => "computer_control",
-            Self::ComputerScrollToElement { .. } => "computer_scroll_to_element",
-            Self::ComputerKeyInput { .. } => "computer_key_input",
-            Self::ComputerReadClipboard { .. } => "computer_read_clipboard",
-            Self::ComputerWriteClipboard { .. } => "computer_write_clipboard",
-            Self::ComputerPointerMove { .. } => "computer_pointer_move",
-            Self::ComputerPointerClick { .. } => "computer_pointer_click",
-            Self::ComputerInputText { .. } => "computer_input_text",
-            Self::ComputerSnapshot { .. } => "computer_snapshot",
-            Self::ComputerSnapshotDisplay { .. } => "computer_snapshot_display",
+            Self::ComputerObserve(..) => "computer_observe",
+            Self::ComputerControl(..) => "computer_control",
             Self::ComputerSaveSnapshot { .. } => "computer_save_snapshot",
             Self::ListProjects { .. } => "list_projects",
             Self::RegisterProject { .. } => "register_project",

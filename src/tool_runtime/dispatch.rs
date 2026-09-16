@@ -1827,27 +1827,10 @@ impl ToolRuntime {
                 self.dispatch_workspace_checkpoint_tool(call).await
             }
 
-            call @ (ToolCall::ComputerListTargets
-            | ToolCall::ComputerListWindows { .. }
-            | ToolCall::ComputerListApplications { .. }
-            | ToolCall::ComputerListDisplays { .. }
-            | ToolCall::ComputerLaunchApplication { .. }
-            | ToolCall::ComputerAccessibilityStatus { .. }
-            | ToolCall::ComputerAccessibilityTree { .. }
-            | ToolCall::ComputerFindElements { .. }
-            | ToolCall::ComputerElementState { .. }
-            | ToolCall::ComputerActivateWindow { .. }
-            | ToolCall::ComputerControl { .. }
-            | ToolCall::ComputerScrollToElement { .. }
-            | ToolCall::ComputerKeyInput { .. }
-            | ToolCall::ComputerReadClipboard { .. }
-            | ToolCall::ComputerWriteClipboard { .. }
-            | ToolCall::ComputerInputText { .. }
-            | ToolCall::ComputerSnapshot { .. }
-            | ToolCall::ComputerSnapshotDisplay { .. }
-            | ToolCall::ComputerPointerMove { .. }
-            | ToolCall::ComputerPointerClick { .. }
-            | ToolCall::ComputerSaveSnapshot { .. }) => {
+            ToolCall::ComputerObserve(_) | ToolCall::ComputerControl(_) => ToolResult::err(
+                "Computer gateways must pass action-sensitive specialized governance".to_string(),
+            ),
+            call @ ToolCall::ComputerSaveSnapshot { .. } => {
                 self.dispatch_computer_tool(call, auth).await
             }
 
