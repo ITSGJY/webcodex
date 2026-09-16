@@ -51,8 +51,8 @@ the gate fails so the raw evidence remains inspectable.
 
 The script starts one ignored, test-only Rust fixture on `127.0.0.1:0`. The
 fixture composes the same Salvo `AuthMiddleware` and `/mcp` handlers used by the
-production HTTP surface, with temporary database/runtime state and anonymous test
-authority. The referee therefore reaches real WebCodex parsing, dispatch and
+production HTTP surface, with temporary database/runtime state and authentication
+disabled in the isolated test config. The referee therefore reaches real WebCodex parsing, dispatch and
 rendering without production credentials or an external deployment.
 
 No conformance-only tool is added to the production registry. Some upstream
@@ -114,8 +114,10 @@ The gate also fails when:
 - a new non-success check in a scored required scenario has no exact classification;
 - a classified check changes status/evidence, disappears, or now passes;
 - the referee exits abnormally, its exit code disagrees with the scored FAILURE
-  set, or any scored/not-scored scenario emits one of the pinned referee's
-  structural infrastructure failures (`scenario-timeout` or `Failed to run scenario`);
+  set, or any scored/not-scored scenario emits `scenario-timeout`,
+  `wire-schema-harness-error`, one of the pinned referee's generic top-level
+  scenario-error checks, the outer `Failed to run scenario` shape, or an exact
+  transport-exception form emitted by the pinned Node runner;
 - the server capability advertisement changes while optional-capability baseline
   entries depend on the previous advertisement;
 - an explicitly classified inconclusive infrastructure result is present.
@@ -132,11 +134,12 @@ python3 scripts/tests/test_mcp_conformance_report.py
 ```
 
 It covers all-skipped output, missing/empty/INFO-only scenarios, unknown statuses,
-abnormal referee exits, scored and not-scored infrastructure failures, changed
-status/evidence for an existing check ID, capability-advertisement drift,
+abnormal referee exits, scored and not-scored infrastructure/transport failures,
+changed status/evidence for an existing check ID, capability-advertisement drift,
 ambiguous duplicate non-success check IDs, harness-pin mismatch, placeholder evidence, new scored
-failures, informational non-success reporting, stale classifications, volatile
-JSON-RPC request IDs, wire-schema payload drift, and rejection of broad masks.
+failures, informational non-success reporting, stale classifications, exact-path
+JSON-RPC request-ID normalization, wire-schema payload drift, ordinary lookalike
+objects, empty structured evidence, and rejection of broad masks.
 
 ## Raw evidence and review policy
 
@@ -151,10 +154,12 @@ Each profile retains:
 
 Baseline updates should be narrow. Add a classification only after reproducing
 and understanding the exact check, then record its observed status and evidence
-fingerprint. Fingerprints retain semantic diagnostics but normalize two known
-referee noise sources: millisecond-epoch JSON-RPC probe IDs and the complete
-offending message duplicated inside wire-schema violations (the violation context
-and errors remain hashed). A changed fingerprint is a review prompt, not something
+fingerprint. Fingerprints retain semantic diagnostics but normalize two narrowly
+scoped referee noise sources: the numeric value (not presence/type) of the two
+known SEP-2575 millisecond-epoch response IDs, and the duplicated offending
+message only inside the structured `wire-schema-valid` violation list. Wire-schema
+origin/context/errors/specVersion remain hashed, and ordinary objects with similar
+field names are not normalized. A changed fingerprint is a review prompt, not something
 to refresh mechanically. Remove the entry as soon as the check passes. Do not replace
 multiple check IDs with a scenario-wide exception. The SEP-2164 `data.uri`
 finding is kept as an advisory SHOULD/WARNING rather than described as a MUST

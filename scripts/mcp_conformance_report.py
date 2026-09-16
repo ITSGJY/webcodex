@@ -36,6 +36,38 @@ SCENARIO_DIR_RE = re.compile(r"^server-(.+)-\d{4}-\d{2}-\d{2}T.*Z$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# The pinned referee uses Date.now() only for these two stateless diagnostic
+# probes. Keep this deliberately narrow: a large integer in any other check is
+# semantic evidence, not generic timestamp noise.
+DYNAMIC_JSONRPC_ID_CHECKS = {
+    "sep-2575-http-server-no-independent-requests-on-stream",
+    "sep-2575-server-no-log-without-loglevel",
+}
+DYNAMIC_JSONRPC_ID_PATH = ("details", "response", "id")
+DYNAMIC_JSONRPC_ID_SENTINEL = {
+    "$webcodexEvidence": "dynamic-millisecond-jsonrpc-id",
+    "sourceType": "integer",
+}
+WIRE_SCHEMA_CHECK_ID = "wire-schema-valid"
+WIRE_SCHEMA_MESSAGE_SENTINEL = "<wire-schema-offending-message>"
+
+# Structural or top-level scenario failures emitted by the immutable referee pin.
+# These IDs mean the scenario/harness aborted outside its intended protocol
+# assertions. Per-assertion task failures and setup checks are deliberately not
+# blanket-listed; transport exceptions from those paths are recognized separately.
+PINNED_REFEREE_INFRA_CHECK_IDS = {
+    "scenario-timeout",
+    "wire-schema-harness-error",
+    "json-schema-2020-12-error",
+    "server-session-lifecycle-error",
+    "server-sse-multiple-streams-error",
+    "server-sse-polling-error",
+}
+PINNED_TRANSPORT_ERROR_RE = re.compile(
+    r"^(?:(?:Failed(?::| to initialize:| to set up tests:)|Error:)\s*)?"
+    r"(?:fetch failed|connect E(?:CONNREFUSED|CONNRESET|HOSTUNREACH|NETUNREACH)\b.*)$"
+)
+
 
 class GateError(RuntimeError):
     """Raised when report or baseline input is malformed."""
@@ -56,54 +88,124 @@ class Classification:
         return (self.scenario, self.check_id)
 
 
-def _normalize_evidence_value(value: Any) -> Any:
-    """Remove only known referee noise while preserving diagnostic semantics."""
+def _normalize_evidence_value(
+    value: Any,
+    *,
+    path: tuple[str, ...] = (),
+    normalize_dynamic_probe_id: bool = False,
+) -> Any:
+    """Normalize only pin-specific noise at an exact known evidence path."""
 
     if isinstance(value, list):
-        return [_normalize_evidence_value(item) for item in value]
+        return [
+            _normalize_evidence_value(
+                item,
+                path=path,
+                normalize_dynamic_probe_id=normalize_dynamic_probe_id,
+            )
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
 
-    # Wire-schema violations include the complete offending JSON-RPC message.
-    # That payload can change whenever an unrelated tool description/schema
-    # changes even though the actual schema violation is identical. Keep the
-    # violation context/errors/spec version, but omit the redundant full message.
-    wire_schema_violation = (
-        isinstance(value.get("origin"), str)
-        and isinstance(value.get("context"), str)
-        and isinstance(value.get("errors"), list)
-        and isinstance(value.get("specVersion"), str)
-        and isinstance(value.get("message"), dict)
-    )
-
     normalized: dict[str, Any] = {}
     for field, item in value.items():
-        if wire_schema_violation and field == "message":
-            continue
-        # The pinned stateless referee uses Date.now() as request IDs for some
-        # diagnostic probes. Those millisecond-epoch IDs are run-specific and do
-        # not describe the protocol failure. Fixed/small JSON-RPC IDs remain part
-        # of the fingerprint so meaningful response-shape changes still surface.
+        item_path = path + (field,)
         if (
-            field == "id"
+            normalize_dynamic_probe_id
+            and item_path == DYNAMIC_JSONRPC_ID_PATH
             and value.get("jsonrpc") == "2.0"
             and isinstance(item, int)
             and not isinstance(item, bool)
             and abs(item) >= 1_000_000_000_000
         ):
+            # Preserve field presence/type semantics while ignoring only the
+            # Date.now()-style numeric value used by the pinned probe.
+            normalized[field] = DYNAMIC_JSONRPC_ID_SENTINEL
             continue
-        normalized[field] = _normalize_evidence_value(item)
+        normalized[field] = _normalize_evidence_value(
+            item,
+            path=item_path,
+            normalize_dynamic_probe_id=normalize_dynamic_probe_id,
+        )
     return normalized
 
 
+def _wire_schema_semantic_details(check: dict[str, Any]) -> Any | None:
+    """Return structured wire-schema evidence with only the duplicated message normalized."""
+
+    if check.get("id") != WIRE_SCHEMA_CHECK_ID:
+        return None
+    details = check.get("details")
+    if not isinstance(details, dict) or not isinstance(details.get("messagesValidated"), int):
+        return None
+    violations = details.get("violations")
+    if not isinstance(violations, list) or not violations:
+        return None
+
+    normalized = _normalize_evidence_value(details, path=("details",))
+    normalized_violations = normalized.get("violations")
+    if not isinstance(normalized_violations, list):
+        return None
+
+    recognized = False
+    for index, violation in enumerate(violations):
+        if not isinstance(violation, dict):
+            continue
+        if (
+            violation.get("origin") not in {"harness", "implementation"}
+            or not isinstance(violation.get("context"), str)
+            or not isinstance(violation.get("errors"), list)
+            or not isinstance(violation.get("specVersion"), str)
+            or "message" not in violation
+        ):
+            continue
+        normalized_violation = normalized_violations[index]
+        if not isinstance(normalized_violation, dict):
+            continue
+        # The same complete JSON-RPC object is also rendered into the referee's
+        # errorMessage. Retain message *presence* with a sentinel and hash the
+        # authoritative origin/context/errors/specVersion fields instead.
+        normalized_violation["message"] = WIRE_SCHEMA_MESSAGE_SENTINEL
+        recognized = True
+    return normalized if recognized else None
+
+
+def _has_substantive_evidence(value: Any) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, dict):
+        return any(_has_substantive_evidence(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_substantive_evidence(item) for item in value)
+    return True
+
+
 def check_evidence_sha256(check: dict[str, Any]) -> str:
-    """Hash stable failure evidence while excluding timestamps and verbose logs."""
+    """Hash stable failure evidence while excluding only proven referee noise."""
 
     payload: dict[str, Any] = {}
-    for field in ("errorMessage", "details", "metadata"):
-        if field in check:
-            payload[field] = _normalize_evidence_value(check.get(field))
-    if not payload:
+    wire_schema_details = _wire_schema_semantic_details(check)
+    if wire_schema_details is not None:
+        # The structured violations are the authoritative evidence. The pinned
+        # referee's errorMessage redundantly serializes the entire offending
+        # message, so including it would reintroduce unrelated tool/schema drift.
+        payload["details"] = wire_schema_details
+        if "metadata" in check:
+            payload["metadata"] = _normalize_evidence_value(
+                check.get("metadata"), path=("metadata",)
+            )
+    else:
+        normalize_dynamic_probe_id = check.get("id") in DYNAMIC_JSONRPC_ID_CHECKS
+        for field in ("errorMessage", "details", "metadata"):
+            if field in check:
+                payload[field] = _normalize_evidence_value(
+                    check.get(field),
+                    path=(field,),
+                    normalize_dynamic_probe_id=normalize_dynamic_probe_id,
+                )
+
+    if not payload or not any(_has_substantive_evidence(value) for value in payload.values()):
         payload = {
             "name": check.get("name"),
             "description": check.get("description"),
@@ -118,14 +220,21 @@ def check_evidence_sha256(check: dict[str, Any]) -> str:
 
 
 def _infrastructure_reason(check: dict[str, Any]) -> str | None:
-    # These are structural failure shapes emitted by the pinned referee itself.
-    # Do not scan arbitrary assertion text for words such as "timeout": a valid
-    # protocol/schema assertion can mention those words and must remain a scored
-    # protocol result rather than being promoted to infrastructure failure.
-    if check.get("id") == "scenario-timeout":
-        return "referee scenario timeout"
+    # These are structural/top-level failure shapes emitted by the immutable referee
+    # pin. Do not scan arbitrary assertion text for words such as "timeout": a
+    # valid protocol assertion may contain those words.
+    check_id = check.get("id")
+    if check_id in PINNED_REFEREE_INFRA_CHECK_IDS:
+        if check_id == "scenario-timeout":
+            return "referee scenario timeout"
+        if check_id == "wire-schema-harness-error":
+            return "referee wire-schema harness error"
+        return f"referee top-level scenario failure ({check_id})"
     if check.get("description") == "Failed to run scenario":
         return "referee failed to run scenario"
+    error_message = check.get("errorMessage")
+    if isinstance(error_message, str) and PINNED_TRANSPORT_ERROR_RE.fullmatch(error_message.strip()):
+        return "referee transport exception"
     return None
 
 

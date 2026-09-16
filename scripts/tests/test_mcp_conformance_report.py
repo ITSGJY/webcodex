@@ -156,6 +156,37 @@ class ReportGateTests(unittest.TestCase):
         self.assertFalse(summary["gate_passed"])
         self.assertEqual(summary["missing_scenarios"], ["scenario-b"])
 
+    def test_unexpected_scenario_fails(self) -> None:
+        self.write_metadata(["scenario-a"])
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks("scenario-extra", [self.check("extra", "SUCCESS")])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertEqual(summary["unexpected_scenarios"], ["scenario-extra"])
+
+    def test_duplicate_scenario_reports_are_rejected(self) -> None:
+        self.write_metadata(["scenario-a"])
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        duplicate = self.raw / "server-scenario-a-2026-09-14T00-00-01-000Z"
+        duplicate.mkdir()
+        (duplicate / "checks.json").write_text(
+            json.dumps([self.check("ok-again", "SUCCESS")]), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(report_gate.GateError, "multiple raw reports"):
+            self.evaluate()
+
+    def test_required_and_not_scored_overlap_is_rejected(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "scenario-a", "reason": "pending"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        with self.assertRaisesRegex(report_gate.GateError, "both required and not_scored"):
+            self.evaluate()
+
     def test_required_empty_report_fails_even_with_other_coverage(self) -> None:
         self.write_metadata(["scenario-a", "scenario-b"])
         self.write_baseline([])
@@ -367,7 +398,7 @@ class ReportGateTests(unittest.TestCase):
 
     def test_timestamp_jsonrpc_id_does_not_change_evidence(self) -> None:
         expected = self.check(
-            "stream-probe",
+            "sep-2575-http-server-no-independent-requests-on-stream",
             "FAILURE",
             error_message="diagnostic tool is unavailable",
         )
@@ -387,9 +418,49 @@ class ReportGateTests(unittest.TestCase):
         summary = self.evaluate()
         self.assertTrue(summary["gate_passed"])
 
+    def test_missing_timestamp_jsonrpc_id_requires_review(self) -> None:
+        expected = self.check(
+            "sep-2575-http-server-no-independent-requests-on-stream",
+            "FAILURE",
+            error_message="diagnostic tool is unavailable",
+        )
+        expected["details"] = {
+            "response": {
+                "jsonrpc": "2.0",
+                "id": 1_789_000_000_001,
+                "error": {"code": -32602, "message": "tool unavailable"},
+            }
+        }
+        actual = json.loads(json.dumps(expected))
+        del actual["details"]["response"]["id"]
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected, "missing_harness_fixture")])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
+    def test_timestamp_jsonrpc_id_type_change_requires_review(self) -> None:
+        expected = self.check(
+            "sep-2575-http-server-no-independent-requests-on-stream",
+            "FAILURE",
+            error_message="diagnostic tool is unavailable",
+        )
+        expected["details"] = {
+            "response": {"jsonrpc": "2.0", "id": 1_789_000_000_001, "error": {"code": -32602}}
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["response"]["id"] = "<dynamic-millisecond-jsonrpc-id>"
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected, "missing_harness_fixture")])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
     def test_fixed_jsonrpc_id_change_still_requires_review(self) -> None:
         expected = self.check(
-            "fixed-id-probe",
+            "sep-2575-http-server-no-independent-requests-on-stream",
             "FAILURE",
             error_message="protocol assertion failed",
         )
@@ -405,11 +476,25 @@ class ReportGateTests(unittest.TestCase):
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
 
+    def test_timestamp_id_on_unrelated_check_is_not_normalized(self) -> None:
+        expected = self.check("other-check", "FAILURE", error_message="protocol assertion failed")
+        expected["details"] = {
+            "response": {"jsonrpc": "2.0", "id": 1_789_000_000_001, "error": {"code": -32602}}
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["response"]["id"] = 1_789_000_000_999
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected)])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
     def test_wire_schema_full_message_drift_does_not_change_evidence(self) -> None:
         expected = self.check(
             "wire-schema-valid",
             "FAILURE",
-            error_message="Schema validation failed",
+            error_message='Schema validation failed; offending message: {"tools":[{"name":"old-tool"}]}',
         )
         expected["details"] = {
             "messagesValidated": 5,
@@ -431,6 +516,10 @@ class ReportGateTests(unittest.TestCase):
         actual["details"]["violations"][0]["message"]["result"] = {
             "tools": [{"name": "new-unrelated-tool", "description": "changed"}]
         }
+        actual["errorMessage"] = (
+            'Schema validation failed; offending message: '
+            '{"tools":[{"name":"new-unrelated-tool","description":"changed"}]}'
+        )
         self.write_metadata(["scenario-a"], harness_exit_code=1)
         self.write_baseline([self.classification(expected)])
         self.write_checks("scenario-a", [actual])
@@ -466,6 +555,127 @@ class ReportGateTests(unittest.TestCase):
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
 
+    def test_business_message_change_is_not_wire_schema_noise(self) -> None:
+        expected = self.check(
+            "business-error",
+            "FAILURE",
+            error_message="tool failed",
+        )
+        expected["details"] = {
+            "origin": "application",
+            "context": "tool-call",
+            "errors": [],
+            "specVersion": "business-v1",
+            "message": {"code": "FIXTURE_MISSING"},
+        }
+        actual = json.loads(json.dumps(expected))
+        actual["details"]["message"]["code"] = "AUTH_DENIED"
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected, "missing_harness_fixture")])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
+    def test_empty_structured_evidence_falls_back_to_description(self) -> None:
+        expected = self.check("empty-details", "FAILURE", description="first diagnostic")
+        expected["details"] = {}
+        actual = self.check("empty-details", "FAILURE", description="changed diagnostic")
+        actual["details"] = {}
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected)])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
+    def test_not_scored_wire_schema_harness_error_is_infrastructure_failure(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "extension-a", "reason": "pending"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks(
+            "extension-a",
+            [self.check("wire-schema-harness-error", "FAILURE", error_message="harness emitted invalid JSON-RPC")],
+        )
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("infrastructure failures" in p for p in summary["problems"]))
+
+    def test_not_scored_scenario_catch_error_is_infrastructure_failure(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "json-schema-2020-12", "reason": "pending"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks(
+            "json-schema-2020-12",
+            [self.check("json-schema-2020-12-error", "FAILURE", error_message="Failed: fetch failed")],
+        )
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("infrastructure failures" in p for p in summary["problems"]))
+
+    def test_not_scored_top_level_scenario_error_is_infrastructure_failure(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "server-sse-polling", "reason": "pending"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks(
+            "server-sse-polling",
+            [
+                self.check(
+                    "server-sse-polling-error",
+                    "FAILURE",
+                    error_message="Error: unexpected scenario exception",
+                )
+            ],
+        )
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("top-level scenario failure" in p for p in summary["problems"]))
+
+    def test_not_scored_transport_exception_is_infrastructure_failure(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "tasks-mrtr-composition", "reason": "extension"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks(
+            "tasks-mrtr-composition",
+            [
+                self.check(
+                    "sep-2663-mrtr-synchronous-before-task-creation",
+                    "FAILURE",
+                    error_message="fetch failed",
+                )
+            ],
+        )
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("transport exception" in p for p in summary["problems"]))
+
+    def test_not_scored_setup_failure_is_infrastructure_failure(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "http-header-validation", "reason": "pending"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks(
+            "http-header-validation",
+            [self.check("sep-2243-server-standard-setup", "FAILURE", error_message="Failed to set up tests: fetch failed")],
+        )
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("infrastructure failures" in p for p in summary["problems"]))
+
     def test_connection_failure_cannot_hide_behind_fixture_classification(self) -> None:
         expected = self.check(
             "tools-call-simple-text",
@@ -500,6 +710,16 @@ class ReportGateTests(unittest.TestCase):
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("expected status SKIPPED" in p for p in summary["problems"]))
+
+    def test_warning_to_failure_requires_review(self) -> None:
+        expected = self.check("advisory", "WARNING", error_message="SHOULD mismatch")
+        actual = self.check("advisory", "FAILURE", error_message="SHOULD mismatch")
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected)])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("expected status WARNING" in p for p in summary["problems"]))
 
     def test_optional_classification_requires_same_capability_advertisement(self) -> None:
         failed = self.check(
