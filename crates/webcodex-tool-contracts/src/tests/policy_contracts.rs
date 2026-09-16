@@ -94,10 +94,7 @@ fn composition_opt_in_requires_an_explicit_declaration() {
     let definition = lookup_tool_definition("git_status").unwrap();
     assert_eq!(definition.metadata.effect, ToolEffect::Observe);
     assert_eq!(definition.metadata.risk, ToolRisk::Read);
-    assert_eq!(
-        definition.metadata.idempotency,
-        ToolIdempotency::PureRead
-    );
+    assert_eq!(definition.metadata.idempotency, ToolIdempotency::PureRead);
     assert_eq!(
         definition.context_continuity_policy(),
         ToolContextContinuityPolicy::REOBSERVABLE
@@ -127,10 +124,7 @@ fn git_review_summary_composition_opt_in_matches_reviewed_facts() {
     let definition = lookup_tool_definition("git_review_summary").unwrap();
     assert!(is_adaptive_runtime_direct_tool(definition.name));
     assert_eq!(definition.metadata.effect, ToolEffect::Observe);
-    assert_eq!(
-        definition.metadata.idempotency,
-        ToolIdempotency::PureRead
-    );
+    assert_eq!(definition.metadata.idempotency, ToolIdempotency::PureRead);
     assert_eq!(
         definition.context_continuity_policy(),
         ToolContextContinuityPolicy::REOBSERVABLE
