@@ -39,8 +39,76 @@ fn read_project_artifact_suggested_call_schema() -> Value {
     )
 }
 
+fn project_artifact_suggested_call_schema() -> Value {
+    suggested_tool_call_schema(
+        "project_artifact",
+        json!({
+            "type": "object",
+            "description": "Parser-ready continuation for one more bounded inspect of the same exact full-file artifact incarnation.",
+            "additionalProperties": false,
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "action": {"type": "string", "const": "inspect"},
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "expected_sha256": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                },
+                "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
+            },
+            "required": [
+                "project",
+                "path",
+                "action",
+                "offset",
+                "length",
+                "expected_sha256"
+            ]
+        }),
+        "Parser-ready advisory continuation for project_artifact(action=inspect). It carries the observed full-file SHA-256 fence and grants no Project or Session authority.",
+    )
+}
+
+fn project_artifact_output_schema() -> Value {
+    let mut merged = wrapped_output_schema(vec![]);
+    let target = merged["properties"]["output"]["properties"]
+        .as_object_mut()
+        .expect("project_artifact output properties");
+    for specialist in [
+        "read_project_artifact_metadata",
+        "read_project_artifact",
+        "export_project_artifact",
+    ] {
+        let source = output_schema_for_tool(specialist).expect("artifact specialist output schema");
+        let properties = source["properties"]["output"]["properties"]
+            .as_object()
+            .expect("artifact specialist output properties");
+        for (name, schema) in properties {
+            target.entry(name.clone()).or_insert_with(|| schema.clone());
+        }
+    }
+    target.insert(
+        "suggested_call".to_string(),
+        project_artifact_suggested_call_schema(),
+    );
+    target.insert(
+        "content_delivery".to_string(),
+        json!({
+            "type": "string",
+            "const": "mcp_image",
+            "description": "MCP image action marker after native-image framing; image bytes are carried in an MCP image ContentBlock instead of structuredContent."
+        }),
+    );
+    merged
+}
+
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "project_artifact" => Some(project_artifact_output_schema()),
         "save_project_artifact" => Some(wrapped_output_schema(vec![
             (
                 "path",

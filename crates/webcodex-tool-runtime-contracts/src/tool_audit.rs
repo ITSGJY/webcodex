@@ -4560,6 +4560,24 @@ impl ToolCall {
                 "overwrite": overwrite,
                 "session_id": session_id,
             }),
+            Self::ProjectArtifact {
+                project,
+                path,
+                action,
+                allow_missing,
+                offset,
+                length,
+                expected_sha256,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "path": path,
+                "action": action.as_str(),
+                "allow_missing": allow_missing,
+                "offset": offset,
+                "length": length,
+                "expected_sha256_present": expected_sha256.as_ref().is_some_and(|v| !v.is_empty()),
+            }),
             Self::ReadProjectArtifactMetadata {
                 project,
                 path,

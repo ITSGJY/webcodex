@@ -403,6 +403,54 @@ async fn issue_mcp_artifact_export(
 }
 
 #[tokio::test]
+async fn project_artifact_export_uses_existing_resource_link_authority_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
+    let auth = mcp_export_api_auth("key-unified-export", "alice");
+    let path = "paper/unified.pdf";
+    let bytes = b"%PDF-1.7\nunified export\n%%EOF\n".to_vec();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
+    let call = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc(
+                    "tools/call",
+                    Some(json!(3099)),
+                    mcp_2026_params(json!({
+                        "name": "project_artifact",
+                        "arguments": {
+                            "project": "agent:exporter:demo",
+                            "path": path,
+                            "action": "export"
+                        }
+                    })),
+                ),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    complete_mcp_export_metadata(registry, path, bytes.len(), &sha256, "application/pdf").await;
+    let outcome = call.await.unwrap();
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("unified artifact export must succeed, got {outcome:?}");
+    };
+    let result = &value["result"];
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["content"][0]["type"], "resource_link");
+    assert!(result["content"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .starts_with(MCP_ARTIFACT_EXPORT_URI_PREFIX));
+    let serialized = serde_json::to_string(result).unwrap();
+    assert!(!serialized.contains("content_base64"));
+}
+
+#[tokio::test]
 async fn mcp_artifact_export_surface_is_stateless_full_operator_only() {
     let legacy = mcp_tools_list_payload_with_compact(ModelSurface::FullOperatorRuntime, false);
     assert!(!legacy["tools"]
@@ -456,20 +504,34 @@ async fn mcp_artifact_export_surface_is_stateless_full_operator_only() {
 }
 
 #[tokio::test]
-async fn adaptive_artifact_export_direct_and_gateway_preserve_protocol_and_caller_gates() {
+async fn adaptive_artifact_export_unified_direct_and_legacy_gateway_preserve_gates() {
     let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
     let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
     auth.is_bootstrap = true;
-    for via_gateway in [false, true] {
-        let arguments = json!({"project": "agent:any:any", "path": "report.pdf"});
-        let params = if via_gateway {
+    let routes = [
+        (
+            "unified-direct",
+            json!({
+                "name": "project_artifact",
+                "arguments": {
+                    "project": "agent:any:any",
+                    "path": "report.pdf",
+                    "action": "export"
+                }
+            }),
+        ),
+        (
+            "legacy-gateway",
             json!({
                 "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
-                "arguments": {"tool": "export_project_artifact", "arguments": arguments}
-            })
-        } else {
-            json!({"name": "export_project_artifact", "arguments": arguments})
-        };
+                "arguments": {
+                    "tool": "export_project_artifact",
+                    "arguments": {"project": "agent:any:any", "path": "report.pdf"}
+                }
+            }),
+        ),
+    ];
+    for (route, params) in routes {
         for (stateless, expected_error) in [
             (false, "stateless-2026"),
             (true, "authenticated caller identity is unavailable"),
@@ -489,9 +551,7 @@ async fn adaptive_artifact_export_direct_and_gateway_preserve_protocol_and_calle
             )
             .await;
             let McpOutcome::BadRequest(value) = outcome else {
-                panic!(
-                    "export must reject gateway={via_gateway}, stateless={stateless}: {outcome:?}"
-                );
+                panic!("export must reject route={route}, stateless={stateless}: {outcome:?}");
             };
             assert_eq!(value["error"]["code"], -32602);
             assert!(
@@ -499,7 +559,7 @@ async fn adaptive_artifact_export_direct_and_gateway_preserve_protocol_and_calle
                     .as_str()
                     .unwrap()
                     .contains(expected_error),
-                "gateway={via_gateway}, stateless={stateless}: {value}"
+                "route={route}, stateless={stateless}: {value}"
             );
         }
     }

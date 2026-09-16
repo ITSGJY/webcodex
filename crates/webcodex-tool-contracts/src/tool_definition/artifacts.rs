@@ -14,8 +14,8 @@ use crate::registry::input_schemas::{
     artifact_upload_abort_input_schema, artifact_upload_begin_input_schema,
     artifact_upload_chunk_input_schema, artifact_upload_finish_input_schema,
     export_project_artifact_input_schema, import_conversation_files_to_project_input_schema,
-    read_project_artifact_input_schema, read_project_artifact_metadata_input_schema,
-    save_project_artifact_input_schema,
+    project_artifact_input_schema, read_project_artifact_input_schema,
+    read_project_artifact_metadata_input_schema, save_project_artifact_input_schema,
 };
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
@@ -79,7 +79,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     adaptive_runtime_direct(
         model_spec(
             def(
-                "export_project_artifact",
+                "project_artifact",
                 super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_ARTIFACT,
@@ -98,12 +98,37 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Create one short-lived authenticated MCP ResourceLink for a bounded project artifact so the host/user can fetch the complete binary with resources/read without routing base64 through model output. This is the preferred project-to-host/user transfer path and remains limited to supported Stateless/operator-capable MCP surfaces with caller binding and resource revalidation.",
-            export_project_artifact_input_schema,
+            "Project artifact read: metadata=facts; inspect=fenced segment; image=MCP image; export=MCP ResourceLink. Use export for whole files, not repeated inspect calls; use import_conversation_files_to_project for host-to-Project attachments.",
+            project_artifact_input_schema,
         )
-        .with_gpt_action_unsupported(),
+        .with_gpt_action_description("Project artifact read surface. GPT Actions supports metadata and bounded inspect; native image and ResourceLink export require MCP."),
         56,
     ),
+    model_spec(
+        def(
+            "export_project_artifact",
+            super::ToolAuditPolicy::TYPED_CANONICAL,
+            ModelVisible,
+            TOOL_CATEGORY_ARTIFACT,
+            Some(FileRead),
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(PROJECT_READ),
+            true,
+            Artifact,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE,
+        ),
+        "Compatibility project artifact export specialist. Create one short-lived authenticated MCP ResourceLink for a bounded project artifact so the host/user can fetch the complete binary with resources/read without routing base64 through model output. Prefer project_artifact(action=export) on model surfaces that expose the unified facade.",
+        export_project_artifact_input_schema,
+    )
+    .with_gpt_action_unsupported(),
     model_spec(
         def(
             "read_project_artifact_metadata",

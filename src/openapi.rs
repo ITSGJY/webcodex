@@ -223,13 +223,35 @@ fn action_request_schema(tool_name: &str, mut schema: Value) -> Value {
     if tool_name == "import_conversation_files_to_project" {
         project_gpt_action_file_params(&mut schema);
     }
+    if tool_name == "project_artifact" {
+        project_gpt_action_artifact_read_modes(&mut schema);
+    }
     project_schema_descriptions(schema)
 }
 
 /// GPT Actions and MCP receive host-file references in different host-owned
-/// wire shapes. This is the only business-schema shape overlay in the generic
-/// Action projection; the HTTP adapter rewrites it into the private canonical
-/// ToolCall host-file shape and separately supplies trusted Action provenance.
+/// wire shapes, and GPT Actions cannot carry MCP-native image or ResourceLink
+/// delivery. These are presentation overlays only; canonical ToolRuntime input
+/// validation and authority remain unchanged.
+fn project_gpt_action_artifact_read_modes(schema: &mut Value) {
+    if let Some(actions) = schema
+        .pointer_mut("/properties/action/enum")
+        .and_then(Value::as_array_mut)
+    {
+        actions.retain(|value| matches!(value.as_str(), Some("metadata" | "inspect")));
+    }
+    if let Some(variants) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
+        variants.retain(|variant| {
+            matches!(
+                variant
+                    .pointer("/properties/action/const")
+                    .and_then(Value::as_str),
+                Some("metadata" | "inspect")
+            )
+        });
+    }
+}
+
 fn project_gpt_action_file_params(schema: &mut Value) {
     let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
         return;
@@ -445,7 +467,10 @@ mod tests {
             .map(|spec| (spec.name.clone(), spec))
             .collect::<BTreeMap<_, _>>();
         for definition in gpt_action_direct_tool_definitions() {
-            if definition.name == "import_conversation_files_to_project" {
+            if matches!(
+                definition.name,
+                "import_conversation_files_to_project" | "project_artifact"
+            ) {
                 continue;
             }
             let mut canonical = specs[definition.name].input_schema.clone();
@@ -457,6 +482,21 @@ mod tests {
             strip_descriptions(&mut action);
             assert_eq!(action, canonical, "{}", definition.name);
         }
+    }
+
+    #[test]
+    fn project_artifact_gpt_action_schema_excludes_mcp_only_delivery_modes() {
+        let generated = build_openapi_spec();
+        let schema = &generated["paths"][format!("{GPT_ACTION_PATH_PREFIX}project_artifact")]
+            ["post"]["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["metadata", "inspect"])
+        );
+        assert_eq!(schema["allOf"].as_array().unwrap().len(), 2);
+        let serialized = serde_json::to_string(schema).unwrap();
+        assert!(!serialized.contains("\"image\""));
+        assert!(!serialized.contains("\"export\""));
     }
 
     #[test]

@@ -475,6 +475,26 @@ pub struct AgentWaitEventSelectorCall {
     pub task_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectArtifactAction {
+    Metadata,
+    Inspect,
+    Image,
+    Export,
+}
+
+impl ProjectArtifactAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Inspect => "inspect",
+            Self::Image => "image",
+            Self::Export => "export",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "tool", content = "params", rename_all = "snake_case")]
 pub enum ToolCall {
@@ -1900,6 +1920,25 @@ pub enum ToolCall {
         host_file_import_provenance: HostFileImportProvenance,
     },
 
+    /// Preferred unified read-side facade for Project artifacts. Physical
+    /// dispatch remains action-specific: Runner-backed metadata/inspection and
+    /// MCP presentation/authority for native images and complete export.
+    ProjectArtifact {
+        project: String,
+        path: String,
+        action: ProjectArtifactAction,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        allow_missing: Option<bool>,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        length: Option<usize>,
+        #[serde(default)]
+        expected_sha256: Option<String>,
+    },
+
     /// Prepare one project artifact for standards-native MCP resource export.
     /// The runtime returns only stable metadata; the MCP transport owns the
     /// short-lived resource handle and complete binary framing.
@@ -2687,11 +2726,50 @@ fn reject_unknown_bounded_computer_fields(
     }
 }
 
+fn validate_project_artifact_arguments(name: &str, arguments: &Value) -> Result<(), String> {
+    if name != "project_artifact" {
+        return Ok(());
+    }
+    let Some(object) = arguments.as_object() else {
+        return Ok(()); // serde reports the canonical object-shape error below.
+    };
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "invalid arguments for tool 'project_artifact': action is required".to_string()
+        })?;
+    let action_fields: &[&str] = match action {
+        "metadata" => &["allow_missing"],
+        "inspect" => &["offset", "length", "expected_sha256"],
+        "image" | "export" => &[],
+        _ => {
+            return Err(format!(
+                "invalid arguments for tool 'project_artifact': unsupported action '{action}'; expected metadata, inspect, image, or export"
+            ))
+        }
+    };
+    let common = ["project", "path", "action", "session_id"];
+    let invalid = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !common.contains(key) && !action_fields.contains(key))
+        .collect::<Vec<_>>();
+    if invalid.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid arguments for tool 'project_artifact': action={action} does not accept field(s) {}",
+            invalid.join(", ")
+        ))
+    }
+}
+
 fn validate_read_project_artifact_expected_sha256(
     name: &str,
     arguments: &Value,
 ) -> Result<(), String> {
-    if name != "read_project_artifact" {
+    if !matches!(name, "read_project_artifact" | "project_artifact") {
         return Ok(());
     }
     let Some(object) = arguments.as_object() else {
@@ -2787,6 +2865,7 @@ impl ToolCall {
         validate_model_facing_assertion_name(name, &arguments)?;
         validate_model_facing_result_expectation(name, &arguments)?;
         validate_structured_validation_sync_wait(name, &arguments)?;
+        validate_project_artifact_arguments(name, &arguments)?;
         validate_read_project_artifact_expected_sha256(name, &arguments)?;
         if name == "apply_patch"
             && arguments
@@ -3076,6 +3155,7 @@ impl ToolCall {
             Self::WriteProjectFile { .. } => "write_project_file",
             Self::SaveProjectArtifact { .. } => "save_project_artifact",
             Self::ImportConversationFilesToProject { .. } => "import_conversation_files_to_project",
+            Self::ProjectArtifact { .. } => "project_artifact",
             Self::ExportProjectArtifact { .. } => "export_project_artifact",
             Self::ReadProjectArtifactMetadata { .. } => "read_project_artifact_metadata",
             Self::ReadProjectArtifact { .. } => "read_project_artifact",
@@ -3169,6 +3249,7 @@ impl ToolCall {
             | Self::WriteProjectFile { session_id, .. }
             | Self::SaveProjectArtifact { session_id, .. }
             | Self::ComputerSaveSnapshot { session_id, .. }
+            | Self::ProjectArtifact { session_id, .. }
             | Self::ExportProjectArtifact { session_id, .. }
             | Self::ReadProjectArtifactMetadata { session_id, .. }
             | Self::ReadProjectArtifact { session_id, .. }
@@ -3306,6 +3387,7 @@ impl ToolCall {
             | Self::SaveProjectArtifact { project, .. }
             | Self::ComputerSaveSnapshot { project, .. }
             | Self::ImportConversationFilesToProject { project, .. }
+            | Self::ProjectArtifact { project, .. }
             | Self::ExportProjectArtifact { project, .. }
             | Self::ReadProjectArtifactMetadata { project, .. }
             | Self::ReadProjectArtifact { project, .. }

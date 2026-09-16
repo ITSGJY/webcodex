@@ -344,18 +344,24 @@ host-native 文件传输，不需要把完整二进制经由模型文本搬运�
   适用于 host 能绑定为 file parameter 的本轮新生成文件。Control 端负责下载原始
   bytes，并通过现有有界 artifact write 路径提交；调用方不应自行构造下载 URL，
   也不应手工 Base64 转运这些文件。
-- `export_project_artifact` 为一个有界 project artifact 创建短期、受认证的 MCP
+- `project_artifact` 是首选的 Project → Model / Host 读取入口：
+  `action=metadata` 用于 existence/size/MIME/digest/image/archive metadata；
+  `action=inspect` 只读取一个有 snapshot fence 的有界 Base64 segment；
+  `action=image` 通过 MCP native image delivery 给模型查看图片；
+  `action=export` 用于把完整 artifact 交付给 host/user。不要循环 `inspect` chunk
+  来完成整文件传输。
+- `action=export` 继续复用现有 artifact export authority，创建短期、受认证的 MCP
   `ResourceLink` 并返回 metadata。`tools/call` 不包含完整二进制；host 通过
   `resources/read` 取得 binary resource。读取时会再次检查认证与当前
-  project-read authority，并在返回 bytes 前重新验证 artifact metadata。
-- resource URI 本身不是独立 bearer authority。Export handle 只是短期、
-  process-local 的 presentation state；现有 project artifact 的大小、MIME、路径与
-  authorization 边界继续生效。
+  project-read authority，并在返回 bytes 前重新验证 artifact metadata。Resource
+  URI 本身不是独立 bearer authority；export handle 只是短期、process-local 的
+  presentation state，现有大小、MIME、路径与 authorization 边界继续生效。
 
-`read_project_artifact` 仍然只是有界 chunk inspection API，不承担大文件下载。
-DOCX/PPTX/XLSX 等 Office artifact 与 PDF 复用同一 artifact transport，因此在
-支持这些 host 能力的 ChatGPT 中，可以在 project 与 host 之间直接传递，而不需要
-模型手工搬运 Base64。
+旧的 `read_project_artifact_metadata`、`read_project_artifact` 和
+`export_project_artifact` 继续作为 compatibility/operator primitive 保留；新的模型面
+workflow 应优先使用 `project_artifact`。DOCX/PPTX/XLSX 等 Office artifact 与 PDF
+仍复用同一底层 artifact transport，因此在支持这些 host 能力的 ChatGPT 中，可以在
+project 与 host 之间直接传递，而不需要模型手工搬运 Base64。
 
 更宽的 model coding surface 暴露 `work_on_project` 时，请阅读
 [Coding 工作流](CODING_WORKFLOW.zh-CN.md)，使用 canonical bootstrap / behavioral role

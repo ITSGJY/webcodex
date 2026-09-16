@@ -376,7 +376,7 @@ mod tests {
         "search_project_texts",
         "read_files",
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "project_artifact",
         "apply_text_edits",
         "run_process",
         "run_detached_process",
@@ -505,16 +505,28 @@ mod tests {
     }
 
     #[test]
-    fn ergonomics_promotions_do_not_expand_local_coding_or_project_connector() {
-        for tool_name in [
-            "import_conversation_files_to_project",
+    fn ergonomics_promotions_do_not_expand_project_connector_or_duplicate_artifact_reads() {
+        assert!(is_adaptive_runtime_direct_tool(
+            "import_conversation_files_to_project"
+        ));
+        assert!(!LOCAL_CODING_TOOL_NAMES.contains(&"import_conversation_files_to_project"));
+
+        assert!(is_adaptive_runtime_direct_tool("project_artifact"));
+        assert!(LOCAL_CODING_TOOL_NAMES.contains(&"project_artifact"));
+        for legacy in [
+            "read_project_artifact_metadata",
+            "read_project_artifact",
             "export_project_artifact",
         ] {
-            assert!(is_adaptive_runtime_direct_tool(tool_name), "{tool_name}");
-            assert!(
-                !LOCAL_CODING_TOOL_NAMES.contains(&tool_name),
-                "{tool_name} must not expand local_coding"
+            assert!(!LOCAL_CODING_TOOL_NAMES.contains(&legacy));
+            assert!(!is_adaptive_runtime_direct_tool(legacy));
+            assert_eq!(
+                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(legacy),
+                (TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)),
+                "legacy artifact specialist {legacy} should remain reachable through the Adaptive gateway"
             );
+        }
+        for tool_name in ["import_conversation_files_to_project", "project_artifact"] {
             assert!(
                 !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&tool_name),
                 "{tool_name} must not expand project_connector"

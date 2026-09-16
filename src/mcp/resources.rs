@@ -719,7 +719,7 @@ pub(super) fn mcp_runtime_tool_result_with_snapshot_resource(
     mut result: ToolResult,
     snapshot_caller: Option<McpArtifactExportCallerBinding>,
 ) -> Value {
-    let native_image_requested = (tool_name == "read_project_artifact" && as_image_requested)
+    let native_image_requested = as_image_requested
         || matches!(tool_name, "computer_snapshot" | "computer_snapshot_display");
     if native_image_requested && result.success {
         match mcp_native_image_tool_result(tool_name, &mut result, snapshot_caller) {
@@ -1624,6 +1624,42 @@ pub(super) async fn handle_read(
     McpOutcome::Ok(rpc_result(id, result))
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ProjectArtifactPresentationMode {
+    #[default]
+    None,
+    Image,
+    Export,
+}
+
+pub(super) fn project_artifact_presentation_mode(
+    tool_name: &str,
+    arguments: &Value,
+) -> ProjectArtifactPresentationMode {
+    match tool_name {
+        "export_project_artifact" => ProjectArtifactPresentationMode::Export,
+        "read_project_artifact"
+            if arguments.get("as_image").and_then(Value::as_bool) == Some(true) =>
+        {
+            ProjectArtifactPresentationMode::Image
+        }
+        "project_artifact" => match arguments.get("action").and_then(Value::as_str) {
+            Some("image") => ProjectArtifactPresentationMode::Image,
+            Some("export") => ProjectArtifactPresentationMode::Export,
+            _ => ProjectArtifactPresentationMode::None,
+        },
+        _ => ProjectArtifactPresentationMode::None,
+    }
+}
+
+fn artifact_export_operation_label(tool_name: &str) -> &'static str {
+    if tool_name == "project_artifact" {
+        "project_artifact(action=export)"
+    } else {
+        "export_project_artifact"
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct McpResourceToolCallContext {
     artifact_export_caller: Option<McpArtifactExportCallerBinding>,
@@ -1632,42 +1668,45 @@ pub(super) struct McpResourceToolCallContext {
 
 #[derive(Debug)]
 pub(super) enum McpResourceToolCallPrepareError {
-    UnsupportedExportSurface,
-    ArtifactCallerBinding(&'static str),
+    UnsupportedExportSurface(&'static str),
+    ArtifactCallerBinding(&'static str, &'static str),
 }
 
 impl McpResourceToolCallPrepareError {
     pub(super) fn message(&self) -> String {
         match self {
-            Self::UnsupportedExportSurface => {
-                "export_project_artifact requires a stateless-2026 operator-capable MCP surface"
-                    .to_string()
+            Self::UnsupportedExportSurface(operation) => {
+                format!("{operation} requires a stateless-2026 operator-capable MCP surface")
             }
-            Self::ArtifactCallerBinding(error) => {
-                format!("export_project_artifact cannot bind this caller: {error}")
+            Self::ArtifactCallerBinding(operation, error) => {
+                format!("{operation} cannot bind this caller: {error}")
             }
         }
     }
 
     pub(super) fn records_model_ergonomics_failure(&self) -> bool {
-        matches!(self, Self::ArtifactCallerBinding(_))
+        matches!(self, Self::ArtifactCallerBinding(_, _))
     }
 }
 
 pub(super) fn prepare_tool_call(
     tool_name: &str,
+    artifact_presentation: ProjectArtifactPresentationMode,
     stateless_2026: bool,
     model_surface: ModelSurface,
     auth: Option<&AuthContext>,
 ) -> Result<McpResourceToolCallContext, McpResourceToolCallPrepareError> {
-    let artifact_export_caller = if tool_name == "export_project_artifact" {
+    let artifact_export_caller = if artifact_presentation == ProjectArtifactPresentationMode::Export
+    {
+        let operation = artifact_export_operation_label(tool_name);
         if !stateless_2026 || !model_surface.supports_operator_extensions() {
-            return Err(McpResourceToolCallPrepareError::UnsupportedExportSurface);
+            return Err(McpResourceToolCallPrepareError::UnsupportedExportSurface(
+                operation,
+            ));
         }
-        Some(
-            mcp_artifact_export_caller_binding(auth)
-                .map_err(McpResourceToolCallPrepareError::ArtifactCallerBinding)?,
-        )
+        Some(mcp_artifact_export_caller_binding(auth).map_err(|error| {
+            McpResourceToolCallPrepareError::ArtifactCallerBinding(operation, error)
+        })?)
     } else {
         None
     };
@@ -1692,11 +1731,11 @@ pub(super) enum McpResourceToolResultAdaptation {
 
 pub(super) fn adapt_tool_result(
     tool_name: &str,
-    as_image_requested: bool,
+    artifact_presentation: ProjectArtifactPresentationMode,
     result: ToolResult,
     context: McpResourceToolCallContext,
 ) -> McpResourceToolResultAdaptation {
-    if tool_name == "export_project_artifact" {
+    if artifact_presentation == ProjectArtifactPresentationMode::Export {
         return McpResourceToolResultAdaptation::Framed(mcp_artifact_export_tool_result(
             result,
             context
@@ -1704,13 +1743,13 @@ pub(super) fn adapt_tool_result(
                 .expect("validated artifact export caller binding"),
         ));
     }
-    if matches!(tool_name, "computer_snapshot" | "computer_snapshot_display")
-        || (tool_name == "read_project_artifact" && as_image_requested)
+    if artifact_presentation == ProjectArtifactPresentationMode::Image
+        || matches!(tool_name, "computer_snapshot" | "computer_snapshot_display")
     {
         return McpResourceToolResultAdaptation::Framed(
             mcp_runtime_tool_result_with_snapshot_resource(
                 tool_name,
-                as_image_requested,
+                artifact_presentation == ProjectArtifactPresentationMode::Image,
                 result,
                 context.snapshot_resource_caller,
             ),

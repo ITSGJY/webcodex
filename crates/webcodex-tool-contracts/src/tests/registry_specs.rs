@@ -136,12 +136,26 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "import_conversation_files_to_project: {phrase}"
         );
     }
+    let project_artifact_desc = desc("project_artifact");
+    for phrase in [
+        "metadata=facts",
+        "inspect=fenced segment",
+        "image=mcp image",
+        "export=mcp resourcelink",
+        "not repeated inspect calls",
+        "import_conversation_files_to_project",
+    ] {
+        assert!(
+            project_artifact_desc.contains(phrase),
+            "project_artifact: {phrase}"
+        );
+    }
     let export_artifact_desc = desc("export_project_artifact");
     for phrase in [
+        "compatibility project artifact export specialist",
         "resourcelink",
         "without routing base64 through model output",
-        "preferred project-to-host/user transfer path",
-        "stateless/operator-capable mcp surfaces",
+        "prefer project_artifact(action=export)",
     ] {
         assert!(
             export_artifact_desc.contains(phrase),

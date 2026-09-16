@@ -1368,9 +1368,9 @@ fn ordinary_artifact_result_keeps_existing_text_and_structured_base64_shape() {
 }
 
 #[tokio::test]
-async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
-    // read_project_artifact is an artifact tool outside the local_coding
-    // surface; select the full operator surface for this call.
+async fn project_artifact_image_call_returns_native_image_for_remote_agent_project() {
+    // Exercise the unified facade through the real MCP dispatch and native-image
+    // framing path. Full Operator also retains the legacy specialist for compatibility.
     let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
     let client_id = "mcp-vision-agent";
     let runner_instance_id = "inst-mcp-vision";
@@ -1450,11 +1450,11 @@ async fn mcp_image_call_returns_native_image_for_remote_agent_project() {
                     "tools/call",
                     Some(json!(77)),
                     json!({
-                        "name": "read_project_artifact",
+                        "name": "project_artifact",
                         "arguments": {
                             "project": project,
                             "path": path,
-                            "as_image": true
+                            "action": "image"
                         }
                     }),
                 ),

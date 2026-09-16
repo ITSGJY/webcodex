@@ -90,6 +90,105 @@ impl ToolRuntime {
                 self.save_project_artifact(project, path, content_base64, mime_type, overwrite)
                     .await
             }
+            ToolCall::ProjectArtifact {
+                project,
+                path,
+                action,
+                session_id,
+                allow_missing,
+                offset,
+                length,
+                expected_sha256,
+            } => match action {
+                super::ProjectArtifactAction::Metadata => {
+                    self.read_project_artifact_metadata(project, path, allow_missing)
+                        .await
+                }
+                super::ProjectArtifactAction::Inspect => {
+                    let mut result = self
+                        .read_project_artifact(
+                            project,
+                            path,
+                            None,
+                            offset,
+                            length,
+                            expected_sha256,
+                            session_id,
+                            None,
+                        )
+                        .await;
+                    if let Some(suggested_call) = result
+                        .output
+                        .get_mut("suggested_call")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        if suggested_call
+                            .get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("read_project_artifact")
+                        {
+                            suggested_call
+                                .insert("tool".to_string(), serde_json::json!("project_artifact"));
+                            if let Some(arguments) = suggested_call
+                                .get_mut("arguments")
+                                .and_then(serde_json::Value::as_object_mut)
+                            {
+                                arguments.remove("encoding");
+                                arguments
+                                    .insert("action".to_string(), serde_json::json!("inspect"));
+                            }
+                        }
+                    }
+                    result
+                }
+                super::ProjectArtifactAction::Image => {
+                    if !matches!(transport, SessionTransport::Mcp) {
+                        ToolResult::err_with_output(
+                            "project_artifact action=image requires a supported MCP native-image surface",
+                            serde_json::json!({
+                                "error_kind": "unsupported_transport",
+                                "action": "image",
+                                "required_transport": "mcp",
+                            }),
+                        )
+                    } else {
+                        self.read_project_artifact(
+                            project,
+                            path,
+                            None,
+                            None,
+                            None,
+                            None,
+                            session_id,
+                            Some(true),
+                        )
+                        .await
+                    }
+                }
+                super::ProjectArtifactAction::Export => {
+                    if !matches!(transport, SessionTransport::Mcp) {
+                        ToolResult::err_with_output(
+                            "project_artifact action=export requires a supported stateless operator-capable MCP ResourceLink surface",
+                            serde_json::json!({
+                                "error_kind": "unsupported_transport",
+                                "action": "export",
+                                "required_transport": "mcp",
+                            }),
+                        )
+                    } else {
+                        match project_resolution {
+                            Some(Ok(resolved)) => {
+                                self.export_project_artifact_metadata_resolved(&resolved, path, auth)
+                                    .await
+                            }
+                            Some(Err(error)) => error.into_tool_result(),
+                            None => ToolResult::err(
+                                "project_artifact action=export requires an exact resolved Runner project",
+                            ),
+                        }
+                    }
+                }
+            },
             ToolCall::ExportProjectArtifact {
                 project: _,
                 path,
