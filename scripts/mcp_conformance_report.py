@@ -59,14 +59,11 @@ class Classification:
 def check_evidence_sha256(check: dict[str, Any]) -> str:
     """Hash stable failure evidence while excluding timestamps and verbose logs."""
 
-    error_message = check.get("errorMessage")
-    if isinstance(error_message, str) and error_message:
-        payload: dict[str, Any] = {"errorMessage": error_message}
-    elif "details" in check:
-        payload = {"details": check.get("details")}
-    elif "metadata" in check:
-        payload = {"metadata": check.get("metadata")}
-    else:
+    payload: dict[str, Any] = {}
+    for field in ("errorMessage", "details", "metadata"):
+        if field in check:
+            payload[field] = check.get(field)
+    if not payload:
         payload = {
             "name": check.get("name"),
             "description": check.get("description"),
@@ -121,7 +118,6 @@ def load_reports(report_root: Path) -> dict[str, list[dict[str, Any]]]:
         if not isinstance(value, list):
             raise GateError(f"{checks_path} must contain a JSON array")
         checks: list[dict[str, Any]] = []
-        check_ids: set[str] = set()
         for index, check in enumerate(value):
             if not isinstance(check, dict):
                 raise GateError(f"{checks_path}[{index}] is not an object")
@@ -129,9 +125,6 @@ def load_reports(report_root: Path) -> dict[str, list[dict[str, Any]]]:
             status = check.get("status")
             if not isinstance(check_id, str) or not check_id:
                 raise GateError(f"{checks_path}[{index}] has no non-empty check id")
-            if check_id in check_ids:
-                raise GateError(f"{checks_path} contains duplicate check id {check_id!r}")
-            check_ids.add(check_id)
             if not isinstance(status, str) or not status:
                 raise GateError(f"{checks_path}[{index}] has no non-empty status")
             if status not in VALID_STATUSES:
@@ -339,6 +332,22 @@ def evaluate_reports(
 
     for scenario, checks in sorted(reports.items()):
         scored = scenario in required_set
+        if scored:
+            checks_by_id: dict[str, list[dict[str, Any]]] = {}
+            for check in checks:
+                checks_by_id.setdefault(check["id"], []).append(check)
+            ambiguous_duplicates = sorted(
+                check_id
+                for check_id, repeated in checks_by_id.items()
+                if len(repeated) > 1
+                and any(item["status"] in NON_SUCCESS_STATUSES for item in repeated)
+            )
+            if ambiguous_duplicates:
+                problems.append(
+                    f"required scenario {scenario!r} emitted duplicate non-success check IDs "
+                    "that cannot be matched to one baseline entry: "
+                    + ", ".join(ambiguous_duplicates)
+                )
         if scored and not any(check["status"] in VERDICT_STATUSES for check in checks):
             problems.append(f"required scenario {scenario!r} emitted no verdict checks")
         if not scored and not checks:

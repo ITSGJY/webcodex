@@ -134,7 +134,7 @@ python3 scripts/tests/test_mcp_conformance_report.py
 It covers all-skipped output, missing/empty/INFO-only scenarios, unknown statuses,
 abnormal referee exits, scored and not-scored infrastructure failures, changed
 status/evidence for an existing check ID, capability-advertisement drift,
-duplicate check IDs, harness-pin mismatch, placeholder evidence, new scored
+ambiguous duplicate non-success check IDs, harness-pin mismatch, placeholder evidence, new scored
 failures, informational non-success reporting, stale classifications, and
 rejection of broad masks.
 

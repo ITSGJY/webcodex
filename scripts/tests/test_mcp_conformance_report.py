@@ -181,15 +181,25 @@ class ReportGateTests(unittest.TestCase):
         with self.assertRaisesRegex(report_gate.GateError, "unknown status"):
             self.evaluate()
 
-    def test_duplicate_check_id_is_rejected(self) -> None:
+    def test_duplicate_success_check_id_is_allowed(self) -> None:
         self.write_metadata(["scenario-a"])
         self.write_baseline([])
         self.write_checks(
             "scenario-a",
             [self.check("duplicate", "SUCCESS"), self.check("duplicate", "SUCCESS")],
         )
-        with self.assertRaisesRegex(report_gate.GateError, "duplicate check id"):
-            self.evaluate()
+        summary = self.evaluate()
+        self.assertTrue(summary["gate_passed"])
+
+    def test_duplicate_non_success_check_id_fails_closed(self) -> None:
+        first = self.check("duplicate", "FAILURE", error_message="first failure")
+        second = self.check("duplicate", "FAILURE", error_message="second failure")
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(first)])
+        self.write_checks("scenario-a", [first, second])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("duplicate non-success check IDs" in p for p in summary["problems"]))
 
     def test_metadata_harness_sha_must_match_baseline_pin(self) -> None:
         self.write_metadata(["scenario-a"])
@@ -234,6 +244,21 @@ class ReportGateTests(unittest.TestCase):
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])
         self.assertTrue(any("infrastructure failures" in p for p in summary["problems"]))
+
+    def test_not_scored_duplicate_check_ids_remain_informational(self) -> None:
+        self.write_metadata(
+            ["scenario-a"],
+            [{"scenario": "extension-a", "reason": "pending"}],
+        )
+        self.write_baseline([])
+        self.write_checks("scenario-a", [self.check("ok", "SUCCESS")])
+        self.write_checks(
+            "extension-a",
+            [self.check("repeated", "FAILURE"), self.check("repeated", "FAILURE")],
+        )
+        summary = self.evaluate()
+        self.assertTrue(summary["gate_passed"])
+        self.assertEqual(summary["informational_status_counts"], {"FAILURE": 2})
 
     def test_missing_not_scored_scenario_fails_coverage_integrity(self) -> None:
         self.write_metadata(
@@ -306,6 +331,26 @@ class ReportGateTests(unittest.TestCase):
         )
         self.write_metadata(["scenario-a"], harness_exit_code=1)
         self.write_baseline([self.classification(expected, "missing_harness_fixture")])
+        self.write_checks("scenario-a", [actual])
+        summary = self.evaluate()
+        self.assertFalse(summary["gate_passed"])
+        self.assertTrue(any("evidence changed" in p for p in summary["problems"]))
+
+    def test_changed_failure_details_with_same_message_requires_review(self) -> None:
+        expected = self.check(
+            "stable-message",
+            "FAILURE",
+            error_message="protocol assertion failed",
+        )
+        expected["details"] = {"actual": 200, "expected": 400}
+        actual = self.check(
+            "stable-message",
+            "FAILURE",
+            error_message="protocol assertion failed",
+        )
+        actual["details"] = {"actual": 500, "expected": 400}
+        self.write_metadata(["scenario-a"], harness_exit_code=1)
+        self.write_baseline([self.classification(expected)])
         self.write_checks("scenario-a", [actual])
         summary = self.evaluate()
         self.assertFalse(summary["gate_passed"])

@@ -55,22 +55,26 @@ if [ -z "$WORK_ROOT" ] || [ -z "$HARNESS_DIR" ] || [ -z "$REPORT_ROOT" ]; then
 fi
 mkdir -p "$WORK_ROOT"
 
+fixture_group_alive() {
+  [ -n "$fixture_pid" ] && kill -0 -- "-$fixture_pid" 2>/dev/null
+}
+
 stop_fixture() {
   [ -n "$fixture_pid" ] || return 0
   touch "$fixture_dir/stop" 2>/dev/null || true
   for _ in $(seq 1 50); do
-    if ! kill -0 "$fixture_pid" 2>/dev/null; then break; fi
+    if ! fixture_group_alive; then break; fi
     sleep 0.1
   done
-  if kill -0 "$fixture_pid" 2>/dev/null; then
-    kill "$fixture_pid" 2>/dev/null || true
+  if fixture_group_alive; then
+    kill -TERM -- "-$fixture_pid" 2>/dev/null || true
   fi
   for _ in $(seq 1 50); do
-    if ! kill -0 "$fixture_pid" 2>/dev/null; then break; fi
+    if ! fixture_group_alive; then break; fi
     sleep 0.1
   done
-  if kill -0 "$fixture_pid" 2>/dev/null; then
-    kill -KILL "$fixture_pid" 2>/dev/null || true
+  if fixture_group_alive; then
+    kill -KILL -- "-$fixture_pid" 2>/dev/null || true
   fi
   wait "$fixture_pid" 2>/dev/null || true
   fixture_pid=""
@@ -109,17 +113,23 @@ prepare_harness_source() {
   elif ! is_git_worktree "$HARNESS_DIR"; then
     echo "default harness path exists but is not a Git worktree; refusing to remove it: $HARNESS_DIR" >&2
     exit 2
-  elif [ ! -f "$HARNESS_DIR/$HARNESS_OWNER_MARKER" ]; then
+  fi
+
+  if [ "$HARNESS_DIR_EXTERNAL" -eq 0 ]; then
     origin_url="$(git -C "$HARNESS_DIR" remote get-url origin 2>/dev/null || true)"
     case "$origin_url" in
-      https://github.com/modelcontextprotocol/conformance.git|https://github.com/modelcontextprotocol/conformance)
-        touch "$HARNESS_DIR/$HARNESS_OWNER_MARKER"
-        ;;
+      https://github.com/modelcontextprotocol/conformance.git|https://github.com/modelcontextprotocol/conformance) ;;
       *)
-        echo "default harness checkout is not WebCodex-owned and has an unexpected origin; refusing to modify it" >&2
+        echo "default harness checkout has an unexpected origin; refusing to modify it: $HARNESS_DIR" >&2
         exit 2
         ;;
     esac
+    # Older versions of this script created the same default checkout before the
+    # ownership marker existed. Adopt only that exact known-origin checkout; an
+    # externally supplied worktree remains read-only and is never marked/modified.
+    if [ ! -f "$HARNESS_DIR/$HARNESS_OWNER_MARKER" ]; then
+      touch "$HARNESS_DIR/$HARNESS_OWNER_MARKER"
+    fi
   fi
 
   actual="$(git -C "$HARNESS_DIR" rev-parse HEAD 2>/dev/null || true)"
@@ -143,14 +153,16 @@ prepare_report_root() {
     echo "MCP conformance report root is not a directory: $REPORT_ROOT" >&2
     exit 2
   fi
-  mkdir -p "$REPORT_ROOT"
-  if [ "$REPORT_ROOT_EXTERNAL" -eq 1 ] && [ ! -f "$REPORT_ROOT/$REPORT_OWNER_MARKER" ]; then
+  if [ ! -e "$REPORT_ROOT" ]; then
+    mkdir -p "$REPORT_ROOT"
+    touch "$REPORT_ROOT/$REPORT_OWNER_MARKER"
+  elif [ ! -f "$REPORT_ROOT/$REPORT_OWNER_MARKER" ]; then
     if find "$REPORT_ROOT" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-      echo "external MCP report root is non-empty and not WebCodex-owned; refusing to delete its contents: $REPORT_ROOT" >&2
+      echo "MCP report root is non-empty and lacks the WebCodex ownership marker; refusing to delete its contents: $REPORT_ROOT" >&2
       exit 2
     fi
+    touch "$REPORT_ROOT/$REPORT_OWNER_MARKER"
   fi
-  touch "$REPORT_ROOT/$REPORT_OWNER_MARKER"
   rm -rf "$REPORT_ROOT/2026-07-28" "$REPORT_ROOT/2025-11-25"
   rm -f "$REPORT_ROOT/fixture.log" "$REPORT_ROOT/server-capabilities.json"
 }
@@ -184,15 +196,20 @@ fixture_dir="$(mktemp -d "${TMPDIR:-/tmp}/webcodex-mcp-conformance.XXXXXX")"
 url_file="$fixture_dir/url"
 stop_file="$fixture_dir/stop"
 fixture_log="$REPORT_ROOT/fixture.log"
-WEBCODEX_MCP_CONFORMANCE_URL_FILE="$url_file" \
-WEBCODEX_MCP_CONFORMANCE_STOP_FILE="$stop_file" \
+if ! command -v setsid >/dev/null 2>&1; then
+  echo "MCP conformance fixture supervision requires setsid" >&2
+  exit 2
+fi
+setsid env \
+  WEBCODEX_MCP_CONFORMANCE_URL_FILE="$url_file" \
+  WEBCODEX_MCP_CONFORMANCE_STOP_FILE="$stop_file" \
   cargo test --locked -p webcodex --lib mcp_conformance_fixture_server -- --ignored --nocapture \
   >"$fixture_log" 2>&1 &
 fixture_pid=$!
 
 ready_deadline=$((SECONDS + 60))
 while [ ! -s "$url_file" ]; do
-  if ! kill -0 "$fixture_pid" 2>/dev/null; then
+  if ! fixture_group_alive; then
     echo "MCP conformance fixture exited before publishing its URL" >&2
     tail -80 "$fixture_log" >&2 || true
     exit 1

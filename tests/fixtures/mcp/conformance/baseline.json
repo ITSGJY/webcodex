@@ -110,7 +110,7 @@
           "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
           "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "9cb48cfaaa1b12cefb5bb3466b2df926a4b379bd230b00e51a539ef9f0b1a182"
+          "evidence_sha256": "a9ce6a3e09ef612a093679f8168ec4fb3fa2aca1297a5768620a6bc32f284b09"
         },
         {
           "scenario": "elicitation-sep1034-defaults",
@@ -245,7 +245,7 @@
           "reason": "The 2025-11-25 tools/list wire schema rejects a WebCodex outputSchema that omits the required root type.",
           "evidence": "MCP 2025-11-25 Tool outputSchema wire schema; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "853ee32a673acee6464bf043eaed3098e3da523045d6acd96b21592706fe5842"
+          "evidence_sha256": "ececf4d2bd6e6309d77a640908419f8c8124c93a0dcc41701c6f361b6771273c"
         }
       ],
       "expected_server_capabilities": {
@@ -263,7 +263,7 @@
           "reason": "The cacheable endpoint belongs to an optional capability that the current WebCodex surface does not implement.",
           "evidence": "SEP-2549 applies when the corresponding optional endpoint exists; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "bb452629335c11ead82c495e5f5e338e3242ffa46057da1c7c4f08a028e71497"
+          "evidence_sha256": "7af406127f9e0edb58db00d3c7a974c4a64e9dc2eb966779a6de918741a9f5f8"
         },
         {
           "scenario": "caching",
@@ -272,7 +272,7 @@
           "reason": "The cacheable endpoint belongs to an optional capability that the current WebCodex surface does not implement.",
           "evidence": "SEP-2549 applies when the corresponding optional endpoint exists; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "1d8f9b5b01db46426f7a6c6e730c4575938939d3e6a28009f08c798864413b28"
+          "evidence_sha256": "e3fb42ce657d615df87789d7f92cc5b379ed29c676d48cd6f60f27515347ec75"
         },
         {
           "scenario": "caching",
@@ -344,7 +344,7 @@
           "reason": "WebCodex accepted invalid Host/Origin input instead of rejecting the rebinding probe.",
           "evidence": "MCP transport security / DNS rebinding protection; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "9cb48cfaaa1b12cefb5bb3466b2df926a4b379bd230b00e51a539ef9f0b1a182"
+          "evidence_sha256": "318016600ed6861ea36888a269d82ca3105673a7d3d7e540c15b2ea493571b2c"
         },
         {
           "scenario": "input-required-result-basic-elicitation",
@@ -353,7 +353,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "a45ff6b1c8bdf199012aa9981b96ebc919728dbcba11feca2e13bdb691ff8143"
+          "evidence_sha256": "18bdbb4b49ac7b1a73e056914b6627a1b3ffe9c36cd1c438b72c09a4be638f1b"
         },
         {
           "scenario": "input-required-result-basic-list-roots",
@@ -362,7 +362,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "2bc53d620969f34d0981d7d5fe6acf718a3a3d8e5726fb56ce76fcb9d13d9ce0"
+          "evidence_sha256": "09733701c42953223f9761ea327f831d5eef286a08e3807e2f2687ffafc45625"
         },
         {
           "scenario": "input-required-result-basic-sampling",
@@ -371,7 +371,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "1d5d13f6588d6ea704a0ff01b0c49acfb3c1188b088210aed7cb1c9661d251b9"
+          "evidence_sha256": "a220d559b1a7050e97a4634952062d2c2eab238542450d87980f0c0aece9733e"
         },
         {
           "scenario": "input-required-result-capability-check",
@@ -380,7 +380,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "8ca1123a297295ee6687823184c59c4ef98e7181fbd0bdbac892ccd767ef5900"
+          "evidence_sha256": "253ff0b64d1e6b62721dcd10c4d48f9df0dcd12648f406e7e96a15f19824d3e7"
         },
         {
           "scenario": "input-required-result-ignore-extra-params",
@@ -389,7 +389,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "WARNING",
-          "evidence_sha256": "242650bdb1be45878f0a4a8236da3a578c3b30cdf5d1d33c00239a616d31dfcc"
+          "evidence_sha256": "52a17049b7fa7e0e6e9d2654c9d42125aa6b79edde9ee4b37751e60f39bca83f"
         },
         {
           "scenario": "input-required-result-missing-input-response",
@@ -398,7 +398,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "WARNING",
-          "evidence_sha256": "511d84da640d8dcd5b41923a2e1b97f0c8849ca2e224b5b7565ec062cb6dcf2a"
+          "evidence_sha256": "e6fd1be79feba098d507c9f3d21453d995503479cbcc91d09c33fbf331721e66"
         },
         {
           "scenario": "input-required-result-multi-round",
@@ -407,7 +407,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "3521f1986753263f2678691a266a3b3f7073b7772fd7d441963c57a0c586ecd7"
+          "evidence_sha256": "3afcf29210ae83e39892a28ac859e41baac1ab6838e5ad869bd193f08cfd505b"
         },
         {
           "scenario": "input-required-result-multiple-input-requests",
@@ -416,7 +416,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "5d9f35a56d677d40ae9c848dc8ad342aeedb7cefbd0f81593f2732d213cf31e4"
+          "evidence_sha256": "cba19b857b74e5a744f92234cd251678d0cf1ec67feb1563d4b3732a6536e4e3"
         },
         {
           "scenario": "input-required-result-request-state",
@@ -425,7 +425,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "787cc0f014e8ccd28230db81eab394b0f47392cf65210a102608e60c2143c656"
+          "evidence_sha256": "bb56f96f2a4741573281dd15c3af52bb3dce1dcf68d966b5eb36cff46aec2ae1"
         },
         {
           "scenario": "input-required-result-result-type",
@@ -434,7 +434,7 @@
           "reason": "The SEP-2322 scenario requires a named diagnostic/reference tool; this baseline fixture does not yet inject conformance-only tools.",
           "evidence": "Pinned SEP-2322 conformance scenario fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "a45ff6b1c8bdf199012aa9981b96ebc919728dbcba11feca2e13bdb691ff8143"
+          "evidence_sha256": "18bdbb4b49ac7b1a73e056914b6627a1b3ffe9c36cd1c438b72c09a4be638f1b"
         },
         {
           "scenario": "input-required-result-tampered-state",
@@ -452,7 +452,7 @@
           "reason": "This MRTR probe uses prompts/get, but the current WebCodex surface does not implement the optional prompts capability.",
           "evidence": "SEP-2322 non-tool request scenario plus server capability model; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "c1c0268e795faa2ed47e9ac10ab235bbc1b0a29ed4f73187459aab0257226bc1"
+          "evidence_sha256": "19847c48286d6012d963b8274997698a9c1a9cdfb53fc7f9980729303d5c62bc"
         },
         {
           "scenario": "resources-read-binary",
@@ -488,7 +488,7 @@
           "reason": "The resource-not-found error omits the recommended data.uri echo.",
           "evidence": "SEP-2164 resource-not-found error data; first GitHub Actions conformance baseline raw report",
           "expected_status": "WARNING",
-          "evidence_sha256": "1eac24b0b70f00d528822678810a5ebf3a13986bef525f6dc175ac2991f257ad"
+          "evidence_sha256": "03e182c64ad2607c2749b90609cbf22dc87eda95ae0951f9c7a4c2f1227aabe0"
         },
         {
           "scenario": "server-stateless",
@@ -497,7 +497,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "18cbc6f45d27b694f190edbe99b354f0a0088aa9068c683511902583f07e1ee3"
+          "evidence_sha256": "b76faa90c503520992faac5ee3e81c11fa174de69d97e1bfdc977759e91daf0f"
         },
         {
           "scenario": "server-stateless",
@@ -506,7 +506,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "6a886aa9a507ed141f1d9ae77bbe156dcdfb85204481ca63179db175435319f8"
+          "evidence_sha256": "00318fb6a220abec56b408ee72fa031253a43ec35e93d0247bd7f49f3f0ce1e3"
         },
         {
           "scenario": "server-stateless",
@@ -515,7 +515,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "01a7e2476184fdb6cbaba03327cfd84443f9a1edc1e1695bdfff7672f430c7fc"
+          "evidence_sha256": "d54d3cc76357dd0289e936526cdced33478df35af58bfbe516084dfd8a478207"
         },
         {
           "scenario": "server-stateless",
@@ -524,7 +524,7 @@
           "reason": "The check explicitly requires a named diagnostic tool that the product registry does not expose.",
           "evidence": "Pinned server-stateless diagnostic fixture contract; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "04d4a4bea3a86334565b22e03d9b5bb34679eedb46b8b1feaa0e56b43a3e0e37"
+          "evidence_sha256": "9b03051fab076a4266977ed4b87c04f57ac9ea8077e40474f6c4d72971a3ffd9"
         },
         {
           "scenario": "server-stateless",
@@ -533,7 +533,7 @@
           "reason": "The request is rejected with WebCodex header-mismatch code -32020 instead of the required -32602 Invalid params.",
           "evidence": "SEP-2575 request metadata validation; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "f36b764f2c0df40406923e05c785784c2df3fc7c52985ae1447bb0c84f8bc5f7"
+          "evidence_sha256": "f72e87a4dcd615f71164cc3d3a94bc2e9a8db5fd4da6364c1379115262c62a15"
         },
         {
           "scenario": "server-stateless",
@@ -542,7 +542,7 @@
           "reason": "The request is rejected with WebCodex header-mismatch code -32020 instead of the required -32602 Invalid params.",
           "evidence": "SEP-2575 request metadata validation; first GitHub Actions conformance baseline raw report",
           "expected_status": "FAILURE",
-          "evidence_sha256": "f36b764f2c0df40406923e05c785784c2df3fc7c52985ae1447bb0c84f8bc5f7"
+          "evidence_sha256": "453717c56bda626408c987bb9e6c8dd5c2582e1523481557197a85f3169fc463"
         },
         {
           "scenario": "server-stateless",
