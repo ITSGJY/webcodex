@@ -406,6 +406,8 @@ must remain separate because only the former are wholly service-owned.
   changing execution behavior.
 - Establish representative review/implementation traces to compare outer MCP
   calls, canonical child calls, Runner calls, and wall time separately.
+  The concrete Direct-vs-Code-Mode capture/report protocol is documented in
+  [`../experiments/agent-loop-baseline.md`](../experiments/agent-loop-baseline.md).
 
 Success means we can explain where elapsed time is spent without claiming access
 to model-private state.
