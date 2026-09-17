@@ -1,5 +1,4 @@
 use super::*;
-use crate::auth::middleware::enforce_project_connector_surface;
 
 fn bootstrap_ctx() -> AuthContext {
     bootstrap_context()
@@ -1128,7 +1127,7 @@ async fn oauth2_verifier_accepts_current_project_share_and_preserves_project_ide
         ctx.token_kind.as_deref(),
         Some(PROJECT_SHARE_OAUTH_TOKEN_KIND)
     );
-    assert!(enforce_project_connector_surface(true, &ctx, "/mcp").is_ok());
+    assert!(crate::auth::middleware::enforce_token_surface(&ctx, "/mcp").is_ok());
     for path in crate::route_metadata::iter_routes()
         .filter(|spec| spec.surface == crate::route_metadata::RouteSurface::RunnerTransport)
         .map(|spec| spec.path)

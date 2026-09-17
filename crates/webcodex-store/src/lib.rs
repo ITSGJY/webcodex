@@ -6,7 +6,6 @@ use self::connection_observation::{
 };
 use crate::models::PairingCodeRecord;
 use rusqlite::Connection;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +19,6 @@ mod agent_wake;
 mod audit;
 mod communication;
 mod connection_observation;
-mod execution_model;
-mod executions;
 mod goal;
 mod job_receipts;
 mod memory;
@@ -29,7 +26,6 @@ pub mod models;
 mod oauth;
 mod schema;
 mod server_instance;
-mod task_kernel;
 mod window_activity;
 
 pub use self::admin_project_lifecycle::{AdminProjectAudit, AdminProjectIdempotencyRecord};
@@ -68,15 +64,6 @@ pub use self::communication::{
     MAX_DURABLE_AGENTS,
 };
 pub(crate) use self::connection_observation::StoreDomain;
-pub use self::execution_model::{
-    ConnectorExecution, ConnectorExecutionFailure, ConnectorExecutionKind,
-    ConnectorExecutionObservation, ConnectorExecutionReservation, ConnectorExecutionState,
-    ConnectorTerminalContinuationDeliveryState, MAX_ASSERTION_EVIDENCE_BYTES,
-};
-#[cfg(any(test, feature = "root-test-support"))]
-pub use self::execution_model::{
-    ConnectorExecutionContinuationIntent, ConnectorTerminalContinuationClaim,
-};
 pub use self::goal::{
     GoalCorrelation, GoalCorrelationKind, GoalDetail, GoalLifecycle, GoalMutation, GoalPage,
     GoalPatch, GoalStoreError, GoalSummary, NewGoal, GOAL_ID_PREFIX, MAX_GOAL_CORRELATIONS,
@@ -102,27 +89,12 @@ pub use self::memory::{
 };
 pub use self::oauth::RotateResult;
 pub use self::server_instance::ServerInstanceGuard;
-pub use self::task_kernel::{
-    AppliedPaths, ConnectorApproval, ConnectorApprovalGate, ConnectorApprovalState,
-    ConnectorBinding, ConnectorEditOperationGate, ConnectorPreservedWorkspace,
-    ConnectorResultDecision, ConnectorResultDecisionRecovery, ConnectorResultDecisionRecoveryState,
-    ConnectorResultDecisionStatus, ConnectorRunLifecycle, ConnectorRunState,
-    ConnectorTaskContinuation, ConnectorTaskEvent, ConnectorTaskLifecycle, ConnectorTaskMode,
-    ConnectorTaskResult, ConnectorTaskSnapshot, ConnectorTaskState, ConnectorTaskStoreError,
-    ConnectorWindowBinding, ConnectorWindowContext, ConnectorWorkspaceTransition,
-    GuidanceReadState, LocalReviewableTask, NewConnectorResult, NewConnectorTask,
-    WindowProjectActivation,
-};
 pub use self::window_activity::{MAX_WINDOW_ACTIVITY_LIMIT, MAX_WINDOW_LINK_LIMIT};
 
 pub struct Database {
     conn: Mutex<Connection>,
     connection_observer: Arc<dyn StoreConnectionObserver>,
     state_path: PathBuf,
-    /// Ephemeral navigation only. Connector work stays in wc_tasks and
-    /// wc_window_project_contexts; AgentTask owns separate durable tables, and
-    /// restarting never guesses a window's current project.
-    window_projects: Mutex<HashMap<(String, String), String>>,
 }
 
 impl Database {
@@ -131,7 +103,6 @@ impl Database {
             conn: Mutex::new(conn),
             connection_observer: Arc::new(TracingStoreConnectionObserver),
             state_path,
-            window_projects: Mutex::new(HashMap::new()),
         }
     }
 
@@ -175,11 +146,7 @@ mod agent_wake_tests;
 #[cfg(test)]
 mod communication_tests;
 #[cfg(test)]
-mod continuation_delivery_tests;
-#[cfg(test)]
 mod db_tests;
-#[cfg(test)]
-mod execution_intent_tests;
 #[cfg(test)]
 mod goal_tests;
 #[cfg(test)]

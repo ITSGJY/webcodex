@@ -1,4 +1,3 @@
-use crate::connector_runtime::ConnectorCallOutcome;
 use crate::tool_runtime::ToolResult;
 use serde_json::{json, Value};
 
@@ -50,35 +49,6 @@ fn mcp_tool_text_content(structured: &Value, concise: String, text_json_compat: 
     } else {
         concise
     }
-}
-
-fn connector_call_tool_result_with_compat(
-    outcome: ConnectorCallOutcome,
-    text_json_compat: bool,
-) -> Value {
-    // Connector output follows the same MCP layering as Runtime tools: the body
-    // is canonical in structuredContent and content.text is compact by default.
-    let concise = if outcome.ok {
-        "WebCodex connector tool completed successfully.".to_string()
-    } else {
-        outcome
-            .body
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("WebCodex connector tool failed.")
-            .to_string()
-    };
-    let structured = outcome.body;
-    let text = mcp_tool_text_content(&structured, concise, text_json_compat);
-    json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": structured,
-        "isError": !outcome.ok
-    })
-}
-
-pub(super) fn connector_call_tool_result(outcome: ConnectorCallOutcome) -> Value {
-    connector_call_tool_result_with_compat(outcome, crate::config::mcp_text_json_compat_enabled())
 }
 
 fn mcp_runtime_tool_result_fallback_with_compat(
@@ -172,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn text_json_compat_mirrors_runtime_and_connector_structured_content() {
+    fn text_json_compat_mirrors_runtime_structured_content() {
         let runtime = mcp_runtime_tool_result_fallback_with_compat(
             ToolResult::ok(json!({ "count": 2 })),
             true,
@@ -180,21 +150,6 @@ mod tests {
         assert_eq!(
             runtime["content"][0]["text"],
             serde_json::to_string(&runtime["structuredContent"]).unwrap()
-        );
-
-        let connector = connector_call_tool_result_with_compat(
-            ConnectorCallOutcome {
-                ok: true,
-                body: json!({ "ok": true, "data": { "task": "ready" } }),
-                http_status: 200,
-                required_scope: None,
-                protocol_error: false,
-            },
-            true,
-        );
-        assert_eq!(
-            connector["content"][0]["text"],
-            serde_json::to_string(&connector["structuredContent"]).unwrap()
         );
     }
 }

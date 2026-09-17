@@ -3091,9 +3091,6 @@ mod tests {
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(db))
             .hoop(affix_state::inject(runtime))
-            .hoop(affix_state::inject(
-                crate::connector_runtime::ConnectorRuntimeSlot::default(),
-            ))
             .push(
                 Router::with_path("api")
                     .hoop(crate::AuthMiddleware)
@@ -3112,9 +3109,6 @@ mod tests {
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(db))
             .hoop(affix_state::inject(runtime))
-            .hoop(affix_state::inject(
-                crate::connector_runtime::ConnectorRuntimeSlot::default(),
-            ))
             .push(
                 Router::with_path("api")
                     .hoop(crate::AuthMiddleware)
@@ -3137,9 +3131,6 @@ mod tests {
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(db))
             .hoop(affix_state::inject(runtime))
-            .hoop(affix_state::inject(
-                crate::connector_runtime::ConnectorRuntimeSlot::default(),
-            ))
             .push(
                 Router::with_path("api")
                     .hoop(crate::AuthMiddleware)
@@ -3838,7 +3829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_runtime_console_works_without_connector_runtime_and_projects_are_safe() {
+    async fn hosted_runtime_console_uses_ordinary_runtime_and_projects_are_safe() {
         let runtime = test_runtime();
         register_project(
             &runtime,

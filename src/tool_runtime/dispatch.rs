@@ -1926,6 +1926,15 @@ impl ToolRuntime {
                 self.dispatch_patch_tool(call).await
             }
 
+            ToolCall::SkillLoad { name, .. } => {
+                let project = match project_resolution {
+                    Some(Ok(project)) => project,
+                    Some(Err(error)) => return error.into_tool_result(),
+                    None => return ToolResult::err("skill_load requires a resolved Project"),
+                };
+                self.skill_load(&project, name, auth).await
+            }
+
             ToolCall::SkillList {
                 query,
                 offset,

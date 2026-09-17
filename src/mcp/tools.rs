@@ -1,13 +1,10 @@
 use super::presentation;
 use super::resources;
 use super::response::{
-    connector_call_tool_result, mcp_runtime_tool_result_fallback, mcp_stateless_result, rpc_error,
-    rpc_result,
+    mcp_runtime_tool_result_fallback, mcp_stateless_result, rpc_error, rpc_result,
 };
-use super::tasks;
 use super::{require_mcp_scope, scope_forbidden, McpOutcome};
 use crate::auth::AuthContext;
-use crate::connector_runtime::{ConnectorRuntime, ConnectorTransport};
 pub(super) use crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
 use crate::model_surface::{ModelSurface, RuntimeExposure};
 use crate::tool_request_trace::ToolRequestLifecycle;
@@ -355,22 +352,6 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
         tools.append(&mut app_specs);
     }
     json!({ "tools": tools })
-}
-
-fn project_connector_tools_list_payload_for_auth(
-    compact: bool,
-    auth: Option<&AuthContext>,
-) -> Value {
-    let tools = filter_specs_for_oauth(crate::connector_runtime::surface::capability_specs(), auth)
-        .into_iter()
-        .map(|spec| mcp_tool_spec_json(spec, compact, false))
-        .collect::<Vec<_>>();
-    json!({ "tools": tools })
-}
-
-#[cfg(test)]
-pub(super) fn project_connector_tools_list_payload_with_compact(compact: bool) -> Value {
-    project_connector_tools_list_payload_for_auth(compact, None)
 }
 
 fn adapt_computer_observe_output_schema_for_mcp(spec: &mut ToolSpec) {
@@ -946,46 +927,37 @@ pub(super) async fn handle_list(
     compact_schemas: bool,
     app_enabled: bool,
 ) -> McpOutcome {
-    let result = match runtime.runtime_exposure() {
-        RuntimeExposure::ProjectConnector => {
-            project_connector_tools_list_payload_for_auth(compact_schemas, auth)
-        }
-        RuntimeExposure::Runtime(model_surface) => {
-            let mut result = mcp_tools_list_payload_with_features_for_auth(
-                model_surface,
+    let RuntimeExposure::Runtime(model_surface) = runtime.runtime_exposure();
+    let mut result = mcp_tools_list_payload_with_features_for_auth(
+        model_surface,
+        compact_schemas,
+        app_enabled,
+        stateless_2026,
+        stateless_2026,
+        auth,
+    );
+    if model_surface == ModelSurface::AdaptiveRuntime {
+        if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.push(mcp_tool_spec_json(
+                adaptive_runtime_gateway_tool_spec(),
                 compact_schemas,
-                app_enabled,
-                stateless_2026,
-                stateless_2026,
-                auth,
-            );
-            if model_surface == ModelSurface::AdaptiveRuntime {
-                if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
-                    tools.push(mcp_tool_spec_json(
-                        adaptive_runtime_gateway_tool_spec(),
-                        compact_schemas,
-                        false,
-                    ));
-                }
-            }
-            if stateless_2026 {
-                add_stateless_workflow_recorder_metadata(&mut result, model_surface);
-            }
-            if crate::mcp_gateway::authorized(auth) {
-                if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
-                    tools.push(crate::mcp_gateway::tool_spec());
-                }
-            }
-            if model_surface == ModelSurface::LocalCoding
-                && crate::ssh_resource_gateway::authorized(auth)
-            {
-                if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
-                    tools.push(crate::ssh_resource_gateway::tool_spec(compact_schemas));
-                }
-            }
-            result
+                false,
+            ));
         }
-    };
+    }
+    if stateless_2026 {
+        add_stateless_workflow_recorder_metadata(&mut result, model_surface);
+    }
+    if crate::mcp_gateway::authorized(auth) {
+        if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.push(crate::mcp_gateway::tool_spec());
+        }
+    }
+    if model_surface == ModelSurface::LocalCoding && crate::ssh_resource_gateway::authorized(auth) {
+        if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.push(crate::ssh_resource_gateway::tool_spec(compact_schemas));
+        }
+    }
     McpOutcome::Ok(rpc_result(
         id,
         if stateless_2026 {
@@ -1472,7 +1444,6 @@ pub(super) fn session_context_revision_ack_from_wire(
 
 pub(super) async fn handle_call(
     runtime: &ToolRuntime,
-    connector: Option<&ConnectorRuntime>,
     request_params: Value,
     id: Option<Value>,
     auth: Option<&AuthContext>,
@@ -1485,7 +1456,6 @@ pub(super) async fn handle_call(
     mut model_ergonomics_out: Option<&mut Option<ModelErgonomicsRecord>>,
     mut correlation_out: Option<&mut crate::tool_runtime::ToolCallCorrelation>,
 ) -> McpOutcome {
-    let tasks_extension_declared = stateless_2026 && tasks::request_supports_tasks(&request_params);
     let mut params: McpToolCallParams = match serde_json::from_value(request_params) {
         Ok(params) => params,
         Err(e) => {
@@ -1509,100 +1479,7 @@ pub(super) async fn handle_call(
     if let Some(lc) = lifecycle.as_deref_mut() {
         lc.set_app_call_id(app_call_id.clone());
     }
-    if runtime.runtime_exposure() == RuntimeExposure::ProjectConnector {
-        if let Some(lc) = lifecycle.as_deref() {
-            lc.capture_payload("raw_arguments", &params.arguments);
-        }
-    }
-    if runtime.runtime_exposure() == RuntimeExposure::ProjectConnector {
-        let connector = connector.expect("validated ProjectConnector runtime state");
-        if !stateless_2026 && params.name == "task_start" && window.is_none() {
-            if let Some(lc) = lifecycle.as_deref() {
-                lc.dispatch_failed("window_identity_unavailable");
-                lc.dispatch_finished(false, Some(false), "window_identity_unavailable");
-            }
-            return McpOutcome::BadRequest(rpc_error(
-                id,
-                -32600,
-                "MCP session identity is unavailable; initialize the connection before starting or continuing project work",
-            ));
-        }
-        if let Some(lc) = lifecycle.as_deref() {
-            lc.capture_payload("effective_arguments", &params.arguments);
-        }
-        let task_polling = tasks_extension_declared
-            && matches!(params.name.as_str(), "commands_run" | "checks_run");
-        let outcome = if task_polling {
-            connector
-                .call_for_window_with_task_polling(
-                    &params.name,
-                    params.arguments,
-                    auth,
-                    ConnectorTransport::Mcp,
-                    window,
-                )
-                .await
-        } else {
-            connector
-                .call_for_window(
-                    &params.name,
-                    params.arguments,
-                    auth,
-                    ConnectorTransport::Mcp,
-                    window,
-                )
-                .await
-        };
-        if let Some(required_scope) = outcome.required_scope {
-            if let Some(lc) = lifecycle.as_deref() {
-                lc.dispatch_failed("forbidden");
-                lc.dispatch_finished(false, Some(false), "forbidden");
-            }
-            let description = outcome
-                .body
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("connector credential lacks the required scope")
-                .to_string();
-            return scope_forbidden(auth, Some(required_scope), description);
-        }
-        if outcome.protocol_error {
-            if let Some(lc) = lifecycle.as_deref() {
-                lc.dispatch_failed("invalid_arguments");
-                lc.dispatch_finished(false, Some(false), "invalid_arguments");
-            }
-            let message = outcome
-                .body
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("invalid connector capability arguments")
-                .to_string();
-            return McpOutcome::BadRequest(rpc_error(id, -32602, message));
-        }
-        if let Some(lc) = lifecycle.as_deref() {
-            let category = if outcome.ok { "success" } else { "tool_error" };
-            lc.dispatch_finished(true, Some(outcome.ok), category);
-        }
-        if task_polling && outcome.ok {
-            if let Some(task_outcome) =
-                tasks::promote_connector_tool_call(&id, &outcome, auth, connector).await
-            {
-                return task_outcome;
-            }
-        }
-        let result = connector_call_tool_result(outcome);
-        return McpOutcome::Ok(rpc_result(
-            id,
-            if stateless_2026 {
-                mcp_stateless_result(result, false)
-            } else {
-                result
-            },
-        ));
-    }
-    let RuntimeExposure::Runtime(model_surface) = runtime.runtime_exposure() else {
-        unreachable!("ProjectConnector returned before runtime ModelSurface dispatch");
-    };
+    let RuntimeExposure::Runtime(model_surface) = runtime.runtime_exposure();
     let via_adaptive_runtime_gateway = model_surface == ModelSurface::AdaptiveRuntime
         && params.name == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
     if via_adaptive_runtime_gateway {

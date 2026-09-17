@@ -38,7 +38,7 @@ WebCodex exposes the same Server/Runner runtime through several user-facing adap
 - **CLI** — operator/developer setup, lifecycle, and diagnostics.
 - **Console** — the Server-hosted operator browser surface.
 
-For daily use, a regular Server + Runner exposes the configured coding tools for registered Projects. `webcodex share` / `webcodex run` instead create a project-first Connector bound to one repository and use a smaller task-oriented workflow. These are product choices, not identities or credentials.
+A regular Server + Runner and the local `webcodex share` / `webcodex run` lifecycle all expose the ordinary WebCodex runtime. `share` and `run` are deployment/auth/reachability conveniences around one locally registered Project; they do not define a second coding runtime or task model. Their project-scoped credentials restrict which Runner/Project is visible without changing ToolRuntime semantics.
 
 Internal type names used to route these adapters are maintainer implementation details; ordinary users should follow the tools and connection instructions returned by the current Server.
 
@@ -82,14 +82,13 @@ The Server also owns an independent durable **Goal** domain for high-level inten
 
 Stateless MCP 2026 can optionally present one exact Goal through the sparse Goal Plan App. `present_goal_plan(goal_id)` is the sole model-visible App-bound entry; the View converges through the ModelHidden/app-only `goal_plan_state(goal_id)` read. Both are bounded observations over the same SQLite Goal truth and carry no Project, Runner, Job, Workflow Session mutation, or Host-continuation authority. Existing coding tools do not require Goal identity and keep their normal/native presentation.
 
-## Task, Job, and Workflow Session continuity
+## Goal, Job, and Workflow Session continuity
 
 - **Goal** — high-level durable intent/control state (`wc_goal_*`). It can correlate multiple work/execution records, but it does not run them and is never inferred from the current Project, window, credential, or Workflow Session.
-- **Connector Task** — project-first work created by the task-oriented Connector. It can be explicitly resumed by its task handle.
 - **Job** — a long-running command or validation that continues after the initiating call returns. Observe the same Job instead of starting another copy.
-- **Workflow Session** — bounded coding evidence/continuity used by the regular runtime for review, validation, collaboration, and closeout. It is not a credential.
+- **Workflow Session** — bounded coding evidence/continuity used by the runtime for review, validation, collaboration, and closeout. It is not a credential.
 
-These objects have different lifecycles and are never inferred from one another merely because requests share a user, credential, project, or chat window. Their exact continuity protocols are maintainer details.
+These objects have different lifecycles and are never inferred from one another merely because requests share a user, credential, project, or chat window. Coding work does not create a parallel Connector Task/Run/Result lifecycle.
 
 ## Runner execution boundary
 
@@ -108,9 +107,7 @@ The Runner is the trust boundary closest to the repository:
   fact: active Jobs enter a bounded `recovering` state and are restored from
   the Runner's inventory when the same instance reconnects.
 
-Runner Job wire lifecycle vocabulary is interpreted once by the canonical typed
-contract in `webcodex-core`; the Runner, Registry, Store, Connector runtime, and
-Workflow Session then project that lifecycle into their own domain states. Server
+Runner Job wire lifecycle vocabulary is interpreted once by the canonical typed contract in `webcodex-core`; the Runner, Registry, Store, and Workflow Session then project that lifecycle into their own domain states. Server
 recovery remains an orthogonal Registry overlay, so `recovering` is an observed
 recovery state rather than a Runner wire lifecycle value.
 
@@ -138,11 +135,11 @@ See [SECURITY.md](../SECURITY.md) and [AUTH_MODEL.md](AUTH_MODEL.md).
 
 ## Persistence and recovery
 
-The Server persists managed accounts, OAuth state, project/task history, durable Agent/Conversation state, and durable Goal state. Workflow/task/Goal continuity is restored from each domain's own durable identifiers; WebCodex does not invent continuity from a credential, current browser window, Project, or neighboring domain identity.
+The Server persists managed accounts, OAuth state, Workflow Session evidence, durable Agent/Conversation/Agent Task state, and durable Goal state. Workflow Session, Agent Task, and Goal continuity is restored from each domain's own durable identifiers; WebCodex does not invent continuity from a credential, current browser window, Project, or neighboring domain identity.
 
 Runner Jobs are reconciled when the same live Runner process reconnects. Ordinary child processes cannot be adopted by an unrelated replacement Runner; specialized detached execution has its own explicit durable ownership path. The stable Runner `client_id` and the current process lease are separate, but the exact lease field is an internal wire detail.
 
-Durable Store aggregates use closed typed Rust lifecycle/state contracts for business authority. SQLite `TEXT` values and `CHECK` constraints remain the persistence encoding, not a second semantic registry. In particular, a Connector Task's persisted lifecycle is distinct from its derived/effective state: cancellation, result decision, and Run interruption are projected from typed durable facts before the existing public strings are serialized. Connector Execution, result/approval, and durable communication lifecycles likewise decode fail-closed from their unchanged SQLite vocabularies.
+Durable Store aggregates use closed typed Rust lifecycle/state contracts for business authority. SQLite `TEXT` values and `CHECK` constraints remain the persistence encoding, not a second semantic registry. Durable Agent/Conversation/Agent Task/Goal state and other current Store domains decode fail-closed from their owned vocabularies; ordinary coding uses Workflow Session and Runner Job state instead of a parallel Task/Run/Result/Approval schema.
 
 ## Module map
 
@@ -156,18 +153,13 @@ Runtime Console -----------------------> canonical Server HTTP/kernel paths abov
 ```
 
 - `route_metadata` — canonical HTTP route identity plus security/surface metadata.
-  Legacy REST routes and the one dynamic GPT Action adapter remain ordinary HTTP
-  routes; generic GPT Action operation identity is no longer stored here.
-  Connector routes still bind canonical Connector capability identities.
+  Legacy REST routes and the one dynamic GPT Action adapter remain ordinary HTTP routes; generic GPT Action operation identity is no longer stored here.
 - `runtime_http` — REST runtime routes plus the shared `/api/actions/{tool_name}`
   adapter. The Action adapter performs transport decoding/admission only and then
   enters the same ToolRuntime kernel as the canonical runtime path.
 - `mcp` — the primary model-facing adapter and model-surface selection.
 - `openapi` — the generic GPT Actions compatibility projector. It derives direct
-  operations from the canonical Adaptive Runtime direct rank, removes only explicit
-  protocol-incompatible `ToolDefinition` exceptions, and adds `call_runtime_tool`
-  for the supported long tail. Project Connector OpenAPI remains capability-based.
-- `connector_runtime` — the canonical project-bound coding path.
+  operations from the canonical Adaptive Runtime direct rank, removes only explicit protocol-incompatible `ToolDefinition` exceptions, and adds `call_runtime_tool` for the supported long tail.
 - `tool_runtime` — protocol-independent tool parsing, dispatch, project
   resolution, registry metadata, sessions, handoff, hygiene, files, Git,
   patches, validation, shell, Jobs, artifacts, and checkpoints.
@@ -302,8 +294,6 @@ The current layers are:
 - **domain** — Runner config/registry, Store, Workspace, Workflow Session,
   Tool contracts, Validation, Persistent Shell, and native LSP ownership.
 - **runtime** — `webcodex-runner` and `webcodex-tool-runtime-contracts`.
-- **application** — `webcodex-connector-runtime`, which composes the domain
-  crates needed by the project-bound Connector path.
 - **composition** — the root `webcodex` package, which owns Server composition
   and protocol adapters rather than forcing those concerns into lower crates.
 - **entrypoint** — `webcodex-cli`, the user-facing executable over the lower

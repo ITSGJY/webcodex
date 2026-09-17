@@ -16,7 +16,6 @@ async fn handle_with_server_apps_enabled(
     let protocol_era = super::super::inferred_protocol_era(&request);
     super::super::handle_mcp_request_with_lifecycle(
         runtime,
-        None,
         request,
         auth,
         protocol_era,

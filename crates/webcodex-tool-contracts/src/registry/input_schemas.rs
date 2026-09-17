@@ -129,6 +129,7 @@ pub use sessions::{
     session_lifecycle_schema, session_mode_schema, session_summary_input_schema,
     update_session_context_input_schema, validation_summary_input_schema,
 };
+pub(crate) use skills::skill_load_input_schema;
 pub(super) use skills::{
     skill_activate_input_schema, skill_install_input_schema, skill_list_input_schema,
     skill_read_file_input_schema, skill_remove_revision_input_schema, skill_versions_input_schema,

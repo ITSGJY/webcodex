@@ -328,7 +328,7 @@ where
             stdout: build_info::version_output("webcodex"),
             stderr: String::new(),
         },
-        "status" | "doctor" | "run" | "share" | "task" => CliAction::Project(args),
+        "status" | "doctor" | "run" | "share" => CliAction::Project(args),
         "setup" if args.get(1).map(String::as_str) == Some("single-user") => cli_parse_error(
             "`webcodex setup single-user` was removed; use `webcodex pairing create` followed by `webcodex login`"
                 .to_string(),

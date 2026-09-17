@@ -47,8 +47,7 @@ domains and must remain explicit in code, schemas, documentation, and reviews.
 | Conversation | Durable communication space | Workflow Session, task queue, execution context |
 | Agent Delivery | Recipient-specific Inbox state for one Message | model invocation or accepted work |
 | Wake Intent | Durable logical processing opportunity for an Agent | Message, Delivery, Agent Task, execution lease |
-| Connector Task | Existing project-bound `task_start` / `task_resume` continuity domain | Agent Task |
-| Agent Task | Durable unit of explicitly created/accepted asynchronous Agent work | Connector Task, Session todo, Conversation Message |
+| Agent Task | Durable unit of explicitly created/accepted asynchronous Agent work | Workflow Session todo, Conversation Message, Job |
 | Agent TaskAttempt | Durable exact execution-ownership attempt for one Agent Task | Endpoint, Workflow Session, CodingAgentRun |
 | Workflow Session | Existing execution/provenance/validation/handoff evidence context | Agent, Conversation, Agent Task |
 | Job | Concrete long-running process/validation execution | Agent Task or TaskAttempt |
@@ -58,10 +57,7 @@ domains and must remain explicit in code, schemas, documentation, and reviews.
 The `agent:` prefix in a runtime Project id is historical Runner-address syntax. It
 is unrelated to the durable `wc_dagent_*` Agent identity domain.
 
-In implementation names, prefer `ConnectorTask` for the existing Connector
-continuity domain and `AgentTask` / `AgentTaskAttempt` for the asynchronous Agent
-work domain. Do not introduce an unqualified new `Task` type where ownership would
-be ambiguous.
+In implementation names, use `AgentTask` / `AgentTaskAttempt` for the asynchronous Agent work domain. Ordinary coding work uses Workflow Session and Job terminology; do not introduce an unqualified new `Task` type where ownership would be ambiguous.
 
 ## Implemented durable Agent foundation
 
@@ -140,7 +136,7 @@ G3 adds an optional production ChatGPT MCP App Host carrier on top of this subst
 
 Every bridge operation re-runs ordinary communication authorization and exact Agent/Endpoint/controller-generation validation. Ordinary push bindings still require an Endpoint freshly attached in the current Server process. For MCP Apps, successful bind persists the current identity-bound recovery fingerprint and the optional canonical ClientWindow key already derived by the protocol adapter. Server takeover clears process-local bindings and `wake_capable` but preserves both. With no local binding, the exact fingerprint remains sufficient; when a canonical Window is present, the same principal + exact current Endpoint/generation + same Window may also receive the normal `success=true` recovery projection and create a new iframe fence after refresh. Exact unbind clears the current fingerprint but preserves a matching Window key; natural expiry also preserves only that Window key for the dedicated expired-Endpoint replacement operation. Explicit detach (including after expiry), ordinary Endpoint replacement, and push transition clear both recovery values. Replacement replay re-checks the successor's retained Window key, so a historical replay record cannot undo that revocation. Only a newly committed replacement populates `attached_endpoints`; replay and restart recovery never recreate fresh push-attachment authority. Missing or malformed Window metadata grants nothing beyond the exact fingerprint fallback, and another Window, stale generation, expiry, detach, foreign principal, malformed result, or generic bridge failure remains fail-closed. The strict published continuation projection schema still requires `recovery` on every result (`null` normally, the sole fixed restart-loss object when recoverable), so Host schema projection cannot discard the observation. Replacing or withdrawing a View reuses existing Wake reconciliation: a pre-fence claim is revoked and the logical Wake returns to `pending`, while a prepared/delivered Attempt becomes `delivery_unknown`. The App never blindly resends after the dispatch fence. Host `ui/message` success means only `dispatch_accepted`; only later exact `consume_agent_wake` proves that a continuation model turn actually ran. A consume-before-ACK race is valid and late ACK is idempotent. v16 keeps the slower bounded heartbeat cadence while hidden but allows the same acquire -> prepare -> `ui/message` -> finish path in background. Visibility transitions are scheduling observations only: they do not by themselves create `delivery_unknown`. Host scheduling remains best effort/non-immediate, and correctness still depends on the durable Wake and exact consume rather than timer liveness.
 
-MCP 2026 Tasks, Connector continuation, Runtime Console, explicit activation, and push `ContinuationAdapter` behavior retain their existing contracts. The MCP App is an optional carrier, not a scheduler or a source of Agent, Task, Goal, Project, Workflow Session, or execution authority. See [`../agent/mcp-app-continuation-experiments.md`](../agent/mcp-app-continuation-experiments.md) for the Host evidence and production mapping.
+Runtime Console, explicit activation, and push `ContinuationAdapter` behavior retain their existing contracts. The MCP App is an optional carrier, not a scheduler or a source of Agent, Task, Goal, Project, Workflow Session, or execution authority. Ordinary WebCodex Jobs are not materialized as MCP Tasks. See [`../agent/mcp-app-continuation-experiments.md`](../agent/mcp-app-continuation-experiments.md) for the Host evidence and production mapping.
 
 These invariants, the natural-conversation slice, and the durable A3 ownership
 substrate support asynchronous Agent work without introducing a scheduler.

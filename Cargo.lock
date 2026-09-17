@@ -5131,11 +5131,11 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "unicase",
  "url",
  "urlencoding",
  "uuid",
  "webcodex-admin",
- "webcodex-connector-runtime",
  "webcodex-core",
  "webcodex-persistent-shell",
  "webcodex-runner-config",
@@ -5208,28 +5208,6 @@ dependencies = [
  "windows",
  "windows-sys 0.61.2",
  "xcap",
-]
-
-[[package]]
-name = "webcodex-connector-runtime"
-version = "0.4.1"
-dependencies = [
- "chrono",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
- "webcodex-core",
- "webcodex-runner-config",
- "webcodex-runner-registry",
- "webcodex-store",
- "webcodex-tool-contracts",
- "webcodex-validation",
- "webcodex-workspace",
 ]
 
 [[package]]

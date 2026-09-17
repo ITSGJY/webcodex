@@ -116,7 +116,7 @@ A Server chooses its model-facing MCP surface at startup. Ordinary users do not 
 
 Machine-readable MCP tool results are returned in `structuredContent`; `content` is a concise human-readable/protocol-native fallback. Clients that need fields should consume `structuredContent` rather than parse text.
 
-Some MCP hosts do not expose `structuredContent` to the model. This has been observed with Claude Custom Connector even when WebCodex successfully executes the tool and returns the complete structured result. Operators serving such a host can explicitly set `WEBCODEX_MCP_TEXT_JSON_COMPAT=true`. Ordinary Runtime and Connector tool results then keep `structuredContent` canonical while also serializing that same JSON value into `content[0].text`. The option is off by default because the duplicate representation increases response/model-context size; protocol-native image/resource framing and the existing App-only compatibility paths remain unchanged.
+Some MCP hosts do not expose `structuredContent` to the model. This has been observed with Claude Custom Connector even when WebCodex successfully executes the tool and returns the complete structured result. Operators serving such a host can explicitly set `WEBCODEX_MCP_TEXT_JSON_COMPAT=true`. Ordinary runtime tool results then keep `structuredContent` canonical while also serializing that same JSON value into `content[0].text`. The option is off by default because the duplicate representation increases response/model-context size; protocol-native image/resource framing and the existing App-only compatibility paths remain unchanged.
 
 Recovery fields in a result describe the next safe **explicit** call. They never grant authority and never trigger a hidden retry. In particular, an uncertain outcome must be reconciled before repeating an effect.
 
@@ -225,114 +225,36 @@ Common setup failures:
 See xAI's [Connector documentation](https://docs.x.ai/grok/connectors) for the
 current Grok Custom MCP UI and availability.
 
-## Project-bound Connector workflow
+## Project-scoped ordinary runtime
 
-`webcodex run` and `webcodex share` bind one configured repository and expose a small task-oriented MCP surface:
+`webcodex run` and `webcodex share` bind one configured repository, start a local Server + Runner, and expose the ordinary Adaptive Runtime. The temporary or persistent Project Credential is an authentication/ProjectGrant boundary; it does not select a separate capability surface.
 
-```text
-task_start
-task_list
-task_resume
-files_list
-files_read
-files_search
-code_navigate
-edits_apply
-checks_run
-commands_run
-task_review
-task_cancel
-task_finish
-code_impact
-```
-
-Start with `task_start`. The Connector already knows the project, so prompts do not need runtime project ids or project discovery. A returned `task_id` is the durable handle for that Connector task; use `task_resume(task_id)` when you explicitly want to continue it. Do not assume that the same chat, HTTP/MCP connection, or credential automatically resumes prior work.
-
-The exact MCP Tasks-extension materialization/polling protocol is an implementation compatibility detail and is intentionally omitted from this user-facing guide.
-
-## Golden coding loop
+A typical coding flow is:
 
 ```text
-task_start
-→ files_list
-→ files_read / files_search / code_navigate / code_impact
-→ edits_apply
-→ checks_run
-→ task_finish
-→ task_review
+work_on_project
+→ read_files / search_project_texts / semantic navigation as needed
+→ apply_text_edits or other canonical edit tools
+→ run_process / run_shell / focused validation tools as needed
+→ show_changes
+→ finish_coding_task
 ```
 
-`task_start` has two execution modes:
+`work_on_project` starts or resumes an explicit Workflow Session on an ordinary registered Project. If the user requests isolation, `work_on_project(mode=worktree)` asks the Runner to create its canonical managed worktree and registers that worktree as another ordinary Project. Without that request, local `share`/`run` work directly on the one Project already registered by setup.
 
-- `normal` (default) is writable coding. WebCodex prepares a managed isolated Git
-  worktree outside the target checkout, runs edits/commands/checks there, and
-  `task_finish` captures a stable result. The target checkout changes only after
-  the project owner accepts that result locally. If isolation cannot be prepared
-  or verified, `normal` fails closed; it never falls back to writing the target.
-- `read_only` is analysis only. Reads, search, LSP navigation, and impact analysis
-  remain available; structured writes, commands, and checks are rejected.
+Adaptive Runtime may expose common tools directly and long-tail tools through `call_runtime_tool`. Direct versus gateway exposure never changes schema validation, OAuth scope, Project authority, permission policy, Runner capability checks, Session fences, or effects.
 
-A task may remain in its current mode, and `read_only` may upgrade to `normal`
-after write authority and isolated-workspace preparation succeed. A `normal` task
-cannot downgrade to `read_only`: finish or reject the writable task, then start a
-new `read_only` task. Any isolated writable result requires structured checks
-before `task_finish`, independent of the persisted mode label.
+The removed ProjectConnector capability names (`task_start`, `files_read`, `edits_apply`, `task_finish`, and related operations) are not compatibility aliases for runtime tools. Use the current ToolRuntime names returned by `tools/list`/`tool_manifest`.
 
-- `files_list` answers "what is in this project" from the Git index, so
-  ignored directories never appear. Call it before guessing paths.
-- `code_navigate` provides read-only language-server status, document/workspace
-  symbols, definitions, references, diagnostics, and hover. It accepts only
-  project-relative paths and 1-based Unicode scalar positions; the Connector
-  chooses the bound executor project. Arguments are operation-specific:
-  `status` takes no extras; document symbols and diagnostics take `path`;
-  workspace symbols takes `query`; definition, references, and hover take
-  `path` + `line` + `column`. Unsupported fields are rejected. It is available
-  in normal and read-only tasks.
-- `code_impact` performs one bounded call-hierarchy operation from a
-  project-relative source position. It accepts `incoming`, `outgoing`, or
-  `both`, breadth-first depth 1 or 2, and a global edge limit of 1..100. It
-  returns only normalized project-local roots, edges, and bounded call-site
-  ranges; unsupported language servers fail explicitly with no grep or AST
-  fallback. It is available in normal and read-only tasks.
-- `edits_apply` is the guarded edit tool; `commands_run` is the bounded escape
-  hatch for commands that need a shell.
-- `checks_run` performs structured validation. Follow its returned retry/status guidance rather than rebuilding internal operation identity by hand.
-- `task_finish` produces a stable result; a human reviews and accepts or
-  rejects it locally with `webcodex task accept <id>` / `webcodex task reject
-  <id>`. The model can never accept its own work.
+### Long work continues as Jobs
 
-### Validation recipes
-
-`checks_run` accepts `format`, `check`, and `test` plus an optional `recipe`
-enum (`rust`, `node`, `python`, `go`). Omit `recipe` for automatic resolution
-from the nearest `Cargo.toml`, `package.json`, `pyproject.toml`, or `go.mod`
-relative to the task `cwd`. Recipes do not install dependencies, mutate
-lockfiles, or use the network. A missing tool is an executor failure; a
-started validator returning non-zero is an assertion failure.
-
-| Recipe | Marker | `format` | `check` | `test` |
-| --- | --- | --- | --- | --- |
-| Rust | `Cargo.toml` | `cargo fmt -- --check` | `cargo check --all-targets` | `cargo test` |
-| Node | `package.json` | first of `format:check`, `format-check`, `check:format` | first of `check`, `typecheck`, `lint` | exact `test` |
-| Python | `pyproject.toml` | configured Ruff/Black | configured Ruff/Mypy | configured pytest |
-| Go | `go.mod` | unavailable | `go vet ./...` | `go test -json ./...` |
-
-### Long validation continues durably
-
-`checks_run` and `commands_run` use durable executions and may quick-yield
-after about 8 seconds while work continues. On the fourteen-tool Connector
-surface, call `task_review` with `after_cursor` / `wait_ms` (and
-`include_output_tail=true` when output is needed) until the execution becomes
-terminal; use `task_cancel` to stop it. Do not re-run an operation merely to
-poll it.
-
-On regular runtime surfaces, long-running work may instead be exposed as a WebCodex Job. Use the Job observation/recovery guidance returned by the connected Server rather than starting another copy. Opaque observation tokens should be returned unchanged; they are read cursors, not credentials or execution authority.
+Long-running commands and validations use the canonical WebCodex Job lifecycle. Observe the exact Job returned by the initiating call with `observe_jobs` (or recover it with `list_jobs` when identity was genuinely lost) instead of starting another copy. Jobs are not wrapped as MCP Tasks; WebCodex does not advertise the former Connector-specific MCP Tasks extension.
 
 ## First safe prompt
 
 ```text
-Use the configured WebCodex project. Start a read-only task, read README.md,
-summarize the project, review the result, and finish. Do not edit files.
+Use the configured WebCodex project. Inspect README.md and summarize the
+project structure. Do not edit files or run commands.
 ```
 
 No project discovery or runtime identifier belongs in this prompt.
@@ -370,17 +292,11 @@ prose.
 | `workspace_unavailable` | The configured Git workspace is unavailable | Restore the workspace, then run doctor |
 | `server_unreachable` / `agent_offline` | The project Runner/runtime is unavailable | Run `webcodex run` / `webcodex doctor` |
 | `required_capability_unavailable` | The current Runner/runtime lacks a required coding capability | Upgrade all binaries |
-| `task_not_active` | The task can no longer mutate or execute | Start a new task |
-| `execution_not_terminal` | Finish is blocked by active/unknown work | Review/wait/cancel |
-| `checks_required` | A normal task has not run checks | Call `checks_run` |
-| `checks_stale` | The workspace changed after the last check | Run a new check |
+| `project_registry_scope_denied` | A project-scoped credential tried to expand or mutate the Project registry outside its granted visibility | Use an already-visible Project or `work_on_project(mode=worktree)` |
 
 ## Advanced runtime surface
 
-Beyond the project-bound Connector, WebCodex can run as a multi-project
-management ToolRuntime with discovery, session, LSP, raw job, and artifact
-tools. That is an advanced surface for operators, not the canonical project
-Connector and not a prerequisite for ordinary coding.
+The same ToolRuntime can serve one project-scoped local `share`/`run` instance or a multi-project hosted Server. Model surfaces such as Adaptive Runtime, Local Coding, and Full Operator are projections of that one runtime; project-scoped credentials change visibility, not the underlying coding architecture.
 
 ### ChatGPT file bridge
 

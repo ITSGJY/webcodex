@@ -85,9 +85,7 @@ allow_patch = true
 会 fail closed，而不是 merge 或猜 precedence。新的 CLI 命令使用
 `--project-registry-dir`。
 
-Runtime project id 形如 `agent:<client_id>:<project_id>`，例如
-`agent:workstation:my-repo`。project-bound Connector 会在内部解析它；普通用户
-不需要输入。
+Runtime project id 形如 `agent:<client_id>:<project_id>`，例如 `agent:workstation:my-repo`。ToolRuntime 通过调用方可见的 Runner registry 解析这些 id；普通用户通常不需要输入。
 
 ### 允许根目录
 

@@ -6,8 +6,8 @@ Custom GPT 需要通过 Server 的 OpenAPI 兼容集成调用 WebCodex 时使用
 
 `/openapi.json` 会根据 Server 模式生成不同 surface：
 
-- 普通 runtime Server 投影 canonical Adaptive Runtime model surface；
-- project-bound Connector Server 继续投影独立的十四个 Connector capability。
+- runtime Server 默认投影 canonical Adaptive Runtime model surface；
+- project-scoped `share` / `run` credential 只收窄 authority/visibility，不定义第二套 Action surface。
 
 ## 导入 schema
 
@@ -69,51 +69,22 @@ Custom GPT importer 还会拒绝达到 1 MB 的 OpenAPI schema。WebCodex 因此
 
 MCP host-file import 保留独立的 trusted provenance 路径。普通 network-accessible Server 继续要求配置过的 trusted OAuth MCP client；显式 opt in 的 loopback-only OpenAI Secure Tunnel 部署可以改为信任本机注入的 user API token。Action 与 MCP 两种 provenance 模式共享 canonical authorization，但不能互相伪造。
 
-## Project-bound Connector Server
+## Project-scoped local `share` / `run`
 
-Server 使用 project-bound Connector 配置时，OpenAPI 仍从 canonical MCP Connector 相同的十四个 capability 生成：
+`webcodex share` 或 `webcodex run` 启动的 Server 使用与普通 Server 相同的 generic Adaptive Runtime OpenAPI projection。Project-scoped authentication 只把调用方限制在自己的 ProjectGrant，不会切换到单独的 Connector capability registry。
 
-```text
-task_start
-task_list
-task_resume
-files_list
-files_read
-files_search
-code_navigate
-edits_apply
-checks_run
-commands_run
-task_review
-task_cancel
-task_finish
-code_impact
-```
-
-Connector 已经绑定项目。普通 coding 直接从 Connector actions 开始，不要先做 broader runtime/project discovery，也不要在 prompt 中放 Runner client ID 或 runtime project ID。
-
-`task_start` 只接受 `normal`（默认）和 `read_only`。`normal` 在受管理的隔离 Git worktree 中执行可写工作；无法安全准备 workspace 时 fail closed。`read_only` 允许分析，但拒绝 edit、command 与 check。
-
-## 建议的 Connector GPT 指令
+Custom GPT 可以使用 canonical runtime workflow：
 
 ```text
-使用配置好的 WebCodex 项目。
-每次用户指令用 task_start 开始或延续。
-让 task_start 复用当前项目上下文；不要向用户询问 ID。
-只有 WebCodex 明确要求恢复或继续已有 task 时才使用 task_list 与 task_resume。
-猜测路径前先用 files_list 查看项目内容。
-在 edits_apply 前使用 files_read/files_search。
-使用 code_navigate 做只读语义导航；只提供项目相对路径。
-使用 code_impact 做有界 call hierarchy 与变更影响检查。
-在 task_finish 前运行 checks_run。
-用 task_review 查看执行进度与结果审查。
-仅当结构化能力不足且有人工审批时使用 commands_run。
-永远不要向用户询问 WebCodex 内部 ID；后续调用需要时直接使用工具返回值。
+使用 work_on_project 建立精确 Project 与 Workflow Session。
+先 read/search 再 edit；使用 discovery 返回的 canonical runtime tool 名称。
+只有用户需要隔离 managed worktree 时才使用 work_on_project(mode=worktree)。
+validation 或 command 继续异步运行时观察同一个 Job。
+使用 show_changes 审查，并用 finish_coding_task 收尾。
+不要从 chat、credential 或猜测的 id 推导 Project/Session authority。
 ```
 
-`checks_run` 是 Connector 的结构化校验 Action，可选 `recipe` 为 `rust`、`node`、`python`、`go`；省略时做确定性的最近 manifest 解析。Recipe 表格见 [MCP](MCP.zh-CN.md#校验-recipe)。
-
-`task_finish` 生成稳定结果，不会静默把变更应用到目标 checkout。宿主用户使用 `webcodex task show`、`webcodex task accept` 或 `webcodex task reject` 在本地完成审查和决策。
+旧 ProjectConnector Action 名称与 host-side `webcodex task` review workflow 不再作为 compatibility alias 投影。
 
 ## 管理与安全
 

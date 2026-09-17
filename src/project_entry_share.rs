@@ -268,7 +268,7 @@ impl ShareSession {
         let share_root = state.join("share");
         create_private_dir(&share_root)?;
         let directory = share_root.join(uuid::Uuid::new_v4().simple().to_string());
-        let credential_file = directory.join("connector-key");
+        let credential_file = directory.join("project-credential");
         let result = (|| {
             create_private_dir(&directory)?;
             let credential = generate_project_credential();
@@ -530,7 +530,7 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         config.port,
         "Stop the conflicting process, then retry webcodex share.",
     )?;
-    let persistent_credential = read_project_credential(&paths.connector_key)?;
+    let persistent_credential = read_project_credential(&paths.project_credential)?;
     let session = ShareSession::create(&paths.state)?;
     if session.credential == persistent_credential {
         return Err(ProductError::new(
@@ -586,7 +586,7 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         &options.project,
         LocalRuntimeOptions {
             public_url: Some(public_url.clone()),
-            connector_credential_file: Some(session.credential_file.clone()),
+            project_credential_file: Some(session.credential_file.clone()),
             mcp_query_token_auth: options.auth == ShareAuth::QueryToken,
             project_share_oauth,
             child_environment_remove: if options.tunnel == TunnelProvider::OpenAiSecure {
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn share_output_contains_only_the_temporary_connector_credential() {
+    fn share_output_contains_only_the_temporary_project_credential() {
         let persistent = "webcodex_persistent-never-print";
         let temporary = "webcodex_temporary-print-once";
         let output = render_share_ready(
@@ -1499,7 +1499,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         create_private_dir(&state).unwrap();
-        let persistent = state.join("credentials/connector-key");
+        let persistent = state.join("credentials/project-credential");
         let persistent_value = generate_project_credential();
         write_new_private(&persistent, format!("{persistent_value}\n").as_bytes()).unwrap();
         let persistent_before = fs::read_to_string(&persistent).unwrap();

@@ -1086,6 +1086,7 @@ fn active_job_continuation_brief(summary: &Value) -> Value {
 }
 
 impl ToolRuntime {
+    #[cfg(test)]
     pub(crate) async fn run_job_for_auth(
         &self,
         project: String,
@@ -1110,6 +1111,7 @@ impl ToolRuntime {
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_job_for_auth_with_contract(
         &self,

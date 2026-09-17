@@ -779,7 +779,6 @@ pub(crate) fn compact_runtime_status(status: &Value) -> Value {
             "server_transport": {"status": "not_observed"},
             "server_registration": {"status": "not_observed"},
             "project_registry": {"status": "not_observed"},
-            "connector_endpoint": {"status": "not_observed"},
             "last_successful_tool_call": {"status": "not_observed"},
         })),
         "version_compatibility": {
@@ -1069,47 +1068,6 @@ fn connection_layers(
         )
     };
 
-    // -- connector_endpoint: observed activity, never config inference --------
-    let connector_endpoint = if !observations.connector_configured() {
-        layer_observation(
-            "not_configured",
-            None,
-            "connector_runtime",
-            None,
-            Some("connector_runtime_disabled"),
-            now,
-            json!({}),
-        )
-    } else {
-        match observations.latest_connector_observation() {
-            Some(observation) => {
-                let status = match observation.status.as_str() {
-                    "ready" | "request_succeeded" => "ready",
-                    _ => "unknown",
-                };
-                let reason = (status == "unknown").then_some("last_probe_not_ready");
-                layer_observation(
-                    status,
-                    Some(observation.observed_at),
-                    &observation.source,
-                    Some(ACTIVITY_STALE_AFTER_SECS),
-                    reason,
-                    now,
-                    json!({"last_observation": observation.status}),
-                )
-            }
-            None => layer_observation(
-                "not_observed",
-                None,
-                "connector_runtime",
-                None,
-                Some("no_connector_requests_observed"),
-                now,
-                json!({}),
-            ),
-        }
-    };
-
     // -- last_successful_tool_call: scoped meaningful activity ----------------
     let principal = super::session_context::runtime_observation_principal(auth).ok();
     let observation = principal
@@ -1154,7 +1112,6 @@ fn connection_layers(
         "server_transport": server_transport,
         "server_registration": server_registration,
         "project_registry": project_registry,
-        "connector_endpoint": connector_endpoint,
         "last_successful_tool_call": last_successful_tool_call,
     })
 }

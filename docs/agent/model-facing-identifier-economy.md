@@ -41,7 +41,7 @@ compatibility. Other formats below switch directly; existing files are not rewri
 | Memory identity | `wc_mem_` + 32 hex (39) → B64(12) (23) | store/memory primary key and schemas | memory lookup/update |
 | Computer application/display/surface/element identities | domain prefix + 32 hex → B64(12) | computer registry / platform accessibility collections | computer tools; exact process/snapshot routing remains |
 | Persistent shell identity | `wc_shell_` + 32 hex → B64(12) | tool_runtime/session_shell map | explicit shell calls |
-| Connector Task, Run, Result and checkpoint identities | domain prefix + 32 hex → B64(12) | connector-runtime and tool_runtime/checkpoint; SQLite uniqueness or atomic file publication owns collision retry | model-facing task lifecycle and checkpoint inputs/outputs |
+| Checkpoint identity | domain prefix + 32 hex → B64(12) | tool_runtime/checkpoint; atomic file publication owns collision retry | model-facing checkpoint inputs/outputs |
 
 ## Deliberate exclusions
 

@@ -1966,7 +1966,6 @@ fn runtime_status_input_schema_exposes_compact_flags() {
         crate::model_surface::MODEL_SURFACE_LOCAL_CODING,
         crate::model_surface::MODEL_SURFACE_ADAPTIVE_RUNTIME,
         crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR,
     ] {
         assert!(
             runtime_exposure_description.contains(exposure),
@@ -2472,63 +2471,6 @@ async fn runtime_status_defaults_to_local_coding_surface() {
 }
 
 #[tokio::test]
-async fn runtime_status_reports_project_connector_exposure_when_configured() {
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.set("WEBCODEX_SHARED_KEY_ENABLED", "true");
-    env.set("WEBCODEX_ALLOW_ANONYMOUS", "true");
-    let runtime = runtime_with_info(RuntimeInfo {
-        auth_enabled: true,
-        oauth2_enabled: true,
-        oauth2_shared_key_bridge_enabled: true,
-        ..RuntimeInfo::default()
-    })
-    .with_runtime_exposure(crate::model_surface::RuntimeExposure::ProjectConnector);
-    let full = runtime.dispatch(runtime_status_call()).await;
-    assert_eq!(
-        full.output["runtime_exposure"],
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["shared_key_enabled"],
-        false
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["anonymous_enabled"],
-        false
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["oauth2_enabled"],
-        true
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
-        true
-    );
-    let compact = runtime
-        .dispatch(ToolCall::from_tool_name("runtime_status", json!({"compact": true})).unwrap())
-        .await;
-    assert_eq!(
-        compact.output["runtime_exposure"],
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR
-    );
-    assert_eq!(
-        compact.output["mcp_compact_schemas"],
-        crate::model_surface::effective_mcp_compact_schemas(
-            runtime.runtime_exposure(),
-            crate::config::mcp_compact_schemas_override(),
-        )
-    );
-    assert_eq!(
-        compact.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
-        true
-    );
-}
-
-// runtime_status resolves the effective exposure-aware compact-schema policy on
-// each call. Serialize this async assertion with tests that mutate the override
-// so the value cannot change between dispatch and the matching expectation.
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
 async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
     use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
 
@@ -2593,7 +2535,6 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
             "/connection_layers/server_transport/status",
             "/connection_layers/server_registration/status",
             "/connection_layers/project_registry/status",
-            "/connection_layers/connector_endpoint/status",
             "/connection_layers/last_successful_tool_call/status",
         ] {
             assert!(
@@ -3444,11 +3385,6 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
         "registration_instance_disconnected"
     );
     assert_eq!(layers["project_registry"]["status"], "not_configured");
-    assert_eq!(layers["connector_endpoint"]["status"], "not_configured");
-    assert_eq!(
-        layers["connector_endpoint"]["reason_code"],
-        "connector_runtime_disabled"
-    );
     assert!(layers.get("session_binding").is_none());
 }
 

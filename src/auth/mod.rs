@@ -62,7 +62,8 @@ pub(crate) use project_credential::read_protected_secret;
 pub(crate) use project_credential::{
     validate_agent_token as validate_project_agent_token,
     validate_credential as validate_project_credential, ProjectAgentTokenVerifier,
-    ProjectCredentialVerifier,
+    ProjectAuthState, PROJECT_AGENT_TOKEN_FILE_ENV, PROJECT_CREDENTIAL_FILE_ENV,
+    PROJECT_GRANT_ID_ENV, PROJECT_RUNNER_CLIENT_ID_ENV,
 };
 pub(crate) use project_share::{
     configured_project_share_subject, generate_project_share_session_id,

@@ -80,7 +80,7 @@ pub(crate) fn builtin_coding_workflow_projection() -> Value {
             "context_sidecar": "context_request adds bounded context after the main tool and never authorizes effects. Recover lost project.instructions with an observation call before dependent mutation.",
             "runner_targeting": "For exact Runner client_id, use runtime_status(client_id=...) or list_projects(client_id=...) before treating it as absent.",
             "persistent_shell": "Local: run_process=literal argv; run_shell=shell grammar/short chains; run_script=program-like scripts; specialize for added semantics. Persistent shell only for repeated named-SSH state or local same-process state.",
-            "normal_closeout": "Normal success: finish_coding_task(summary_only=true); full closeout only for unresolved evidence or handoff/debug."
+            "normal_closeout": "Source/validation/open evidence: finish_coding_task(summary_only=true). Read/planning/artifact: finalize directly."
         },
         "roles": {
             "independent_review": {

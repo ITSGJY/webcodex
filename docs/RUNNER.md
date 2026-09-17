@@ -94,9 +94,7 @@ both old and new locations/fields are configured, WebCodex fails closed instead
 of merging or guessing precedence. Use `--project-registry-dir` in new CLI
 commands.
 
-Runtime project ids take the shape `agent:<client_id>:<project_id>`, for
-example `agent:workstation:my-repo`. A project-bound Connector resolves this
-internally; ordinary users do not type it.
+Runtime project ids take the shape `agent:<client_id>:<project_id>`, for example `agent:workstation:my-repo`. ToolRuntime resolves these ids through the caller-visible Runner registry; ordinary users usually do not type them.
 
 ### Allowed roots
 

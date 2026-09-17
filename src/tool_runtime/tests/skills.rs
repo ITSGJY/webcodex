@@ -149,6 +149,121 @@ fn skill_by_name<'a>(result: &'a ToolResult, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing skill {name}: {}", result.output))
 }
 
+#[tokio::test]
+async fn skill_load_is_exact_case_insensitive_and_fails_closed_on_ambiguity() {
+    let root = tempfile::tempdir().unwrap();
+    write_skill(
+        root.path(),
+        "time-tracking",
+        "time-tracking",
+        "Generate timesheets",
+        "load body\n",
+    );
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_runner_project_at_path(&runtime, "skill-load-project", "demo", root.path()).await;
+
+    let (loaded, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-project",
+        "skill_load",
+        json!({"project": project, "name": "TIME-TRACKING"}),
+        true,
+    )
+    .await;
+    assert!(loaded.success, "{:?}", loaded.error);
+    assert_eq!(loaded.output["name"], "time-tracking");
+    assert_eq!(loaded.output["path"], "SKILL.md");
+    assert!(loaded.output["text"]
+        .as_str()
+        .unwrap()
+        .contains("load body"));
+    assert_eq!(loaded.output["source_scope"], "project");
+    assert_eq!(loaded.output["trust"], "project_content");
+    assert_eq!(loaded.output["descriptor"]["name"], "time-tracking");
+    assert_eq!(
+        loaded.output["descriptor"]["skill_id"],
+        loaded.output["skill_id"]
+    );
+    assert!(loaded.output["catalog_revision"].as_str().is_some());
+
+    write_skill(
+        root.path(),
+        "unicode-name",
+        "Maße",
+        "Unicode case-fold guidance",
+        "unicode body\n",
+    );
+    let (unicode_loaded, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-project",
+        "skill_load",
+        json!({"project": project, "name": "MASSE"}),
+        true,
+    )
+    .await;
+    assert!(unicode_loaded.success, "{:?}", unicode_loaded.error);
+    assert_eq!(unicode_loaded.output["name"], "Maße");
+
+    let (substring, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-project",
+        "skill_load",
+        json!({"project": project, "name": "time"}),
+        true,
+    )
+    .await;
+    assert!(!substring.success);
+    assert_eq!(substring.output["error_kind"], "skill_not_found");
+
+    write_skill(
+        root.path(),
+        "time-tracking-copy",
+        "Time-Tracking",
+        "Duplicate timesheet guidance",
+        "duplicate body\n",
+    );
+    let (ambiguous, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-project",
+        "skill_load",
+        json!({"project": project, "name": "time-tracking"}),
+        true,
+    )
+    .await;
+    assert!(!ambiguous.success);
+    assert_eq!(ambiguous.output["error_kind"], "skill_name_ambiguous");
+    assert_eq!(ambiguous.output["candidate_count"], 2);
+    assert_eq!(ambiguous.output["candidates"].as_array().unwrap().len(), 2);
+    assert!(ambiguous.output.get("text").is_none());
+    assert!(ambiguous.output.get("name").is_none());
+
+    let (listed, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-load-project",
+        "skill_list",
+        json!({"project": project, "query": "time-tracking", "limit": 10}),
+        true,
+    )
+    .await;
+    assert!(listed.success, "{:?}", listed.error);
+    let collisions = listed.output["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|skill| {
+            matches!(
+                skill["name"].as_str(),
+                Some("time-tracking" | "Time-Tracking")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(collisions.len(), 2);
+    assert!(collisions
+        .iter()
+        .all(|skill| skill["name_conflict"] == true));
+}
+
 #[derive(Debug, Clone)]
 struct FakeConfiguredSkillState {
     skill_id: String,
@@ -824,6 +939,21 @@ async fn configured_skill_exact_read_uses_unified_resolve_then_read() {
         }),
         managed: None,
     }));
+
+    let (loaded, _) = call_kernel_with_fake_operator_store(
+        &runtime,
+        client_id,
+        "skill_load",
+        json!({"project": project, "name": "CONFIGURED"}),
+        sources.clone(),
+    )
+    .await;
+    assert!(loaded.success, "{:?}", loaded.error);
+    assert_eq!(loaded.output["skill_id"], configured_id);
+    assert_eq!(loaded.output["source_scope"], "runner");
+    assert_eq!(loaded.output["trust"], "operator_configured_guidance");
+    assert_eq!(loaded.output["text"], "configured definition");
+    assert_eq!(loaded.output["descriptor"]["name"], "configured");
 
     let (read, kinds) = call_kernel_with_fake_operator_store(
         &runtime,
@@ -2013,6 +2143,12 @@ async fn skill_surface_sidecar_privacy_and_authority_are_fenced() {
     );
     assert_eq!(list_audit["query_present"], true);
     assert!(!list_audit.to_string().contains("PRIVATE QUERY"));
+    let load_audit = super::super::tool_audit::session_log_arguments_for_tool_request(
+        "skill_load",
+        &json!({"project": project, "name": "PRIVATE SKILL NAME"}),
+    );
+    assert_eq!(load_audit["name_present"], true);
+    assert!(!load_audit.to_string().contains("PRIVATE SKILL NAME"));
     let read_audit = super::super::tool_audit::session_log_arguments_for_tool_request(
         "skill_read_file",
         &json!({"project": project, "skill_id": skill_id, "path": "SKILL.md"}),

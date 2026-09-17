@@ -1980,26 +1980,6 @@ async fn tool_manifest_operator_extensions_require_explicit_family_capabilities(
 }
 
 #[tokio::test]
-async fn tool_manifest_is_not_a_project_connector_runtime_route() {
-    let runtime = test_runtime()
-        .with_runtime_exposure(crate::model_surface::RuntimeExposure::ProjectConnector);
-    let result = runtime
-        .dispatch(ToolCall::ToolManifest {
-            tool_name: Some("run_process".to_string()),
-            category: None,
-            intent: None,
-            include_recommended_flows: false,
-            include_risk_summary: false,
-        })
-        .await;
-    assert!(!result.success);
-    assert!(result
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("project_connector")));
-}
-
-#[tokio::test]
 async fn tool_manifest_exact_tool_fails_closed_for_unknown_or_mixed_filters() {
     let runtime = test_runtime();
     let unknown = runtime

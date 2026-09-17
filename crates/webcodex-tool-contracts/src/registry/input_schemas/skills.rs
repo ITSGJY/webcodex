@@ -4,6 +4,7 @@ use webcodex_core::runtime_contract::{
     MAX_SKILL_LIST_LIMIT, MAX_SKILL_QUERY_CHARS, MAX_SKILL_READ_LINES,
     MAX_SKILL_RESOURCE_PATH_CHARS,
 };
+use webcodex_core::skill_metadata::MAX_SKILL_NAME_CHARS;
 use webcodex_core::skill_store::{
     MAX_OPERATOR_SKILL_KEY_CHARS, MAX_SKILL_STORE_IDEMPOTENCY_KEY_CHARS,
     MAX_SKILL_STORE_VERSIONS_LIMIT,
@@ -21,6 +22,19 @@ pub fn skill_list_input_schema() -> Value {
             "session_id": {"type": "string", "description": "Optional explicit Workflow Session for this tool call. No implicit current-Session fallback is used."}
         },
         "required": ["project"],
+        "additionalProperties": false
+    })
+}
+
+pub fn skill_load_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project": {"type": "string", "minLength": 1, "description": "Required authorized runtime Project id."},
+            "name": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_NAME_CHARS, "description": "Exact Skill name to load. Matching uses Unicode case folding; substring and fuzzy matching are not used."},
+            "session_id": {"type": "string", "description": "Optional explicit Workflow Session for this tool call. No implicit current-Session fallback is used."}
+        },
+        "required": ["project", "name"],
         "additionalProperties": false
     })
 }
