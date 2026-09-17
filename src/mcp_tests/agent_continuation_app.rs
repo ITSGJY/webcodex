@@ -125,7 +125,6 @@ async fn handle_with_server_apps_enabled(
     let window = crate::client_window::stateless_mcp_window(&request.params);
     super::super::handle_mcp_request_with_lifecycle(
         runtime,
-        None,
         request,
         auth,
         protocol_era,

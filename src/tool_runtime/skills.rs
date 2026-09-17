@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Component;
 use std::time::{Duration, Instant};
+use unicase::UniCase;
 use webcodex_core::runner_skill::{
     RunnerSkillDescriptor, RunnerSkillListResponse, RunnerSkillReadResponse, RunnerSkillRequest,
     RunnerSkillResolveResponse, RunnerSkillSource,
@@ -831,6 +832,101 @@ impl ToolRuntime {
         ))
     }
 
+    pub(crate) async fn skill_load(
+        &self,
+        project: &ResolvedProject,
+        name: String,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        let name = match validate_skill_load_name(name) {
+            Ok(name) => name,
+            Err(kind) => return skill_error(kind, &project.resolved_id, None),
+        };
+        let catalog = match self.discover_skills(project, auth).await {
+            Ok(catalog) => catalog,
+            Err(_) => return skill_error("skill_catalog_unavailable", &project.resolved_id, None),
+        };
+        let matches = match exact_skill_name_matches(&catalog, &name) {
+            Ok(matches) => matches,
+            Err(kind) => {
+                return skill_error(
+                    kind,
+                    &project.resolved_id,
+                    Some(json!({
+                        "catalog_revision": catalog.catalog_revision,
+                        "discovery_truncated": true,
+                    })),
+                )
+            }
+        };
+        if matches.is_empty() {
+            return skill_error("skill_not_found", &project.resolved_id, None);
+        }
+        if matches.len() != 1 {
+            let candidates = matches
+                .iter()
+                .take(8)
+                .map(|skill| {
+                    json!({
+                        "skill_id": skill.descriptor.skill_id,
+                        "name": skill.descriptor.name,
+                        "source_scope": skill.descriptor.source_scope,
+                        "trust": skill.descriptor.trust,
+                        "package_revision": skill.descriptor.package_revision,
+                        "definition_revision": skill.descriptor.definition_revision,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return skill_error(
+                "skill_name_ambiguous",
+                &project.resolved_id,
+                Some(json!({
+                    "candidate_count": matches.len(),
+                    "candidates": candidates,
+                    "candidates_truncated": matches.len() > 8,
+                })),
+            );
+        }
+        let descriptor = matches[0].descriptor.clone();
+        let mut result = self
+            .skill_read_file(
+                project,
+                descriptor.skill_id.clone(),
+                Some(SKILL_DEFINITION_FILE.to_string()),
+                Some(1),
+                Some(MAX_SKILL_READ_LINES),
+                Some(descriptor.definition_revision.clone()),
+                descriptor.package_revision.clone(),
+                auth,
+            )
+            .await;
+        if !result.success {
+            return result;
+        }
+        let Some(output) = result.output.as_object_mut() else {
+            return skill_error("skill_load_result_invalid", &project.resolved_id, None);
+        };
+        output.insert(
+            "catalog_revision".to_string(),
+            Value::String(catalog.catalog_revision),
+        );
+        output.insert(
+            "descriptor".to_string(),
+            serde_json::to_value(&descriptor).expect("SkillDescriptor serialization is infallible"),
+        );
+        if serialized_json_len(&result.output)
+            .map(|bytes| bytes > MAX_SKILL_READ_RESULT_BYTES)
+            .unwrap_or(true)
+        {
+            return skill_error(
+                "skill_load_result_too_large",
+                &project.resolved_id,
+                Some(json!({"skill_id": descriptor.skill_id})),
+            );
+        }
+        result
+    }
+
     pub(crate) async fn skill_list(
         &self,
         project: &ResolvedProject,
@@ -1580,17 +1676,7 @@ impl ToolRuntime {
             });
         }
         skills.sort_by(|left, right| left.order_key.cmp(&right.order_key));
-        let mut counts = BTreeMap::<String, usize>::new();
-        for skill in &skills {
-            *counts.entry(skill.descriptor.name.clone()).or_default() += 1;
-        }
-        for skill in &mut skills {
-            skill.descriptor.name_conflict = counts
-                .get(&skill.descriptor.name)
-                .copied()
-                .unwrap_or_default()
-                > 1;
-        }
+        recompute_name_conflicts(&mut skills);
         let catalog_revision =
             catalog_revision(&skills, invalid_count, &diagnostics, discovery_truncated);
         Ok(SkillCatalog {
@@ -2111,18 +2197,50 @@ fn uncertain_skill_store_error(kind: &str) -> bool {
     )
 }
 
+fn skill_name_key(name: &str) -> String {
+    UniCase::unicode(name).to_folded_case()
+}
+
+fn exact_skill_name_matches<'a>(
+    catalog: &'a SkillCatalog,
+    name: &str,
+) -> Result<Vec<&'a CatalogSkill>, &'static str> {
+    if catalog.discovery_truncated {
+        return Err("skill_catalog_truncated");
+    }
+    let key = skill_name_key(name);
+    Ok(catalog
+        .skills
+        .iter()
+        .filter(|skill| skill_name_key(&skill.descriptor.name) == key)
+        .collect())
+}
+
 fn recompute_name_conflicts(skills: &mut [CatalogSkill]) {
     let mut counts = BTreeMap::<String, usize>::new();
     for skill in skills.iter() {
-        *counts.entry(skill.descriptor.name.clone()).or_default() += 1;
+        *counts
+            .entry(skill_name_key(&skill.descriptor.name))
+            .or_default() += 1;
     }
     for skill in skills {
         skill.descriptor.name_conflict = counts
-            .get(&skill.descriptor.name)
+            .get(&skill_name_key(&skill.descriptor.name))
             .copied()
             .unwrap_or_default()
             > 1;
     }
+}
+
+fn validate_skill_load_name(name: String) -> Result<String, &'static str> {
+    if name.is_empty()
+        || name.trim() != name
+        || name.chars().count() > MAX_SKILL_NAME_CHARS
+        || name.chars().any(char::is_control)
+    {
+        return Err("skill_name_invalid");
+    }
+    Ok(name)
 }
 
 fn validate_query(query: Option<String>) -> Result<Option<String>, &'static str> {
@@ -2293,6 +2411,34 @@ mod tests {
         assert_ne!(a, skill_id("agent:a:demo", "bar"));
         assert!(valid_skill_id(&a));
         assert!(!a.contains(SKILL_ROOT));
+    }
+
+    #[test]
+    fn exact_name_selection_fails_closed_when_catalog_discovery_is_truncated() {
+        let skills = vec![CatalogSkill {
+            descriptor: SkillDescriptor {
+                skill_id: "wc_skill_AAAAAAAAAAAAAAAAAAAAAg".to_string(),
+                name: "demo".to_string(),
+                description: "demo".to_string(),
+                definition_revision: "a".repeat(64),
+                package_revision: None,
+                source_scope: "project",
+                trust: "project_content",
+                name_conflict: false,
+            },
+            order_key: "demo".to_string(),
+        }];
+        let catalog = SkillCatalog {
+            catalog_revision: catalog_revision(&skills, 0, &[], true),
+            skills,
+            invalid_count: 0,
+            diagnostics: Vec::new(),
+            discovery_truncated: true,
+        };
+        assert_eq!(
+            exact_skill_name_matches(&catalog, "demo").unwrap_err(),
+            "skill_catalog_truncated"
+        );
     }
 
     #[test]

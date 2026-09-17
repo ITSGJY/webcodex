@@ -138,10 +138,86 @@ fn project_candidates(
     candidates
 }
 
+fn project_registry_scope_denied(operation: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        format!(
+            "{operation} is unavailable to project-scoped credentials; use an already-visible Project, or derive an isolated Project with work_on_project(mode=worktree)"
+        ),
+        json!({
+            "error_kind": "project_registry_scope_denied",
+            "failure_kind": "authorization_denied",
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::UserAction)
+}
+
+fn project_registry_mutation_denied(
+    auth: Option<&AuthContext>,
+    operation: &str,
+) -> Option<ToolResult> {
+    auth.is_some_and(AuthContext::is_project_scoped_model_subject)
+        .then(|| project_registry_scope_denied(operation))
+}
+
+fn existing_project_path_result(client_id: &str, project: &RunnerProjectSummary) -> ToolResult {
+    ToolResult::ok(json!({
+        "id": runner_project_runtime_id(client_id, &project.id),
+        "agent_project_id": project.id,
+        "client_id": client_id,
+        "name": project.name,
+        "path": project.path,
+        "kind": project.kind,
+        "description": project.description,
+        "allow_patch": project.allow_patch,
+        "disabled": project.disabled,
+        "revision": project.revision,
+        "source": "path",
+        "outcome": "reused_existing_registration",
+        "registered": false,
+        "created_config": false,
+        "changed": false,
+        "recovered": true,
+    }))
+}
+
 impl ToolRuntime {
     pub(crate) async fn list_projects(&self, auth: Option<&AuthContext>) -> ToolResult {
         self.list_projects_with_options(auth, ListProjectsOptions::default())
             .await
+    }
+
+    /// For project-scoped model/API credentials, path-based coding may only use
+    /// an exact path already present in that ProjectGrant's caller-visible
+    /// Runner inventory. This prevents broad Runner filesystem authority (needed
+    /// for canonical managed-worktree siblings) from becoming Project-registry
+    /// authority. Other credential classes keep the ordinary path-registration
+    /// behavior.
+    pub(crate) async fn project_scoped_visible_project_for_exact_path(
+        &self,
+        client_id: &str,
+        path: &str,
+        auth: Option<&AuthContext>,
+    ) -> Result<Option<RunnerProjectSummary>, ToolResult> {
+        if !auth.is_some_and(AuthContext::is_project_scoped_model_subject) {
+            return Ok(None);
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        let Some(client) = self
+            .runner_registry
+            .get_runner_semantic_view_for_auth(client_id, access.as_ref())
+            .await
+        else {
+            return Err(project_registry_scope_denied("project path resolution"));
+        };
+        let project = client
+            .view
+            .projects
+            .iter()
+            .find(|project| !project.disabled && project.path == path)
+            .cloned()
+            .ok_or_else(|| project_registry_scope_denied("project path resolution"))?;
+        Ok(Some(project))
     }
 
     pub(crate) async fn list_projects_with_options(
@@ -400,6 +476,9 @@ impl ToolRuntime {
         expected_revision: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        if let Some(result) = project_registry_mutation_denied(auth, "unregister_project") {
+            return result;
+        }
         let response = crate::admin_project_lifecycle::unregister_project_runtime(
             self,
             auth,
@@ -469,7 +548,6 @@ impl ToolRuntime {
         path: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Err(error) = validate_project_op_path(&path) {
             return ToolResult::err_with_output(
                 error,
@@ -481,6 +559,15 @@ impl ToolRuntime {
                 }),
             );
         }
+        match self
+            .project_scoped_visible_project_for_exact_path(&client_id, &path, auth)
+            .await
+        {
+            Ok(Some(project)) => return existing_project_path_result(&client_id, &project),
+            Ok(None) => {}
+            Err(result) => return result,
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Some(client) = self
             .runner_registry
             .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
@@ -528,7 +615,6 @@ impl ToolRuntime {
         resume_project_id: Option<String>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Err(error) = validate_project_op_path(&path) {
             return ToolResult::err_with_output(
                 error,
@@ -540,6 +626,14 @@ impl ToolRuntime {
                 }),
             );
         }
+        match self
+            .project_scoped_visible_project_for_exact_path(&client_id, &path, auth)
+            .await
+        {
+            Ok(Some(_)) | Ok(None) => {}
+            Err(result) => return result,
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Some(client) = self
             .runner_registry
             .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
@@ -632,6 +726,9 @@ impl ToolRuntime {
         overwrite: bool,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        if let Some(result) = project_registry_mutation_denied(auth, kind) {
+            return result;
+        }
         // -- basic server-side request shape validation ----------------------
         // The Runner does the authoritative path/policy validation, but the
         // server rejects obviously malformed requests early so the Runner is

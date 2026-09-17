@@ -475,8 +475,8 @@ for compatibility but are not part of the new model-facing schema.
 
 Both integrations enter the same ToolRuntime authority path. GPT Actions does not
 introduce a separate scope, Project-authority, permission, Runner-capability, or
-retry policy. Project-bound Connector deployments keep their independent canonical
-fourteen-capability MCP/OpenAPI surface.
+retry policy. Project-scoped `share`/`run` deployments expose the same ordinary
+Adaptive Runtime while ProjectGrant visibility keeps them bound to their Project.
 
 See [GPT Actions](GPT_ACTIONS.md), [MCP](MCP.md), and [AI Onboarding](AI_ONBOARDING.md).
 
@@ -491,7 +491,7 @@ auto-execute or require human approval:
 | --- | --- |
 | unset / empty | `trusted_agent` (default for self-hosted single-operator deployments). |
 | `trusted_agent` | Project work, shell, jobs, git, and validation auto-execute after hard safety checks, with no approval interruptions. Push/tag/publish/release/deploy still require an explicit user task action. |
-| `restricted` | Consequential tools are denied unless a human approves them (`webcodex task approve/deny`). |
+| `restricted` | Consequential runtime tools are denied by permission policy. There is no separate Connector command-approval queue. |
 
 Hard safety boundaries (project roots, read-only sessions, path policy,
 credential redaction, job cancel semantics) are never relaxed by
@@ -527,14 +527,13 @@ Recommended production smoke sequence:
 
 ### Runtime console
 
-The Server serves a host-local browser console at `/console`. It shows project
-readiness, the work queue, Workflow Session activity, visible Runners, and recent
-mutating activity. For Connector tasks, the same host-local human can send task
-guidance, decide pending approvals, cancel work, and Accept or Reject a stable
-result. These actions use the same authority boundaries as the CLI; the online
-model still cannot accept its own work. The console also shows non-secret client
-connection targets, with ChatGPT Developer Mode MCP custom apps as the primary
-ChatGPT path. Credentials are deliberately never returned by the console API.
+The Server serves the Runtime Console at `/runtime`. It projects ordinary runtime,
+Project, Runner, Job, Workflow Session, collaboration, and recent activity state
+through the same authorization path used by ToolRuntime. Project-scoped credentials
+see only their ProjectGrant-visible Runner/Project set; knowing another Project or
+Runner id does not widen visibility. The old Connector Project Review Console at
+`/console` and its task/result/approval APIs are removed. Credentials are never
+returned by the Runtime Console API.
 
 ### Runtime job API trust model
 

@@ -115,7 +115,7 @@ fn with_model_surface_env<T>(value: Option<&str>, operation: impl FnOnce() -> T)
 
 fn test_runtime_from_model_surface_env(value: Option<&str>) -> ToolRuntime {
     with_model_surface_env(value, || {
-        let runtime_exposure = crate::model_surface::resolve_runtime_exposure(None)
+        let runtime_exposure = crate::model_surface::resolve_runtime_exposure()
             .expect("test runtime exposure configuration");
         test_runtime_with_exposure(runtime_exposure)
     })
@@ -142,38 +142,6 @@ fn mcp_2026_params(mut params: Value) -> Value {
             }),
         );
     params
-}
-
-fn mcp_2026_tasks_params(mut params: Value) -> Value {
-    params
-        .as_object_mut()
-        .expect("MCP params must be an object")
-        .insert(
-            "_meta".to_string(),
-            json!({
-                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
-                "io.modelcontextprotocol/clientCapabilities": {
-                    "extensions": {
-                        MCP_TASKS_EXTENSION: {}
-                    }
-                }
-            }),
-        );
-    params
-}
-
-#[test]
-fn mcp_2026_tasks_capability_is_request_scoped_and_shape_strict() {
-    assert!(!request_supports_tasks(&mcp_2026_params(json!({}))));
-    assert!(request_supports_tasks(&mcp_2026_tasks_params(json!({}))));
-
-    let mut malformed = mcp_2026_params(json!({}));
-    malformed["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({
-        "extensions": {
-            MCP_TASKS_EXTENSION: true
-        }
-    });
-    assert!(!request_supports_tasks(&malformed));
 }
 
 fn mcp_2026_ui_params(mut params: Value) -> Value {
@@ -234,8 +202,6 @@ mod oauth_scope;
 mod plugin_check;
 #[path = "mcp_tests/plugin_tools.rs"]
 mod plugin_tools;
-#[path = "mcp_tests/project_connector.rs"]
-mod project_connector;
 #[path = "mcp_tests/protocol.rs"]
 mod protocol;
 #[path = "mcp_tests/result_app.rs"]
@@ -298,9 +264,6 @@ fn build_test_router(
         .hoop(affix_state::inject(config))
         .hoop(affix_state::inject(db))
         .hoop(affix_state::inject(runtime))
-        .hoop(affix_state::inject(
-            crate::connector_runtime::ConnectorRuntimeSlot::default(),
-        ))
         .push(
             Router::with_path("mcp")
                 .hoop(crate::AuthMiddleware)

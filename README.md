@@ -23,7 +23,7 @@ cd /path/to/your/repository
 npx --yes @yyjeqhc/webcodex share
 ```
 
-`share` starts a temporary, single-project, restricted WebCodex environment and prints the ChatGPT connection values. The endpoint and temporary credential stop working when the command exits. It is intended for trials and short-lived sharing, not as the default full daily setup. See the [Quick Trial](docs/QUICK_START.md) for the exact steps.
+`share` starts a temporary, single-project instance of the ordinary WebCodex Adaptive Runtime and prints the ChatGPT connection values. Its temporary Project Credential limits access to that ProjectGrant; the endpoint and credential stop working when the command exits. It is intended for trials and short-lived sharing, not as the default full daily setup. See the [Quick Trial](docs/QUICK_START.md) for the exact steps.
 
 ## What can it do?
 
@@ -31,7 +31,7 @@ npx --yes @yyjeqhc/webcodex share
 - **Use the real toolchain** — run commands, tests, formatters, compilers, and project-specific tooling on the machine that owns the repository.
 - **Work with Git** — inspect status and diffs while keeping repository operations visible and reviewable.
 - **Handle long-running work** — keep jobs observable instead of requiring one model turn to stay open indefinitely.
-- **Support human review** — use the [Runtime Console](docs/runtime-console.md) and task workflow to guide, cancel, accept, or reject work where those actions are available.
+- **Support human review** — use the [Runtime Console](docs/runtime-console.md), Workflow Session evidence, Jobs, and Git/diff review without a separate task/result acceptance subsystem.
 
 ## Why WebCodex?
 

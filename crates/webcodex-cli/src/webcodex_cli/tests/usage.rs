@@ -292,7 +292,6 @@ fn unified_project_and_auth_commands_dispatch() {
         &["setup", "--help"][..],
         &["status", "--help"][..],
         &["doctor", "--help"][..],
-        &["task", "--help"][..],
         &["run", "--help"][..],
         &["share", "--help"][..],
     ] {
@@ -300,6 +299,13 @@ fn unified_project_and_auth_commands_dispatch() {
             cli_action(args.iter().copied()),
             CliAction::Project(_)
         ));
+    }
+    match cli_action(["task", "list"]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(stderr.starts_with("unknown command: task"), "{stderr}");
+        }
+        other => panic!("retired task namespace still dispatched: {other:?}"),
     }
     match cli_action(["auth", "status", "--help"]) {
         CliAction::Exit { code, stdout, .. } => {

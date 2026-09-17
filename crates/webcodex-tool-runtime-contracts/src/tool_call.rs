@@ -1333,6 +1333,14 @@ pub enum ToolCall {
         max_result_bytes: Option<usize>,
     },
 
+    /// Load one Skill definition by unique exact Unicode case-folded name.
+    SkillLoad {
+        project: String,
+        name: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+
     /// Fresh bounded discovery of project-scoped Agent Skills. This tool is
     /// model-hidden globally and exposed only by capable Stateless MCP Full
     /// Operator surfaces.
@@ -3073,6 +3081,7 @@ impl ToolCall {
             Self::CargoTest { .. } => "cargo_test",
             Self::GoTest { .. } => "go_test",
             Self::ReadFiles { .. } => "read_files",
+            Self::SkillLoad { .. } => "skill_load",
             Self::SkillList { .. } => "skill_list",
             Self::SkillReadFile { .. } => "skill_read_file",
             Self::SkillVersions { .. } => "skill_versions",
@@ -3201,6 +3210,7 @@ impl ToolCall {
             | Self::CargoTest { session_id, .. }
             | Self::GoTest { session_id, .. }
             | Self::ReadFiles { session_id, .. }
+            | Self::SkillLoad { session_id, .. }
             | Self::SkillList { session_id, .. }
             | Self::SkillReadFile { session_id, .. }
             | Self::SkillVersions { session_id, .. }
@@ -3339,6 +3349,7 @@ impl ToolCall {
             | Self::CargoTest { project, .. }
             | Self::GoTest { project, .. }
             | Self::ReadFiles { project, .. }
+            | Self::SkillLoad { project, .. }
             | Self::SkillList { project, .. }
             | Self::SkillReadFile { project, .. }
             | Self::SkillVersions { project, .. }

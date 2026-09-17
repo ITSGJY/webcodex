@@ -13,7 +13,7 @@ A1 adds a concrete communication domain without changing the meaning of Workflow
 | Agent Delivery | Recipient-specific queued/consumed Inbox state pointing to one Message | a duplicate Message or model invocation |
 | Wake Intent | Durable logical continuation saying an Agent should receive another processing opportunity | a Message, Inbox Delivery, or Host delivery attempt |
 | Wake Delivery Attempt | One Endpoint/generation-bound attempt to deliver a Wake Intent through a continuation adapter | the durable communication fact or a grant of execution authority |
-| Agent Task | Planned durable asynchronous work accepted/created for an Agent | Connector Task, Conversation Message, Session todo, or execution authority |
+| Agent Task | Planned durable asynchronous work accepted/created for an Agent | Conversation Message, Workflow Session todo, Job, or execution authority |
 | Workflow Session | Existing execution, provenance, validation, Job, workspace, todo, and guidance context | a chat room |
 
 An Agent Card contains a mutable non-unique handle, display name, description, bounded specialty labels, profile revision, and timestamps. These fields are self-description metadata. Canonical identity is only the Server-generated `agent_id`, and neither identity nor metadata grants Project, filesystem, Runner, Agent Task, or Workflow Session authority.
@@ -98,7 +98,7 @@ Goal-correlated terminal attention reuses that carrier without reusing A4b's act
 
 ## Next boundaries
 
-Agent Task plus fenced TaskAttempt (A3), CodingAgentRun execution (A4a), Endpoint continuation execution (A4b), the production MCP App Host carrier, and the first Goal-correlated terminal-attention loop are now implemented; the detailed execution roadmap lives in [`durable-agent-runtime.md`](durable-agent-runtime.md). Existing Connector Tasks and Workflow Session todos remain separate domains.
+Agent Task plus fenced TaskAttempt (A3), CodingAgentRun execution (A4a), Endpoint continuation execution (A4b), the production MCP App Host carrier, and the first Goal-correlated terminal-attention loop are now implemented; the detailed execution roadmap lives in [`durable-agent-runtime.md`](durable-agent-runtime.md). Agent Tasks and Workflow Session todos remain separate domains.
 
 The attention implementation intentionally stops at one Event kind: `agent_task_terminal`. It is not a generic Event/Actor framework, timer/cron service, webhook bus, dependency DAG, worker pool, or Goal scheduler. The existing `agent_task_attempt` Wake continues to mean "execute this exact active Attempt" with lease/heartbeat/controller fencing; `attention_event` means "a correlated Task Attempt is terminal; re-read Goal and Task truth and explicitly decide the next step." Both reuse the same Endpoint/Host delivery state machine and one-dispatched-Wake-per-Agent bound, but their source correctness rules remain separate.
 

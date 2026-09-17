@@ -306,6 +306,41 @@ mod tests {
     }
 
     #[test]
+    fn skill_load_session_audit_omits_private_name() {
+        let input = session_input_summary_for_tool(
+            "skill_load",
+            &json!({
+                "project": "demo",
+                "name": "PRIVATE SKILL NAME"
+            }),
+        );
+        assert_eq!(input["project"], "demo");
+        assert!(input.get("name").is_none());
+        assert!(!input.to_string().contains("PRIVATE SKILL NAME"));
+
+        let context = context_result_summary_for_tool_result(
+            "skill_load",
+            &json!({
+                "catalog_revision": "wc_skillcat_demo",
+                "skill_id": "wc_skill_demo",
+                "name": "PRIVATE SKILL NAME",
+                "source_scope": "runner",
+                "trust": "operator_configured_guidance",
+                "definition_revision": "definition-demo",
+                "path": "SKILL.md",
+                "sha256": "sha-demo",
+                "returned_lines": 12,
+                "has_more": false,
+                "next_start_line": null
+            }),
+        )
+        .unwrap();
+        assert_eq!(context["skill_id"], "wc_skill_demo");
+        assert!(context.get("name").is_none());
+        assert!(!context.to_string().contains("PRIVATE SKILL NAME"));
+    }
+
+    #[test]
     fn result_projection_reuse_and_working_tree_semantics_are_definition_owned() {
         let agent = context_result_summary_for_tool_result(
             "create_agent_identity",

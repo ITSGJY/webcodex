@@ -3,12 +3,10 @@ mod presentation;
 mod protocol;
 mod resources;
 mod response;
-mod tasks;
 mod tools;
 
 use crate::action_audit::{ActionAudit, ActionAuditRecord};
 use crate::auth::AuthContext;
-use crate::connector_runtime::{ConnectorRuntime, ConnectorRuntimeSlot};
 use crate::json_error;
 use crate::json_measurement::serialized_json_len;
 #[cfg(test)]
@@ -63,20 +61,14 @@ use tokio::sync::Semaphore;
 #[cfg(test)]
 use resources::*;
 #[cfg(test)]
-use tasks::{
-    mcp_create_task_result, request_supports_tasks, MCP_MISSING_REQUIRED_CLIENT_CAPABILITY,
-    MCP_TASKS_EXTENSION,
-};
-#[cfg(test)]
 use tools::{
     add_stateless_workflow_recorder_metadata, mcp_host_file_import_trust_decision_from_state,
     mcp_host_file_import_trust_from_state, mcp_tools_list_payload_with_compact,
     mcp_tools_list_payload_with_compact_and_app, mcp_tools_list_payload_with_features_for_auth,
-    project_connector_tools_list_payload_with_compact, session_context_revision_ack_from_wire,
-    strip_recording_session_id, strip_stateless_ack_session_context_revision,
-    strip_stateless_ack_session_message_ids, strip_stateless_context_request,
-    strip_stateless_session_message_resolution, take_last_mcp_host_file_import_trust_decision,
-    HostFileImportTrustReason, McpToolCallParams,
+    session_context_revision_ack_from_wire, strip_recording_session_id,
+    strip_stateless_ack_session_context_revision, strip_stateless_ack_session_message_ids,
+    strip_stateless_context_request, strip_stateless_session_message_resolution,
+    take_last_mcp_host_file_import_trust_decision, HostFileImportTrustReason, McpToolCallParams,
 };
 
 /// Hard upper bound on a single MCP JSON-RPC dispatch, applied in `mcp_post`.
@@ -90,17 +82,6 @@ const MCP_DISPATCH_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from
 
 fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()
-}
-
-fn connector_runtime_slot(depot: &Depot) -> Option<ConnectorRuntimeSlot> {
-    depot.obtain::<ConnectorRuntimeSlot>().ok().cloned()
-}
-
-fn validate_runtime_exposure_state(
-    runtime_exposure: RuntimeExposure,
-    connector_present: bool,
-) -> Result<(), String> {
-    crate::model_surface::validate_connector_runtime_presence(runtime_exposure, connector_present)
 }
 
 fn finalize_mcp_tool_observability(
@@ -299,23 +280,7 @@ pub async fn mcp_info(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         ));
         return;
     };
-    let Some(connector_slot) = connector_runtime_slot(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MCP runtime exposure state not configured",
-        ));
-        return;
-    };
     let runtime_exposure = runtime.runtime_exposure();
-    if let Err(error) =
-        validate_runtime_exposure_state(runtime_exposure, connector_slot.0.is_some())
-    {
-        tracing::error!(%error, "MCP runtime exposure state mismatch");
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, error));
-        return;
-    }
     res.render(Json(json!({
         "name": "webcodex",
         "version": env!("CARGO_PKG_VERSION"),
@@ -393,27 +358,6 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         guard.handler_returned(500, None, Some(false), None, "error_runtime_missing");
         return;
     };
-    let Some(connector_slot) = connector_runtime_slot(depot) else {
-        guard.response_serialized(500, None, Some(false), None, "error_surface_state_missing");
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "MCP runtime exposure state not configured",
-        ));
-        guard.handler_returned(500, None, Some(false), None, "error_surface_state_missing");
-        return;
-    };
-    let connector = connector_slot.0;
-    if let Err(error) =
-        validate_runtime_exposure_state(runtime.runtime_exposure(), connector.is_some())
-    {
-        tracing::error!(%error, "MCP runtime exposure state mismatch");
-        guard.response_serialized(500, None, Some(false), None, "error_surface_state_mismatch");
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, error));
-        guard.handler_returned(500, None, Some(false), None, "error_surface_state_mismatch");
-        return;
-    }
     let request: JsonRpcRequest = match req.parse_json().await {
         Ok(request) => request,
         Err(e) => {
@@ -634,17 +578,13 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     // one outer emergency timer only so the MCP hard-timeout path does not erase
     // an otherwise established runtime invocation from ergonomics telemetry.
     let mut hard_timeout_model_ergonomics =
-        if runtime.runtime_exposure() == RuntimeExposure::ProjectConnector {
-            None
-        } else {
-            tool_name.as_deref().and_then(ModelErgonomicsTimer::start)
-        };
+        tool_name.as_deref().and_then(ModelErgonomicsTimer::start);
     let mut tool_correlation = crate::tool_runtime::ToolCallCorrelation::default();
     let mut model_ergonomics = None;
     // Window liveness needs request correlation even when trace retention is off.
     let active_trace_id = Some(server_trace_id.clone());
     // Keep the complete MCP dispatch future off the current thread's stack. The
-    // handler state spans every method arm (including Connector task polling),
+    // handler state spans every method arm,
     // so nesting it inline under tracing + timeout can exhaust the default
     // ~2 MiB libtest/Tokio worker stack even when a request takes another arm.
     let outcome = match tokio::time::timeout(
@@ -653,7 +593,6 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             active_trace_id,
             Box::pin(handle_mcp_request_with_lifecycle(
                 &runtime,
-                connector.as_deref(),
                 request,
                 auth.as_ref(),
                 protocol_era,
@@ -993,7 +932,6 @@ async fn handle_mcp_request(
     let server_mcp_apps_enabled = crate::config::mcp_apps_enabled();
     let outcome = handle_mcp_request_with_lifecycle(
         runtime,
-        None,
         request,
         auth,
         protocol_era,
@@ -1023,7 +961,6 @@ async fn handle_mcp_request(
 
 async fn handle_mcp_request_with_lifecycle(
     runtime: &ToolRuntime,
-    connector: Option<&ConnectorRuntime>,
     request: JsonRpcRequest,
     auth: Option<&AuthContext>,
     protocol_era: McpProtocolEra,
@@ -1037,22 +974,18 @@ async fn handle_mcp_request_with_lifecycle(
 ) -> McpOutcome {
     let stateless_2026 = protocol_era == McpProtocolEra::Stateless2026;
     let runtime_exposure = runtime.runtime_exposure();
-    let resource_read_bypasses_runtime_read =
-        matches!(runtime_exposure, RuntimeExposure::Runtime(_))
-            && stateless_2026
-            && request.method == "resources/read"
-            && resources::resource_read_bypasses_runtime_read(&request.params);
-    let mcp_app_enabled = match runtime_exposure {
-        RuntimeExposure::Runtime(model_surface) => resources::mcp_app_enabled(
-            server_mcp_apps_enabled,
-            stateless_2026,
-            model_surface,
-            &request.params,
-        ),
-        RuntimeExposure::ProjectConnector => false,
-    };
-    let runtime_resource_method = matches!(runtime_exposure, RuntimeExposure::Runtime(_))
-        && matches!(request.method.as_str(), "resources/list" | "resources/read");
+    let RuntimeExposure::Runtime(model_surface) = runtime_exposure;
+    let resource_read_bypasses_runtime_read = stateless_2026
+        && request.method == "resources/read"
+        && resources::resource_read_bypasses_runtime_read(&request.params);
+    let mcp_app_enabled = resources::mcp_app_enabled(
+        server_mcp_apps_enabled,
+        stateless_2026,
+        model_surface,
+        &request.params,
+    );
+    let runtime_resource_method =
+        matches!(request.method.as_str(), "resources/list" | "resources/read");
 
     if auth.is_some()
         && (matches!(request.method.as_str(), "server/discover" | "tools/list")
@@ -1105,10 +1038,6 @@ async fn handle_mcp_request_with_lifecycle(
         return McpOutcome::BadRequest(rpc_error(request.id, -32600, "jsonrpc must be '2.0'"));
     }
 
-    if let Err(error) = validate_runtime_exposure_state(runtime_exposure, connector.is_some()) {
-        return McpOutcome::BadRequest(rpc_error(request.id, -32603, error));
-    }
-
     let id = request.id.clone();
     let response = match request.method.as_str() {
         // MCP 2026-07-28 clients discover capabilities before issuing ordinary
@@ -1116,14 +1045,10 @@ async fn handle_mcp_request_with_lifecycle(
         // modern clients while retaining the initialized 2025 tool-only
         // session lifecycle used by 2025-06-18 and ChatGPT 2025-11-25 clients.
         "server/discover" if stateless_2026 => {
-            let capabilities = match runtime_exposure {
-                RuntimeExposure::ProjectConnector => tasks::server_capabilities(),
-                RuntimeExposure::Runtime(model_surface)
-                    if resources::model_surface_supports_computer_app(model_surface) =>
-                {
-                    resources::server_capabilities(server_mcp_apps_enabled)
-                }
-                RuntimeExposure::Runtime(_) => json!({ "tools": { "listChanged": false } }),
+            let capabilities = if resources::model_surface_supports_computer_app(model_surface) {
+                resources::server_capabilities(server_mcp_apps_enabled)
+            } else {
+                json!({ "tools": { "listChanged": false } })
             };
             rpc_result(
                 id,
@@ -1150,9 +1075,6 @@ async fn handle_mcp_request_with_lifecycle(
             return resources::handle_list(runtime, id, mcp_app_enabled);
         }
         "resources/read" if stateless_2026 && runtime_resource_method => {
-            let RuntimeExposure::Runtime(model_surface) = runtime_exposure else {
-                unreachable!("runtime_resource_method requires a runtime ModelSurface");
-            };
             return resources::handle_read(
                 runtime,
                 request.params,
@@ -1163,22 +1085,9 @@ async fn handle_mcp_request_with_lifecycle(
             )
             .await;
         }
-        method @ ("tasks/get" | "tasks/update" | "tasks/cancel")
-            if stateless_2026 && tasks::runtime_exposure_supports_tasks(runtime_exposure) =>
-        {
-            return tasks::handle_request(
-                method,
-                request.params,
-                id,
-                auth,
-                connector.expect("validated ProjectConnector runtime state"),
-            )
-            .await;
-        }
         "tools/call" => {
             return tools::handle_call(
                 runtime,
-                connector,
                 request.params,
                 id,
                 auth,

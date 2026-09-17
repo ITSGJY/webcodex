@@ -21,10 +21,8 @@ mod audit_http;
 mod auth;
 mod client_window;
 mod config;
-mod connector_runtime;
 mod console_web;
 mod db;
-mod host_console_http;
 mod job_observation;
 mod job_receipts;
 mod json_digest;
@@ -52,7 +50,6 @@ mod server_listener;
 mod server_shutdown;
 mod ssh_resource_gateway;
 mod startup;
-mod task_cli;
 #[cfg(test)]
 mod test_support;
 mod tool_request_trace;
@@ -268,13 +265,11 @@ only for local/trusted-network demos."
     // authoritative drain transition and Salvo consuming its stop command.
     let shutdown_coordinator = Arc::new(server_shutdown::ShutdownCoordinator::default());
     let quic_cfg = config::QuicServerConfig::from_env();
-    let connector_context =
-        connector_runtime::ConnectorContext::from_env().map_err(std::io::Error::other)?;
-    // Resolve the top-level runtime exposure exactly once at startup, after
-    // Connector configuration has been parsed and validated. Every request-time
-    // projection reads this immutable enum from ToolRuntime.
-    let runtime_exposure = model_surface::resolve_runtime_exposure(connector_context.as_ref())
-        .map_err(std::io::Error::other)?;
+    let project_auth = Arc::new(auth::ProjectAuthState::from_env().map_err(std::io::Error::other)?);
+    // Resolve the one model-facing Runtime exposure exactly once at startup.
+    // Project-scoped deployment changes authentication/visibility, not the coding runtime.
+    let runtime_exposure =
+        model_surface::resolve_runtime_exposure().map_err(std::io::Error::other)?;
     let runtime_info = Arc::new(tool_runtime::RuntimeInfo::from_config_with_quic_config(
         &config, &quic_cfg,
     ));
@@ -298,27 +293,12 @@ only for local/trusted-network demos."
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));
     }
     let tool_runtime = Arc::new(tool_runtime_builder);
-    let connector_runtime = connector_runtime::ConnectorRuntime::from_context(
-        tool_runtime.clone(),
-        db.clone(),
-        connector_context,
-    )
-    .map_err(std::io::Error::other)?;
-    if let Some(runtime) = connector_runtime.0.as_ref() {
-        tracing::info!(
-            project_id = %runtime.context().project_id,
-            profile = %runtime.context().profile,
-            capabilities = connector_runtime::surface::CAPABILITY_NAMES.len(),
-            runtime_exposure = runtime_exposure.name(),
-            "Project-bound Connector exposure enabled"
-        );
-    } else {
-        tracing::info!(
-            runtime_exposure = runtime_exposure.name(),
-            config = "WEBCODEX_MCP_MODEL_SURFACE",
-            "MCP runtime exposure enabled"
-        );
-    }
+    tracing::info!(
+        runtime_exposure = runtime_exposure.name(),
+        project_scoped = project_auth.is_configured(),
+        config = "WEBCODEX_MCP_MODEL_SURFACE",
+        "MCP runtime exposure enabled"
+    );
 
     // Custom QUIC Runner transport. Default disabled;
     // only starts when WEBCODEX_QUIC_ENABLED=true. Runs a separate quinn UDP
@@ -369,8 +349,6 @@ only for local/trusted-network demos."
 
     let authed_api_router = Router::new()
         .hoop(AuthMiddleware)
-        .push(connector_runtime::http::routes())
-        .push(host_console_http::routes())
         .push(runtime_console_http::routes())
         .push(admin_http::routes())
         .push(
@@ -603,28 +581,6 @@ only for local/trusted-network demos."
     let openapi_router =
         Router::with_path(route_metadata::root_path(RouteId::OpenApiDocument)).get(openapi_json);
 
-    // Read-only readiness console. Public static entry — the HTML/JS/CSS
-    // bundle carries no secrets; project facts come from the protected shared
-    // `POST /api/connector/readiness` application projection. Mirrors
-    // `/openapi.json` being public. NOT part of the GPT Actions schema.
-    let console_root = RouteId::ConsoleWebRoot;
-    let console_router = Router::with_path(route_metadata::root_path(console_root))
-        .get(console_web::console_html)
-        .push(
-            Router::with_path(route_metadata::direct_child_path(
-                console_root,
-                RouteId::ConsoleWebAppJs,
-            ))
-            .get(console_web::console_app_js),
-        )
-        .push(
-            Router::with_path(route_metadata::direct_child_path(
-                console_root,
-                RouteId::ConsoleWebStylesCss,
-            ))
-            .get(console_web::console_styles_css),
-        );
-
     let runtime_root = RouteId::RuntimeWebRoot;
     let runtime_console_router = Router::with_path(route_metadata::root_path(runtime_root))
         .get(console_web::runtime_html)
@@ -680,12 +636,11 @@ only for local/trusted-network demos."
         .hoop(affix_state::inject(authorize_session_store.clone()))
         .hoop(affix_state::inject(runner_registry.clone()))
         .hoop(affix_state::inject(tool_runtime.clone()))
-        .hoop(affix_state::inject(connector_runtime.clone()))
+        .hoop(affix_state::inject(project_auth.clone()))
         .hoop(affix_state::inject(console_asset_source))
         .hoop(cors.into_handler())
         .push(api_router)
         .push(openapi_router)
-        .push(console_router)
         .push(runtime_console_router)
         .push(admin_router)
         // OAuth2 token, revocation, and discovery endpoints — public, no
@@ -787,7 +742,7 @@ only for local/trusted-network demos."
         "mcp_compact_schemas"
     );
     tracing::info!("OpenAPI (GPT Actions): {}/openapi.json", base);
-    tracing::info!("MCP App console: {}/console", base);
+    tracing::info!("Runtime console: {}/runtime", base);
     tracing::info!("Runtime status: {}/api/runtime/status", base);
     tracing::info!("Runner WebSocket: {}/api/agents/ws", base);
     tracing::info!("Runner polling (fallback): {}/api/shell/agent/poll", base);

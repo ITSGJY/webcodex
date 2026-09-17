@@ -76,7 +76,6 @@ async fn handle_with_server_apps_enabled(
     let protocol_era = super::super::inferred_protocol_era(&request);
     super::super::handle_mcp_request_with_lifecycle(
         runtime,
-        None,
         request,
         auth,
         protocol_era,
@@ -337,17 +336,6 @@ async fn result_app_descriptor_and_resource_exposure_require_ui_operator_capabil
         panic!("expected LocalCoding tools/list");
     };
     assert!(local_tools["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|tool| tool
-            .pointer("/_meta/ui/resourceUri")
-            .and_then(Value::as_str)
-            != Some(MCP_RESULT_UI_RESOURCE_URI)));
-
-    let connector_tools =
-        super::super::tools::project_connector_tools_list_payload_with_compact(false);
-    assert!(connector_tools["tools"]
         .as_array()
         .unwrap()
         .iter()

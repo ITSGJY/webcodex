@@ -249,6 +249,28 @@ fn registration_scope_denied(auth: Option<&AuthContext>, operation: &str) -> Opt
         })
 }
 
+fn runner_coding_capability_error(client_id: &str, error: String) -> ToolResult {
+    if error.contains("unknown shell client") {
+        return ToolResult::err_with_output(
+            format!("Runner client_id is unknown or not visible: {client_id}"),
+            json!({
+                "error_kind": "unknown_runner",
+                "failure_kind": "unknown_runner",
+                "client_id": client_id,
+                "state_changed": false,
+                "suggested_call": {
+                    "tool": "list_runners",
+                    "arguments": {
+                        "include_projects": false,
+                        "summary_only": true,
+                    }
+                }
+            }),
+        );
+    }
+    ToolResult::err(error)
+}
+
 fn attach_permission(
     mut result: ToolResult,
     permission: Option<&PermissionDecision>,
@@ -287,14 +309,14 @@ impl ToolRuntime {
             .runner_registry
             .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_SHELL, access.as_ref())
             .await
-            .map_err(ToolResult::err)?;
+            .map_err(|error| runner_coding_capability_error(client_id, error))?;
         let supports_git = if supports_shell {
             false
         } else {
             self.runner_registry
                 .runner_supports_for_auth(client_id, RUNNER_CAPABILITY_GIT, access.as_ref())
                 .await
-                .map_err(ToolResult::err)?
+                .map_err(|error| runner_coding_capability_error(client_id, error))?
         };
         if supports_shell || supports_git {
             Ok(())
@@ -523,6 +545,12 @@ impl ToolRuntime {
                     }
                 }
                 if let Some(result) = registration_scope_denied(auth, "project path registration") {
+                    return result;
+                }
+                if let Err(result) = self
+                    .project_scoped_visible_project_for_exact_path(&client_id, &path, auth)
+                    .await
+                {
                     return result;
                 }
                 let permission = super::permissions::evaluate_permission_for_tool(
@@ -1044,7 +1072,6 @@ impl ToolRuntime {
                     "server_transport": {"status": "not_observed"},
                     "server_registration": {"status": "not_observed"},
                     "project_registry": {"status": "resolved", "resolved_project": resolved.resolved_id},
-                    "connector_endpoint": {"status": "not_observed"},
                     "last_successful_tool_call": {"status": "not_observed"},
                 })
             });

@@ -11,7 +11,6 @@ entrypoint = 5
 [root_test_support]
 feature = "root-test-support"
 providers = [
-    "webcodex-connector-runtime",
     "webcodex-runner-registry",
     "webcodex-store",
     "webcodex-tool-contracts",
@@ -28,7 +27,6 @@ layer = "composition"
 role = "Server composition and protocol adapters."
 normal = [
     "webcodex-admin",
-    "webcodex-connector-runtime",
     "webcodex-core",
     "webcodex-persistent-shell",
     "webcodex-runner-config",
@@ -41,7 +39,6 @@ normal = [
     "webcodex-workspace",
 ]
 dev = [
-    "webcodex-connector-runtime",
     "webcodex-runner-registry",
     "webcodex-store",
     "webcodex-tool-contracts",
@@ -49,7 +46,6 @@ dev = [
 ]
 build = []
 test_support = [
-    "webcodex-connector-runtime",
     "webcodex-runner-registry",
     "webcodex-store",
     "webcodex-tool-contracts",
@@ -84,22 +80,6 @@ normal = ["webcodex-core"]
 dev = []
 build = []
 test_support = []
-
-[packages.webcodex-connector-runtime]
-layer = "application"
-role = "Project-bound connector application service coordinating domain crates."
-normal = [
-    "webcodex-core",
-    "webcodex-runner-config",
-    "webcodex-runner-registry",
-    "webcodex-store",
-    "webcodex-tool-contracts",
-    "webcodex-validation",
-    "webcodex-workspace",
-]
-dev = ["webcodex-store"]
-build = []
-test_support = ["webcodex-store"]
 
 [packages.webcodex-core]
 layer = "leaf"

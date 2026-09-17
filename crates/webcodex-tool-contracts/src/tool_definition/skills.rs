@@ -1,17 +1,80 @@
 use super::RunnerCapabilityRequirement::{FileRead, SkillManagement};
-use super::ToolVisibility::ModelHidden;
-use super::{def, ToolDefinition, ToolOperatorExtensionFamily, TOOL_CATEGORY_RUNTIME};
+use super::ToolVisibility::{ModelHidden, ModelVisible};
+use super::{
+    adaptive_runtime_direct, def, model_spec, ToolDefinition, ToolOperatorExtensionFamily,
+    TOOL_CATEGORY_RUNTIME,
+};
 use crate::metadata::{
     ToolPathHint::None as NoPath,
     ToolRisk::{Read, SkillManage},
     ADMIN, PROJECT_READ, TOOL_PROVIDER_RUNNER,
 };
+use crate::registry::input_schemas::skill_load_input_schema;
 
-/// Fixed Phase-3 project Skill runtime tools. They are known to the kernel but
-/// intentionally hidden from the generic registry; Stateless MCP 2026 Full
-/// Operator projects them explicitly, and the kernel capability gate remains
-/// authoritative for execution.
+/// Project Skill runtime tools. `skill_load` is the narrow direct model path;
+/// the broader discovery/read compatibility tools remain hidden operator
+/// extensions. Kernel capability and authority gates remain authoritative.
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
+    adaptive_runtime_direct(
+        model_spec(
+            def(
+                "skill_load",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::value("project"),
+                    super::ToolAuditResultField::value("catalog_revision"),
+                    super::ToolAuditResultField::value("skill_id"),
+                    super::ToolAuditResultField::value("source_scope"),
+                    super::ToolAuditResultField::value("trust"),
+                    super::ToolAuditResultField::value("package_revision"),
+                    super::ToolAuditResultField::value("definition_revision"),
+                    super::ToolAuditResultField::value("path"),
+                    super::ToolAuditResultField::value("sha256"),
+                    super::ToolAuditResultField::value("returned_lines"),
+                    super::ToolAuditResultField::value("has_more"),
+                    super::ToolAuditResultField::value("next_start_line"),
+                    super::ToolAuditResultField::value("candidate_count"),
+                    super::ToolAuditResultField::value("error_kind"),
+                    super::ToolAuditResultField::value("state_changed"),
+                ])
+                .session_input(super::ToolAuditSessionInputPolicy::OmitTopLevel(&["name"]))
+                .context(super::ToolAuditContextPolicy::Fields(&[
+                    super::ToolAuditResultField::value("catalog_revision"),
+                    super::ToolAuditResultField::value("skill_id"),
+                    super::ToolAuditResultField::value("source_scope"),
+                    super::ToolAuditResultField::value("trust"),
+                    super::ToolAuditResultField::value("package_revision"),
+                    super::ToolAuditResultField::value("definition_revision"),
+                    super::ToolAuditResultField::value("path"),
+                    super::ToolAuditResultField::value("sha256"),
+                    super::ToolAuditResultField::value("returned_lines"),
+                    super::ToolAuditResultField::value("has_more"),
+                    super::ToolAuditResultField::value("next_start_line"),
+                    super::ToolAuditResultField::value("candidate_count"),
+                    super::ToolAuditResultField::value("error_kind"),
+                    super::ToolAuditResultField::value("state_changed"),
+                ])),
+                ModelVisible,
+                TOOL_CATEGORY_RUNTIME,
+                Some(FileRead),
+                TOOL_PROVIDER_RUNNER,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Observe,
+                    risk: Read,
+                    approval: super::ToolApprovalPolicy::None,
+                    idempotency: super::ToolIdempotency::PureRead,
+                },
+                Some(PROJECT_READ),
+                true,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE,
+            ),
+            "Load one uniquely named Skill by exact Unicode case folding. Returns its descriptor, bounded SKILL.md, and revisions in one read-only Project call. Missing, ambiguous, or truncated discovery fails closed; scripts and other Skill resources are never executed.",
+            skill_load_input_schema,
+        ),
+        27,
+    ),
     def(
         "skill_list",
         super::ToolAuditPolicy::typed_fields(&[

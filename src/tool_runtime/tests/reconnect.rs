@@ -137,7 +137,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
         "server_transport",
         "server_registration",
         "project_registry",
-        "connector_endpoint",
         "last_successful_tool_call",
     ] {
         assert_layer_contract(&connected[name], name);
@@ -155,12 +154,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
     );
     assert_eq!(connected["server_registration"]["status"], "registered");
     assert_eq!(connected["project_registry"]["status"], "registered");
-    // Connector runtime is not configured in this process.
-    assert_eq!(connected["connector_endpoint"]["status"], "not_configured");
-    assert_eq!(
-        connected["connector_endpoint"]["reason_code"],
-        "connector_runtime_disabled"
-    );
 
     // Disconnect: layers change independently; stale registration is not ready.
     runtime

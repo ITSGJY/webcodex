@@ -402,9 +402,9 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "could not initialize isolated Git repo for Windows share smoke"
     }
-    # ProjectConnector normal-mode readiness requires a real Git baseline so the
-    # first writable task can create its managed isolated worktree. An empty
-    # `git init` repository is intentionally not writable-ready.
+    # Canonical managed-worktree creation requires a real Git baseline. Keep the
+    # share smoke repository committed so work_on_project(mode=worktree) can use
+    # it without relying on the removed Connector writable-workspace model.
     $ShareReadme = Join-Path $ShareRepo "README.md"
     [System.IO.File]::WriteAllText(
         $ShareReadme,

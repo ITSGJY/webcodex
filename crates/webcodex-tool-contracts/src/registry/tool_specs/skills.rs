@@ -1,6 +1,7 @@
 use super::super::input_schemas::{
     skill_activate_input_schema, skill_install_input_schema, skill_list_input_schema,
-    skill_read_file_input_schema, skill_remove_revision_input_schema, skill_versions_input_schema,
+    skill_load_input_schema, skill_read_file_input_schema, skill_remove_revision_input_schema,
+    skill_versions_input_schema,
 };
 use super::tool_spec;
 use crate::tool_spec::ToolSpec;
@@ -15,6 +16,11 @@ pub(super) fn tool_specs() -> Vec<ToolSpec> {
         SKILL_STORE_REPLAY_EFFECT_RETENTION_SECS / (24 * 60 * 60),
     );
     vec![
+        tool_spec(
+            "skill_load",
+            "Load one uniquely named Skill by exact case-insensitive name for an authorized Project. Returns the selected descriptor plus bounded SKILL.md text and revision metadata in one read-only call. Ambiguous names fail closed; scripts and other Skill resources are never executed.",
+            skill_load_input_schema(),
+        ),
         tool_spec(
             "skill_list",
             "Fresh, bounded discovery of project-scoped Skills, configured live read-only Skills on the Project's exact owning Runner, and active operator-installed immutable Skills. Returns lightweight descriptors only; bodies require skill_read_file. trust and package_revision distinguish live configured content from managed installed revisions, and same names across sources remain independently selectable by opaque skill_id.",

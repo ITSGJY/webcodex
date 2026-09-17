@@ -20,7 +20,6 @@ Project / diagnostics:\n\
   setup                         Configure the current Git project without starting it\n\
   run                           Run the project-bound Server and Runner locally\n\
   disconnect                    Disconnect a local project from its hosted Server\n\
-  task                          Review tasks and make host-local decisions\n\n\
 Account:\n\
   auth status                   Show login status\n\
   logout                        Remove this device's credentials\n\n\

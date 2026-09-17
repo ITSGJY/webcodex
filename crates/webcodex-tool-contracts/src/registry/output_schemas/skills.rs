@@ -24,6 +24,22 @@ fn descriptor_schema() -> Value {
     })
 }
 
+fn skill_load_candidate_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "skill_id": {"type": "string", "pattern": "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$"},
+            "name": {"type": "string", "maxLength": MAX_SKILL_NAME_CHARS},
+            "source_scope": {"type": "string", "enum": ["project", "runner"]},
+            "trust": {"type": "string", "enum": ["project_content", "operator_configured_guidance", "operator_installed_guidance"]},
+            "package_revision": {"anyOf": [{"type":"string","pattern":"^wc_skillpkg_[A-Za-z0-9_-]{43}$"},{"type":"null"}]},
+            "definition_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "required": ["skill_id", "name", "source_scope", "trust", "package_revision", "definition_revision"],
+        "additionalProperties": false
+    })
+}
+
 fn skill_versions_recovery_call_schema() -> Value {
     suggested_tool_call_schema(
         "skill_versions",
@@ -167,6 +183,47 @@ mod tests {
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     let mut schema = match name {
+        "skill_load" => Some(wrapped_output_schema(vec![
+            ("project", schema_type("string", "Resolved Project id.")),
+            (
+                "catalog_revision",
+                schema_type("string", "Digest of the freshly observed bounded Skill catalog used for exact-name selection."),
+            ),
+            ("skill_id", schema_type("string", "Opaque project-scoped Skill identity.")),
+            ("name", schema_type("string", "Selected Skill metadata name.")),
+            ("source_scope", schema_type("string", "Selected Skill source: project or runner.")),
+            ("trust", schema_type("string", "Guidance trust label for the selected source; never execution authority.")),
+            (
+                "package_revision",
+                nullable_schema("string", "Active immutable whole-package revision for runner-installed Skills; null for project/configured Skills."),
+            ),
+            ("definition_revision", schema_type("string", "Current SKILL.md content digest.")),
+            ("path", schema_type("string", "Package-relative SKILL.md path.")),
+            ("sha256", schema_type("string", "Full current SKILL.md SHA-256.")),
+            ("text", schema_type("string", "Bounded UTF-8 SKILL.md text.")),
+            ("start_line", schema_type("integer", "Effective 1-based selected start line.")),
+            ("end_line", nullable_schema("integer", "Last returned line, or null when none.")),
+            ("returned_lines", schema_type("integer", "Returned SKILL.md source lines.")),
+            ("has_more", schema_type("boolean", "Whether SKILL.md lines remain.")),
+            ("next_start_line", nullable_schema("integer", "Continuation line when has_more.")),
+            ("descriptor", descriptor_schema()),
+            ("candidate_count", json!({"type":"integer","minimum":2,"description":"Total case-fold-equivalent exact-name candidates when selection is ambiguous."})),
+            (
+                "candidates",
+                {
+                    let mut schema = array_schema(
+                        skill_load_candidate_schema(),
+                        "At most eight bounded exact-name ambiguity candidates.",
+                    );
+                    schema["maxItems"] = json!(8);
+                    schema
+                },
+            ),
+            ("candidates_truncated", schema_type("boolean", "Whether more than eight ambiguity candidates exist.")),
+            ("discovery_truncated", schema_type("boolean", "True when bounded catalog discovery was incomplete and exact-name uniqueness could not be proven.")),
+            ("error_kind", schema_type("string", "Stable guard/error code on failure.")),
+            ("state_changed", schema_type("boolean", "Always false for Skill loading failures.")),
+        ])),
         "skill_list" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (

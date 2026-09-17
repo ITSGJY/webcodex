@@ -1076,6 +1076,7 @@ fn work_on_project_schema_and_registration() {
         "jobs",
         "blockers",
         "warnings",
+        "suggested_call",
         "suggested_next_actions",
     ] {
         assert!(
@@ -2558,6 +2559,65 @@ async fn source_project_session_cannot_resume_a_managed_worktree() {
     assert_eq!(result.output["state_changed"], false);
     assert_eq!(instruction_events(&runtime, &session_id).len(), 1);
     assert_eq!(runtime.list_projects(Some(&auth)).await.output["count"], 1);
+}
+
+#[tokio::test]
+async fn path_source_unknown_runner_returns_parser_ready_discovery_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let project_path = root.path().canonicalize().unwrap();
+    let project_path = project_path.to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "wop-missing-runner";
+    let auth = auth_context(None, true);
+
+    let outcome = runtime
+        .call_tool_with_context(
+            ToolCallRequest {
+                tool_name: "work_on_project".to_string(),
+                arguments: json!({
+                    "client_id": client_id,
+                    "path": project_path,
+                    "instruction": "recover missing runner",
+                }),
+            },
+            ToolCallContext {
+                transport: ToolTransport::Mcp,
+                session_id: None,
+                auth: Some(&auth),
+                window: None,
+                record_oauth_scope_denials: true,
+                host_file_import_trust: HostFileImportTrust::Untrusted,
+            },
+        )
+        .await;
+    assert!(
+        outcome.error_status.is_none(),
+        "unexpected transport error: {:?}",
+        outcome.error_status
+    );
+    let result = outcome.result.expect("tool result");
+
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "unknown_runner");
+    assert_eq!(result.output["failure_kind"], "unknown_runner");
+    assert_eq!(result.output["client_id"], client_id);
+    assert_eq!(result.output["state_changed"], false);
+    let suggested = &result.output["suggested_call"];
+    assert_eq!(suggested["tool"], "list_runners");
+    assert_eq!(
+        suggested["arguments"],
+        json!({"include_projects": false, "summary_only": true})
+    );
+    assert!(ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .is_ok());
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("work_on_project");
+    let instance = json!({"success": false, "output": result.output, "error": result.error});
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
+        .unwrap_or_else(|error| panic!("unknown Runner recovery must match schema: {error}"));
 }
 
 #[tokio::test]

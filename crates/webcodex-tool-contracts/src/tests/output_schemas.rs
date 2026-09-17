@@ -2050,6 +2050,29 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
 }
 
 #[test]
+fn skill_load_declares_exact_loading_and_ambiguity_output_contract() {
+    let specs = registered_tool_specs();
+    let fields = output_schema_field_names(spec_named(&specs, "skill_load"));
+    for field in [
+        "catalog_revision",
+        "descriptor",
+        "skill_id",
+        "name",
+        "text",
+        "definition_revision",
+        "package_revision",
+        "candidate_count",
+        "candidates",
+        "candidates_truncated",
+        "discovery_truncated",
+        "error_kind",
+    ] {
+        assert!(fields.contains(field), "skill_load missing {field}");
+    }
+    assert_ne!(fields, default_output_schema_field_names());
+}
+
+#[test]
 fn skill_recovery_output_schema_accepts_canonical_shapes_and_declares_legacy_rejection() {
     let schema = output_schema_for_tool("skill_install");
     let actionable = json!({

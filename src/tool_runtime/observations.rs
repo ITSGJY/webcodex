@@ -1,15 +1,11 @@
 //! Cross-surface runtime observations.
 //!
-//! Two facts back the `connector_endpoint` and `last_successful_tool_call`
-//! connection layers instead of guesses:
-//! - connector endpoint activity (readiness probes and successful requests);
-//! - the last successful *meaningful* tool call, scoped by principal,
-//!   project, surface, and session.
+//! Records the last successful *meaningful* tool call, scoped by principal,
+//! project, surface, and session.
 //!
 //! Never stores tool arguments, output bodies, command text, or secrets.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Bounded number of retained tool-call observations.
@@ -21,55 +17,19 @@ pub(crate) struct ToolCallObservation {
     pub(crate) principal_kind: String,
     pub(crate) principal_id: String,
     pub(crate) project: Option<String>,
-    /// Calling surface: `api`, `mcp`, or `connector`.
+    /// Calling surface, for example `api` or `mcp`.
     pub(crate) surface: String,
     pub(crate) session_id: Option<String>,
     pub(crate) tool: String,
     pub(crate) observed_at: i64,
 }
 
-/// Latest connector endpoint observation.
-#[derive(Debug, Clone)]
-pub(crate) struct ConnectorObservation {
-    /// `ready`, `not_ready`, or `request_succeeded`.
-    pub(crate) status: String,
-    /// `readiness_probe` or `connector_request`.
-    pub(crate) source: String,
-    pub(crate) observed_at: i64,
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeObservations {
-    connector_configured: AtomicBool,
-    connector: Mutex<Option<ConnectorObservation>>,
     tool_calls: Mutex<VecDeque<ToolCallObservation>>,
 }
 
 impl RuntimeObservations {
-    pub(crate) fn set_connector_configured(&self) {
-        self.connector_configured.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) fn connector_configured(&self) -> bool {
-        self.connector_configured.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn record_connector_observation(&self, status: &str, source: &str, now: i64) {
-        let mut slot = self.connector.lock().expect("connector observation lock");
-        *slot = Some(ConnectorObservation {
-            status: status.to_string(),
-            source: source.to_string(),
-            observed_at: now,
-        });
-    }
-
-    pub(crate) fn latest_connector_observation(&self) -> Option<ConnectorObservation> {
-        self.connector
-            .lock()
-            .expect("connector observation lock")
-            .clone()
-    }
-
     /// Record a successful tool call. Non-meaningful activity is rejected here
     /// so the canonical ToolDefinition interaction policy is enforced at the
     /// single recording funnel as a defensive backstop.

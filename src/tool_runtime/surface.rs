@@ -251,10 +251,7 @@ impl ToolRuntime {
     ) -> Result<Value, ToolResult> {
         let tool_name = raw_tool_name.trim();
         let model_surface = self.model_surface().ok_or_else(|| {
-            ToolResult::err(
-                "tool_manifest is unavailable under the project_connector runtime exposure"
-                    .to_string(),
-            )
+            ToolResult::err("tool_manifest requires a model-facing runtime surface".to_string())
         })?;
         if tool_name.is_empty() {
             return Err(unknown_tool_manifest_tool_result(tool_name));
@@ -378,10 +375,7 @@ impl ToolRuntime {
             },
         };
         let model_surface = self.model_surface().ok_or_else(|| {
-            ToolResult::err(
-                "tool_manifest is unavailable under the project_connector runtime exposure"
-                    .to_string(),
-            )
+            ToolResult::err("tool_manifest requires a model-facing runtime surface".to_string())
         })?;
 
         let specs = tool_manifest_specs(protocol_capabilities, model_surface);

@@ -40,11 +40,7 @@ export const RUNTIME_INLINE_MODULES = Object.freeze([
 ]);
 
 const watchedSources = new Set([
-  "app.ts",
-  "review_state.ts",
   ...RUNTIME_INLINE_MODULES,
-  "styles.css",
-  "console.html",
   "runtime.css",
   "runtime.html",
   "admin.ts",
@@ -351,10 +347,6 @@ export function createOutputs(
   sourceDirectory = resolve(root, "src")
 ) {
   assertRuntimeClassicBundleContract(sourceDirectory);
-  const reviewStateModule = buildJs(
-    transpileTypeScript(sourceDirectory, "review_state.ts")
-  );
-  const reviewStateClassic = stripModuleExports(reviewStateModule);
   const workflowSessionStateModule = buildJs(
     transpileTypeScript(sourceDirectory, "workflow_session_state.ts")
   );
@@ -391,22 +383,6 @@ export function createOutputs(
         ""
       )
   );
-  const appModule = transpileTypeScript(sourceDirectory, "app.ts");
-  const appScript = stripModuleExports(
-    appModule
-      .replace(
-        /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/review_state(?:\.js)?["'];?\s*\n/m,
-        ""
-      )
-      .replace(
-        /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/workflow_session_state(?:\.js)?["'];?\s*\n/m,
-        ""
-      )
-  );
-  const appInlined = buildJs(
-    reviewStateClassic + "\n" + workflowSessionStateClassic + "\n" + appScript
-  );
-  assertClassicScript(resolve(outputDirectory, "app.js"), appInlined);
   const runtimeI18nModule = buildJs(
     transpileTypeScript(sourceDirectory, "runtime_i18n.ts")
   );
@@ -696,7 +672,6 @@ export function createOutputs(
   assertClassicScript(resolve(outputDirectory, "admin.js"), adminScript);
 
   return new Map([
-    ["review_state.js", reviewStateModule],
     ["workflow_session_state.js", workflowSessionStateModule],
     ["runtime_collaboration_state.js", runtimeCollaborationStateModule],
     ["runtime_communication_state.js", runtimeCommunicationStateModule],
@@ -718,13 +693,10 @@ export function createOutputs(
     ["admin_mutation_controller.js", adminMutationControllerModule],
     ["admin_mutation_view.js", adminMutationViewModule],
     ["admin_view.js", adminViewModule],
-    ["app.js", appInlined],
-    ["styles.css", minifyCss(readSource(sourceDirectory, "styles.css"))],
     ["runtime.js", runtimeInlined],
     ["runtime.css", minifyCss(readSource(sourceDirectory, "runtime.css"))],
     ["admin.js", adminScript],
     ["admin.css", minifyCss(readSource(sourceDirectory, "admin.css"))],
-    ["console.html", normalizeNewline(readSource(sourceDirectory, "console.html"))],
     ["runtime.html", normalizeNewline(readSource(sourceDirectory, "runtime.html"))],
     ["admin.html", normalizeNewline(readSource(sourceDirectory, "admin.html"))],
   ]);

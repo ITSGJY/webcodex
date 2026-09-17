@@ -415,9 +415,7 @@ refresh-token scope，不授予额外 WebCodex 权限。
 canonical operation names。旧 REST route 可以为了兼容继续存在，但不会进入新的
 model-facing schema。
 
-MCP 与 GPT Actions 最终进入同一个 ToolRuntime authority path；GPT Actions 不会建立
-第二套 scope、Project authority、permission、Runner capability 或 retry policy。
-Project-bound Connector 部署继续保持独立的 canonical 十四 capability MCP/OpenAPI surface。
+MCP 与 GPT Actions 最终进入同一个 ToolRuntime authority path；GPT Actions 不会建立第二套 scope、Project authority、permission、Runner capability 或 retry policy。Project-scoped `share` / `run` 部署同样暴露普通 Adaptive Runtime，由 ProjectGrant visibility 把访问限制在对应 Project。
 
 详见 [GPT Actions](GPT_ACTIONS.zh-CN.md)、[MCP](MCP.zh-CN.md) 与
 [AI 接入指南](AI_ONBOARDING.zh-CN.md)。
@@ -432,7 +430,7 @@ Project-bound Connector 部署继续保持独立的 canonical 十四 capability 
 | --- | --- |
 | 未设置 / 空 | `trusted_agent`（自托管单运维者部署的默认值）。 |
 | `trusted_agent` | 项目工作、shell、jobs、git、校验在硬安全检查后自动执行，无审批中断。Push/tag/publish/release/deploy 仍要求用户任务显式包含该动作。 |
-| `restricted` | 有后果的工具在人工批准前被拒绝（`webcodex task approve/deny`）。 |
+| `restricted` | 有后果的 runtime 工具由 permission policy 拒绝；不存在独立 Connector command approval queue。 |
 
 `trusted_agent` 永不放松硬安全边界（项目根、只读会话、路径策略、凭据脱敏、
 job 取消语义）。`WEBCODEX_PERMISSION_MODE` 支持明确映射：`dev_auto_approve` → `trusted_agent`，
@@ -464,12 +462,7 @@ webcodex ops smoke-preflight --server-url "$SERVER_URL" \
 
 ### Runtime console
 
-Server 在 `/console` 提供 host-local 浏览器 console。它展示项目就绪状态、工作队列、
-Workflow Session 活动、当前可见 Runner 与近期变更性活动。对于 Connector task，同机
-人类可以发送 task guidance、处理待审批操作、取消工作，并对稳定结果执行 Accept 或
-Reject；这些动作与 CLI 使用相同的权限边界，在线模型仍然不能接受自己的工作。Console
-还会展示不含 secret 的客户端连接目标，并把 ChatGPT Developer Mode MCP custom app
-作为 ChatGPT 主路径。Credential 不会由 console API 返回。
+Server 在 `/runtime` 提供 Runtime Console。它通过与 ToolRuntime 相同的 authorization path 展示普通 runtime、Project、Runner、Job、Workflow Session、collaboration 与近期 activity。Project-scoped credential 只能看到自己的 ProjectGrant-visible Runner/Project；知道其它 Project/Runner id 也不会扩大可见性。旧 `/console` Project Review Console 以及 task/result/approval API 已删除。Runtime Console API 不会返回 credential。
 
 ### Runtime job API 信任模型
 

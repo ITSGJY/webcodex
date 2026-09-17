@@ -182,7 +182,7 @@ fn project_dashboard(
                     },
                     "shell_profile_status": project.get("shell_profile_status").cloned().unwrap_or(Value::Null),
                     "compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
-                    "console_hint": "Use /console with that project's credential; credentials never belong in URLs.",
+                    "console_hint": "Use /runtime with that project's credential; credentials never belong in URLs.",
                 })
             })
             .collect::<Vec<_>>()
@@ -218,7 +218,6 @@ fn project_dashboard(
             "server_transport": status.pointer("/connection_layers/server_transport").cloned().unwrap_or(Value::Null),
             "server_registration": status.pointer("/connection_layers/server_registration").cloned().unwrap_or(Value::Null),
             "project_registry": status.pointer("/connection_layers/project_registry").cloned().unwrap_or(Value::Null),
-            "connector_endpoint": status.pointer("/connection_layers/connector_endpoint").cloned().unwrap_or(Value::Null),
             "version_compatibility": status.get("version_compatibility").cloned().unwrap_or(Value::Null),
         })
     } else {
@@ -705,14 +704,10 @@ mod tests {
 
     #[test]
     fn admin_routes_are_separate_from_console_routes() {
-        let mut admin = crate::route_metadata::iter_routes()
+        let admin = crate::route_metadata::iter_routes()
             .filter(|spec| spec.surface == crate::route_metadata::RouteSurface::Admin);
         assert!(admin
             .clone()
             .all(|spec| spec.path.starts_with("/api/admin/")));
-        assert!(admin.all(|spec| !crate::route_metadata::path_has_surface(
-            spec.path,
-            crate::route_metadata::RouteSurface::HostConsole,
-        )));
     }
 }

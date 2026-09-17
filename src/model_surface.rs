@@ -2,17 +2,13 @@
 //!
 //! WebCodex exposes exactly one top-level `RuntimeExposure` per process:
 //!
-//! - A complete Connector configuration (`WEBCODEX_CONNECTOR_SURFACE=task-v1`)
-//!   selects the separate `project_connector` contract.
-//! - Without Connector configuration, an unset `WEBCODEX_MCP_MODEL_SURFACE`
-//!   selects `Runtime(AdaptiveRuntime)`. Explicit `local-coding-v1`,
+//! - An unset `WEBCODEX_MCP_MODEL_SURFACE` selects `Runtime(AdaptiveRuntime)`.
+//!   Explicit `local-coding-v1`,
 //!   `adaptive-runtime-v1`, and `full-operator-v1` values select the corresponding
 //!   runtime `ModelSurface`.
-//! - Setting Connector configuration and `WEBCODEX_MCP_MODEL_SURFACE` together,
-//!   or using an unsupported value, is a startup configuration error and never
-//!   falls through to another exposure.
+//! - Unsupported values are startup configuration errors and never silently
+//!   fall through to another exposure.
 
-use crate::connector_runtime::ConnectorContext;
 use crate::tool_runtime::tool_definition::{
     adaptive_runtime_direct_tool_definitions, is_adaptive_runtime_direct_tool,
     is_model_visible_tool_name, LOCAL_CODING_TOOL_NAMES,
@@ -22,7 +18,6 @@ use crate::tool_runtime::{registered_tool_specs, ToolSpec};
 pub(crate) const MODEL_SURFACE_LOCAL_CODING: &str = "local_coding";
 pub(crate) const MODEL_SURFACE_ADAPTIVE_RUNTIME: &str = "adaptive_runtime";
 pub(crate) const MODEL_SURFACE_FULL_OPERATOR_RUNTIME: &str = "full_operator_runtime";
-pub(crate) const RUNTIME_EXPOSURE_PROJECT_CONNECTOR: &str = "project_connector";
 
 pub(crate) const MCP_MODEL_SURFACE_ENV: &str = "WEBCODEX_MCP_MODEL_SURFACE";
 pub(crate) const MCP_MODEL_SURFACE_LOCAL_CODING_V1: &str = "local-coding-v1";
@@ -64,21 +59,18 @@ pub(crate) fn adaptive_runtime_gateway_target_route(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeExposure {
     Runtime(ModelSurface),
-    ProjectConnector,
 }
 
 impl RuntimeExposure {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Runtime(surface) => surface.name(),
-            Self::ProjectConnector => RUNTIME_EXPOSURE_PROJECT_CONNECTOR,
         }
     }
 
     pub(crate) fn model_surface(self) -> Option<ModelSurface> {
         match self {
             Self::Runtime(surface) => Some(surface),
-            Self::ProjectConnector => None,
         }
     }
 }
@@ -87,7 +79,7 @@ impl RuntimeExposure {
 ///
 /// An explicit operator override always wins. Without one, Adaptive Runtime uses
 /// compact discovery to reduce model schema/context cost; compatibility surfaces
-/// and ProjectConnector preserve their historical full-schema projection.
+/// and compatibility surfaces preserve their configured projection.
 pub(crate) fn effective_mcp_compact_schemas(
     exposure: RuntimeExposure,
     configured_override: Option<bool>,
@@ -96,24 +88,6 @@ pub(crate) fn effective_mcp_compact_schemas(
         exposure,
         RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)
     ))
-}
-
-/// The top-level exposure and Connector runtime slot are one coherent startup state.
-/// ProjectConnector requires Connector state; runtime ModelSurfaces forbid it.
-pub(crate) fn validate_connector_runtime_presence(
-    exposure: RuntimeExposure,
-    connector_present: bool,
-) -> Result<(), String> {
-    match (exposure, connector_present) {
-        (RuntimeExposure::ProjectConnector, true) | (RuntimeExposure::Runtime(_), false) => Ok(()),
-        (RuntimeExposure::ProjectConnector, false) => {
-            Err("runtime exposure 'project_connector' requires Connector runtime state".to_string())
-        }
-        (RuntimeExposure::Runtime(surface), true) => Err(format!(
-            "runtime exposure '{}' cannot coexist with Connector runtime state",
-            surface.name()
-        )),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,34 +169,26 @@ impl ModelSurface {
 
 /// Resolve the top-level runtime exposure from the process environment.
 ///
-/// `connector_context` is present only after a complete Connector
-/// configuration has been parsed and validated. Returns an error for a
-/// conflict (Connector plus `WEBCODEX_MCP_MODEL_SURFACE`) or for an unsupported
-/// `WEBCODEX_MCP_MODEL_SURFACE` value; the server must fail startup rather
-/// than silently serving a different exposure.
-pub(crate) fn resolve_runtime_exposure(
-    connector_context: Option<&ConnectorContext>,
-) -> Result<RuntimeExposure, String> {
+/// Unset selects ordinary Adaptive Runtime. Explicit compatibility values remain
+/// available for operators, but no project-scoped deployment selects a second
+/// coding runtime.
+pub(crate) fn resolve_runtime_exposure() -> Result<RuntimeExposure, String> {
     let configured = std::env::var(MCP_MODEL_SURFACE_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    match (connector_context, configured.as_deref()) {
-        (Some(_), Some(value)) => Err(format!(
-            "{MCP_MODEL_SURFACE_ENV}='{value}' cannot be combined with WEBCODEX_CONNECTOR_SURFACE; the Connector surface is authoritative"
-        )),
-        (Some(_), None) => Ok(RuntimeExposure::ProjectConnector),
-        (None, None) => Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)),
-        (None, Some(MCP_MODEL_SURFACE_LOCAL_CODING_V1)) => {
+    match configured.as_deref() {
+        None => Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)),
+        Some(MCP_MODEL_SURFACE_LOCAL_CODING_V1) => {
             Ok(RuntimeExposure::Runtime(ModelSurface::LocalCoding))
         }
-        (None, Some(MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1)) => {
+        Some(MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1) => {
             Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime))
         }
-        (None, Some(MCP_MODEL_SURFACE_FULL_OPERATOR_V1)) => {
+        Some(MCP_MODEL_SURFACE_FULL_OPERATOR_V1) => {
             Ok(RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime))
         }
-        (None, Some(value)) => Err(format!(
+        Some(value) => Err(format!(
             "unsupported {MCP_MODEL_SURFACE_ENV} '{value}'; expected {MCP_MODEL_SURFACE_LOCAL_CODING_V1}, {MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1}, or {MCP_MODEL_SURFACE_FULL_OPERATOR_V1}"
         )),
     }
@@ -372,6 +338,7 @@ mod tests {
         "runtime_status",
         "wait_for_agent_events",
         "plugin_tool",
+        "skill_load",
         "tool_manifest",
         "search_project_texts",
         "read_files",
@@ -506,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn ergonomics_promotions_do_not_expand_project_connector_or_duplicate_artifact_reads() {
+    fn ergonomics_promotions_do_not_duplicate_artifact_reads() {
         assert!(is_adaptive_runtime_direct_tool(
             "import_conversation_files_to_project"
         ));
@@ -528,10 +495,6 @@ mod tests {
             );
         }
         for tool_name in ["import_conversation_files_to_project", "project_artifact"] {
-            assert!(
-                !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&tool_name),
-                "{tool_name} must not expand project_connector"
-            );
             assert_eq!(
                 ModelSurface::FullOperatorRuntime.runtime_tool_invocation_route(tool_name),
                 (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
@@ -565,10 +528,6 @@ mod tests {
             assert!(
                 !is_adaptive_runtime_direct_tool(name),
                 "{name} must stay behind adaptive_runtime discovery"
-            );
-            assert!(
-                !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&name),
-                "{name} must not expand project_connector"
             );
         }
     }
@@ -607,28 +566,12 @@ mod tests {
         }
     }
 
-    fn connector_context() -> ConnectorContext {
-        ConnectorContext {
-            project_id: "wc_proj_1111111111111111".to_string(),
-            project_name: "demo".to_string(),
-            workspace_id: "wc_ws_1111111111111111".to_string(),
-            executor_project: "agent:special:webcodex".to_string(),
-            executor_root: "/tmp/webcodex".to_string(),
-            runs_root: "/tmp/webcodex-runs".to_string(),
-            results_root: "/tmp/webcodex-results".to_string(),
-            project_registry_dir: "/tmp/webcodex-projects".to_string(),
-            profile: "default".to_string(),
-            project_grant_id: "wc_pgrant_1111111111111111".to_string(),
-        }
-    }
-
     #[test]
     fn compact_schema_policy_defaults_only_adaptive_runtime_to_compact() {
         for exposure in [
             RuntimeExposure::Runtime(ModelSurface::LocalCoding),
             RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime),
             RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime),
-            RuntimeExposure::ProjectConnector,
         ] {
             let expected_default = matches!(
                 exposure,
@@ -651,43 +594,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_exposure_connector_state_matrix_is_closed() {
-        for (exposure, connector_present) in [
-            (RuntimeExposure::ProjectConnector, true),
-            (RuntimeExposure::Runtime(ModelSurface::LocalCoding), false),
-            (
-                RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime),
-                false,
-            ),
-            (
-                RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime),
-                false,
-            ),
-        ] {
-            assert!(
-                validate_connector_runtime_presence(exposure, connector_present).is_ok(),
-                "expected valid state: {exposure:?}, connector_present={connector_present}"
-            );
-        }
-        assert!(
-            validate_connector_runtime_presence(RuntimeExposure::ProjectConnector, false)
-                .unwrap_err()
-                .contains("requires Connector runtime state")
-        );
-        assert!(validate_connector_runtime_presence(
-            RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime),
-            true
-        )
-        .unwrap_err()
-        .contains("cannot coexist with Connector runtime state"));
-    }
-
-    #[test]
-    fn default_surface_is_adaptive_runtime_without_connector_or_env() {
+    fn default_surface_is_adaptive_runtime() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.remove(MCP_MODEL_SURFACE_ENV);
         assert_eq!(
-            resolve_runtime_exposure(None),
+            resolve_runtime_exposure(),
             Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime))
         );
     }
@@ -697,46 +608,29 @@ mod tests {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_LOCAL_CODING_V1);
         assert_eq!(
-            resolve_runtime_exposure(None),
+            resolve_runtime_exposure(),
             Ok(RuntimeExposure::Runtime(ModelSurface::LocalCoding))
         );
         env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1);
         assert_eq!(
-            resolve_runtime_exposure(None),
+            resolve_runtime_exposure(),
             Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime))
         );
         env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_FULL_OPERATOR_V1);
         assert_eq!(
-            resolve_runtime_exposure(None),
+            resolve_runtime_exposure(),
             Ok(RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime))
         );
         env.remove(MCP_MODEL_SURFACE_ENV);
     }
 
     #[test]
-    fn connector_configured_selects_project_connector() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.remove(MCP_MODEL_SURFACE_ENV);
-        let context = connector_context();
-        assert_eq!(
-            resolve_runtime_exposure(Some(&context)),
-            Ok(RuntimeExposure::ProjectConnector)
-        );
-    }
-
-    #[test]
-    fn invalid_and_conflicting_values_fail_resolution() {
+    fn invalid_surface_value_fails_resolution() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.set(MCP_MODEL_SURFACE_ENV, "bogus-surface");
-        let error = resolve_runtime_exposure(None).expect_err("invalid value must fail");
+        let error = resolve_runtime_exposure().expect_err("invalid value must fail");
         assert!(error.contains("unsupported"), "error: {error}");
         assert!(error.contains("bogus-surface"), "error: {error}");
-
-        env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_LOCAL_CODING_V1);
-        let context = connector_context();
-        let error = resolve_runtime_exposure(Some(&context)).expect_err("conflict must fail");
-        assert!(error.contains("cannot be combined"), "error: {error}");
-        assert!(error.contains(MCP_MODEL_SURFACE_ENV), "error: {error}");
         env.remove(MCP_MODEL_SURFACE_ENV);
     }
 }

@@ -4362,6 +4362,10 @@ impl ToolCall {
                     "expected_catalog_revision": expected_catalog_revision,
                 }),
             ),
+            Self::SkillLoad { project, name, .. } => serde_json::json!({
+                "project": project,
+                "name_present": !name.is_empty(),
+            }),
             Self::SkillList {
                 project,
                 query,

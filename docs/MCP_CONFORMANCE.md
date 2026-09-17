@@ -61,8 +61,7 @@ not expose such a tool, that result is a coverage gap until a test-only adapter 
 provided; it must not be relabeled as a product protocol failure merely to make a
 summary green.
 
-Authenticated Runtime/Connector behavior remains covered by focused synthetic-
-credential integration tests. The upstream server CLI does not provide a generic
+Authenticated runtime behavior, including project-scoped ProjectGrant access, remains covered by focused synthetic-credential integration tests. The upstream server CLI does not provide a generic
 way to inject WebCodex authorization headers, so an authentication-blocked
 scenario is inconclusive rather than a pass.
 
@@ -169,10 +168,4 @@ multiple check IDs with a scenario-wide exception. The SEP-2164 `data.uri`
 finding is kept as an advisory SHOULD/WARNING rather than described as a MUST
 violation.
 
-This baseline deliberately records two already-demonstrated 2026 result-shape findings
-without fixing production behavior: streamed artifact `resources/read` omits the
-cache hints emitted by ordinary resource reads, and a completed Connector Task
-embeds its original tool result without a nested `resultType`. Their focused Rust
-observations and planned follow-up are recorded in the baseline fixture. Fixes
-belong in a separate protocol-behavior change so this baseline remains an
-independent measuring instrument.
+This baseline deliberately records already-demonstrated 2026 result-shape findings without rewriting production behavior merely to satisfy the harness. Their focused Rust observations and planned follow-up belong in the baseline fixture; fixes belong in a separate protocol-behavior change so this baseline remains an independent measuring instrument.
