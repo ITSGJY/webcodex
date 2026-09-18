@@ -143,6 +143,42 @@ fn instruction_snapshot_observes_confirmed_removal_and_empty_files() {
     assert!(empty.files.is_empty());
 }
 
+#[test]
+fn missing_instruction_parent_is_not_a_confirmed_leaf_removal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let missing = root.join("never-created").join("nested").join("AGENTS.md");
+    let result = observe(&missing);
+    assert!(!result.scan_complete);
+    assert!(result.files.is_empty());
+}
+
+#[test]
+fn moved_instruction_parent_recovers_before_confirmed_leaf_removal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let parent = root.join("configured");
+    let moved = root.join("temporarily-unavailable");
+    std::fs::create_dir(&parent).unwrap();
+    let path = parent.join("AGENTS.md");
+    std::fs::write(&path, "retained global guidance").unwrap();
+    let first = observe(&path);
+    assert!(first.scan_complete);
+    assert_eq!(first.files.len(), 1);
+    std::fs::rename(&parent, &moved).unwrap();
+    let unavailable = observe(&path);
+    assert!(!unavailable.scan_complete);
+    assert!(unavailable.files.is_empty());
+    std::fs::rename(&moved, &parent).unwrap();
+    let recovered = observe(&path);
+    assert!(recovered.scan_complete);
+    assert_eq!(recovered.files[0].fingerprint, first.files[0].fingerprint);
+    std::fs::remove_file(&path).unwrap();
+    let removed = observe(&path);
+    assert!(removed.scan_complete);
+    assert!(removed.files.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn missing_leaf_under_redirected_or_dangling_parent_stays_unavailable() {

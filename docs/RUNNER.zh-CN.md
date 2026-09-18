@@ -208,8 +208,10 @@ bootstrap 都会独立观察当前 Runner-global instructions；v1 不做跨 Pro
 Runner-global source 被截断时保持有界，也不会因此开放 generic arbitrary-file `read_more`。
 
 
-Configured file 确认缺失或为空时移除其 guidance；其他读取失败仍表示 Runner scope
-暂时不可用。显式恢复 Session 时，Runner 与 Project scope 独立更新；不可用的 scope
+Configured file 为空，或所有父目录均通过 ordinary-path 检查后确认末级文件缺失时，
+移除其 guidance。父目录缺失、发生重定向或无法读取，以及其他读取失败，均表示
+Runner scope 暂时不可用。从 `instructions.files` 移除条目并 reload 仍会明确撤销规则。
+显式恢复 Session 时，Runner 与 Project scope 独立更新；不可用的 scope
 只在内存中保留上一份规则。观察到新的 Runner instance 或 config generation 后，
 不会继承旧的全局规则。同一 instance 内，已知的较高 config generation 优先于请求
 开始顺序；未知 generation 不能替换已知 generation。Instance 替换按 live-instance

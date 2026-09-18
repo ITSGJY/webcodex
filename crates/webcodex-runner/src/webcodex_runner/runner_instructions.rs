@@ -131,7 +131,15 @@ fn open_instruction_file(path: &Path) -> io::Result<File> {
     // or redirected parent must remain unavailable, not evidence of removal.
     let components = path.ancestors().collect::<Vec<_>>();
     for component in components.into_iter().rev() {
-        let metadata = std::fs::symlink_metadata(component)?;
+        let metadata = std::fs::symlink_metadata(component).map_err(|error| {
+            if component != path && error.kind() == io::ErrorKind::NotFound {
+                // A missing directory may be an unavailable mount or a
+                // temporarily moved tree, not a confirmed leaf-file removal.
+                io::Error::other("instruction parent is unavailable")
+            } else {
+                error
+            }
+        })?;
         if metadata_is_link_like(&metadata)
             || (component == path && !metadata.is_file())
             || (component != path && !metadata.is_dir())

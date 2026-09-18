@@ -234,8 +234,11 @@ across Projects. Truncated Runner-global sources stay bounded and do not create 
 generic arbitrary-file `read_more` authority.
 
 
-Missing or empty configured files confirm removal; other read failures leave
-the Runner scope unavailable. An explicit Session resume refreshes Runner and
+An empty configured file or a missing leaf beneath verified ordinary parent
+directories confirms removal. A missing, redirected, or unreadable parent leaves
+the Runner scope unavailable, as do other read failures. Removing an entry from
+`instructions.files` remains an explicit revocation after config reload.
+An explicit Session resume refreshes Runner and
 Project scopes independently, retaining an unavailable scope's last-known rules
 only in memory. A newly observed Runner instance or config generation cannot
 inherit the previous global rules. Within one instance, a higher known config
