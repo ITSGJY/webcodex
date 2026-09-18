@@ -1,4 +1,4 @@
-use crate::model::{MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX};
+use crate::model::{CodingSessionOutcome, MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX};
 use crate::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
