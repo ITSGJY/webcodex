@@ -679,12 +679,52 @@ fn roots_projection(source: &Value) -> Value {
 
 pub(crate) fn project_instructions_context_projection(
     current: &ProjectInstructionsSnapshot,
+    max_bytes: usize,
 ) -> Value {
-    // Sidecar requests are explicit current observations rather than Session
-    // continuation deltas. Reuse the same bounded source/content/read_more
-    // projection as coding startup, without consulting or mutating Session
-    // instruction-retention state.
-    instructions_projection(current, None, true, true, true, false)
+    // Sidecar requests observe current sources without Session retention. Its
+    // shared envelope is smaller than startup, especially with 16 global files.
+    let mut projection = instructions_projection(current, None, true, true, true, false);
+    if serialized_len(&projection) <= max_bytes {
+        return projection;
+    }
+    // Headings duplicate the body; remove this optional index before losing
+    // actual guidance or source identities.
+    if let Some(sources) = projection["sources"].as_array_mut() {
+        for source in sources {
+            source["headings"] = json!([]);
+        }
+    }
+    while serialized_len(&projection) > max_bytes {
+        let largest = projection["sources"].as_array().and_then(|sources| {
+            sources
+                .iter()
+                .enumerate()
+                .filter_map(|(index, source)| {
+                    source["content"]
+                        .as_str()
+                        .filter(|body| !body.is_empty())
+                        .map(|body| (index, json_string_payload_len(body)))
+                })
+                .max_by_key(|(_, bytes)| *bytes)
+        });
+        let Some((index, bytes)) = largest else {
+            // Essential source metadata itself does not fit. The owning
+            // sidecar envelope will return its existing explicit budget error.
+            break;
+        };
+        let source = &mut projection["sources"][index];
+        let body = source["content"].as_str().unwrap_or_default();
+        let (bounded, _) = bounded_json_string(body, bytes / 2);
+        source["read_more"] = if source["source_scope"] == "project" {
+            projected_read_more(source["path"].as_str().unwrap_or_default(), &bounded)
+        } else {
+            Value::Null
+        };
+        source["content"] = json!(bounded);
+        source["truncated"] = json!(true);
+        projection["truncated"] = json!(true);
+    }
+    projection
 }
 
 fn instructions_projection(

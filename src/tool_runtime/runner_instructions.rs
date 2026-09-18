@@ -18,16 +18,20 @@ impl ToolRuntime {
         project: &ResolvedProject,
         auth: Option<&AuthContext>,
     ) -> ProjectInstructionsSnapshot {
+        let project_started_at = Instant::now();
         let local = self.load_coding_project_instructions(&project.config);
-        if !project.resolved_id.starts_with("agent:") {
-            return ProjectInstructionsSnapshot::with_runner_files(Vec::new(), local.await, true);
-        }
-        let runner = self.load_runner_instruction_files(&project.config.client_id, auth);
         let ((runner_files, runner_complete, observation), local) =
-            futures_util::future::join(runner, local).await;
+            if project.resolved_id.starts_with("agent:") {
+                let runner = self.load_runner_instruction_files(&project.config.client_id, auth);
+                futures_util::future::join(runner, local).await
+            } else {
+                ((Vec::new(), true, None), local.await)
+            };
         let mut snapshot =
             ProjectInstructionsSnapshot::with_runner_files(runner_files, local, runner_complete);
-        snapshot.scan.as_mut().expect("combined scan").runner = observation;
+        let scan = snapshot.scan.as_mut().expect("combined scan");
+        scan.runner = observation;
+        scan.project_started_at = Some(project_started_at);
         snapshot
     }
 
@@ -36,16 +40,20 @@ impl ToolRuntime {
         project: &ResolvedProject,
         auth: Option<&AuthContext>,
     ) -> ProjectInstructionsSnapshot {
+        let project_started_at = Instant::now();
         let local = self.load_project_instructions(&project.config);
-        if !project.resolved_id.starts_with("agent:") {
-            return ProjectInstructionsSnapshot::with_runner_files(Vec::new(), local.await, true);
-        }
-        let runner = self.load_runner_instruction_files(&project.config.client_id, auth);
         let ((runner_files, runner_complete, observation), local) =
-            futures_util::future::join(runner, local).await;
+            if project.resolved_id.starts_with("agent:") {
+                let runner = self.load_runner_instruction_files(&project.config.client_id, auth);
+                futures_util::future::join(runner, local).await
+            } else {
+                ((Vec::new(), true, None), local.await)
+            };
         let mut snapshot =
             ProjectInstructionsSnapshot::with_runner_files(runner_files, local, runner_complete);
-        snapshot.scan.as_mut().expect("combined scan").runner = observation;
+        let scan = snapshot.scan.as_mut().expect("combined scan");
+        scan.runner = observation;
+        scan.project_started_at = Some(project_started_at);
         snapshot
     }
 
@@ -72,6 +80,7 @@ impl ToolRuntime {
             instance_id: semantic.view.runner_instance_id.clone(),
             generation: advertised_generation(&semantic.view),
             started_at,
+            instance_verified_at: semantic.observed_at,
         };
         if !semantic.supports(RunnerFeature::InstructionRuntime) {
             // An old Runner is a confirmed empty global scope.
@@ -144,6 +153,7 @@ impl ToolRuntime {
             .get_runner_semantic_view_checked_for_auth(client_id, access.as_ref())
             .await
         {
+            observation.instance_verified_at = current.observed_at;
             let generation = advertised_generation(&current.view);
             if current.view.runner_instance_id != runner_instance_id
                 || generation.is_some_and(|current| {

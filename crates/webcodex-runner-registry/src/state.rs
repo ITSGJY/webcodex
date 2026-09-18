@@ -122,6 +122,9 @@ pub(super) struct RunnerRecord {
 #[derive(Debug, Clone)]
 pub struct RunnerSemanticView {
     pub view: RunnerView,
+    /// Captured with the record under the registry lock, not after an awaiting
+    /// caller resumes. This preserves identity-observation order across tasks.
+    pub observed_at: std::time::Instant,
     pub(super) runner_features: RunnerFeatureSet,
 }
 
@@ -135,6 +138,7 @@ impl RunnerSemanticView {
         let runner_features = RunnerFeatureSet::from_wire_for_test(&view.capabilities);
         Self {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         }
     }

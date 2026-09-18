@@ -89,3 +89,46 @@ fn incomplete_global_scan_reports_confirmed_project_changes_without_false_global
     assert_eq!(projection["content_included"], false);
     assert!(projection["sources"][0]["content"].is_null());
 }
+
+#[test]
+fn instruction_sidecar_budget_preserves_sources_and_local_guidance() {
+    let heading = format!("# {}\n", "h".repeat(158));
+    let globals = ProjectInstructionsSnapshot::from_candidates(
+        (0..16)
+            .map(|index| LoadedInstructionCandidate {
+                source_scope: InstructionSourceScope::Runner,
+                path: format!("runner/{index}/global.md"),
+                content: heading.repeat(6),
+                total_lines: 6,
+                full_sha256: None,
+            })
+            .collect(),
+        true,
+    );
+    let locals = ProjectInstructionsSnapshot::from_candidates(
+        INSTRUCTION_CANDIDATE_PATHS
+            .iter()
+            .map(|path| LoadedInstructionCandidate {
+                source_scope: InstructionSourceScope::Project,
+                path: (*path).into(),
+                content: "specific project guidance".into(),
+                total_lines: 1,
+                full_sha256: None,
+            })
+            .collect(),
+        true,
+    );
+    let combined = ProjectInstructionsSnapshot::with_runner_files(globals.files, locals, true);
+    for budget in [19 * 1024, 12 * 1024] {
+        let projection = project_instructions_context_projection(&combined, budget);
+        assert!(serialized_len(&projection) <= budget);
+        let sources = projection["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 21);
+        assert!(sources[..16]
+            .iter()
+            .all(|source| source["read_more"].is_null()));
+        assert!(sources[16..]
+            .iter()
+            .all(|source| source["content"] == "specific project guidance"));
+    }
+}

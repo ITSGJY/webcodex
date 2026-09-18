@@ -1623,7 +1623,9 @@ fn instruction_observation(
         instance_id: instance.into(),
         generation: Some(generation),
         started_at,
+        instance_verified_at: started_at,
     });
+    combined.scan.as_mut().unwrap().project_started_at = Some(started_at);
     combined
 }
 
@@ -1724,6 +1726,7 @@ fn instruction_observation_cannot_revive_obsolete_generation_or_runner() {
     let store = SessionStore::default();
     let at = std::time::Instant::now();
     let next = at + std::time::Duration::from_secs(1);
+    let replacement_at = next + std::time::Duration::from_secs(1);
     let observe = |body, complete, instance, generation, time| {
         instruction_observation(
             body,
@@ -1761,7 +1764,7 @@ fn instruction_observation_cannot_revive_obsolete_generation_or_runner() {
     let replacement = commit_instruction_observation(
         &store,
         Some(&id),
-        observe(Some("new runner"), true, "b", 1, next),
+        observe(Some("new runner"), true, "b", 1, replacement_at),
     );
     assert_eq!(
         replacement.project_instructions.unwrap().files[0].content,
@@ -1777,16 +1780,428 @@ fn instruction_observation_cannot_revive_obsolete_generation_or_runner() {
         "new runner"
     );
     // A transient failure from that same instance/config preserves its rule.
-    let failed =
-        commit_instruction_observation(&store, Some(&id), observe(None, false, "b", 1, next));
+    let failed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, false, "b", 1, replacement_at),
+    );
     assert_eq!(
         failed.project_instructions.unwrap().files[0].content,
         "new runner"
     );
-    let replacement_failed =
-        commit_instruction_observation(&store, Some(&id), observe(None, false, "c", 1, next));
+    let replacement_failed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(
+            None,
+            false,
+            "c",
+            1,
+            replacement_at + std::time::Duration::from_secs(1),
+        ),
+    );
     assert_eq!(
         replacement_failed.project_instructions.unwrap().files.len(),
         1
     );
+}
+
+#[test]
+fn newer_instruction_generation_wins_even_when_request_started_first() {
+    use webcodex_core::project_instructions::InstructionSourceScope;
+    let at = std::time::Instant::now();
+    let later = at + std::time::Duration::from_secs(1);
+    for complete in [false, true] {
+        let store = SessionStore::default();
+        let first = commit_instruction_observation(
+            &store,
+            None,
+            instruction_observation(
+                Some("revoked"),
+                Some("new local"),
+                true,
+                true,
+                "a",
+                1,
+                later,
+            ),
+        );
+        let id = first.summary.session_id;
+        let refreshed = commit_instruction_observation(
+            &store,
+            Some(&id),
+            instruction_observation(
+                complete.then_some("generation two"),
+                Some("old local"),
+                complete,
+                true,
+                "a",
+                2,
+                at,
+            ),
+        )
+        .project_instructions
+        .unwrap();
+        assert_eq!(
+            refreshed
+                .scan
+                .as_ref()
+                .unwrap()
+                .runner
+                .as_ref()
+                .unwrap()
+                .generation,
+            Some(2)
+        );
+        assert!(!refreshed.scope_complete(InstructionSourceScope::Project));
+        assert_eq!(refreshed.files.last().unwrap().content, "new local");
+        assert!(refreshed.files.iter().all(|file| file.content != "revoked"));
+        assert_eq!(
+            refreshed.scope_complete(InstructionSourceScope::Runner),
+            complete
+        );
+        if complete {
+            assert_eq!(refreshed.files[0].content, "generation two");
+        }
+        // A later-started lower generation and an unknown generation cannot revive it.
+        for generation in [Some(1), None] {
+            let mut late = instruction_observation(
+                Some("revoked"),
+                Some("new local"),
+                true,
+                true,
+                "a",
+                1,
+                later,
+            );
+            late.scan
+                .as_mut()
+                .unwrap()
+                .runner
+                .as_mut()
+                .unwrap()
+                .generation = generation;
+            let late = commit_instruction_observation(&store, Some(&id), late)
+                .project_instructions
+                .unwrap();
+            assert!(!late.scope_complete(InstructionSourceScope::Runner));
+            assert_eq!(
+                late.scan
+                    .as_ref()
+                    .unwrap()
+                    .runner
+                    .as_ref()
+                    .unwrap()
+                    .generation,
+                Some(2)
+            );
+            assert!(late.files.iter().all(|file| file.content != "revoked"));
+        }
+    }
+}
+
+#[test]
+fn replacement_instruction_instance_uses_verification_order_not_request_start() {
+    use webcodex_core::project_instructions::InstructionSourceScope;
+    let at = std::time::Instant::now();
+    let later = at + std::time::Duration::from_secs(1);
+    let verified = later + std::time::Duration::from_secs(1);
+    for complete in [false, true] {
+        let store = SessionStore::default();
+        let first = commit_instruction_observation(
+            &store,
+            None,
+            instruction_observation(Some("retired"), None, true, true, "a", 9, later),
+        );
+        let id = first.summary.session_id;
+        let mut replacement = instruction_observation(
+            complete.then_some("replacement"),
+            None,
+            complete,
+            true,
+            "b",
+            1,
+            at,
+        );
+        replacement
+            .scan
+            .as_mut()
+            .unwrap()
+            .runner
+            .as_mut()
+            .unwrap()
+            .instance_verified_at = verified;
+        let replacement = commit_instruction_observation(&store, Some(&id), replacement)
+            .project_instructions
+            .unwrap();
+        assert_eq!(
+            replacement
+                .scan
+                .as_ref()
+                .unwrap()
+                .runner
+                .as_ref()
+                .unwrap()
+                .instance_id,
+            "b"
+        );
+        assert_eq!(
+            replacement.scope_complete(InstructionSourceScope::Runner),
+            complete
+        );
+        assert!(replacement
+            .files
+            .iter()
+            .all(|file| file.content != "retired"));
+        // This old-instance request started after B's request, but verified A before B.
+        let late = commit_instruction_observation(
+            &store,
+            Some(&id),
+            instruction_observation(Some("retired"), None, true, true, "a", 10, later),
+        )
+        .project_instructions
+        .unwrap();
+        assert_eq!(
+            late.scan
+                .as_ref()
+                .unwrap()
+                .runner
+                .as_ref()
+                .unwrap()
+                .instance_id,
+            "b"
+        );
+        assert!(!late.scope_complete(InstructionSourceScope::Runner));
+        assert!(late.files.iter().all(|file| file.content != "retired"));
+        if complete {
+            assert_eq!(late.files[0].content, "replacement");
+        }
+    }
+}
+
+#[test]
+fn same_instruction_generation_uses_observation_order() {
+    let store = SessionStore::default();
+    let at = std::time::Instant::now();
+    let later = at + std::time::Duration::from_secs(1);
+    let first = commit_instruction_observation(
+        &store,
+        None,
+        instruction_observation(Some("new body"), None, true, true, "a", 1, later),
+    );
+    let mut late = instruction_observation(Some("old body"), None, true, true, "a", 1, at);
+    late.scan
+        .as_mut()
+        .unwrap()
+        .runner
+        .as_mut()
+        .unwrap()
+        .instance_verified_at = later;
+    let late = commit_instruction_observation(&store, Some(&first.summary.session_id), late)
+        .project_instructions
+        .unwrap();
+    assert!(!late.scan_complete);
+    assert_eq!(late.files[0].content, "new body");
+}
+
+#[test]
+fn resumed_project_observation_has_an_independent_freshness_fence() {
+    use webcodex_core::project_instructions::InstructionSourceScope;
+    let at = std::time::Instant::now();
+    let time = |seconds| at + std::time::Duration::from_secs(seconds);
+    // Exercise an unavailable Runner, no Runner capability, and a new generation
+    // that must update the global scope without rolling back the local scope.
+    for runner_case in 0..3 {
+        let store = SessionStore::default();
+        let observe = |body, complete, seconds| {
+            let mut snapshot = instruction_observation(
+                None,
+                body,
+                runner_case == 1,
+                complete,
+                "a",
+                1,
+                time(seconds),
+            );
+            if runner_case < 2 {
+                snapshot.scan.as_mut().unwrap().runner = None;
+            }
+            snapshot
+        };
+        let mut delayed = observe(Some("old local"), true, 0);
+        let first =
+            commit_instruction_observation(&store, None, observe(Some("new local"), true, 1));
+        let id = first.summary.session_id;
+        if runner_case == 2 {
+            delayed = instruction_observation(
+                Some("new global"),
+                Some("old local"),
+                true,
+                true,
+                "a",
+                2,
+                at,
+            );
+        }
+        let delayed = commit_instruction_observation(&store, Some(&id), delayed)
+            .project_instructions
+            .unwrap();
+        assert!(!delayed.scan_complete);
+        assert!(!delayed.scope_complete(InstructionSourceScope::Project));
+        assert_eq!(delayed.files.last().unwrap().content, "new local");
+        if runner_case == 2 {
+            assert_eq!(delayed.files[0].content, "new global");
+            assert!(delayed.scope_complete(InstructionSourceScope::Runner));
+        }
+        let failed = commit_instruction_observation(
+            &store,
+            Some(&id),
+            observe(Some("partial local"), false, 3),
+        );
+        assert_eq!(
+            failed
+                .project_instructions
+                .unwrap()
+                .files
+                .last()
+                .unwrap()
+                .content,
+            "new local"
+        );
+        // The incomplete refresh must not lose the fence when retaining text.
+        let late =
+            commit_instruction_observation(&store, Some(&id), observe(Some("late local"), true, 2));
+        assert_eq!(
+            late.project_instructions
+                .unwrap()
+                .files
+                .last()
+                .unwrap()
+                .content,
+            "new local"
+        );
+        let recovered = commit_instruction_observation(
+            &store,
+            Some(&id),
+            observe(Some("recovered local"), true, 4),
+        )
+        .project_instructions
+        .unwrap();
+        assert!(recovered.scope_complete(InstructionSourceScope::Project));
+        assert_eq!(recovered.files.last().unwrap().content, "recovered local");
+    }
+}
+
+#[test]
+fn retained_project_selection_preserves_global_edit_and_only_persists_metadata() {
+    use webcodex_core::project_instructions::{InstructionSourceScope, MAX_TOTAL_CHARS};
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let at = std::time::Instant::now();
+    let observe = |runner, project, rc, pc, seconds| {
+        instruction_observation(
+            runner,
+            project,
+            rc,
+            pc,
+            "a",
+            1,
+            at + std::time::Duration::from_secs(seconds),
+        )
+    };
+    let first = commit_instruction_observation(
+        &store,
+        None,
+        observe(
+            Some("old global private"),
+            Some("short local private"),
+            true,
+            true,
+            0,
+        ),
+    );
+    let id = first.summary.session_id;
+    let large = "界".repeat(MAX_TOTAL_CHARS);
+    let partial = observe(Some("edited global private"), Some(&large), true, false, 1);
+    assert!(partial.files[0].content.is_empty());
+    let selected = commit_instruction_observation(&store, Some(&id), partial)
+        .project_instructions
+        .unwrap();
+    assert_eq!(selected.files[0].content, "edited global private");
+    assert_eq!(selected.files[1].content, "short local private");
+    assert!(!selected.scan_complete);
+    // A successful large Project can hide global text; a later local shrink
+    // must restore its bounded source even if the new global read fails.
+    let expanded = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, Some(&large), false, true, 2),
+    )
+    .project_instructions
+    .unwrap();
+    assert!(expanded.files[0].content.is_empty());
+    assert_eq!(expanded.total_chars, MAX_TOTAL_CHARS);
+    let recovered = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, Some("recovered local private"), false, true, 3),
+    )
+    .project_instructions
+    .unwrap();
+    assert_eq!(recovered.files[0].content, "edited global private");
+    assert_eq!(recovered.files[1].content, "recovered local private");
+    assert!(!recovered.files[0].truncated);
+    for snapshot in [&selected, &expanded, &recovered] {
+        assert!(snapshot.total_chars <= MAX_TOTAL_CHARS);
+        assert_eq!(
+            snapshot.total_chars,
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.content.chars().count())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            snapshot.files[0].source_scope,
+            InstructionSourceScope::Runner
+        );
+        assert!(snapshot.files[0].read_more.is_none());
+        assert!(
+            snapshot
+                .scan
+                .as_ref()
+                .unwrap()
+                .runner_source_files
+                .iter()
+                .map(|file| file.chars)
+                .sum::<usize>()
+                <= MAX_TOTAL_CHARS
+        );
+        let public = serde_json::to_value(snapshot).unwrap();
+        assert!(public.get("scan").is_none());
+        let summary = serde_json::to_string(&snapshot.to_summary()).unwrap();
+        for hidden in [
+            "private",
+            "started_at",
+            "instance_verified_at",
+            "runner_source_files",
+        ] {
+            assert!(!summary.contains(hidden));
+        }
+    }
+    // Even an entirely hidden source body cannot leak through snapshot serialization.
+    let public = serde_json::to_string(&expanded).unwrap();
+    assert!(!public.contains("edited global private"));
+    store.flush_persistence();
+    let durable = std::fs::read_to_string(&ledger).unwrap();
+    for hidden in [
+        "private",
+        "project_instructions",
+        "instance_verified_at",
+        "project_started_at",
+        "runner_source_files",
+    ] {
+        assert!(!durable.contains(hidden));
+    }
 }

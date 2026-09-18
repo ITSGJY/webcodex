@@ -238,17 +238,31 @@ Missing or empty configured files confirm removal; other read failures leave
 the Runner scope unavailable. An explicit Session resume refreshes Runner and
 Project scopes independently, retaining an unavailable scope's last-known rules
 only in memory. A newly observed Runner instance or config generation cannot
-inherit the previous global rules, and late older global observations cannot
-restore retired guidance. Retention is scope-wide, not per-file within an
-incomplete scope. Instruction bodies and observation fences are not persisted.
+inherit the previous global rules. Within one instance, a higher known config
+generation wins regardless of request start order; an unknown generation cannot
+replace a known generation. Instance replacement uses live-instance verification
+order, so a late retired-instance observation cannot restore old guidance.
+Within one instance/generation, request observation order breaks ties. Project
+reads have their own start-order fence, independent of Runner availability;
+late Project observations retain newer local rules and report an incomplete
+scan. Retention is scope-wide, not per-file within an incomplete scope.
+Instruction bodies and observation fences are not persisted.
 
 Project-local text reserves its share of the 32 Ki-character snapshot before
-global text is shortened; presentation remains global-before-project. Runner
+global text is shortened; presentation remains global-before-project. Session
+retention selects scopes before applying this shared budget. An independently
+bounded global source copy (at most 32 Ki characters) stays only in Session
+memory, so retaining a short Project scope or later shrinking it can recover
+global text hidden by an earlier aggregate budget. This source copy and all
+observation fences are omitted from public snapshots and summaries. Runner
 sources never receive a Project `read_file` continuation, including during final
 startup byte-budget reduction. `include_project_instructions=false` suppresses
 bodies without skipping observation or change detection. An explicit
 `project.instructions` context request observes current Runner and Project
-sources together, without reusing Session-retained bodies.
+sources together, without reusing Session-retained bodies. The instruction
+projection fits the remaining 20 KiB shared sidecar envelope by dropping derived
+headings before shortening text, preserving source identities and Project rules
+instead of discarding the entire material solely because global sources were added.
 
 ## Local MCP providers
 

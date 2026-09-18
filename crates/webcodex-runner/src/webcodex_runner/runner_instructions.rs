@@ -127,7 +127,10 @@ fn snapshot(generation: u64, config: &InstructionsConfig, started: Instant) -> C
 // trees. Check every component, not only the final AGENTS.md entry. Open the
 // leaf without following links and keep that handle for metadata and content.
 fn open_instruction_file(path: &Path) -> io::Result<File> {
-    for component in path.ancestors() {
+    // Establish parent authority before classifying a missing leaf. A dangling
+    // or redirected parent must remain unavailable, not evidence of removal.
+    let components = path.ancestors().collect::<Vec<_>>();
+    for component in components.into_iter().rev() {
         let metadata = std::fs::symlink_metadata(component)?;
         if metadata_is_link_like(&metadata)
             || (component == path && !metadata.is_file())

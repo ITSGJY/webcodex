@@ -211,15 +211,26 @@ Runner-global source 被截断时保持有界，也不会因此开放 generic ar
 Configured file 确认缺失或为空时移除其 guidance；其他读取失败仍表示 Runner scope
 暂时不可用。显式恢复 Session 时，Runner 与 Project scope 独立更新；不可用的 scope
 只在内存中保留上一份规则。观察到新的 Runner instance 或 config generation 后，
-不会继承旧的全局规则；迟到的旧全局 observation 也不能恢复已撤销的 guidance。
-保留粒度是整个 scope，不是不完整 scope 内的单个文件。规则正文与 observation fence
-不会持久化到 Session records。
+不会继承旧的全局规则。同一 instance 内，已知的较高 config generation 优先于请求
+开始顺序；未知 generation 不能替换已知 generation。Instance 替换按 live-instance
+验证顺序判断，迟到的旧 instance observation 不能恢复已撤销的 guidance。
+同一 instance/generation 内按请求 observation 顺序判断。Project 读取有独立的
+开始顺序 fence，不依赖 Runner 是否可用；迟到的 Project observation 保留较新的
+本地规则，并将 scan 标记为 incomplete。保留粒度是整个 scope，不是不完整 scope
+内的单个文件。规则正文与 observation fence 不会持久化到 Session records。
 
 32 Ki-character snapshot 会先为 Project-local 正文预留预算，再缩短全局正文；
-展示顺序仍为 global-before-project。即使最终 startup byte budget 再次截断，Runner
+展示顺序仍为 global-before-project。Session retention 先选择各 scope，再应用共享
+预算。独立限于 32 Ki characters 的全局来源副本仅保留在 Session 内存中，因此保留
+较短的 Project scope，或后续本地正文缩短时，都能恢复之前被共享预算隐藏的全局正文。
+此来源副本与所有 observation fence 均不进入 public snapshot 或 summary。
+即使最终 startup byte budget 再次截断，Runner
 source 也不会获得 Project `read_file` continuation。`include_project_instructions=false`
 只省略正文，不跳过 observation/change detection。显式 `project.instructions` context
 请求同时观察当前 Runner 与 Project source，不复用 Session 中保留的正文。
+Instruction projection 按共享 sidecar 的 20 KiB 剩余预算裁剪：先移除由正文派生的
+heading 索引，再缩短正文；保留 source identity 和 Project 规则，避免仅因新增全局
+source 就丢弃整份 context material。
 
 ## 本地 MCP provider
 

@@ -1490,6 +1490,7 @@ impl RunnerRegistry {
         let view = Self::runner_view_locked(inner, client_id)?;
         Some(RunnerSemanticView {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         })
     }

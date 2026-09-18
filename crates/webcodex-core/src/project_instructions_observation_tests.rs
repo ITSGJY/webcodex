@@ -61,3 +61,39 @@ fn composing_runner_sources_preserves_project_continuation() {
         MAX_LINES_PER_FILE
     );
 }
+
+#[test]
+fn pre_projection_runner_sources_have_an_independent_aggregate_bound() {
+    let runner_files = (0..2)
+        .flat_map(|index| {
+            source(
+                InstructionSourceScope::Runner,
+                &format!("runner/{index}/rules.md"),
+                &"界".repeat(MAX_TOTAL_CHARS),
+            )
+            .files
+        })
+        .collect();
+    let project = source(
+        InstructionSourceScope::Project,
+        "AGENTS.md",
+        "local guidance",
+    );
+    let snapshot = ProjectInstructionsSnapshot::with_runner_files(runner_files, project, true);
+    let sources = &snapshot.scan.as_ref().unwrap().runner_source_files;
+    assert_eq!(
+        sources.iter().map(|file| file.chars).sum::<usize>(),
+        MAX_TOTAL_CHARS
+    );
+    assert_eq!(sources[0].content.chars().count(), MAX_TOTAL_CHARS);
+    assert!(sources[1].content.is_empty());
+    assert!(sources[1].truncated);
+    assert!(sources.iter().all(|file| file.read_more.is_none()));
+    assert!(snapshot.total_chars <= MAX_TOTAL_CHARS);
+    assert_eq!(snapshot.files.last().unwrap().content, "local guidance");
+    let serialized = serde_json::to_value(&snapshot).unwrap();
+    assert!(serialized.get("scan").is_none());
+    assert!(!serde_json::to_string(&serialized).unwrap().contains('界'));
+    let restored: ProjectInstructionsSnapshot = serde_json::from_value(serialized).unwrap();
+    assert!(restored.scan.is_none());
+}
