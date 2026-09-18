@@ -4977,3 +4977,150 @@ async fn work_on_project_guidance_profile_is_request_local_and_not_durable() {
         Some("root objective")
     );
 }
+
+#[tokio::test]
+async fn runner_instruction_refresh_keeps_local_changes_and_observes_suppressed_removals() {
+    let root = tempfile::tempdir().unwrap();
+    seed_coding_repository(root.path(), "LOCAL_INITIAL_RULE");
+    let runtime = ToolRuntime::new_for_tests();
+    register_agent_with_projects(
+        &runtime,
+        "instruction-refresh",
+        None,
+        RunnerCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            file_write: true,
+            lsp_read_only_navigation: true,
+            internal_posix_script: true,
+            instruction_runtime: true,
+            ..Default::default()
+        },
+        vec![registered_project("demo", &root.path().to_string_lossy())],
+    )
+    .await;
+    let project = crate::tool_runtime::runner_project_runtime_id("instruction-refresh", "demo");
+    let auth = auth_context(None, true);
+    let mut global: RunnerInstructionSnapshotResponse = serde_json::from_str(
+        &runner_instruction_snapshot_stdout(&"g".repeat(32 * 1024), 7),
+    )
+    .unwrap();
+    for index in 1..16 {
+        let mut file = global.files[0].clone();
+        file.path = format!("runner/{index}/extra.md");
+        file.content.clear();
+        file.chars = 0;
+        file.truncated = true;
+        global.files.push(file);
+    }
+    let global = serde_json::to_string(&global).unwrap();
+    let (first, _) = dispatch_recording_startup_requests_with_runner_instructions(
+        &runtime,
+        "instruction-refresh",
+        work_on_project_call(&project, "initial", None),
+        Some(&auth),
+        "instruction-window",
+        &global,
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let id = first.output["session_id"].as_str().unwrap();
+    let sources = first.output["instructions"]["sources"].as_array().unwrap();
+    assert!(sources.iter().any(|source| source["content"]
+        .as_str()
+        .is_some_and(|body| body.contains("LOCAL_INITIAL_RULE"))));
+    assert_eq!(sources.len(), 17);
+    assert!(sources[0].get("read_more").is_none());
+    assert!(serde_json::to_vec(&first.output).unwrap().len() <= 30 * 1024);
+
+    std::fs::write(root.path().join("AGENTS.md"), "LOCAL_UPDATED_RULE").unwrap();
+    let (failed, _) = dispatch_recording_startup_requests_with_runner_instructions(
+        &runtime,
+        "instruction-refresh",
+        work_on_project_call(&project, "global refresh fails", Some(id)),
+        Some(&auth),
+        "instruction-window",
+        "invalid snapshot",
+    )
+    .await;
+    assert!(failed.success, "{:?}", failed.error);
+    assert_eq!(failed.output["instructions"]["status"], "unavailable");
+    assert!(failed.output["instructions"]["changed_sources"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("AGENTS.md")));
+    let summary = runtime
+        .sessions
+        .summary(id, None)
+        .unwrap()
+        .project_instructions
+        .unwrap();
+    let updated = summary
+        .files
+        .iter()
+        .find(|file| file.path == "AGENTS.md")
+        .unwrap()
+        .fingerprint
+        .clone();
+
+    std::fs::remove_file(root.path().join("AGENTS.md")).unwrap();
+    let (suppressed, requests) = dispatch_recording_startup_requests_with_runner_instructions(
+        &runtime,
+        "instruction-refresh",
+        work_on_project_call_with_instruction_projection(
+            &project,
+            "observe deletion silently",
+            Some(id),
+            false,
+        ),
+        Some(&auth),
+        "instruction-window",
+        "invalid snapshot",
+    )
+    .await;
+    assert!(suppressed.success, "{:?}", suppressed.error);
+    assert!(requests
+        .iter()
+        .any(|kind| kind == RUNNER_INSTRUCTION_REQUEST_KIND));
+    assert!(suppressed.output["instructions"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|source| source.get("content").is_none()));
+    let summary = runtime
+        .sessions
+        .summary(id, None)
+        .unwrap()
+        .project_instructions
+        .unwrap();
+    assert!(summary.files.iter().all(|file| file.fingerprint != updated));
+    assert!(summary.files.iter().all(|file| file.path != "AGENTS.md"));
+
+    let empty = serde_json::to_string(&RunnerInstructionSnapshotResponse {
+        format: RUNNER_INSTRUCTION_RESPONSE_FORMAT.into(),
+        generation: 7,
+        scan_complete: true,
+        files: Vec::new(),
+    })
+    .unwrap();
+    let (removed, _) = dispatch_recording_startup_requests_with_runner_instructions(
+        &runtime,
+        "instruction-refresh",
+        work_on_project_call(&project, "global removed", Some(id)),
+        Some(&auth),
+        "instruction-window",
+        &empty,
+    )
+    .await;
+    assert!(removed.success, "{:?}", removed.error);
+    assert!(removed.output["instructions"]["changed_sources"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("runner/0/AGENTS.md")));
+    assert!(removed.output["instructions"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|source| source["source_scope"] != "runner"));
+}

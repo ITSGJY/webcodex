@@ -1585,3 +1585,208 @@ fn validation_job_terminal_projects_typed_runner_lifecycle_without_absorbing_act
         );
     }
 }
+
+fn instruction_observation(
+    runner: Option<&str>,
+    project: Option<&str>,
+    runner_complete: bool,
+    project_complete: bool,
+    instance: &str,
+    generation: u64,
+    started_at: std::time::Instant,
+) -> webcodex_core::project_instructions::ProjectInstructionsSnapshot {
+    use webcodex_core::project_instructions::*;
+    let candidate = |scope, path: &str, content: &str| LoadedInstructionCandidate {
+        source_scope: scope,
+        path: path.into(),
+        content: content.into(),
+        total_lines: 1,
+        full_sha256: None,
+    };
+    let runner = ProjectInstructionsSnapshot::from_candidates(
+        runner
+            .map(|body| candidate(InstructionSourceScope::Runner, "runner/0/rules.md", body))
+            .into_iter()
+            .collect(),
+        runner_complete,
+    );
+    let project = ProjectInstructionsSnapshot::from_candidates(
+        project
+            .map(|body| candidate(InstructionSourceScope::Project, "AGENTS.md", body))
+            .into_iter()
+            .collect(),
+        project_complete,
+    );
+    let mut combined =
+        ProjectInstructionsSnapshot::with_runner_files(runner.files, project, runner_complete);
+    combined.scan.as_mut().unwrap().runner = Some(RunnerInstructionObservation {
+        instance_id: instance.into(),
+        generation: Some(generation),
+        started_at,
+    });
+    combined
+}
+
+fn commit_instruction_observation(
+    store: &SessionStore,
+    session_id: Option<&str>,
+    snapshot: webcodex_core::project_instructions::ProjectInstructionsSnapshot,
+) -> CodingSessionOutcome {
+    store
+        .ensure_coding_session(CodingSessionRequest {
+            project: "agent:instructions:demo".into(),
+            authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.into(),
+            resume_session_id: session_id.map(str::to_string),
+            instruction: Some("observe instructions".into()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: Some(snapshot),
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        })
+        .unwrap()
+}
+
+#[test]
+fn instruction_scopes_refresh_and_remove_independently_without_persisting_bodies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let at = std::time::Instant::now();
+    let observe = |runner, project, rc, pc| {
+        instruction_observation(runner, project, rc, pc, "instance", 1, at)
+    };
+    let first = commit_instruction_observation(
+        &store,
+        None,
+        observe(
+            Some("global private body"),
+            Some("local private body"),
+            true,
+            true,
+        ),
+    );
+    let id = first.summary.session_id;
+    let resumed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, Some("local edited body"), false, true),
+    );
+    let snapshot = resumed.project_instructions.unwrap();
+    assert!(!snapshot.scan_complete);
+    assert_eq!(snapshot.files[0].content, "global private body");
+    assert_eq!(snapshot.files[1].content, "local edited body");
+    assert_eq!(
+        resumed.summary.project_instructions.unwrap().files[1].fingerprint,
+        snapshot.files[1].fingerprint
+    );
+    let removed =
+        commit_instruction_observation(&store, Some(&id), observe(None, None, true, false));
+    let snapshot = removed.project_instructions.unwrap();
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].content, "local edited body");
+    let removed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("global updated body"), None, true, true),
+    );
+    let snapshot = removed.project_instructions.unwrap();
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].content, "global updated body");
+    // Confirm the converse: a project failure cannot block a global edit.
+    let updated = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("global newest body"), None, true, false),
+    );
+    assert_eq!(
+        updated.project_instructions.unwrap().files[0].content,
+        "global newest body"
+    );
+    store.flush_persistence();
+    let serialized = std::fs::read_to_string(&ledger).unwrap();
+    for body in [
+        "global private body",
+        "local private body",
+        "local edited body",
+        "global updated body",
+        "global newest body",
+    ] {
+        assert!(!serialized.contains(body));
+    }
+    assert!(!serialized.contains("project_instructions"));
+}
+
+#[test]
+fn instruction_observation_cannot_revive_obsolete_generation_or_runner() {
+    let store = SessionStore::default();
+    let at = std::time::Instant::now();
+    let next = at + std::time::Duration::from_secs(1);
+    let observe = |body, complete, instance, generation, time| {
+        instruction_observation(
+            body,
+            Some("local"),
+            complete,
+            true,
+            instance,
+            generation,
+            time,
+        )
+    };
+    let first =
+        commit_instruction_observation(&store, None, observe(Some("old global"), true, "a", 1, at));
+    let id = first.summary.session_id;
+    // Failure under a newly observed config retires the old config's body.
+    let failed =
+        commit_instruction_observation(&store, Some(&id), observe(None, false, "a", 2, next));
+    assert!(failed
+        .project_instructions
+        .unwrap()
+        .files
+        .iter()
+        .all(|file| file.content != "old global"));
+    let late = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("old global"), true, "a", 1, next),
+    );
+    assert!(late
+        .project_instructions
+        .unwrap()
+        .files
+        .iter()
+        .all(|file| file.content != "old global"));
+    let replacement = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("new runner"), true, "b", 1, next),
+    );
+    assert_eq!(
+        replacement.project_instructions.unwrap().files[0].content,
+        "new runner"
+    );
+    let late = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("old runner"), true, "a", 3, at),
+    );
+    assert_eq!(
+        late.project_instructions.unwrap().files[0].content,
+        "new runner"
+    );
+    // A transient failure from that same instance/config preserves its rule.
+    let failed =
+        commit_instruction_observation(&store, Some(&id), observe(None, false, "b", 1, next));
+    assert_eq!(
+        failed.project_instructions.unwrap().files[0].content,
+        "new runner"
+    );
+    let replacement_failed =
+        commit_instruction_observation(&store, Some(&id), observe(None, false, "c", 1, next));
+    assert_eq!(
+        replacement_failed.project_instructions.unwrap().files.len(),
+        1
+    );
+}

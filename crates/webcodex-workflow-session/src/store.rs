@@ -707,15 +707,10 @@ impl SessionStore {
                     record.execution_context = next_execution_context;
                     record.updated_at = now;
                     if let Some(project_instructions) = request.project_instructions {
-                        // A transient runner/read failure must not erase the
-                        // last complete in-memory rules snapshot. Fresh
-                        // sessions may still retain a partial/unavailable
-                        // snapshot so startup can report it conservatively.
-                        if project_instructions.scan_complete
-                            || record.project_instructions.is_none()
-                        {
-                            record.project_instructions = Some(project_instructions);
-                        }
+                        record.project_instructions = Some(
+                            project_instructions
+                                .retain_unavailable_scopes(record.project_instructions.as_ref()),
+                        );
                     }
                     record.events.push_back(Arc::new(event));
                     record.events_observed = record.events_observed.saturating_add(1);
@@ -728,6 +723,11 @@ impl SessionStore {
                     .summary(&session_id, Some(DEFAULT_SUMMARY_LIMIT))
                     .expect("continued session must summarize");
                 CodingSessionOutcome {
+                    project_instructions: inner
+                        .sessions
+                        .get(&session_id)
+                        .and_then(StoredSession::hot)
+                        .and_then(|record| record.project_instructions.clone()),
                     summary,
                     pre_instruction_summary: Some(pre_instruction_summary),
                     reused: true,
@@ -792,8 +792,10 @@ impl SessionStore {
                     completion_assignment_fence_tracking_complete: true,
                     project_instructions: request.project_instructions,
                 };
+                let project_instructions = record.project_instructions.clone();
                 let summary = inner.insert_session(record);
                 CodingSessionOutcome {
+                    project_instructions,
                     summary,
                     pre_instruction_summary: None,
                     reused: false,

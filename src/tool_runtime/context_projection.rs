@@ -193,7 +193,7 @@ impl ToolRuntime {
                             let project =
                                 resolved_project.expect("registry requires project target");
                             let snapshot =
-                                self.load_coding_project_instructions(&project.config).await;
+                                self.load_effective_coding_instructions(project, auth).await;
                             let projection = project_instructions_context_projection(&snapshot);
                             if snapshot.scan_complete {
                                 json!({

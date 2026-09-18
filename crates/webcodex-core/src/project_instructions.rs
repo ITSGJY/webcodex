@@ -77,6 +77,23 @@ pub struct ProjectInstructionFileSummary {
     pub read_more: Option<ReadMoreHint>,
 }
 
+/// Control-owned observation state. Never serialized into model projections or
+/// durable Session records. Generation is unknown during transport failures when
+/// the Runner has not advertised config status.
+#[derive(Debug, Clone)]
+pub struct RunnerInstructionObservation {
+    pub instance_id: String,
+    pub generation: Option<u64>,
+    pub started_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstructionScanState {
+    pub runner_complete: bool,
+    pub project_complete: bool,
+    pub runner: Option<RunnerInstructionObservation>,
+}
+
 /// Bounded snapshot of loaded project instructions (with content). Stored only
 /// on the in-memory `SessionRecord`; durable persistence deliberately drops it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +108,8 @@ pub struct ProjectInstructionsSnapshot {
     /// the owning runner/capability/read operation was unavailable. Missing
     /// files and empty files are successful observations.
     pub scan_complete: bool,
+    #[serde(skip)]
+    pub scan: Option<InstructionScanState>,
     pub note: String,
 }
 
@@ -140,6 +159,7 @@ impl ProjectInstructionsSnapshot {
             max_total_chars: MAX_TOTAL_CHARS,
             truncated: false,
             scan_complete: true,
+            scan: None,
             note: PROJECT_INSTRUCTIONS_NOTE.to_string(),
         }
     }
@@ -202,6 +222,7 @@ impl ProjectInstructionsSnapshot {
             max_total_chars: MAX_TOTAL_CHARS,
             truncated,
             scan_complete,
+            scan: None,
             note: PROJECT_INSTRUCTIONS_NOTE.to_string(),
         }
     }
@@ -236,6 +257,84 @@ impl ProjectInstructionsSnapshot {
 }
 
 impl ProjectInstructionsSnapshot {
+    pub fn scope_complete(&self, scope: InstructionSourceScope) -> bool {
+        self.scan
+            .as_ref()
+            .map_or(self.scan_complete, |scan| match scope {
+                InstructionSourceScope::Runner => scan.runner_complete,
+                InstructionSourceScope::Project => scan.project_complete,
+            })
+    }
+
+    /// Retain each unavailable scope independently, under the Session store
+    /// lock. A new Runner/config must never inherit the old global rule body.
+    pub fn retain_unavailable_scopes(mut self, previous: Option<&Self>) -> Self {
+        let Some(previous) = previous else {
+            return self;
+        };
+        let incoming = self.scan.as_ref().and_then(|scan| scan.runner.as_ref());
+        let prior = previous.scan.as_ref().and_then(|scan| scan.runner.as_ref());
+        let stale = incoming.zip(prior).is_some_and(|(new, old)| {
+            new.started_at < old.started_at
+                || (new.instance_id == old.instance_id
+                    && new
+                        .generation
+                        .zip(old.generation)
+                        .is_some_and(|(new, old)| new < old))
+        });
+        let same_runner = incoming
+            .zip(prior)
+            .map_or(incoming.is_none(), |(new, old)| {
+                new.instance_id == old.instance_id
+                    && new
+                        .generation
+                        .map_or(true, |generation| Some(generation) == old.generation)
+            });
+        let retain_runner =
+            stale || (!self.scope_complete(InstructionSourceScope::Runner) && same_runner);
+        let retain_project = !self.scope_complete(InstructionSourceScope::Project);
+        let runner_files = if retain_runner {
+            &previous.files
+        } else {
+            &self.files
+        }
+        .iter()
+        .filter(|file| file.source_scope == InstructionSourceScope::Runner)
+        .cloned()
+        .collect();
+        let project_files = if retain_project {
+            &previous.files
+        } else {
+            &self.files
+        }
+        .iter()
+        .filter(|file| file.source_scope == InstructionSourceScope::Project)
+        .cloned()
+        .collect::<Vec<_>>();
+        let mut scan = self.scan.take().unwrap_or(InstructionScanState {
+            runner_complete: self.scan_complete,
+            project_complete: self.scan_complete,
+            runner: None,
+        });
+        if retain_runner {
+            scan.runner = prior.cloned();
+        }
+        if stale {
+            scan.runner_complete = false;
+        }
+        let project = Self {
+            loaded: !project_files.is_empty(),
+            total_chars: project_files.iter().map(|file| file.chars).sum(),
+            truncated: project_files.iter().any(|file| file.truncated),
+            files: project_files,
+            scan_complete: scan.project_complete,
+            ..Self::empty()
+        };
+        let mut combined = Self::with_runner_files(runner_files, project, scan.runner_complete);
+        combined.scan = Some(scan);
+        combined
+    }
+
     /// Compose one bounded startup snapshot with Runner-configured sources first,
     /// followed by project-local sources. Runner sources never gain a generic
     /// read-more path; project-local read-more hints remain project-relative.
@@ -244,14 +343,17 @@ impl ProjectInstructionsSnapshot {
         project: Self,
         runner_scan_complete: bool,
     ) -> Self {
-        let mut remaining_chars = MAX_TOTAL_CHARS;
+        // Reserve the already-bounded project body before spending on global
+        // guidance. Presentation order remains global-before-project.
+        let project_chars: usize = project.files.iter().map(|file| file.chars).sum();
+        let mut remaining_chars = MAX_TOTAL_CHARS.saturating_sub(project_chars);
         let mut files = Vec::with_capacity(runner_files.len() + project.files.len());
-        for mut file in runner_files.into_iter().chain(project.files.into_iter()) {
+        for mut file in runner_files {
+            file.read_more = None;
             let original_chars = file.content.chars().count();
             if original_chars > remaining_chars {
                 let mut kept = String::new();
                 let mut chars = 0usize;
-                let mut lines_kept = 0usize;
                 for (index, line) in file.content.lines().enumerate() {
                     let line_chars = line.chars().count();
                     let separator = usize::from(index > 0);
@@ -263,24 +365,15 @@ impl ProjectInstructionsSnapshot {
                     }
                     kept.push_str(line);
                     chars += separator + line_chars;
-                    lines_kept += 1;
                 }
                 file.content = kept;
                 file.chars = chars;
                 file.truncated = true;
-                if file.source_scope == InstructionSourceScope::Project {
-                    file.read_more = Some(ReadMoreHint {
-                        path: file.path.clone(),
-                        start_line: lines_kept.saturating_add(1),
-                        limit: MAX_LINES_PER_FILE,
-                    });
-                } else {
-                    file.read_more = None;
-                }
             }
             remaining_chars = remaining_chars.saturating_sub(file.chars);
             files.push(file);
         }
+        files.extend(project.files);
         let total_chars = files.iter().map(|file| file.chars).sum();
         let truncated = files.iter().any(|file| file.truncated);
         Self {
@@ -290,6 +383,11 @@ impl ProjectInstructionsSnapshot {
             total_chars,
             max_total_chars: MAX_TOTAL_CHARS,
             truncated,
+            scan: Some(InstructionScanState {
+                runner_complete: runner_scan_complete,
+                project_complete: project.scan_complete,
+                runner: None,
+            }),
             scan_complete: runner_scan_complete && project.scan_complete,
             note: PROJECT_INSTRUCTIONS_NOTE.to_string(),
         }
@@ -606,3 +704,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "project_instructions_observation_tests.rs"]
+mod observation_tests;

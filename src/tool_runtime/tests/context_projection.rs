@@ -800,3 +800,109 @@ async fn context_projection_coexists_without_context_ack_and_with_attention() {
     assert!(!audit.contains("context_projection"));
     assert!(!audit.contains("webcodex.coding_workflow"));
 }
+
+#[tokio::test]
+async fn project_instructions_context_includes_runner_global_sources() {
+    use webcodex_core::project_instructions::{
+        InstructionSourceScope, LoadedInstructionCandidate, ProjectInstructionsSnapshot,
+    };
+    use webcodex_core::runner_instruction::{
+        RunnerInstructionSnapshotResponse, RUNNER_INSTRUCTION_REQUEST_KIND,
+        RUNNER_INSTRUCTION_RESPONSE_FORMAT,
+    };
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    std::fs::write(root.path().join("AGENTS.md"), "local sidecar rule").unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    register_agent_with_projects(
+        &runtime,
+        "context-global",
+        None,
+        RunnerCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            internal_posix_script: true,
+            instruction_runtime: true,
+            ..Default::default()
+        },
+        vec![registered_project("demo", &root.path().to_string_lossy())],
+    )
+    .await;
+    let project = crate::tool_runtime::runner_project_runtime_id("context-global", "demo");
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+                    ToolCall::GitStatus {
+                        project,
+                        session_id: None,
+                    },
+                    Some(&auth_context(None, true)),
+                    SessionTransport::Mcp,
+                    Default::default(),
+                    None,
+                    true,
+                    vec!["project.instructions".into()],
+                    super::super::context_projection::ContextMaterialCapabilities::default(),
+                )
+                .await
+        }
+    });
+    let snapshot = ProjectInstructionsSnapshot::from_candidates(
+        vec![LoadedInstructionCandidate {
+            source_scope: InstructionSourceScope::Runner,
+            path: "runner/0/global.md".into(),
+            content: "global sidecar rule".into(),
+            total_lines: 1,
+            full_sha256: None,
+        }],
+        true,
+    );
+    let stdout = serde_json::to_string(&RunnerInstructionSnapshotResponse {
+        format: RUNNER_INSTRUCTION_RESPONSE_FORMAT.into(),
+        generation: 1,
+        scan_complete: true,
+        files: snapshot.files,
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "global context fixture timed out"
+        );
+        if let Some(request) = probe_patch_agent_request(&runtime, "context-global").await {
+            if request.kind == RUNNER_INSTRUCTION_REQUEST_KIND {
+                complete_patch_agent_request(
+                    &runtime,
+                    "context-global",
+                    &request.request_id,
+                    0,
+                    &stdout,
+                    "",
+                )
+                .await;
+            } else {
+                complete_agent_request_by_running_locally(&runtime, "context-global", request)
+                    .await;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    let material = context_material(&result, "project.instructions");
+    assert_eq!(material["status"], "available");
+    assert_eq!(
+        material["projection"]["sources"][0]["content"],
+        "global sidecar rule"
+    );
+    assert!(material["projection"]["sources"][0]["read_more"].is_null());
+    assert_eq!(
+        material["projection"]["sources"][1]["content"],
+        "local sidecar rule"
+    );
+}

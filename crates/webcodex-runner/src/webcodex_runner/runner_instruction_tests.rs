@@ -118,3 +118,19 @@ fn instruction_snapshot_rejects_parent_symlink_redirection() {
     assert!(!result.scan_complete);
     assert!(result.files.is_empty());
 }
+
+#[test]
+fn instruction_snapshot_observes_confirmed_removal_and_empty_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().canonicalize().unwrap().join("AGENTS.md");
+    std::fs::write(&path, "global guidance").unwrap();
+    assert_eq!(observe(&path).files.len(), 1);
+    std::fs::remove_file(&path).unwrap();
+    let removed = observe(&path);
+    assert!(removed.scan_complete);
+    assert!(removed.files.is_empty());
+    std::fs::write(&path, "").unwrap();
+    let empty = observe(&path);
+    assert!(empty.scan_complete);
+    assert!(empty.files.is_empty());
+}

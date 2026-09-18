@@ -39,6 +39,9 @@ fn snapshot(generation: u64, config: &InstructionsConfig, started: Instant) -> C
     for (index, configured) in config.files.iter().enumerate() {
         let file = match open_instruction_file(configured) {
             Ok(file) => file,
+            // A confirmed missing file withdraws its guidance. Permission and
+            // other read failures remain unavailable, not deletion evidence.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(_) => {
                 scan_complete = false;
                 continue;

@@ -700,7 +700,7 @@ fn instructions_projection(
         && (matches!(status, "loaded" | "changed")
             || (status == "reused" && include_reused_content)
             || (status == "unavailable" && !current.files.is_empty()));
-    let changed_sources = if status == "changed" {
+    let changed_sources = if matches!(status, "changed" | "unavailable") {
         changed_instruction_sources(current, previous)
     } else {
         Vec::new()
@@ -748,7 +748,7 @@ fn instruction_status(
             "not_found"
         };
     }
-    let Some(previous) = previous.filter(|snapshot| snapshot.scan_complete) else {
+    let Some(previous) = previous else {
         return "loaded";
     };
     if force_load {
@@ -802,6 +802,9 @@ fn changed_instruction_sources(
     identities
         .into_iter()
         .filter_map(|(scope, path)| {
+            if !current.scope_complete(scope) {
+                return None;
+            }
             let current_file = current
                 .files
                 .iter()
@@ -1515,7 +1518,11 @@ fn enforce_hard_size_limit(brief: &mut Value) {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let read_more = projected_read_more(&path, &bounded);
+        let read_more = if source["source_scope"] == "project" {
+            projected_read_more(&path, &bounded)
+        } else {
+            Value::Null
+        };
         source["content"] = json!(bounded);
         source["truncated"] = json!(true);
         source["read_more"] = read_more;
@@ -1614,7 +1621,11 @@ fn enforce_hard_size_limit(brief: &mut Value) {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let read_more = projected_read_more(&path, &bounded);
+        let read_more = if source["source_scope"] == "project" {
+            projected_read_more(&path, &bounded)
+        } else {
+            Value::Null
+        };
         source["content"] = json!(bounded);
         source["truncated"] = json!(true);
         source["read_more"] = read_more;
@@ -2376,3 +2387,7 @@ mod tests {
             .any(|action| action.starts_with("rerun focused target 0")));
     }
 }
+
+#[cfg(test)]
+#[path = "tests/startup_instructions_projection.rs"]
+mod instruction_tests;

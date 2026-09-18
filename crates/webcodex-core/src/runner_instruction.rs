@@ -61,7 +61,9 @@ impl RunnerInstructionSnapshotResponse {
             if file.source_scope != InstructionSourceScope::Runner {
                 return Err("Runner instruction response contains non-Runner source");
             }
-            if !valid_runner_logical_source(&file.path) || !sources.insert(file.path.as_str()) {
+            if !valid_runner_logical_source(&file.path)
+                || !sources.insert(file.path.split('/').nth(1))
+            {
                 return Err("Runner instruction response contains invalid logical source");
             }
             if file.read_more.is_some() {
@@ -116,7 +118,11 @@ fn valid_runner_logical_source(path: &str) -> bool {
     let index = parts.next();
     let basename = parts.next();
     scope == Some("runner")
-        && index.is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+        && index.is_some_and(|index| {
+            index.parse::<usize>().is_ok_and(|slot| {
+                slot < RUNNER_INSTRUCTION_RESPONSE_MAX_FILES && slot.to_string() == index
+            })
+        })
         && basename.is_some_and(|name| {
             !name.is_empty() && name.len() <= 255 && name != "." && name != ".."
         })
@@ -179,5 +185,37 @@ mod tests {
         assert!(!valid_runner_logical_source(
             "runner/not-an-index/AGENTS.md"
         ));
+    }
+
+    #[test]
+    fn logical_runner_source_indices_are_bounded_and_unique() {
+        for index in ["16".to_string(), "01".to_string(), "9".repeat(1024)] {
+            assert!(!valid_runner_logical_source(&format!(
+                "runner/{index}/rules.md"
+            )));
+        }
+        let files = crate::project_instructions::ProjectInstructionsSnapshot::from_candidates(
+            ["runner/0/first.md", "runner/0/second.md"]
+                .into_iter()
+                .map(
+                    |path| crate::project_instructions::LoadedInstructionCandidate {
+                        source_scope: InstructionSourceScope::Runner,
+                        path: path.into(),
+                        content: "rule".into(),
+                        total_lines: 1,
+                        full_sha256: None,
+                    },
+                )
+                .collect(),
+            true,
+        )
+        .files;
+        let response = RunnerInstructionSnapshotResponse {
+            format: RUNNER_INSTRUCTION_RESPONSE_FORMAT.into(),
+            generation: 1,
+            scan_complete: true,
+            files,
+        };
+        assert!(response.validate().is_err());
     }
 }

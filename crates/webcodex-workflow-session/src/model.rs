@@ -353,6 +353,8 @@ pub struct CodingSessionRequest {
 
 #[derive(Debug, Clone)]
 pub struct CodingSessionOutcome {
+    /// In-memory observation after independent scope retention and stale fencing.
+    pub project_instructions: Option<ProjectInstructionsSnapshot>,
     pub summary: SessionSummary,
     /// For a reused/resumed session, a bounded summary taken *before* the new
     /// `task_instruction` was appended. Continuation feedback projects over this

@@ -425,12 +425,29 @@ pub(crate) fn dispatch_request_with_outcome(
                 .map(|_| true)
         }
         RunnerOperation::RunnerInstruction(operation) => {
-            let result = handle_runner_instruction_request(
+            let mut result = handle_runner_instruction_request(
                 config.generation,
                 &config.instructions,
                 operation,
             );
-            sink.submit_result_with_metadata(request_id, result, config, runtime)
+            let current = runtime.snapshot();
+            if current.generation != config.generation {
+                // Carry the new generation in the typed response itself. The
+                // best-effort metadata envelope follows the result and may not
+                // have reached Control when it decides which rules to retain.
+                result.stdout = Some(serde_json::to_string(
+                    &webcodex_core::runner_instruction::RunnerInstructionSnapshotResponse {
+                        format: webcodex_core::runner_instruction::RUNNER_INSTRUCTION_RESPONSE_FORMAT.into(),
+                        generation: current.generation,
+                        scan_complete: false,
+                        files: Vec::new(),
+                    },
+                ).expect("instruction snapshot serialization"));
+                result.exit_code = Some(0);
+                result.stderr = None;
+                result.error = None;
+            }
+            sink.submit_result_with_metadata(request_id, result, &current, runtime)
                 .map(|_| true)
         }
         RunnerOperation::RunnerConfig(operation) => {

@@ -233,6 +233,23 @@ Runner-global instructions independently; v1 does not retain or suppress them
 across Projects. Truncated Runner-global sources stay bounded and do not create a
 generic arbitrary-file `read_more` authority.
 
+
+Missing or empty configured files confirm removal; other read failures leave
+the Runner scope unavailable. An explicit Session resume refreshes Runner and
+Project scopes independently, retaining an unavailable scope's last-known rules
+only in memory. A newly observed Runner instance or config generation cannot
+inherit the previous global rules, and late older global observations cannot
+restore retired guidance. Retention is scope-wide, not per-file within an
+incomplete scope. Instruction bodies and observation fences are not persisted.
+
+Project-local text reserves its share of the 32 Ki-character snapshot before
+global text is shortened; presentation remains global-before-project. Runner
+sources never receive a Project `read_file` continuation, including during final
+startup byte-budget reduction. `include_project_instructions=false` suppresses
+bodies without skipping observation or change detection. An explicit
+`project.instructions` context request observes current Runner and Project
+sources together, without reusing Session-retained bodies.
+
 ## Local MCP providers
 
 The Runner can directly host persistent stdio MCP providers for WebCodex's built-in MCP gateway:

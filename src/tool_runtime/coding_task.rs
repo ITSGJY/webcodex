@@ -1067,6 +1067,10 @@ impl ToolRuntime {
                 );
             }
         };
+        let project_instructions = session_outcome
+            .project_instructions
+            .as_ref()
+            .unwrap_or(&project_instructions);
         let session_summary = &session_outcome.summary;
         let mut connection_state = runtime_status
             .get("connection_layers")
@@ -1159,7 +1163,7 @@ impl ToolRuntime {
             "runtime_status": runtime_status.clone(),
             "connection_state": connection_state,
             "authority": authority_profile_payload(),
-            "rules": rules_summary(Some(&project_instructions)),
+            "rules": rules_summary(Some(project_instructions)),
             "git": git.clone(),
             "semantic_navigation": semantic_navigation.clone(),
             "recommended_flow": recommended_flow,
@@ -1212,7 +1216,7 @@ impl ToolRuntime {
             continuation_kind,
             reused: session_outcome.reused,
             resume_requested,
-            instructions: &project_instructions,
+            instructions: project_instructions,
             previous_instructions,
             force_instruction_load,
             include_project_instructions: startup.include_project_instructions,
@@ -2558,10 +2562,13 @@ fn project_work_on_project_output_with_workflow_inner(
             None,
         );
     }
-    if projection.instructions.sources.len() > 5 {
+    if projection.instructions.sources.len()
+        > webcodex_core::runner_instruction::RUNNER_INSTRUCTION_RESPONSE_MAX_FILES
+            + super::project_instructions::INSTRUCTION_CANDIDATE_PATHS.len()
+    {
         return work_on_project_projection_failed(
             "instructions.sources",
-            "at most 5 source objects",
+            "at most 21 source objects",
             "invalid array contents",
             None,
         );
