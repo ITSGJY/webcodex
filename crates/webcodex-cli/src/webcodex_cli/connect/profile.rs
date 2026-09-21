@@ -282,7 +282,16 @@ pub(super) fn read_existing_runner_config(
     validate_existing_regular_file(path)?;
     let content = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read Runner config {}: {error}", path.display()))?;
-    toml::from_str(&content)
+    let document: TomlValue = toml::from_str(&content)
+        .map_err(|error| format!("failed to parse Runner config {}: {error}", path.display()))?;
+    if document.get("projects_dir").is_some() {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir' instead"
+                .to_string(),
+        );
+    }
+    document
+        .try_into()
         .map(Some)
         .map_err(|error| format!("failed to parse Runner config {}: {error}", path.display()))
 }
