@@ -497,7 +497,10 @@ fn runner_cli_config_env_rejects_retired_alias_when_defaults_are_consulted() {
         .remove("WEBCODEX_RUNNER_CONFIG")
         .set("WEBCODEX_AGENT_CONFIG", "/tmp/agent.toml");
     let error = parse_runner_args(std::iter::empty::<&str>()).unwrap_err();
-    assert!(error.contains("WEBCODEX_AGENT_CONFIG is retired"), "{error}");
+    assert!(
+        error.contains("WEBCODEX_AGENT_CONFIG is retired"),
+        "{error}"
+    );
     assert!(error.contains("WEBCODEX_RUNNER_CONFIG"), "{error}");
     drop(_legacy);
 
@@ -505,7 +508,10 @@ fn runner_cli_config_env_rejects_retired_alias_when_defaults_are_consulted() {
         .set("WEBCODEX_RUNNER_CONFIG", "/tmp/runner.toml")
         .set("WEBCODEX_AGENT_CONFIG", "/tmp/agent.toml");
     let error = parse_runner_args(std::iter::empty::<&str>()).unwrap_err();
-    assert!(error.contains("WEBCODEX_AGENT_CONFIG is retired"), "{error}");
+    assert!(
+        error.contains("WEBCODEX_AGENT_CONFIG is retired"),
+        "{error}"
+    );
 
     assert_eq!(
         parse_runner_args(["--config", "/tmp/explicit.toml"]).unwrap(),
@@ -551,7 +557,10 @@ fn runner_profile_config_resolution_rejects_retired_agent_toml() {
 
     std::fs::write(profile_dir.join("runner.toml"), "current").unwrap();
     let error = client_profile_runner_config("special").unwrap_err();
-    assert!(error.contains("both runner.toml and retired agent.toml"), "{error}");
+    assert!(
+        error.contains("both runner.toml and retired agent.toml"),
+        "{error}"
+    );
     assert!(error.contains("remove or archive agent.toml"), "{error}");
 }
 

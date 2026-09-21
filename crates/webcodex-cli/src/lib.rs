@@ -2478,9 +2478,7 @@ fn parse_pairing_create(args: &[String]) -> Result<PairingCreateOptions, String>
                     .map_err(|_| "--ttl-secs must be an integer".to_string())?;
             }
             "--user-token-name" => opts.user_token_name = Some(next_value(&mut iter, arg)?),
-            "--runner-token-name" => {
-                opts.runner_token_name = Some(next_value(&mut iter, arg)?)
-            }
+            "--runner-token-name" => opts.runner_token_name = Some(next_value(&mut iter, arg)?),
             "--agent-token-name" => {
                 return Err(
                     "--agent-token-name is retired; use --runner-token-name instead".to_string(),

@@ -143,7 +143,10 @@ fn user_scope_runner_config_rejects_retired_agent_toml() {
 
     std::fs::write(config_dir.join("runner.toml"), "current = true\n").unwrap();
     let error = runner_config_for_scope(ServiceScope::User, None).unwrap_err();
-    assert!(error.contains("both runner.toml and retired agent.toml"), "{error}");
+    assert!(
+        error.contains("both runner.toml and retired agent.toml"),
+        "{error}"
+    );
     assert!(error.contains("remove or archive agent.toml"), "{error}");
 }
 
