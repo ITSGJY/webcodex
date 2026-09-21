@@ -37,9 +37,9 @@ shell state.
 
 Some compatibility-facing values still use the historical word `agent`, including the `wc_agent_*` Runner-token prefix and `agent:<client_id>:<project_id>` runtime Project address. They do not refer to WebCodex's separate Durable Agent domain, and ordinary users do not need the process-level lease identifiers behind Runner recovery.
 
-### Runner config filename compatibility
+### Runner config filename migration
 
-`runner.toml` is the canonical config filename. A legacy directory containing only `agent.toml` remains readable for compatibility; if both names exist in the same config directory WebCodex fails closed and asks the operator to resolve the ambiguity. `WEBCODEX_RUNNER_CONFIG` is the current path override; the old `WEBCODEX_AGENT_CONFIG` remains a compatibility alias.
+`runner.toml` is the canonical config filename. Automatic/default/profile discovery no longer loads the retired `agent.toml`: a legacy-only directory fails with guidance to rename it to `runner.toml`, while a directory containing both names fails closed until `agent.toml` is removed or archived. An explicit `--config PATH` remains exact and may point to any operator-chosen filename. `WEBCODEX_RUNNER_CONFIG` is the supported path override; `WEBCODEX_AGENT_CONFIG` is retired and fails with migration guidance when default environment resolution is used.
 
 ## Connecting to the Server
 
@@ -88,11 +88,13 @@ allow_patch = true
 `id` and `path` are the important fields; `kind` is optional descriptive metadata.
 The registry directory is storage for Project records, not a workspace root.
 
-New configurations use `project-registry/` and `project_registry_dir`. A legacy
-installation that has only `projects.d/` / `projects_dir` remains readable. If
-both old and new locations/fields are configured, WebCodex fails closed instead
-of merging or guessing precedence. Use `--project-registry-dir` in new CLI
-commands.
+New configurations use `project-registry/` and `project_registry_dir`. An
+existing installation whose only physical registry directory is `projects.d/`
+continues to use that directory in place, but the old `projects_dir` config key
+and `--projects-dir` CLI flag are retired and fail with migration guidance. If
+both physical registry directories exist, WebCodex still fails closed instead
+of merging or guessing precedence. Use `--project-registry-dir` for explicit
+CLI selection.
 
 Runtime Project ids take the canonical shape `agent:<client_id>:<project_id>`, for example `agent:workstation:my-repo`. That canonical identity remains the authorization, persistence, audit, Runner-routing, diagnostic, API and CLI address. Model-facing bootstrap/discovery may additionally return a short Server-issued `project_ref` such as `~p1`. Models should normally reuse that selector on later Project-scoped tool calls instead of copying the canonical id. The mapping is durable and scoped to the authenticated caller, is pinned to the canonical id plus Runner-reported Project root identity, and grants no authority: every use re-runs current Project visibility/authorization. It never depends on Workflow Session, ClientWindow, MCP session, transport connection, recent activity or hidden Host state, and a stale ref is never silently rebound to another Project.
 

@@ -129,7 +129,6 @@ fn usage() -> &'static str {
      --config overrides the profile-derived default.\n\n\
      Environment:\n\
        WEBCODEX_RUNNER_CONFIG     default config path override\n\
-       WEBCODEX_AGENT_CONFIG      legacy alias for WEBCODEX_RUNNER_CONFIG\n\
      Example runner.toml:\n\
        server_url = \"https://v4.yyjeqhc.cn\"\n\
        token = \"...\"\n\
@@ -228,14 +227,13 @@ where
         if let Some(profile) = profile {
             client_profile_runner_config(&profile)?
         } else {
-            if runner_config_env.is_some() && legacy_agent_config_env.is_some() {
+            if legacy_agent_config_env.is_some() {
                 return Err(
-                    "WEBCODEX_RUNNER_CONFIG and legacy WEBCODEX_AGENT_CONFIG cannot both be set"
+                    "WEBCODEX_AGENT_CONFIG is retired; use WEBCODEX_RUNNER_CONFIG instead"
                         .to_string(),
                 );
             }
             runner_config_env
-                .or(legacy_agent_config_env)
                 .map(PathBuf::from)
                 .map(Ok)
                 .unwrap_or_else(default_config_path)?

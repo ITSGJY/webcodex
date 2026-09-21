@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_disconnect_accepts_legacy_agent_toml_only() {
+    async fn offline_disconnect_rejects_retired_agent_toml_only() {
         let tmp = canonical_test_tempdir();
         let config = tmp.path().join("config");
         let state = tmp.path().join("state");
@@ -733,7 +733,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_disconnect(DisconnectOptions {
+        let error = run_disconnect(DisconnectOptions {
             project,
             profile: Some("legacy".to_string()),
             config_base: Some(config),
@@ -741,10 +741,12 @@ mod tests {
             server_http: ServerHttpOptions::default(),
         })
         .await
-        .unwrap();
-        assert_eq!(result.outcome, "local_unregistered");
+        .unwrap_err();
+        assert!(error.contains("retired Runner config"), "{error}");
+        assert!(error.contains("rename it to runner.toml"), "{error}");
         assert!(profile_dir.join("agent.toml").is_file());
         assert!(!profile_dir.join("runner.toml").exists());
+        assert!(profile_dir.join("project-registry/repo.toml").is_file());
     }
 
     #[tokio::test]
@@ -774,7 +776,8 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("runner.toml"));
         assert!(error.contains("agent.toml"));
-        assert!(error.contains("refusing to guess"));
+        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains("remove or archive"), "{error}");
         assert!(profile_dir.join("project-registry/repo.toml").is_file());
     }
 

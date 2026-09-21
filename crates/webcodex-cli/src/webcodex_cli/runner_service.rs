@@ -244,7 +244,7 @@ struct RunnerStatusConfig {
     #[serde(default)]
     project_registry_dir: Option<PathBuf>,
     #[serde(default, rename = "projects_dir")]
-    legacy_projects_dir: Option<PathBuf>,
+    removed_projects_dir: Option<toml::Value>,
     #[serde(default)]
     policy: RunnerStatusPolicy,
 }
@@ -273,15 +273,15 @@ fn read_runner_config_metadata(path: &Path) -> Result<RunnerConfigMetadata, Stri
         .map_err(|e| format!("failed to read Runner config {}: {}", path.display(), e))?;
     let cfg: RunnerStatusConfig = toml::from_str(&content)
         .map_err(|e| format!("failed to parse Runner config {}: {}", path.display(), e))?;
-    let project_registry_dir = match (cfg.project_registry_dir, cfg.legacy_projects_dir) {
-        (Some(_), Some(_)) => {
-            return Err(
-                "project_registry_dir and legacy projects_dir cannot both be configured; keep exactly one Runner project registry setting"
-                    .to_string(),
-            )
-        }
-        (Some(path), None) | (None, Some(path)) => path,
-        (None, None) => {
+    if cfg.removed_projects_dir.is_some() {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir' instead"
+                .to_string(),
+        );
+    }
+    let project_registry_dir = match cfg.project_registry_dir {
+        Some(path) => path,
+        None => {
             let base = webcodex_runner_config::paths::default_client_config_base_dir()?;
             webcodex_runner_config::paths::select_project_registry_dir(&base)?
         }
@@ -818,9 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn runner_status_metadata_accepts_legacy_registry_alias_and_rejects_both_fields() {
+    fn runner_status_metadata_rejects_retired_projects_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("agent.toml");
+        let config = tmp.path().join("runner.toml");
         let legacy = tmp.path().join("projects.d");
         std::fs::write(
             &config,
@@ -830,8 +830,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let metadata = read_runner_config_metadata(&config).unwrap();
-        assert_eq!(metadata.project_registry_dir, legacy);
+        let error = read_runner_config_metadata(&config).unwrap_err();
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
 
         let current = tmp.path().join("project-registry");
         std::fs::write(
@@ -844,7 +845,8 @@ mod tests {
         )
         .unwrap();
         let error = read_runner_config_metadata(&config).unwrap_err();
-        assert!(error.contains("cannot both be configured"), "{error}");
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
     }
 
     #[test]

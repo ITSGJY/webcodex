@@ -49,7 +49,7 @@ struct RegistrationRunnerConfig {
     #[serde(default)]
     project_registry_dir: Option<PathBuf>,
     #[serde(default, rename = "projects_dir")]
-    legacy_projects_dir: Option<PathBuf>,
+    removed_projects_dir: Option<toml::Value>,
     #[serde(default)]
     policy: RegistrationPolicy,
 }
@@ -348,16 +348,15 @@ fn persist_registration_allowed_roots(path: &Path, roots: &[PathBuf]) -> Result<
 }
 
 fn registration_project_registry_dir(config: &RegistrationRunnerConfig) -> Result<PathBuf, String> {
-    match (
-        config.project_registry_dir.as_ref(),
-        config.legacy_projects_dir.as_ref(),
-    ) {
-        (Some(_), Some(_)) => Err(
-            "project_registry_dir and legacy projects_dir cannot both be configured; keep exactly one Runner project registry setting"
+    if config.removed_projects_dir.is_some() {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir' instead"
                 .to_string(),
-        ),
-        (Some(path), None) | (None, Some(path)) => Ok(path.clone()),
-        (None, None) => {
+        );
+    }
+    match config.project_registry_dir.as_ref() {
+        Some(path) => Ok(path.clone()),
+        None => {
             let base = webcodex_runner_config::paths::default_client_config_base_dir()?;
             webcodex_runner_config::paths::select_project_registry_dir(&base)
         }
@@ -1671,7 +1670,7 @@ mod tests {
         let _guard = crate::webcodex_cli::test_support::env_test_guard();
         let config = RegistrationRunnerConfig {
             project_registry_dir: None,
-            legacy_projects_dir: None,
+            removed_projects_dir: None,
             policy: RegistrationPolicy::default(),
         };
         let base = webcodex_runner_config::paths::default_client_config_base_dir().unwrap();
@@ -1683,25 +1682,27 @@ mod tests {
     }
 
     #[test]
-    fn registration_config_accepts_legacy_projects_dir_alias() {
-        let legacy = PathBuf::from("/tmp/legacy-projects.d");
+    fn registration_config_rejects_retired_projects_dir() {
         let config = RegistrationRunnerConfig {
             project_registry_dir: None,
-            legacy_projects_dir: Some(legacy.clone()),
-            policy: RegistrationPolicy::default(),
-        };
-        assert_eq!(registration_project_registry_dir(&config).unwrap(), legacy);
-    }
-
-    #[test]
-    fn registration_config_rejects_both_registry_fields() {
-        let config = RegistrationRunnerConfig {
-            project_registry_dir: Some(PathBuf::from("/tmp/project-registry")),
-            legacy_projects_dir: Some(PathBuf::from("/tmp/projects.d")),
+            removed_projects_dir: Some(toml::Value::String("/tmp/projects.d".to_string())),
             policy: RegistrationPolicy::default(),
         };
         let error = registration_project_registry_dir(&config).unwrap_err();
-        assert!(error.contains("cannot both be configured"), "{error}");
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
+    }
+
+    #[test]
+    fn registration_config_rejects_retired_projects_dir_with_canonical_field() {
+        let config = RegistrationRunnerConfig {
+            project_registry_dir: Some(PathBuf::from("/tmp/project-registry")),
+            removed_projects_dir: Some(toml::Value::String("/tmp/projects.d".to_string())),
+            policy: RegistrationPolicy::default(),
+        };
+        let error = registration_project_registry_dir(&config).unwrap_err();
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
     }
 
     #[test]

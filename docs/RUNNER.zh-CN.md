@@ -31,9 +31,9 @@ Runner 是最接近你仓库的信任边界。请用窄的 allowed roots 与显�
 
 部分 compatibility-facing value 仍使用历史 `agent` 名称，例如 Runner token 的 `wc_agent_*` 前缀与 `agent:<client_id>:<project_id>` runtime Project address。它们不属于 WebCodex 独立的 Durable Agent domain；普通用户也不需要理解 Runner recovery 背后的进程级 lease identifier。
 
-### Runner 配置文件名兼容
+### Runner 配置文件名迁移
 
-`runner.toml` 是 canonical config filename。只有旧 `agent.toml` 的历史目录仍可继续读取；同一配置目录同时存在两种文件名时 WebCodex 会 fail closed，要求 operator 先消除歧义。`WEBCODEX_RUNNER_CONFIG` 是当前 path override，旧 `WEBCODEX_AGENT_CONFIG` 只作为兼容 alias 保留。
+`runner.toml` 是 canonical config filename。自动/default/profile discovery 不再加载已退役的 `agent.toml`：目录中只有旧文件时会直接报错并提示重命名为 `runner.toml`；两种文件名同时存在时继续 fail closed，直到 operator 删除或归档 `agent.toml`。显式 `--config PATH` 仍保持精确路径语义，可以指向 operator 自己选择的任意文件名。`WEBCODEX_RUNNER_CONFIG` 是受支持的 path override；使用默认环境变量解析时，已退役的 `WEBCODEX_AGENT_CONFIG` 会返回明确迁移提示。
 
 ## 连接 Server
 
@@ -80,10 +80,11 @@ allow_patch = true
 真正重要的是 `id` 与 `path`；`kind` 只属于可选描述 metadata。Registry directory
 用于保存 Project record，本身不是 workspace root。
 
-新配置使用 `project-registry/` 与 `project_registry_dir`。历史安装如果只有
-`projects.d/` / `projects_dir` 仍可读取；如果新旧 location/field 同时存在，WebCodex
-会 fail closed，而不是 merge 或猜 precedence。新的 CLI 命令使用
-`--project-registry-dir`。
+新配置使用 `project-registry/` 与 `project_registry_dir`。历史安装如果唯一存在的
+物理 registry directory 是 `projects.d/`，仍会原地继续使用该目录；但旧
+`projects_dir` 配置字段与 `--projects-dir` CLI flag 已退役，出现时会返回迁移提示。
+如果两个物理 registry directory 同时存在，WebCodex 仍会 fail closed，而不是
+merge 或猜 precedence。显式 CLI 选择使用 `--project-registry-dir`。
 
 Runtime Project 的 canonical id 仍形如 `agent:<client_id>:<project_id>`，例如 `agent:workstation:my-repo`。该 canonical identity 继续用于 authorization、persistence、audit、Runner routing、diagnostic、API 与 CLI 显式 addressing。Model-facing bootstrap/discovery 还可以返回很短的 Server-issued `project_ref`（例如 `~p1`）；后续 Project-scoped tool call 应优先复用它，而不是反复复制 canonical id。映射由 Server 持久维护并按 authenticated caller 隔离，同时钉住 canonical id 与 Runner 报告的 Project root identity；它不是 credential/capability，每次使用都会重新执行当前 Project visibility/authorization。该 ref 不依赖 Workflow Session、ClientWindow、MCP session、transport connection、recent activity 或 Host hidden state；失效 ref 绝不会静默重绑到另一个 Project。
 

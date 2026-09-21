@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 /// Canonical Runner configuration filename for WebCodex 0.4 and later.
 pub const RUNNER_CONFIG_FILE: &str = "runner.toml";
-/// Pre-0.4 Runner configuration filename retained as a read compatibility alias.
+/// Retired pre-0.4 Runner configuration filename retained for migration diagnostics.
 pub const LEGACY_AGENT_CONFIG_FILE: &str = "agent.toml";
 /// Canonical directory name for newly created Runner project registries.
 pub const PROJECT_REGISTRY_DIR_NAME: &str = "project-registry";
@@ -44,9 +44,10 @@ fn path_entry_exists(path: &Path) -> Result<bool, String> {
 
 /// Resolve an existing Runner config within one authoritative config directory.
 ///
-/// `runner.toml` is canonical. `agent.toml` remains readable only when it is the
-/// sole config entry. If both names exist, fail closed rather than choosing a
-/// winner and risking split-brain configuration.
+/// `runner.toml` is canonical. A retired `agent.toml` is never selected
+/// automatically: legacy-only directories receive migration guidance, while
+/// directories containing both names continue to fail closed so an operator
+/// cannot accidentally keep editing an ignored legacy file.
 pub fn existing_runner_config_path(dir: &Path) -> Result<Option<PathBuf>, String> {
     let runner = dir.join(RUNNER_CONFIG_FILE);
     let legacy = dir.join(LEGACY_AGENT_CONFIG_FILE);
@@ -54,20 +55,26 @@ pub fn existing_runner_config_path(dir: &Path) -> Result<Option<PathBuf>, String
     let legacy_exists = path_entry_exists(&legacy)?;
     match (runner_exists, legacy_exists) {
         (true, true) => Err(format!(
-            "both {} and {} exist in {}; refusing to guess which Runner config is authoritative",
+            "both {} and retired {} exist in {}; remove or archive {} before continuing with the canonical Runner config",
             RUNNER_CONFIG_FILE,
             LEGACY_AGENT_CONFIG_FILE,
-            dir.display()
+            dir.display(),
+            LEGACY_AGENT_CONFIG_FILE,
         )),
         (true, false) => Ok(Some(runner)),
-        (false, true) => Ok(Some(legacy)),
+        (false, true) => Err(format!(
+            "retired Runner config {} exists in {}; rename it to {} before continuing",
+            LEGACY_AGENT_CONFIG_FILE,
+            dir.display(),
+            RUNNER_CONFIG_FILE,
+        )),
         (false, false) => Ok(None),
     }
 }
 
 /// Resolve the Runner config path for one authoritative config directory.
-/// Existing legacy-only directories keep using `agent.toml`; a new directory
-/// gets the canonical `runner.toml` creation target.
+/// Existing directories must use `runner.toml`; a new directory gets the
+/// canonical `runner.toml` creation target.
 pub fn resolve_runner_config_path(dir: &Path) -> Result<PathBuf, String> {
     Ok(existing_runner_config_path(dir)?.unwrap_or_else(|| dir.join(RUNNER_CONFIG_FILE)))
 }
@@ -568,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_config_path_prefers_canonical_and_keeps_legacy_only_compatibility() {
+    fn runner_config_path_requires_canonical_filename_and_guides_legacy_only() {
         let dir = test_temp_dir("compat");
         assert_eq!(
             resolve_runner_config_path(&dir).unwrap(),
@@ -576,10 +583,10 @@ mod tests {
         );
 
         std::fs::write(dir.join(LEGACY_AGENT_CONFIG_FILE), "legacy").unwrap();
-        assert_eq!(
-            resolve_runner_config_path(&dir).unwrap(),
-            dir.join(LEGACY_AGENT_CONFIG_FILE)
-        );
+        let error = resolve_runner_config_path(&dir).unwrap_err();
+        assert!(error.contains("retired Runner config"));
+        assert!(error.contains(LEGACY_AGENT_CONFIG_FILE));
+        assert!(error.contains(RUNNER_CONFIG_FILE));
 
         std::fs::remove_file(dir.join(LEGACY_AGENT_CONFIG_FILE)).unwrap();
         std::fs::write(dir.join(RUNNER_CONFIG_FILE), "current").unwrap();
@@ -591,14 +598,15 @@ mod tests {
     }
 
     #[test]
-    fn runner_config_path_fails_closed_when_both_names_exist() {
+    fn runner_config_path_fails_closed_when_retired_and_canonical_names_both_exist() {
         let dir = test_temp_dir("dual");
         std::fs::write(dir.join(RUNNER_CONFIG_FILE), "current").unwrap();
         std::fs::write(dir.join(LEGACY_AGENT_CONFIG_FILE), "legacy").unwrap();
         let error = resolve_runner_config_path(&dir).unwrap_err();
         assert!(error.contains(RUNNER_CONFIG_FILE));
         assert!(error.contains(LEGACY_AGENT_CONFIG_FILE));
-        assert!(error.contains("refusing to guess"));
+        assert!(error.contains("retired"));
+        assert!(error.contains("remove or archive"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

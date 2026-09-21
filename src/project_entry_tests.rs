@@ -409,7 +409,7 @@ fn setup_repairs_only_missing_components_and_preserves_existing_config() {
 }
 
 #[test]
-fn setup_accepts_legacy_agent_toml_only_without_creating_runner_toml() {
+fn setup_rejects_retired_agent_toml_only_with_migration_guidance() {
     let (_temp, root, state) = repo("legacy-runner-config");
     let options = options(root, state.clone());
     setup(&options).unwrap();
@@ -418,8 +418,18 @@ fn setup_accepts_legacy_agent_toml_only_without_creating_runner_toml() {
     let original = fs::read(&runner_config).unwrap();
     fs::rename(&runner_config, &legacy_config).unwrap();
 
-    let report = setup(&options).unwrap();
-    assert_eq!(report.status, "already_configured");
+    let error = setup(&options).unwrap_err();
+    assert_eq!(error.code, "project_registration_invalid");
+    assert!(
+        error.message.contains("retired Runner config"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("rename it to runner.toml"),
+        "{}",
+        error.message
+    );
     assert_eq!(fs::read(&legacy_config).unwrap(), original);
     assert!(!runner_config.exists());
 }
@@ -437,7 +447,37 @@ fn setup_rejects_dual_runner_config_names_without_guessing() {
     assert_eq!(error.code, "project_registration_invalid");
     assert!(error.message.contains("runner.toml"));
     assert!(error.message.contains("agent.toml"));
-    assert!(error.message.contains("refusing to guess"));
+    assert!(error.message.contains("retired"));
+    assert!(error.message.contains("remove or archive"));
+}
+
+#[test]
+fn setup_rejects_retired_projects_dir_without_rewriting_config() {
+    let (_temp, root, state) = repo("retired-projects-dir");
+    let options = options(root, state.clone());
+    setup(&options).unwrap();
+    let runner_config = state.join("agent/runner.toml");
+    let canonical = fs::read_to_string(&runner_config).unwrap();
+    let retired = canonical.replace("project_registry_dir", "projects_dir");
+    assert_ne!(
+        retired, canonical,
+        "fixture must contain project_registry_dir"
+    );
+    fs::write(&runner_config, &retired).unwrap();
+
+    let error = setup(&options).unwrap_err();
+    assert_eq!(error.code, "project_registration_invalid");
+    assert!(
+        error.message.contains("'projects_dir'"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("'project_registry_dir'"),
+        "{}",
+        error.message
+    );
+    assert_eq!(fs::read_to_string(&runner_config).unwrap(), retired);
 }
 
 #[test]
