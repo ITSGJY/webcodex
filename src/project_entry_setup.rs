@@ -599,6 +599,13 @@ pub(super) fn validate_existing_runner(
         return Ok(());
     }
     let value: toml::Value = read_toml(&runner_config)?;
+    if value.get("projects_dir").is_some() {
+        return Err(ProductError::new(
+            "project_registration_invalid",
+            "existing Runner configuration uses retired field 'projects_dir'; use 'project_registry_dir' instead",
+            Some("Rename the Runner config field to 'project_registry_dir', then retry setup."),
+        ));
+    }
     let expected = [
         ("server_url", config.server_url()),
         ("client_id", config.executor_client_id.clone()),
@@ -617,14 +624,8 @@ pub(super) fn validate_existing_runner(
     let current_registry = value
         .get("project_registry_dir")
         .and_then(toml::Value::as_str);
-    let legacy_registry = value.get("projects_dir").and_then(toml::Value::as_str);
-    if current_registry.is_some() && legacy_registry.is_some() {
-        return Err(invalid_registration(
-            "existing Runner configuration contains both project_registry_dir and legacy projects_dir",
-        ));
-    }
     let expected_registry = paths.project_registry.to_string_lossy();
-    if current_registry.or(legacy_registry) != Some(expected_registry.as_ref()) {
+    if current_registry != Some(expected_registry.as_ref()) {
         return Err(ProductError::new(
             "project_registration_invalid",
             "existing Runner configuration conflicts in field 'project_registry_dir'",

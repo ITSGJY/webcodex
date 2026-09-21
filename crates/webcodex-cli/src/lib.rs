@@ -359,7 +359,10 @@ where
         "agent-token" => cli_parse_error(
             "`webcodex agent-token` was removed; use `webcodex runner-tokens ...`".to_string(),
         ),
-        "runner-tokens" | "agent-tokens" => parse_runner_token_subcommand(&args[1..]),
+        "agent-tokens" => cli_parse_error(
+            "`webcodex agent-tokens` was removed; use `webcodex runner-tokens ...`".to_string(),
+        ),
+        "runner-tokens" => parse_runner_token_subcommand(&args[1..]),
         "token" => cli_parse_error(
             "`webcodex token` was removed; use `webcodex tokens ...`".to_string(),
         ),
@@ -2265,8 +2268,13 @@ fn parse_runner_status_with_identity(
             "--user-token-file" => {
                 opts.user_token_file = Some(PathBuf::from(next_value(&mut iter, arg)?))
             }
-            "--runner-token-file" | "--agent-token-file" => {
+            "--runner-token-file" => {
                 opts.runner_token_file = Some(PathBuf::from(next_value(&mut iter, arg)?))
+            }
+            "--agent-token-file" => {
+                return Err(
+                    "--agent-token-file is retired; use --runner-token-file instead".to_string(),
+                )
             }
             "--json" => opts.json = true,
             _ => return Err(format!("unknown runner status flag: {}", arg)),
@@ -2470,8 +2478,13 @@ fn parse_pairing_create(args: &[String]) -> Result<PairingCreateOptions, String>
                     .map_err(|_| "--ttl-secs must be an integer".to_string())?;
             }
             "--user-token-name" => opts.user_token_name = Some(next_value(&mut iter, arg)?),
-            "--runner-token-name" | "--agent-token-name" => {
+            "--runner-token-name" => {
                 opts.runner_token_name = Some(next_value(&mut iter, arg)?)
+            }
+            "--agent-token-name" => {
+                return Err(
+                    "--agent-token-name is retired; use --runner-token-name instead".to_string(),
+                )
             }
             "--json" => opts.json = true,
             _ => return Err(format!("unknown pairing create flag: {}", arg)),
@@ -2517,7 +2530,6 @@ fn parse_cli_runner_init(args: &[String]) -> Result<RunnerInitOptions, String> {
     let mut profile: Option<String> = None;
     let mut output_explicit = false;
     let mut project_registry_dir_explicit = false;
-    let mut legacy_projects_dir_explicit = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -2536,24 +2548,13 @@ fn parse_cli_runner_init(args: &[String]) -> Result<RunnerInitOptions, String> {
                     .map_err(|_| "--poll-interval-ms must be an integer".to_string())?;
             }
             "--project-registry-dir" => {
-                if legacy_projects_dir_explicit {
-                    return Err(
-                        "use only one of --project-registry-dir or legacy --projects-dir"
-                            .to_string(),
-                    );
-                }
                 opts.project_registry_dir = PathBuf::from(next_value(&mut iter, arg)?);
                 project_registry_dir_explicit = true;
             }
             "--projects-dir" => {
-                if project_registry_dir_explicit {
-                    return Err(
-                        "use only one of --project-registry-dir or legacy --projects-dir"
-                            .to_string(),
-                    );
-                }
-                opts.project_registry_dir = PathBuf::from(next_value(&mut iter, arg)?);
-                legacy_projects_dir_explicit = true;
+                return Err(
+                    "--projects-dir is retired; use --project-registry-dir instead".to_string(),
+                )
             }
             "--allowed-root" => opts
                 .allowed_roots
@@ -2578,17 +2579,17 @@ fn parse_cli_runner_init(args: &[String]) -> Result<RunnerInitOptions, String> {
         if !output_explicit {
             opts.output = client_profile_runner_config(&profile)?;
         }
-        if !project_registry_dir_explicit && !legacy_projects_dir_explicit {
+        if !project_registry_dir_explicit {
             opts.project_registry_dir = client_profile_project_registry_dir(&profile)?;
         }
     } else {
         if !output_explicit && opts.output.as_os_str().is_empty() {
             let profile = validate_client_profile(&opts.client_id)?;
             opts.output = client_profile_runner_config(&profile)?;
-            if !project_registry_dir_explicit && !legacy_projects_dir_explicit {
+            if !project_registry_dir_explicit {
                 opts.project_registry_dir = client_profile_project_registry_dir(&profile)?;
             }
-        } else if !project_registry_dir_explicit && !legacy_projects_dir_explicit {
+        } else if !project_registry_dir_explicit {
             let default = Path::new(DEFAULT_INIT_PROJECT_REGISTRY_DIR);
             let base = default.parent().ok_or_else(|| {
                 "default Runner project registry path has no parent directory".to_string()
