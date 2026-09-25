@@ -64,7 +64,7 @@ When `work_on_project`, `start_session`, `session_summary`, or an explicit hando
 ## Tool strategy guidance
 
 `work_on_project` accepts `guidance_profile`, defaulting to `direct`. Workflow
-contract v20 returns shared `guidance`, `model_protocol` and review `roles`, plus
+contract v21 returns shared `guidance`, `model_protocol` and review `roles`, plus
 only the selected `tool_strategy`, when explicitly requested
 through `context_request=["webcodex.workflow"]`. The selection is request-local:
 choose again on exact resume without changing Session identity or business state.
