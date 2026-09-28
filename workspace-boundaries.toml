@@ -216,6 +216,7 @@ normal = [
     "webcodex-core",
     "webcodex-tool-contracts",
     "webcodex-workflow-session",
+    "webcodex-workspace",
 ]
 dev = [
     "webcodex-tool-contracts",

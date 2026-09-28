@@ -5698,6 +5698,7 @@ dependencies = [
  "webcodex-tool-contracts",
  "webcodex-tool-runtime-contracts",
  "webcodex-workflow-session",
+ "webcodex-workspace",
 ]
 
 [[package]]

@@ -149,6 +149,14 @@ fn recipe_resolution_fails_closed_for_ambiguity_mismatch_and_missing_marker() {
     )
     .unwrap_err();
     assert_eq!(mismatch.code, "validation_recipe_mismatch");
+    assert_eq!(
+        mismatch.details.as_ref().unwrap(),
+        &serde_json::json!({
+            "recipe_root": ".",
+            "candidate_recipes": ["node", "go"],
+            "detected_markers": ["package.json", "go.mod"],
+        })
+    );
 
     let empty = tempfile::tempdir().unwrap();
     let missing = resolve(empty.path(), None, None, &[SemanticCheck::Check], None).unwrap_err();
@@ -627,6 +635,31 @@ fn rust_filter_contract_normalizes_rejects_and_binds_identity() {
         "test_filter_unsupported"
     );
     assert!(!outside.path().join("target").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn marker_symlink_escape_remains_a_manifest_error_after_recipe_detection() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        outside.path(),
+        "Cargo.toml",
+        "[package]\nname='outside'\nversion='0.1.0'\n",
+    );
+    symlink(
+        outside.path().join("Cargo.toml"),
+        root.path().join("Cargo.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve(root.path(), None, None, &[SemanticCheck::Check], None)
+            .unwrap_err()
+            .code,
+        "validation_manifest_invalid"
+    );
 }
 
 #[cfg(unix)]
