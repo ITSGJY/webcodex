@@ -535,6 +535,16 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_build_v1: bool = false;
     }
+    /// Go project lifecycle gateways execute in Runner-owned single-module mode.
+    /// The Runner forces GO111MODULE=on and GOWORK=off after shell/profile environment
+    /// preparation so ambient module/workspace mode cannot change the planned graph.
+    ProjectGoSingleModule => RUNNER_CAPABILITY_PROJECT_GO_SINGLE_MODULE("project_go_single_module_v1"),
+    v2_baseline = false {
+        /// Additive project_build/project_validate Go execution semantics. Missing
+        /// on older Runners is false and must fail closed at typed Job admission.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_go_single_module_v1: bool = false;
+    }
     /// The Runner understands the additive portable package scope carried by
     /// project validation requests. Older project_validation_v1 Runners reject
     /// scoped requests before dispatch rather than interpreting an unknown field.
@@ -2738,6 +2748,7 @@ mod envelope_tests {
                 structured_go_test_json: true,
                 project_validation_v1: false,
                 project_build_v1: false,
+                project_go_single_module_v1: false,
                 project_validation_package_scope_v1: false,
                 project_validation_test_options_v1: false,
                 structured_go_test_tool: true,

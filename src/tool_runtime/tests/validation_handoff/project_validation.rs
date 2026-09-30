@@ -13,6 +13,7 @@ async fn setup(grace_ms: u64) -> ToolRuntime {
             structured_validation_argv: true,
             structured_cargo_check_packages: true,
             project_validation_v1: true,
+            project_go_single_module_v1: true,
             project_validation_package_scope_v1: true,
             project_validation_test_options_v1: true,
             structured_go_test_json: true,

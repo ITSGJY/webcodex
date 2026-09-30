@@ -2,6 +2,9 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use webcodex_core::project_validation::*;
+use webcodex_core::validation_identity::{
+    contextualize_structured_validation_target_identity, StructuredValidationExecutionContext,
+};
 use webcodex_validation::{
     detect_validation_recipe, project_validation_operation,
     resolve_validation_recipe_with_packages, RecipeId, SemanticCheck,
@@ -66,6 +69,15 @@ pub(crate) fn plan(
     let identity = operation
         .validation_target_id(Some(&resolved.recipe_root_relative))
         .ok_or_else(|| unavailable("validation_scope_invalid", Some(backend.as_str())))?;
+    let identity = if backend == RecipeId::Go {
+        contextualize_structured_validation_target_identity(
+            &identity,
+            StructuredValidationExecutionContext::GoProjectSingleModuleV1,
+        )
+        .ok_or_else(|| unavailable("validation_scope_invalid", Some(backend.as_str())))?
+    } else {
+        identity
+    };
     debug_assert_eq!(
         operation
             .build_readonly_plan()
