@@ -161,7 +161,108 @@ fn rust_workspace_root(
             return Ok(directory);
         }
     }
+    // Cargo workspace inheritance is authoritative evidence that this package
+    // is not standalone. If no workspace root was found inside the registered
+    // Project boundary, do not silently hash a package-local lockfile that
+    // Cargo itself will not use; the caller must register the containing
+    // workspace instead.
+    if cargo_manifest_uses_workspace_inheritance(&member_manifest)? {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
     Ok(resolved.absolute_root.clone())
+}
+
+fn cargo_manifest_uses_workspace_inheritance(
+    manifest: &toml::Value,
+) -> Result<bool, ProjectRecipeResolutionError> {
+    let root = manifest
+        .as_table()
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+
+    if let Some(package) = root.get("package") {
+        let package = package
+            .as_table()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for key in [
+            "authors",
+            "categories",
+            "description",
+            "documentation",
+            "edition",
+            "exclude",
+            "homepage",
+            "include",
+            "keywords",
+            "license",
+            "license-file",
+            "publish",
+            "readme",
+            "repository",
+            "rust-version",
+            "version",
+        ] {
+            if package
+                .get(key)
+                .and_then(toml::Value::as_table)
+                .and_then(|table| table.get("workspace"))
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    if let Some(lints) = root.get("lints") {
+        let lints = lints
+            .as_table()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        if lints.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+            return Ok(true);
+        }
+    }
+
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if cargo_dependency_table_uses_workspace(root.get(key))? {
+            return Ok(true);
+        }
+    }
+
+    if let Some(targets) = root.get("target") {
+        let targets = targets
+            .as_table()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for target in targets.values() {
+            let target = target
+                .as_table()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if cargo_dependency_table_uses_workspace(target.get(key))? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn cargo_dependency_table_uses_workspace(
+    value: Option<&toml::Value>,
+) -> Result<bool, ProjectRecipeResolutionError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let dependencies = value
+        .as_table()
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+    Ok(dependencies.values().any(|dependency| {
+        dependency
+            .as_table()
+            .and_then(|table| table.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    }))
 }
 
 fn parse_cargo_manifest(

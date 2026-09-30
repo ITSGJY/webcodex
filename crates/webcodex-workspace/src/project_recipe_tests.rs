@@ -261,12 +261,12 @@ fn rust_member_provenance_includes_workspace_manifest_and_root_lockfile() {
     write(
         temp.path(),
         "Cargo.toml",
-        "[workspace]\nmembers=['member']\nresolver='2'\n",
+        "[workspace]\nmembers=['member']\nresolver='2'\n[workspace.package]\nversion='0.1.0'\nedition='2021'\n",
     );
     write(
         temp.path(),
         "member/Cargo.toml",
-        "[package]\nname='member'\nversion='0.1.0'\n",
+        "[package]\nname='member'\nversion.workspace=true\nedition.workspace=true\n",
     );
     let resolved =
         resolve_project_recipe_root(temp.path(), Some("member"), Some(ProjectRecipeId::Rust))
@@ -282,6 +282,34 @@ fn rust_member_provenance_includes_workspace_manifest_and_root_lockfile() {
             root.join("Cargo.lock"),
         ]
     );
+}
+
+#[test]
+fn rust_member_workspace_inheritance_cannot_silently_escape_project_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("member");
+    write(
+        &project,
+        "Cargo.toml",
+        "[package]\nname='member'\nversion.workspace=true\nedition.workspace=true\n[dependencies]\nserde.workspace=true\n",
+    );
+    let resolved =
+        resolve_project_recipe_root(&project, None, Some(ProjectRecipeId::Rust)).unwrap();
+
+    assert_eq!(
+        project_recipe_provenance_files(&resolved).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
+
+    // Arbitrary package metadata is not Cargo workspace inheritance.
+    write(
+        &project,
+        "Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n[package.metadata]\nworkspace=true\n",
+    );
+    let standalone =
+        resolve_project_recipe_root(&project, None, Some(ProjectRecipeId::Rust)).unwrap();
+    assert!(project_recipe_provenance_files(&standalone).is_ok());
 }
 
 #[test]
