@@ -15,6 +15,7 @@ use super::shell::{
     configured_explicit_shell_command, configured_prepared_shell_job_command,
     configured_shell_job_command, configured_validation_job_command, cwd_allowed,
     prepare_detached_process_launch, resolve_prepared_shell_profile,
+    run_process_with_profiles_and_execution_state_with_internal_env_and_start_hook,
     run_process_with_profiles_and_execution_state_with_start_hook,
     run_script_with_profiles_and_execution_state_with_start_hook, PreparedShellProfileCache,
 };
@@ -41,6 +42,8 @@ use webcodex_core::runner_protocol::{
     VALIDATION_STEP_SPAWN_FAILED_CODE, VALIDATION_TOOL_UNAVAILABLE_CODE,
 };
 use webcodex_core::workflow_session_contract::ExecutionShell;
+
+const GO_PROJECT_SINGLE_MODULE_ENV: [(&str, &str); 2] = [("GO111MODULE", "on"), ("GOWORK", "off")];
 use webcodex_process::ManagedChild;
 // Existing process-I/O / execution helpers deliberately remain at their current
 // owner. Extracting those independent facilities is outside this refactor.
@@ -2748,7 +2751,12 @@ impl JobManager {
             };
             let result = match &operation {
                 RunnerJobOperation::StartBuild(request) => {
-                    run_process_with_profiles_and_execution_state_with_start_hook(
+                    let env_overrides = if request.provenance.backend == "go" {
+                        &GO_PROJECT_SINGLE_MODULE_ENV[..]
+                    } else {
+                        &[]
+                    };
+                    run_process_with_profiles_and_execution_state_with_internal_env_and_start_hook(
                         generation,
                         &policy,
                         &shell,
@@ -2760,6 +2768,7 @@ impl JobManager {
                         None,
                         request.timeout_secs,
                         Some(stop_requested.as_ref()),
+                        env_overrides,
                         Some(&on_started),
                     )
                 }
@@ -2892,6 +2901,12 @@ impl JobManager {
             ),
             _ => unreachable!("shell Job starter received non shell/validation operation"),
         };
+        let project_go_single_module = validation
+            && context
+                .validation
+                .as_ref()
+                .and_then(|metadata| metadata.project_validation.as_ref())
+                .is_some_and(|provenance| provenance.backend == "go");
         if validation {
             // A project validation can wait in the local queue after its
             // admission fence. Recheck the retained project plan after that
@@ -3018,6 +3033,9 @@ impl JobManager {
                         .iter()
                         .map(|(key, value)| (key.as_str(), value.as_str())),
                 );
+                if project_go_single_module {
+                    command.envs(GO_PROJECT_SINGLE_MODULE_ENV);
+                }
             }
             // Raw Shell Jobs and every validation step have no stdin payload.
             // Never inherit the Runner's parent-liveness pipe: it stays open
