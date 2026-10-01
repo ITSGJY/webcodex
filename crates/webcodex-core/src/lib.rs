@@ -22,6 +22,7 @@ pub mod project_build;
 pub mod project_context_contract;
 pub mod project_instructions;
 pub mod project_listing;
+mod project_operation;
 pub mod runner_instruction;
 pub mod runner_job_lifecycle;
 pub mod runner_job_receipt;
@@ -51,3 +52,6 @@ mod project_validation_tests;
 
 #[cfg(test)]
 mod project_build_tests;
+
+#[cfg(test)]
+mod project_operation_tests;
