@@ -373,7 +373,11 @@ pub fn digest_project_cargo_all_packages_provenance(
     let mut manifest_routes = BTreeSet::new();
     let root_route = cargo_manifest_route_if_present(&workspace_root, &workspace_root)?
         .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
-    manifest_routes.insert(root_route);
+    manifest_routes.insert(root_route.clone());
+    let mut workspace_member_routes = BTreeSet::new();
+    if root_manifest.get("package").is_some() {
+        workspace_member_routes.insert(root_route.clone());
+    }
     for manifest in files
         .iter()
         .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml"))
@@ -406,6 +410,7 @@ pub fn digest_project_cargo_all_packages_provenance(
                     &mut topology,
                     &mut files,
                     &mut manifest_routes,
+                    &mut workspace_member_routes,
                 )?;
             }
         }
@@ -417,6 +422,23 @@ pub fn digest_project_cargo_all_packages_provenance(
         &mut manifest_routes,
         &mut topology,
     )?;
+    extend_cargo_workspace_member_routes(
+        &workspace_root,
+        &root_manifest,
+        &mut workspace_member_routes,
+    )?;
+    if resolved.absolute_root != workspace_root {
+        let requested_manifest = resolved
+            .marker_path()
+            .canonicalize()
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        if !workspace_member_routes
+            .iter()
+            .any(|route| route.canonical == requested_manifest)
+        {
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+        }
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(b"webcodex:cargo-all-packages-provenance:v3\0");
@@ -637,6 +659,7 @@ fn record_workspace_member(
     topology: &mut BTreeSet<CargoTopologyEntry>,
     files: &mut BTreeSet<PathBuf>,
     manifest_routes: &mut BTreeSet<CargoManifestRoute>,
+    workspace_member_routes: &mut BTreeSet<CargoManifestRoute>,
 ) -> Result<(), ProjectRecipeResolutionError> {
     let logical_id = logical_path_identity(workspace_root, logical);
     let Some(canonical) = canonicalize_optional_path(logical)? else {
@@ -668,9 +691,180 @@ fn record_workspace_member(
 
     if let Some(route) = cargo_manifest_route_if_present(workspace_root, logical)? {
         files.insert(route.canonical.clone());
-        manifest_routes.insert(route);
+        manifest_routes.insert(route.clone());
+        workspace_member_routes.insert(route);
         ensure_manifest_route_bound(manifest_routes)?;
+        ensure_manifest_route_bound(workspace_member_routes)?;
         ensure_canonical_manifest_bound(manifest_routes)?;
+    }
+    Ok(())
+}
+
+fn extend_cargo_workspace_member_routes(
+    workspace_root: &Path,
+    root_manifest: &toml::Value,
+    routes: &mut BTreeSet<CargoManifestRoute>,
+) -> Result<(), ProjectRecipeResolutionError> {
+    let workspace_dependencies = root_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .map(|dependencies| {
+            dependencies
+                .as_table()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)
+        })
+        .transpose()?;
+    let mut pending = routes.iter().cloned().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(route) = pending.pop() {
+        let logical_parent = route
+            .logical
+            .parent()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?
+            .canonicalize()
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        if !logical_parent.starts_with(workspace_root)
+            || !visited.insert((route.canonical.clone(), logical_parent))
+        {
+            continue;
+        }
+        let manifest = parse_cargo_manifest(workspace_root, &route.canonical)?;
+        let manifest_dir = route
+            .logical
+            .parent()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for dependency in cargo_workspace_member_path_dependencies(
+            &manifest,
+            manifest_dir,
+            workspace_root,
+            workspace_dependencies,
+        )? {
+            let Some(target) = canonicalize_optional_path(&dependency.logical)? else {
+                continue;
+            };
+            if !target.starts_with(workspace_root) {
+                return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+            }
+            let Some(target_route) =
+                cargo_manifest_route_if_present(workspace_root, &dependency.logical)?
+            else {
+                continue;
+            };
+            if cargo_workspace_excludes_manifest(
+                root_manifest,
+                workspace_root,
+                &target_route.logical,
+            )? {
+                continue;
+            }
+            if routes.insert(target_route.clone()) {
+                ensure_manifest_route_bound(routes)?;
+                ensure_canonical_manifest_bound(routes)?;
+                pending.push(target_route);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cargo_workspace_member_path_dependencies(
+    manifest: &toml::Value,
+    manifest_dir: &Path,
+    workspace_root: &Path,
+    workspace_dependencies: Option<&toml::map::Map<String, toml::Value>>,
+) -> Result<Vec<CargoPathDependencyWitness>, ProjectRecipeResolutionError> {
+    let root = manifest
+        .as_table()
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+    let mut witnesses = BTreeSet::new();
+    for key in CARGO_DEPENDENCY_TABLE_KEYS {
+        collect_workspace_member_dependencies(
+            root.get(key),
+            key,
+            manifest_dir,
+            workspace_root,
+            workspace_dependencies,
+            &mut witnesses,
+        )?;
+    }
+    if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+        for (target_name, target) in targets {
+            let target = target
+                .as_table()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            for key in CARGO_DEPENDENCY_TABLE_KEYS {
+                collect_workspace_member_dependencies(
+                    target.get(key),
+                    &format!("target.{target_name}.{key}"),
+                    manifest_dir,
+                    workspace_root,
+                    workspace_dependencies,
+                    &mut witnesses,
+                )?;
+            }
+        }
+    }
+    Ok(witnesses.into_iter().collect())
+}
+
+fn collect_workspace_member_dependencies(
+    value: Option<&toml::Value>,
+    table_name: &str,
+    manifest_dir: &Path,
+    workspace_root: &Path,
+    workspace_dependencies: Option<&toml::map::Map<String, toml::Value>>,
+    witnesses: &mut BTreeSet<CargoPathDependencyWitness>,
+) -> Result<(), ProjectRecipeResolutionError> {
+    let Some(dependencies) = value else {
+        return Ok(());
+    };
+    let dependencies = dependencies
+        .as_table()
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+    for (name, dependency) in dependencies {
+        let Some(table) = dependency.as_table() else {
+            continue;
+        };
+        let (path, base) = if let Some(path) = table.get("path") {
+            (
+                path.as_str()
+                    .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?,
+                manifest_dir,
+            )
+        } else if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+            let Some(inherited) = workspace_dependencies
+                .and_then(|dependencies| dependencies.get(name))
+                .and_then(toml::Value::as_table)
+            else {
+                continue;
+            };
+            let Some(path) = inherited.get("path") else {
+                continue;
+            };
+            (
+                path.as_str()
+                    .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?,
+                workspace_root,
+            )
+        } else {
+            continue;
+        };
+        if path.is_empty() || path.as_bytes().contains(&0) {
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+        }
+        let declared = Path::new(path);
+        witnesses.insert(CargoPathDependencyWitness {
+            declaration: format!("{table_name}.{name}:path={path}"),
+            logical: if declared.is_absolute() {
+                declared.to_path_buf()
+            } else {
+                base.join(declared)
+            },
+        });
+        if witnesses.len() > CARGO_ALL_PACKAGES_MAX_TOPOLOGY_ENTRIES {
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+        }
     }
     Ok(())
 }

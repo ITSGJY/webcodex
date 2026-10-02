@@ -673,6 +673,65 @@ fn cargo_all_packages_unproven_external_path_membership_fails_closed() {
 }
 
 #[test]
+fn cargo_all_packages_unlisted_child_cannot_borrow_workspace_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['app']\nresolver='2'\n",
+    );
+    for name in ["app", "tool"] {
+        write(
+            temp.path(),
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        );
+    }
+    let resolved =
+        resolve_project_recipe_root(temp.path(), Some("tool"), Some(ProjectRecipeId::Rust))
+            .unwrap();
+
+    assert_eq!(
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
+}
+
+#[test]
+fn cargo_all_packages_auto_path_dependency_cwd_is_a_workspace_member() {
+    for inherited in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root_manifest = if inherited {
+            "[workspace]\nmembers=['app']\nresolver='2'\n[workspace.dependencies]\ntool={path='tool'}\n"
+        } else {
+            "[workspace]\nmembers=['app']\nresolver='2'\n"
+        };
+        write(temp.path(), "Cargo.toml", root_manifest);
+        write(
+            temp.path(),
+            "app/Cargo.toml",
+            if inherited {
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ntool.workspace=true\n"
+            } else {
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ntool={path='../tool'}\n"
+            },
+        );
+        write(
+            temp.path(),
+            "tool/Cargo.toml",
+            "[package]\nname='tool'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        let resolved =
+            resolve_project_recipe_root(temp.path(), Some("tool"), Some(ProjectRecipeId::Rust))
+                .unwrap();
+        assert!(
+            digest_project_cargo_all_packages_provenance(&resolved).is_ok(),
+            "inherited={inherited}"
+        );
+    }
+}
+
+#[test]
 fn cargo_all_packages_provenance_tracks_inherited_workspace_path_dependency() {
     let temp = tempfile::tempdir().unwrap();
     write(
