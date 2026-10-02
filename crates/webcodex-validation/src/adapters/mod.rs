@@ -10,6 +10,16 @@ use webcodex_core::validation_evidence::ValidationDiagnostics;
 use webcodex_core::validation_identity::ToolValidationIdentityKind;
 use webcodex_core::workflow_session_contract::ExecutionPurpose;
 
+pub(super) fn validate_package_scope_exclusivity(
+    explicit_packages: bool,
+    all_packages: bool,
+) -> Result<(), String> {
+    if explicit_packages && all_packages {
+        return Err("packages and all_packages are mutually exclusive".to_string());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ValidationCommandOptions {
     pub check: bool,
@@ -22,6 +32,7 @@ pub struct ValidationCommandOptions {
     pub package: Option<String>,
     /// Canonical sorted, duplicate-free package scope for `cargo_check`.
     pub cargo_packages: Option<Vec<String>>,
+    pub all_packages: bool,
     pub no_run: Option<bool>,
     /// First-class `go_test` package scope. Other validation adapters must
     /// reject this Go-specific option rather than silently ignoring it.
@@ -37,6 +48,7 @@ pub struct CargoCheckOptions {
     pub features: Option<String>,
     pub package: Option<String>,
     pub packages: Option<Vec<String>>,
+    pub all_packages: bool,
     pub dependency_mode: Option<ProjectDependencyMode>,
 }
 
@@ -50,6 +62,7 @@ pub struct CargoTestOptions {
     pub features: Option<String>,
     pub package: Option<String>,
     pub packages: Option<Vec<String>>,
+    pub all_packages: bool,
     pub no_run: Option<bool>,
     pub dependency_mode: Option<ProjectDependencyMode>,
 }
@@ -57,6 +70,7 @@ pub struct CargoTestOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GoCheckOptions {
     pub packages: Option<Vec<String>>,
+    pub all_packages: bool,
     pub dependency_mode: Option<ProjectDependencyMode>,
 }
 
@@ -64,6 +78,7 @@ pub struct GoCheckOptions {
 pub struct GoTestOptions {
     pub filter: Option<String>,
     pub packages: Option<Vec<String>>,
+    pub all_packages: bool,
     pub dependency_mode: Option<ProjectDependencyMode>,
 }
 
@@ -149,6 +164,16 @@ impl ReadOnlyValidationOperation {
             Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => options.dependency_mode,
             Self::Go(GoReadOnlyValidationOperation::Check(options)) => options.dependency_mode,
             Self::Go(GoReadOnlyValidationOperation::Test(options)) => options.dependency_mode,
+        }
+    }
+
+    fn selects_all_packages(&self) -> bool {
+        match self {
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => options.all_packages,
+            Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => options.all_packages,
+            Self::Go(GoReadOnlyValidationOperation::Check(options)) => options.all_packages,
+            Self::Go(GoReadOnlyValidationOperation::Test(options)) => options.all_packages,
+            Self::Cargo(CargoReadOnlyValidationOperation::FormatCheck) => false,
         }
     }
 
@@ -256,18 +281,26 @@ impl ReadOnlyValidationOperation {
                 "filter": options.filter.as_deref(),
             }),
         };
-        let identity = webcodex_core::validation_identity::structured_validation_target_identity(
-            profile.validation_identity,
-            &arguments,
-        )?;
+        let mut identity =
+            webcodex_core::validation_identity::structured_validation_target_identity(
+                profile.validation_identity,
+                &arguments,
+            )?;
         if self.dependency_mode() == Some(ProjectDependencyMode::Locked) {
-            webcodex_core::validation_identity::contextualize_structured_validation_target_identity(
-                &identity,
-                webcodex_core::validation_identity::StructuredValidationExecutionContext::ProjectDependencyLockedV1,
-            )
-        } else {
-            Some(identity)
+            identity =
+                webcodex_core::validation_identity::contextualize_structured_validation_target_identity(
+                    &identity,
+                    webcodex_core::validation_identity::StructuredValidationExecutionContext::ProjectDependencyLockedV1,
+                )?;
         }
+        if matches!(self, Self::Cargo(_)) && self.selects_all_packages() {
+            identity =
+                webcodex_core::validation_identity::contextualize_structured_validation_target_identity(
+                    &identity,
+                    webcodex_core::validation_identity::StructuredValidationExecutionContext::ProjectAllPackagesV1,
+                )?;
+        }
+        Some(identity)
     }
 }
 
@@ -278,22 +311,28 @@ pub fn project_validation_operation(
     backend: &str,
     action: crate::SemanticCheck,
     packages: Option<Vec<String>>,
+    all_packages: bool,
 ) -> Result<ReadOnlyValidationOperation, &'static str> {
     use crate::SemanticCheck::*;
+    if packages.is_some() && all_packages {
+        return Err("validation_scope_invalid");
+    }
     match (backend, action) {
-        ("rust", Format) if packages.is_none() => Ok(ReadOnlyValidationOperation::Cargo(
-            CargoReadOnlyValidationOperation::FormatCheck,
-        )),
+        ("rust", Format) if packages.is_none() && !all_packages => Ok(
+            ReadOnlyValidationOperation::Cargo(CargoReadOnlyValidationOperation::FormatCheck),
+        ),
         ("rust", Format) => Err("validation_scope_unsupported"),
         ("rust", Check) => Ok(ReadOnlyValidationOperation::Cargo(
             CargoReadOnlyValidationOperation::Check(CargoCheckOptions {
                 packages,
+                all_packages,
                 ..Default::default()
             }),
         )),
         ("rust", Test) => Ok(ReadOnlyValidationOperation::Cargo(
             CargoReadOnlyValidationOperation::Test(CargoTestOptions {
                 packages,
+                all_packages,
                 ..Default::default()
             }),
         )),
@@ -301,12 +340,14 @@ pub fn project_validation_operation(
         ("go", Check) => Ok(ReadOnlyValidationOperation::Go(
             GoReadOnlyValidationOperation::Check(GoCheckOptions {
                 packages,
+                all_packages,
                 ..Default::default()
             }),
         )),
         ("go", Test) => Ok(ReadOnlyValidationOperation::Go(
             GoReadOnlyValidationOperation::Test(GoTestOptions {
                 packages,
+                all_packages,
                 ..Default::default()
             }),
         )),
@@ -323,6 +364,7 @@ impl From<CargoCheckOptions> for ValidationCommandOptions {
             features: options.features,
             package: options.package,
             cargo_packages: options.packages,
+            all_packages: options.all_packages,
             dependency_mode: options.dependency_mode,
             ..Self::default()
         }
@@ -340,6 +382,7 @@ impl From<CargoTestOptions> for ValidationCommandOptions {
             features: options.features,
             package: options.package,
             cargo_packages: options.packages,
+            all_packages: options.all_packages,
             no_run: options.no_run,
             dependency_mode: options.dependency_mode,
             ..Self::default()
@@ -351,6 +394,7 @@ impl From<GoCheckOptions> for ValidationCommandOptions {
     fn from(options: GoCheckOptions) -> Self {
         Self {
             go_packages: options.packages,
+            all_packages: options.all_packages,
             dependency_mode: options.dependency_mode,
             ..Self::default()
         }
@@ -362,6 +406,7 @@ impl From<GoTestOptions> for ValidationCommandOptions {
         Self {
             filter: options.filter,
             go_packages: options.packages,
+            all_packages: options.all_packages,
             dependency_mode: options.dependency_mode,
             ..Self::default()
         }
@@ -413,7 +458,7 @@ pub(super) fn read_only_validation_plan(
         args: args.iter().map(ValidationPlanArg::raw).collect(),
         env: Vec::new(),
     };
-    if !structured_step.is_canonical() {
+    if !(structured_step.is_canonical() || structured_step.is_project_workspace_cargo()) {
         return Err("structured validation step is not canonical".to_string());
     }
     let compatibility_command = std::iter::once(program.to_string())

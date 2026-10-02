@@ -45,12 +45,20 @@ pub(crate) fn plan(
         ProjectValidationAction::Check => SemanticCheck::Check,
         ProjectValidationAction::Test => SemanticCheck::Test,
     };
-    let packages = request.scope.as_ref().map(|scope| scope.packages.clone());
+    let packages = request
+        .scope
+        .as_ref()
+        .and_then(ProjectValidationScope::explicit_packages)
+        .map(<[String]>::to_vec);
+    let all_packages = request
+        .scope
+        .as_ref()
+        .is_some_and(ProjectValidationScope::selects_all_packages);
     let filter = request
         .test
         .as_ref()
         .and_then(|test| test.filter.as_deref());
-    let operation = project_validation_operation(backend.as_str(), action, packages)
+    let operation = project_validation_operation(backend.as_str(), action, packages, all_packages)
         .and_then(|operation| operation.with_dependency_policy(request.dependency_policy))
         .and_then(|operation| operation.with_test_filter(filter))
         .map_err(|code| unavailable(code, Some(backend.as_str())))?;
@@ -64,7 +72,8 @@ pub(crate) fn plan(
         request
             .scope
             .as_ref()
-            .map(|scope| scope.packages.as_slice()),
+            .and_then(ProjectValidationScope::explicit_packages),
+        all_packages,
         request.dependency_policy,
     )
     .map_err(|e| unavailable(e.code, Some(backend.as_str())))?;

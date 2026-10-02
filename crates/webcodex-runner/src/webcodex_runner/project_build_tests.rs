@@ -134,6 +134,7 @@ fn project_build_package_scope_maps_to_bounded_backend_argv() {
     let mut rust = request();
     rust.scope = Some(ProjectBuildScope {
         packages: vec!["package-b".into(), "package-a".into(), "package-a".into()],
+        all_packages: false,
     });
     let (plan, _) = project_build::plan(&policy, &registry, &rust).unwrap();
     assert_eq!(
@@ -145,6 +146,7 @@ fn project_build_package_scope_maps_to_bounded_backend_argv() {
     let mut go = request();
     go.scope = Some(ProjectBuildScope {
         packages: vec!["./cmd/...".into(), "./internal".into()],
+        all_packages: false,
     });
     let (plan, _) = project_build::plan(&policy, &registry, &go).unwrap();
     assert_eq!(plan.process.args, ["build", "./cmd/...", "./internal"]);
@@ -152,6 +154,7 @@ fn project_build_package_scope_maps_to_bounded_backend_argv() {
     let mut invalid = request();
     invalid.scope = Some(ProjectBuildScope {
         packages: vec!["not-relative".into()],
+        all_packages: false,
     });
     assert!(matches!(
         project_build::plan(&policy, &registry, &invalid),
@@ -223,6 +226,44 @@ fn project_build_admission_fence_replans_manifest_lock_and_invocation_truth() {
 }
 
 #[test]
+fn project_build_all_packages_member_manifest_change_fails_queue_fence() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("member/src")).unwrap();
+    fs::write(
+        root.join("member/Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let mut req = request();
+    req.cwd = Some("member".into());
+    req.adapter = ProjectBuildAdapter::Rust;
+    req.scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+
+    let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
+    assert_eq!(plan.process.args, ["build", "--workspace"]);
+    let operation = start_build_operation(&plan, &cwd);
+    project_build::fence(&policy, &registry, &operation).unwrap();
+
+    fs::write(
+        root.join("member/Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    assert!(project_build::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("build_plan_stale"));
+}
+
+#[test]
 fn project_build_fence_rejects_process_drift() {
     let (_tmp, _root, registry, policy) = fixture("go.mod");
     let (plan, cwd) = project_build::plan(&policy, &registry, &request()).unwrap();
@@ -249,4 +290,98 @@ fn project_build_fence_rejects_runtime_project_identity_drift() {
         project_build::fence(&policy, &registry, &operation).unwrap_err(),
         "build project identity mismatch"
     );
+}
+
+#[test]
+fn project_build_all_packages_target_member_change_fails_queue_fence() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['target/member']\nresolver='2'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("target/member")).unwrap();
+    fs::write(
+        root.join("target/member/Cargo.toml"),
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+
+    let mut req = request();
+    req.adapter = ProjectBuildAdapter::Rust;
+    req.scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+    let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
+    assert_eq!(plan.process.args, ["build", "--workspace"]);
+    let operation = start_build_operation(&plan, &cwd);
+    project_build::fence(&policy, &registry, &operation).unwrap();
+
+    fs::write(
+        root.join("target/member/Cargo.toml"),
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    assert!(project_build::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("build_plan_stale"));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_build_all_packages_member_symlink_retarget_fails_queue_fence() {
+    use std::os::unix::fs::symlink;
+
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['selected']\nresolver='2'\n",
+    )
+    .unwrap();
+    for package in ["a", "b"] {
+        fs::create_dir_all(root.join(package)).unwrap();
+        fs::write(
+            root.join(package).join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+    }
+    symlink("a", root.join("selected")).unwrap();
+
+    let mut req = request();
+    req.adapter = ProjectBuildAdapter::Rust;
+    req.scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+    let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
+    let operation = start_build_operation(&plan, &cwd);
+    project_build::fence(&policy, &registry, &operation).unwrap();
+
+    fs::remove_file(root.join("selected")).unwrap();
+    symlink("b", root.join("selected")).unwrap();
+    assert!(project_build::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("build_plan_stale"));
+}
+
+#[test]
+fn project_build_all_packages_supports_single_rust_package() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='single'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+
+    let mut req = request();
+    req.adapter = ProjectBuildAdapter::Rust;
+    req.scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+
+    let (plan, _) = project_build::plan(&policy, &registry, &req).unwrap();
+    assert_eq!(plan.process.args, ["build", "--workspace"]);
 }

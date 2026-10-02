@@ -152,7 +152,7 @@ fn go_project_validation_identity_is_single_module_domain_separated() {
             ProjectValidationAction::FormatCheck => unreachable!(),
         };
         let operation =
-            webcodex_validation::project_validation_operation("go", semantic, None).unwrap();
+            webcodex_validation::project_validation_operation("go", semantic, None, false).unwrap();
         let native_identity = operation
             .validation_target_id(Some(&plan.provenance.recipe_root))
             .unwrap();
@@ -211,6 +211,7 @@ fn project_validation_package_scope_maps_through_canonical_operations() {
         let mut req = request(action);
         req.scope = Some(ProjectValidationScope {
             packages: packages.into_iter().map(str::to_string).collect(),
+            all_packages: false,
         });
         let (plan, _) = project::plan(&policy, &registry, &req).unwrap();
         assert_eq!(plan.adapter, adapter);
@@ -228,7 +229,13 @@ fn project_validation_package_scope_maps_through_canonical_operations() {
                 .request
                 .scope
                 .as_ref()
-                .map(|scope| scope.packages.clone()),
+                .and_then(ProjectValidationScope::explicit_packages)
+                .map(<[String]>::to_vec),
+            plan.provenance
+                .request
+                .scope
+                .as_ref()
+                .is_some_and(ProjectValidationScope::selects_all_packages),
         )
         .unwrap();
         let native_identity = operation
@@ -260,6 +267,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     let mut format = request(ProjectValidationAction::FormatCheck);
     format.scope = Some(ProjectValidationScope {
         packages: vec!["package-a".into()],
+        all_packages: false,
     });
     assert!(matches!(
         project::plan(&policy, &registry, &format),
@@ -270,6 +278,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     let mut invalid_rust = request(ProjectValidationAction::Check);
     invalid_rust.scope = Some(ProjectValidationScope {
         packages: vec!["-bad".into()],
+        all_packages: false,
     });
     assert!(matches!(
         project::plan(&policy, &registry, &invalid_rust),
@@ -281,6 +290,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     let mut invalid_go = request(ProjectValidationAction::Test);
     invalid_go.scope = Some(ProjectValidationScope {
         packages: vec!["not-relative".into()],
+        all_packages: false,
     });
     assert!(matches!(
         project::plan(&policy, &registry, &invalid_go),
@@ -466,4 +476,127 @@ fn project_validation_manifest_fence_and_exact_recovery_plan() {
     assert!(project::fence(&policy, &registry, &op).is_err());
     assert_eq!(restored.steps[0].program, "cargo");
     assert_eq!(restored.project_validation.unwrap().backend, "rust");
+}
+
+fn start_project_validation_operation(
+    plan: &ProjectValidationPlan,
+    cwd: &std::path::Path,
+) -> webcodex_core::runner_operation::RunnerJobOperation {
+    use webcodex_core::runner_operation::{RunnerJobOperation, RunnerJobValidationOperation};
+    use webcodex_core::runner_protocol::{ShellJobContext, ShellJobValidationMetadata};
+
+    let kind = match plan.provenance.request.action {
+        ProjectValidationAction::FormatCheck => "format",
+        ProjectValidationAction::Check => "check",
+        ProjectValidationAction::Test => "test",
+    };
+    let metadata = ShellJobValidationMetadata {
+        project_validation: Some(plan.provenance.clone()),
+        tool: "project_validate".into(),
+        kind: kind.into(),
+        adapter: plan.adapter.clone(),
+        steps: vec![plan.step.clone()],
+        effective_timeout_secs: 60,
+        sync_wait_secs: 10,
+        validation_target_id: Some(plan.validation_target_id.clone()),
+        source_fence: None,
+        minimum_tests: None,
+        require_tests: None,
+        no_run: None,
+    };
+    assert!(metadata.is_valid());
+
+    RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+        job_id: "job".into(),
+        cwd: Some(cwd.to_str().unwrap().into()),
+        steps: vec![plan.step.clone()],
+        timeout_secs: 60,
+        context: ShellJobContext {
+            runtime_project_id: Some("agent:runner:demo".into()),
+            validation: Some(metadata),
+            workflow_session_id: None,
+            ssh_resource: None,
+            project_cwd: Some(plan.provenance.recipe_root.clone()),
+            cwd: Some(cwd.to_str().unwrap().into()),
+            purpose: Some("validation".into()),
+            shell: None,
+            command_preview: "cargo check --workspace".into(),
+            validation_steps: vec!["check".into()],
+            structured_execution: None,
+        },
+    })
+}
+
+#[test]
+fn project_validation_all_packages_target_member_change_fails_queue_fence() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['target/member']\nresolver='2'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("target/member")).unwrap();
+    fs::write(
+        root.join("target/member/Cargo.toml"),
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+
+    let mut req = request(ProjectValidationAction::Check);
+    req.adapter = ProjectValidationAdapter::Rust;
+    req.scope = Some(ProjectValidationScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+    let (plan, cwd) = project::plan(&policy, &registry, &req).unwrap();
+    assert!(plan.step.args.iter().any(|arg| arg == "--workspace"));
+    let operation = start_project_validation_operation(&plan, &cwd);
+    project::fence(&policy, &registry, &operation).unwrap();
+
+    fs::write(
+        root.join("target/member/Cargo.toml"),
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    assert!(project::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("validation_plan_stale"));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_validation_all_packages_member_symlink_retarget_fails_queue_fence() {
+    use std::os::unix::fs::symlink;
+
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['selected']\nresolver='2'\n",
+    )
+    .unwrap();
+    for package in ["a", "b"] {
+        fs::create_dir_all(root.join(package)).unwrap();
+        fs::write(
+            root.join(package).join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+    }
+    symlink("a", root.join("selected")).unwrap();
+
+    let mut req = request(ProjectValidationAction::Check);
+    req.adapter = ProjectValidationAdapter::Rust;
+    req.scope = Some(ProjectValidationScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+    let (plan, cwd) = project::plan(&policy, &registry, &req).unwrap();
+    let operation = start_project_validation_operation(&plan, &cwd);
+    project::fence(&policy, &registry, &operation).unwrap();
+
+    fs::remove_file(root.join("selected")).unwrap();
+    symlink("b", root.join("selected")).unwrap();
+    assert!(project::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("validation_plan_stale"));
 }

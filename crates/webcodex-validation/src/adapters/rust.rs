@@ -1,6 +1,6 @@
 use super::{
-    read_only_validation_plan, ReadOnlyValidationPlan, ValidationAdapter, ValidationCommandOptions,
-    ValidationFailureEvidence, ValidationPlanArg,
+    read_only_validation_plan, validate_package_scope_exclusivity, ReadOnlyValidationPlan,
+    ValidationAdapter, ValidationCommandOptions, ValidationFailureEvidence, ValidationPlanArg,
 };
 use webcodex_core::runner_protocol::{
     normalize_cargo_packages, normalize_cargo_value, normalize_rust_test_filter,
@@ -190,6 +190,10 @@ impl ValidationAdapter for RustValidationAdapter {
 }
 
 fn cargo_check_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidationPlan, String> {
+    validate_package_scope_exclusivity(
+        options.package.is_some() || options.cargo_packages.is_some(),
+        options.all_packages,
+    )?;
     let features = validate_arg("features", options.features)?;
     let packages = normalize_cargo_packages(
         options.package.as_deref(),
@@ -215,14 +219,22 @@ fn cargo_check_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidat
         args.push(ValidationPlanArg::Literal("--features"));
         args.push(ValidationPlanArg::Value(features));
     }
-    for package in packages.into_iter().flatten() {
-        args.push(ValidationPlanArg::Literal("-p"));
-        args.push(ValidationPlanArg::Value(package));
+    if options.all_packages {
+        args.push(ValidationPlanArg::Literal("--workspace"));
+    } else {
+        for package in packages.into_iter().flatten() {
+            args.push(ValidationPlanArg::Literal("-p"));
+            args.push(ValidationPlanArg::Value(package));
+        }
     }
     read_only_validation_plan("check", "cargo", args)
 }
 
 fn cargo_test_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidationPlan, String> {
+    validate_package_scope_exclusivity(
+        options.package.is_some() || options.cargo_packages.is_some(),
+        options.all_packages,
+    )?;
     let filter = validate_filter(options.filter)?;
     let features = validate_arg("features", options.features)?;
     let packages = normalize_cargo_packages(
@@ -255,9 +267,13 @@ fn cargo_test_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidati
         args.push(ValidationPlanArg::Literal("--features"));
         args.push(ValidationPlanArg::Value(features));
     }
-    for package in packages.into_iter().flatten() {
-        args.push(ValidationPlanArg::Literal("-p"));
-        args.push(ValidationPlanArg::Value(package));
+    if options.all_packages {
+        args.push(ValidationPlanArg::Literal("--workspace"));
+    } else {
+        for package in packages.into_iter().flatten() {
+            args.push(ValidationPlanArg::Literal("-p"));
+            args.push(ValidationPlanArg::Value(package));
+        }
     }
     if options.no_run.unwrap_or(false) {
         args.push(ValidationPlanArg::Literal("--no-run"));

@@ -285,6 +285,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // by the running binary, never inferred from generated static config.
             project_go_single_module_v1: false,
             project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
             project_validation_test_options_v1: false,
             // Like JSON parsing, first-class durable go_test support is
             // advertised by the running binary, never by generated static config.

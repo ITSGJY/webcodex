@@ -5406,6 +5406,7 @@ dependencies = [
 name = "webcodex-workspace"
 version = "0.4.4"
 dependencies = [
+ "glob",
  "serde",
  "serde_json",
  "sha2",

@@ -539,7 +539,7 @@ fn project_recipe_filtered_execution_is_deterministic_without_repeating_arg_buil
         )
         .unwrap();
         let expected =
-            crate::project_validation_operation(backend.as_str(), SemanticCheck::Test, None)
+            crate::project_validation_operation(backend.as_str(), SemanticCheck::Test, None, false)
                 .unwrap()
                 .with_test_filter(Some(filter))
                 .unwrap()

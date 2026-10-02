@@ -22,25 +22,75 @@ pub struct ProjectDependencyPolicy {
     pub mode: ProjectDependencyMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Portable project-unit package selection shared by build and validation.
+///
+/// Exactly one selector is valid: bounded explicit `packages`, or
+/// `all_packages=true`. The all-packages intent stays ecosystem-neutral here;
+/// adapters translate it only after Runner-owned Project authority is proven.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectOperationScope {
-    /// Portable bounded package selectors. Adapters translate these semantic
-    /// selectors into ecosystem-specific package mechanics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub all_packages: bool,
+}
+
+#[derive(schemars::JsonSchema)]
+#[serde(untagged)]
+enum ProjectOperationScopeSchema {
+    Packages(ProjectOperationPackagesScopeSchema),
+    AllPackages(ProjectOperationAllPackagesScopeSchema),
+}
+
+#[derive(schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProjectOperationPackagesScopeSchema {
     #[schemars(length(min = 1, max = 8))]
     #[schemars(inner(length(min = 1, max = 256)))]
-    pub packages: Vec<String>,
+    packages: Vec<String>,
+}
+
+#[derive(schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProjectOperationAllPackagesScopeSchema {
+    #[schemars(schema_with = "all_packages_true_schema")]
+    all_packages: bool,
+}
+
+fn all_packages_true_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "boolean", "const": true})
+}
+
+impl schemars::JsonSchema for ProjectOperationScope {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ProjectOperationScope".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <ProjectOperationScopeSchema as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectOperationScopeError {
+    Selection,
     PackageCount,
     InvalidPackage,
 }
 
 impl ProjectOperationScope {
     pub(crate) fn validate(&self) -> Result<(), ProjectOperationScopeError> {
-        if self.packages.is_empty() || self.packages.len() > PROJECT_OPERATION_SCOPE_MAX_PACKAGES {
+        match (self.packages.is_empty(), self.all_packages) {
+            (true, true) => return Ok(()),
+            (false, false) => {}
+            _ => return Err(ProjectOperationScopeError::Selection),
+        }
+        if self.packages.len() > PROJECT_OPERATION_SCOPE_MAX_PACKAGES {
             return Err(ProjectOperationScopeError::PackageCount);
         }
         if self.packages.iter().any(|package| {
@@ -51,5 +101,13 @@ impl ProjectOperationScope {
             return Err(ProjectOperationScopeError::InvalidPackage);
         }
         Ok(())
+    }
+
+    pub fn explicit_packages(&self) -> Option<&[String]> {
+        (!self.packages.is_empty()).then_some(self.packages.as_slice())
+    }
+
+    pub const fn selects_all_packages(&self) -> bool {
+        self.all_packages
     }
 }

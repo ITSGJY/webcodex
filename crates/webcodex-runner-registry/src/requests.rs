@@ -2563,6 +2563,10 @@ impl RunnerRegistry {
         access: Option<&crate::RunnerAccess>,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         payload.validate()?;
+        let requires_all_packages = payload
+            .scope
+            .as_ref()
+            .is_some_and(webcodex_core::project_build::ProjectBuildScope::selects_all_packages);
         let requires_dependency_policy = payload.dependency_policy.is_some();
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
@@ -2579,6 +2583,15 @@ impl RunnerRegistry {
         if !runner.runner_features.supports(RunnerFeature::ProjectBuild) {
             return Err(
                 "capability_unavailable: upgrade target Runner for project_build_v1".into(),
+            );
+        }
+        if requires_all_packages
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectAllPackages)
+        {
+            return Err(
+                "capability_unavailable: upgrade target Runner for project_all_packages_v1".into(),
             );
         }
         if requires_dependency_policy
@@ -2613,7 +2626,14 @@ impl RunnerRegistry {
         access: Option<&crate::RunnerAccess>,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         payload.validate()?;
-        let requires_package_scope = payload.scope.is_some();
+        let requires_package_scope = payload
+            .scope
+            .as_ref()
+            .and_then(webcodex_core::project_validation::ProjectValidationScope::explicit_packages)
+            .is_some();
+        let requires_all_packages = payload.scope.as_ref().is_some_and(
+            webcodex_core::project_validation::ProjectValidationScope::selects_all_packages,
+        );
         let requires_dependency_policy = payload.dependency_policy.is_some();
         let requires_test_options = payload.test.is_some();
         let request_id = next_request_id();
@@ -2634,6 +2654,15 @@ impl RunnerRegistry {
         {
             return Err(
                 "capability_unavailable: upgrade target Runner for project_validation_v1".into(),
+            );
+        }
+        if requires_all_packages
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectAllPackages)
+        {
+            return Err(
+                "capability_unavailable: upgrade target Runner for project_all_packages_v1".into(),
             );
         }
         if requires_dependency_policy

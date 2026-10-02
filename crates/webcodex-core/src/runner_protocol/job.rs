@@ -211,6 +211,17 @@ pub struct ShellJobValidationStep {
 
 impl ShellJobValidationStep {
     pub fn is_canonical(&self) -> bool {
+        self.is_canonical_with_project_workspace(false)
+    }
+
+    /// Project gateways may additionally carry Cargo `--workspace` after
+    /// Runner-owned Project/workspace authority has been proven. Specialist
+    /// Cargo tools keep the historical canonical argv vocabulary.
+    pub fn is_canonical_project_step(&self) -> bool {
+        self.is_canonical_with_project_workspace(true)
+    }
+
+    fn is_canonical_with_project_workspace(&self, allow_project_workspace: bool) -> bool {
         if self
             .args
             .iter()
@@ -230,8 +241,8 @@ impl ShellJobValidationStep {
         let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
         match (self.name.as_str(), self.program.as_str()) {
             ("format", "cargo") => args == ["fmt", "--", "--check"],
-            ("check", "cargo") => is_canonical_cargo_check_args(&args),
-            ("test", "cargo") => is_canonical_cargo_test_args(&args),
+            ("check", "cargo") => is_canonical_cargo_check_args(&args, allow_project_workspace),
+            ("test", "cargo") => is_canonical_cargo_test_args(&args, allow_project_workspace),
             ("check", "go") => is_canonical_go_vet_args(&args),
             ("test", "go") => args == ["test", "./..."] || self.is_structured_go_test_json(),
             ("format", "python") => {
@@ -263,6 +274,13 @@ impl ShellJobValidationStep {
         is_canonical_go_test_json_args(&args)
     }
 
+    pub fn is_project_workspace_cargo(&self) -> bool {
+        self.program == "cargo"
+            && matches!(self.name.as_str(), "check" | "test")
+            && self.args.iter().any(|arg| arg == "--workspace")
+            && self.is_canonical_project_step()
+    }
+
     pub fn is_multi_package_cargo_check(&self) -> bool {
         self.name == "check"
             && self.program == "cargo"
@@ -275,8 +293,9 @@ impl ShellJobValidationStep {
 /// read-only flags (`--all-targets`, `--all-features`,
 /// `--no-default-features`, `--locked`) and `--features <value>` /
 /// `-p <value>` pairs.
-fn is_canonical_cargo_check_args(args: &[&str]) -> bool {
-    args.first() == Some(&"check") && is_canonical_cargo_flags(&args[1..], false, true)
+fn is_canonical_cargo_check_args(args: &[&str], allow_project_workspace: bool) -> bool {
+    args.first() == Some(&"check")
+        && is_canonical_cargo_flags(&args[1..], false, true, allow_project_workspace)
 }
 
 /// Canonical `cargo test` argv: the `test` subcommand, an optional libtest
@@ -290,7 +309,7 @@ fn is_canonical_cargo_check_args(args: &[&str]) -> bool {
 /// caller meant the flag or mis-placed it in the filter field, so it is parsed
 /// here as the flag. Rejecting option-like filters is the planner and
 /// request-validation contract (`valid_rust_test_filter`), not this function.
-fn is_canonical_cargo_test_args(args: &[&str]) -> bool {
+fn is_canonical_cargo_test_args(args: &[&str], allow_project_workspace: bool) -> bool {
     if args.first() != Some(&"test") {
         return false;
     }
@@ -298,7 +317,7 @@ fn is_canonical_cargo_test_args(args: &[&str]) -> bool {
         Some(filter) if valid_rust_test_filter(filter) => 2,
         _ => 1,
     };
-    is_canonical_cargo_flags(&args[flags_start..], true, true)
+    is_canonical_cargo_flags(&args[flags_start..], true, true, allow_project_workspace)
 }
 
 /// Normalize and validate one value-taking Cargo argument (`--features`,
@@ -517,6 +536,7 @@ fn is_canonical_cargo_flags(
     args: &[&str],
     cargo_test: bool,
     allow_multiple_packages: bool,
+    allow_project_workspace: bool,
 ) -> bool {
     let mut seen = HashSet::new();
     let mut seen_packages = HashSet::new();
@@ -524,6 +544,7 @@ fn is_canonical_cargo_flags(
     while let Some(arg) = iter.next() {
         let key = match *arg {
             "--all-targets" | "--all-features" | "--no-default-features" | "--locked" => *arg,
+            "--workspace" if allow_project_workspace => *arg,
             "--lib" | "--no-run" if cargo_test => *arg,
             "--features" => {
                 if !seen.insert(*arg) {
@@ -562,7 +583,7 @@ fn is_canonical_cargo_flags(
             return false;
         }
     }
-    true
+    !(seen.contains("--workspace") && !seen_packages.is_empty())
 }
 
 fn node_script_allowed(kind: &str, script: &str) -> bool {
@@ -753,9 +774,21 @@ pub struct ShellJobValidationMetadata {
 
 impl ShellJobValidationMetadata {
     pub fn is_valid(&self) -> bool {
+        let project_all_packages = self
+            .project_validation
+            .as_ref()
+            .and_then(|provenance| provenance.request.scope.as_ref())
+            .is_some_and(crate::project_validation::ProjectValidationScope::selects_all_packages);
+        let step_is_canonical = self.steps.first().is_some_and(|step| {
+            if project_all_packages {
+                step.is_canonical_project_step()
+            } else {
+                step.is_canonical()
+            }
+        });
         if (self.tool != "project_validate" && self.adapter != self.tool)
             || self.steps.len() != 1
-            || !self.steps[0].is_canonical()
+            || !step_is_canonical
             || self.effective_timeout_secs < 1
             || self.sync_wait_secs > self.effective_timeout_secs
             || self.validation_target_id.as_deref().is_some_and(|value| {
@@ -798,6 +831,9 @@ impl ShellJobValidationMetadata {
             };
             if !provenance.is_valid()
                 || provenance.request.action.kind() != self.kind
+                || (provenance.backend == "rust"
+                    && project_all_packages
+                    && !self.steps[0].is_project_workspace_cargo())
                 || !matches!(
                     (provenance.backend.as_str(), self.adapter.as_str()),
                     ("rust", "cargo_fmt" | "cargo_check" | "cargo_test")

@@ -8,8 +8,9 @@ use std::fs;
 use std::path::Path;
 use webcodex_core::runner_protocol::{normalize_rust_test_filter, ShellJobValidationStep};
 use webcodex_workspace::project_recipe::{
-    digest_project_recipe_files, project_recipe_provenance_files, read_project_recipe_file,
-    resolve_project_recipe_root, ProjectRecipeResolutionError,
+    digest_project_cargo_all_packages_provenance, digest_project_recipe_files,
+    project_recipe_provenance_files, read_project_recipe_file, resolve_project_recipe_root,
+    ProjectRecipeResolutionError,
 };
 
 pub use webcodex_workspace::project_recipe::ProjectRecipeId as RecipeId;
@@ -145,6 +146,7 @@ pub fn resolve_validation_recipe_with_packages(
         checks,
         test_filter,
         package_scope,
+        false,
         None,
     )
 }
@@ -156,6 +158,7 @@ pub fn resolve_validation_recipe_with_project_policy(
     checks: &[SemanticCheck],
     test_filter: Option<&str>,
     package_scope: Option<&[String]>,
+    all_packages: bool,
     dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
 ) -> Result<ResolvedValidationRecipe, RecipeError> {
     let resolved_root = resolve_project_recipe_root(execution_root, cwd, explicit_recipe)
@@ -163,7 +166,8 @@ pub fn resolve_validation_recipe_with_project_policy(
     let root = &resolved_root.execution_root;
     let recipe = resolved_root.recipe;
     let recipe_root = &resolved_root.absolute_root;
-    if package_scope.is_some() && !matches!(recipe, RecipeId::Rust | RecipeId::Go) {
+    if (package_scope.is_some() || all_packages) && !matches!(recipe, RecipeId::Rust | RecipeId::Go)
+    {
         return Err(RecipeError::new("validation_scope_unsupported"));
     }
     let root_relative = resolved_root.relative_root.clone();
@@ -186,46 +190,55 @@ pub fn resolve_validation_recipe_with_project_policy(
     } else {
         let manifest =
             read_project_recipe_file(root, &marker_path).map_err(map_project_recipe_error)?;
-        let (steps, provenance_files) = match recipe {
+        match recipe {
             RecipeId::Rust | RecipeId::Go => {
                 let steps = canonical_adapter_steps(
                     recipe,
                     checks,
                     test_filter.as_deref(),
                     package_scope,
+                    all_packages,
                     dependency_policy,
                 )?;
-                let provenance_files = project_recipe_provenance_files(&resolved_root)
-                    .map_err(map_project_recipe_error)?
-                    .expect("canonical project validation adapters are Rust/Go");
-                (steps, provenance_files)
+                let manifest_digest = if recipe == RecipeId::Rust && all_packages {
+                    digest_project_cargo_all_packages_provenance(&resolved_root)
+                        .map_err(|_| RecipeError::new("validation_scope_unavailable"))?
+                } else {
+                    let provenance_files = project_recipe_provenance_files(&resolved_root)
+                        .map_err(map_project_recipe_error)?
+                        .expect("canonical project validation adapters are Rust/Go");
+                    digest_project_recipe_files(root, provenance_files)
+                        .map_err(map_project_recipe_error)?
+                };
+                (steps, manifest_digest)
             }
             RecipeId::Node => {
                 let (steps, extra_digest_files) = node_steps(&recipe_root, &manifest, checks)?;
-                let provenance_files = std::iter::once(marker_path.clone())
+                let provenance_files: Vec<_> = std::iter::once(marker_path.clone())
                     .chain(
                         extra_digest_files
                             .into_iter()
                             .map(|file| recipe_root.join(file)),
                     )
                     .collect();
-                (steps, provenance_files)
+                let manifest_digest = digest_project_recipe_files(root, provenance_files)
+                    .map_err(map_project_recipe_error)?;
+                (steps, manifest_digest)
             }
             RecipeId::Python => {
                 let (steps, extra_digest_files) = python_steps(&manifest, checks)?;
-                let provenance_files = std::iter::once(marker_path.clone())
+                let provenance_files: Vec<_> = std::iter::once(marker_path.clone())
                     .chain(
                         extra_digest_files
                             .into_iter()
                             .map(|file| recipe_root.join(file)),
                     )
                     .collect();
-                (steps, provenance_files)
+                let manifest_digest = digest_project_recipe_files(root, provenance_files)
+                    .map_err(map_project_recipe_error)?;
+                (steps, manifest_digest)
             }
-        };
-        let manifest_digest = digest_project_recipe_files(root, provenance_files)
-            .map_err(map_project_recipe_error)?;
-        (steps, manifest_digest)
+        }
     };
     let invocation_digest = format!(
         "{:x}",
@@ -234,7 +247,9 @@ pub fn resolve_validation_recipe_with_project_policy(
                 .map_err(|_| RecipeError::new("validation_manifest_invalid"))?
         )
     );
-    debug_assert!(steps.iter().all(ShellJobValidationStep::is_canonical));
+    debug_assert!(steps
+        .iter()
+        .all(|step| { step.is_canonical() || (all_packages && step.is_canonical_project_step()) }));
     Ok(ResolvedValidationRecipe {
         recipe_id: recipe.as_str(),
         recipe_root_relative: root_relative,
@@ -252,6 +267,7 @@ fn canonical_adapter_steps(
     checks: &[SemanticCheck],
     test_filter: Option<&str>,
     package_scope: Option<&[String]>,
+    all_packages: bool,
     dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
 ) -> Result<Vec<ShellJobValidationStep>, RecipeError> {
     let mut steps = Vec::with_capacity(checks.len());
@@ -260,6 +276,7 @@ fn canonical_adapter_steps(
             recipe.as_str(),
             *check,
             package_scope.map(<[String]>::to_vec),
+            all_packages,
         )
         .map_err(|code| {
             if package_scope.is_none() && code == "validation_action_unsupported" {
@@ -278,7 +295,7 @@ fn canonical_adapter_steps(
             )
             .map_err(RecipeError::new)?;
         let plan = operation.build_readonly_plan().map_err(|_| {
-            if package_scope.is_some() {
+            if package_scope.is_some() || all_packages {
                 RecipeError::new("validation_scope_invalid")
             } else {
                 check_unavailable()

@@ -406,6 +406,7 @@ async fn go_test_rejects_empty_or_oversized_package_lists_before_dispatch() {
             structured_go_test_json: true,
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
             structured_go_test_tool: true,
             ..Default::default()
         },
@@ -542,6 +543,7 @@ async fn fast_go_test_uses_exact_structured_argv_cwd_and_records_session_evidenc
             structured_go_test_json: true,
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
             structured_go_test_tool: true,
             ..Default::default()
         },
@@ -656,6 +658,7 @@ async fn go_test_failure_reports_failed_test_identity_in_result_and_session() {
             structured_go_test_json: true,
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
             structured_go_test_tool: true,
             ..Default::default()
         },
@@ -746,6 +749,7 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
             structured_go_test_json: true,
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
             structured_go_test_tool: true,
             structured_go_test_packages: true,
             ..Default::default()

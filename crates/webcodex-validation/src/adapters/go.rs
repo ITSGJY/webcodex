@@ -1,6 +1,6 @@
 use super::{
-    read_only_validation_plan, ReadOnlyValidationPlan, ValidationAdapter, ValidationCommandOptions,
-    ValidationFailureEvidence, ValidationPlanArg,
+    read_only_validation_plan, validate_package_scope_exclusivity, ReadOnlyValidationPlan,
+    ValidationAdapter, ValidationCommandOptions, ValidationFailureEvidence, ValidationPlanArg,
 };
 use webcodex_core::runner_protocol::normalize_go_test_packages;
 use webcodex_core::validation_evidence::{parse_go_test_diagnostics, ValidationDiagnostics};
@@ -51,6 +51,7 @@ impl ValidationAdapter for GoTestValidationAdapter {
             return Err("go_test does not accept Cargo validation command options".to_string());
         }
         let explicit_packages = options.go_packages.is_some();
+        validate_package_scope_exclusivity(explicit_packages, options.all_packages)?;
         let packages = normalize_go_test_packages(options.go_packages.as_deref())
             .map_err(|reason| format!("packages {reason}"))?;
         let mut args = vec![
@@ -72,7 +73,7 @@ impl ValidationAdapter for GoTestValidationAdapter {
             args.push(ValidationPlanArg::Literal("-run"));
             args.push(ValidationPlanArg::Value(filter));
         }
-        if explicit_packages {
+        if explicit_packages && !options.all_packages {
             args.extend(packages.into_iter().map(ValidationPlanArg::Value));
         } else {
             debug_assert_eq!(packages.as_slice(), ["./..."]);
@@ -158,6 +159,7 @@ impl ValidationAdapter for GoVetValidationAdapter {
             return Err("go_vet does not accept Cargo validation command options".to_string());
         }
         let explicit_packages = options.go_packages.is_some();
+        validate_package_scope_exclusivity(explicit_packages, options.all_packages)?;
         let packages = normalize_go_test_packages(options.go_packages.as_deref())
             .map_err(|reason| format!("packages {reason}"))?;
         let mut args = vec![ValidationPlanArg::Literal("vet")];
@@ -166,7 +168,7 @@ impl ValidationAdapter for GoVetValidationAdapter {
         {
             args.push(ValidationPlanArg::Literal("-mod=readonly"));
         }
-        if explicit_packages {
+        if explicit_packages && !options.all_packages {
             args.extend(packages.into_iter().map(ValidationPlanArg::Value));
         } else {
             debug_assert_eq!(packages.as_slice(), ["./..."]);

@@ -3,8 +3,10 @@
 //! This module owns filesystem facts shared by project operations. It does not
 //! select validation actions, synthesize argv, or attach validation evidence.
 
+use glob::{MatchOptions, Pattern};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -172,6 +174,695 @@ fn rust_workspace_root(
     Ok(resolved.absolute_root.clone())
 }
 
+/// Resolve and fence the package-selection authority behind portable Cargo
+/// `all_packages`. The effective Cargo workspace must be the exact registered
+/// Project root. Every in-Project Cargo manifest is then bound into provenance,
+/// so workspace membership changes become stale before native execution.
+///
+/// Dependency path/patch/config semantics are intentionally not interpreted
+/// here: they can affect dependency resolution, but they do not by themselves
+/// grant `--workspace` authority over packages outside the registered Project.
+pub fn project_cargo_all_packages_provenance_files(
+    resolved: &ResolvedProjectRecipeRoot,
+) -> Result<Vec<PathBuf>, ProjectRecipeResolutionError> {
+    const MAX_MANIFESTS: usize = 256;
+    const MAX_SCAN_ENTRIES: usize = 8192;
+
+    if resolved.recipe != ProjectRecipeId::Rust {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+    let workspace_root = rust_workspace_root(resolved)?;
+    if workspace_root != resolved.execution_root {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+
+    let root_manifest_path = workspace_root.join("Cargo.toml");
+    let root_manifest = parse_cargo_manifest(&resolved.execution_root, &root_manifest_path)?;
+    let workspace = root_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table);
+    if let Some(members) = workspace.and_then(|workspace| workspace.get("members")) {
+        let members = members
+            .as_array()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for member in members {
+            let member = member
+                .as_str()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            validate_workspace_member_pattern(member)?;
+        }
+    }
+
+    let mut manifests = Vec::new();
+    let mut pending = vec![workspace_root.clone()];
+    let mut visited_dirs = BTreeSet::new();
+    let mut scanned = 0usize;
+    while let Some(directory) = pending.pop() {
+        let canonical_directory = directory
+            .canonicalize()
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        if !canonical_directory.starts_with(&workspace_root)
+            || !visited_dirs.insert(canonical_directory.clone())
+        {
+            continue;
+        }
+        let entries = fs::read_dir(&canonical_directory)
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+            scanned += 1;
+            if scanned > MAX_SCAN_ENTRIES {
+                return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+            }
+            let name = entry.file_name();
+            let file_type = entry
+                .file_type()
+                .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+            if matches!(
+                name.to_str(),
+                Some(".git" | "target" | "node_modules" | ".venv")
+            ) {
+                continue;
+            }
+
+            let mut path = entry.path();
+            let mut effective_type = file_type;
+            if effective_type.is_symlink() {
+                path = path
+                    .canonicalize()
+                    .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+                if !path.starts_with(&workspace_root) {
+                    return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+                }
+                effective_type = fs::metadata(&path)
+                    .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?
+                    .file_type();
+            }
+            if effective_type.is_dir() {
+                pending.push(path);
+            } else if effective_type.is_file() && name == "Cargo.toml" {
+                manifests.push(path);
+                if manifests.len() > MAX_MANIFESTS {
+                    return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+                }
+            }
+        }
+    }
+    manifests.sort();
+    if !manifests.iter().any(|path| path == &root_manifest_path) {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+    manifests.push(workspace_root.join("Cargo.lock"));
+    Ok(manifests)
+}
+
+fn validate_workspace_member_pattern(member: &str) -> Result<(), ProjectRecipeResolutionError> {
+    let path = Path::new(member);
+    if member.is_empty()
+        || member.contains('\0')
+        || member.contains('\\')
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+    Ok(())
+}
+
+/// Hash Cargo all-packages provenance as a conservative superset.
+///
+/// The existing bounded project-wide manifest scan remains the content source.
+/// This adds only topology that scan can lose: workspace-member glob matches,
+/// symlink targets, manifests below pruned directories, and in-project path
+/// dependencies. It does not reproduce Cargo's final membership algorithm.
+pub fn digest_project_cargo_all_packages_provenance(
+    resolved: &ResolvedProjectRecipeRoot,
+) -> Result<String, ProjectRecipeResolutionError> {
+    let mut files = project_cargo_all_packages_provenance_files(resolved)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let workspace_root = rust_workspace_root(resolved)?;
+    if workspace_root != resolved.execution_root {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+
+    let root_manifest_path = workspace_root.join("Cargo.toml");
+    let root_manifest = parse_cargo_manifest(&workspace_root, &root_manifest_path)?;
+    let workspace = root_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table);
+    let mut topology = BTreeSet::new();
+    let mut manifest_routes = BTreeSet::new();
+    let root_route = cargo_manifest_route_if_present(&workspace_root, &workspace_root)?
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+    manifest_routes.insert(root_route);
+    for manifest in files
+        .iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml"))
+    {
+        manifest_routes.insert(CargoManifestRoute {
+            logical: manifest.clone(),
+            canonical: manifest.clone(),
+        });
+    }
+    ensure_manifest_route_bound(&manifest_routes)?;
+    ensure_canonical_manifest_bound(&manifest_routes)?;
+
+    let mut scanned = 0usize;
+    if let Some(members) = workspace.and_then(|workspace| workspace.get("members")) {
+        let members = members
+            .as_array()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for member in members {
+            let member = member
+                .as_str()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            validate_workspace_member_pattern(member)?;
+            for logical in
+                workspace_member_witnesses(&workspace_root, member, &mut scanned, &mut topology)?
+            {
+                record_workspace_member(
+                    &workspace_root,
+                    member,
+                    &logical,
+                    &mut topology,
+                    &mut files,
+                    &mut manifest_routes,
+                )?;
+            }
+        }
+    }
+
+    add_path_dependency_witnesses(
+        &workspace_root,
+        &mut files,
+        &mut manifest_routes,
+        &mut topology,
+    )?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"webcodex:cargo-all-packages-provenance:v3\0");
+    let files_digest = digest_project_recipe_files(&workspace_root, files)?;
+    hash_field(&mut hasher, files_digest.as_bytes());
+    for route in manifest_routes {
+        hash_field(&mut hasher, b"manifest_route");
+        hash_field(
+            &mut hasher,
+            &logical_path_identity(&workspace_root, &route.logical),
+        );
+        hash_field(
+            &mut hasher,
+            &relative_path_identity(&workspace_root, &route.canonical)?,
+        );
+    }
+    for entry in topology {
+        hash_field(&mut hasher, entry.kind.as_bytes());
+        hash_field(&mut hasher, &entry.owner);
+        hash_field(&mut hasher, entry.declaration.as_bytes());
+        hash_field(&mut hasher, &entry.logical);
+        hash_field(&mut hasher, &entry.resolved);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+const CARGO_ALL_PACKAGES_MAX_MANIFESTS: usize = 256;
+const CARGO_ALL_PACKAGES_MAX_SCAN_ENTRIES: usize = 8192;
+const CARGO_ALL_PACKAGES_MAX_TOPOLOGY_ENTRIES: usize = 1024;
+const CARGO_DEPENDENCY_TABLE_KEYS: [&str; 5] = [
+    "dependencies",
+    "dev-dependencies",
+    "dev_dependencies",
+    "build-dependencies",
+    "build_dependencies",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CargoTopologyEntry {
+    kind: &'static str,
+    owner: Vec<u8>,
+    declaration: String,
+    logical: Vec<u8>,
+    resolved: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CargoPathDependencyWitness {
+    declaration: String,
+    logical: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CargoManifestRoute {
+    logical: PathBuf,
+    canonical: PathBuf,
+}
+
+fn workspace_member_witnesses(
+    workspace_root: &Path,
+    declaration: &str,
+    scanned: &mut usize,
+    topology: &mut BTreeSet<CargoTopologyEntry>,
+) -> Result<Vec<PathBuf>, ProjectRecipeResolutionError> {
+    if !workspace_pattern_has_glob(declaration) {
+        return Ok(vec![workspace_root.join(declaration)]);
+    }
+
+    // Cargo feeds the joined member path through glob(), which decomposes it
+    // with Path::components(). Mirror that normalization so repeated
+    // separators and interior dot components cannot create a provenance-only
+    // mismatch for an otherwise valid Cargo workspace.
+    let normalized = Path::new(declaration)
+        .components()
+        .filter_map(|component| match component {
+            Component::CurDir => None,
+            Component::Normal(component) => component.to_str(),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let pattern =
+        Pattern::new(&normalized).map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+    let components = normalized.split('/').collect::<Vec<_>>();
+    let prefix_len = components
+        .iter()
+        .position(|component| workspace_component_has_glob(component))
+        .unwrap_or(components.len());
+    let mut start = workspace_root.to_path_buf();
+    for component in &components[..prefix_len] {
+        if *component != "." {
+            start.push(component);
+        }
+    }
+    if fs::symlink_metadata(&start).is_err() {
+        return Ok(Vec::new());
+    }
+
+    let max_depth = (!components.iter().any(|component| *component == "**"))
+        .then_some(components.len().saturating_sub(prefix_len));
+    // Cargo expands workspace members with glob::glob(), whose glob_with()
+    // path iterator always requires wildcard tokens to respect path-component
+    // separators. Match the same rule while retaining our explicit scan bound.
+    let options = MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    let mut pending = vec![(start, 0usize, Vec::<PathBuf>::new())];
+    let mut matches = BTreeSet::new();
+
+    while let Some((directory, depth, ancestry)) = pending.pop() {
+        let canonical_directory = directory
+            .canonicalize()
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        if !canonical_directory.starts_with(workspace_root) {
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+        }
+        if max_depth.is_none() && ancestry.contains(&canonical_directory) {
+            continue;
+        }
+        let mut branch_ancestry = ancestry;
+        if max_depth.is_none() {
+            branch_ancestry.push(canonical_directory);
+        }
+
+        let entries = fs::read_dir(&directory)
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        let mut bounded_entries = Vec::new();
+        for entry in entries {
+            *scanned += 1;
+            if *scanned > CARGO_ALL_PACKAGES_MAX_SCAN_ENTRIES {
+                return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+            }
+            bounded_entries
+                .push(entry.map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?);
+        }
+        bounded_entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in bounded_entries {
+            let path = entry.path();
+            let symlink = entry
+                .file_type()
+                .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?
+                .is_symlink();
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+            if !canonical.starts_with(workspace_root) {
+                return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+            }
+
+            if symlink {
+                insert_topology(
+                    topology,
+                    CargoTopologyEntry {
+                        kind: "member_glob_symlink",
+                        owner: b"workspace.members".to_vec(),
+                        declaration: declaration.into(),
+                        logical: relative_path_identity(workspace_root, &path)?,
+                        resolved: relative_path_identity(workspace_root, &canonical)?,
+                    },
+                )?;
+            }
+
+            let relative = path
+                .strip_prefix(workspace_root)
+                .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+            if pattern.matches_path_with(relative, options) {
+                matches.insert(path.clone());
+                if matches.len() > CARGO_ALL_PACKAGES_MAX_TOPOLOGY_ENTRIES {
+                    return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+                }
+            }
+
+            let next_depth = depth + 1;
+            if max_depth.is_none_or(|limit| next_depth < limit) {
+                pending.push((path, next_depth, branch_ancestry.clone()));
+            }
+        }
+    }
+    Ok(matches.into_iter().collect())
+}
+fn record_workspace_member(
+    workspace_root: &Path,
+    declaration: &str,
+    logical: &Path,
+    topology: &mut BTreeSet<CargoTopologyEntry>,
+    files: &mut BTreeSet<PathBuf>,
+    manifest_routes: &mut BTreeSet<CargoManifestRoute>,
+) -> Result<(), ProjectRecipeResolutionError> {
+    let logical_id = logical_path_identity(workspace_root, logical);
+    let Some(canonical) = canonicalize_optional_path(logical)? else {
+        insert_topology(
+            topology,
+            CargoTopologyEntry {
+                kind: "workspace_member",
+                owner: b"workspace.members".to_vec(),
+                declaration: declaration.into(),
+                logical: logical_id,
+                resolved: b"missing\0".to_vec(),
+            },
+        )?;
+        return Ok(());
+    };
+    if !canonical.starts_with(workspace_root) {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+    insert_topology(
+        topology,
+        CargoTopologyEntry {
+            kind: "workspace_member",
+            owner: b"workspace.members".to_vec(),
+            declaration: declaration.into(),
+            logical: logical_id,
+            resolved: relative_path_identity(workspace_root, &canonical)?,
+        },
+    )?;
+
+    if let Some(route) = cargo_manifest_route_if_present(workspace_root, logical)? {
+        files.insert(route.canonical.clone());
+        manifest_routes.insert(route);
+        ensure_manifest_route_bound(manifest_routes)?;
+        ensure_canonical_manifest_bound(manifest_routes)?;
+    }
+    Ok(())
+}
+
+fn add_path_dependency_witnesses(
+    workspace_root: &Path,
+    files: &mut BTreeSet<PathBuf>,
+    manifest_routes: &mut BTreeSet<CargoManifestRoute>,
+    topology: &mut BTreeSet<CargoTopologyEntry>,
+) -> Result<(), ProjectRecipeResolutionError> {
+    let mut pending = manifest_routes.iter().cloned().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+
+    while let Some(route) = pending.pop() {
+        if !route.canonical.starts_with(workspace_root) {
+            continue;
+        }
+        let logical_parent = route
+            .logical
+            .parent()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?
+            .canonicalize()
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        if !logical_parent.starts_with(workspace_root)
+            || !visited.insert((route.canonical.clone(), logical_parent))
+        {
+            continue;
+        }
+        let manifest = parse_cargo_manifest(workspace_root, &route.canonical)?;
+        let manifest_dir = route
+            .logical
+            .parent()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        let owner = logical_path_identity(workspace_root, &route.logical);
+
+        for dependency in cargo_path_dependency_witnesses(&manifest, manifest_dir)? {
+            let logical_id = logical_path_identity(workspace_root, &dependency.logical);
+            let resolved = match canonicalize_optional_path(&dependency.logical)? {
+                Some(target) if target.starts_with(workspace_root) => {
+                    if let Some(target_route) =
+                        cargo_manifest_route_if_present(workspace_root, &dependency.logical)?
+                    {
+                        files.insert(target_route.canonical.clone());
+                        if manifest_routes.insert(target_route.clone()) {
+                            ensure_manifest_route_bound(manifest_routes)?;
+                            ensure_canonical_manifest_bound(manifest_routes)?;
+                            pending.push(target_route);
+                        }
+                    }
+                    relative_path_identity(workspace_root, &target)?
+                }
+                Some(_) if lexical_path_is_within(workspace_root, &dependency.logical) => {
+                    return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+                }
+                Some(_) => b"outside-project\0".to_vec(),
+                None => b"missing\0".to_vec(),
+            };
+            insert_topology(
+                topology,
+                CargoTopologyEntry {
+                    kind: "path_dependency",
+                    owner: owner.clone(),
+                    declaration: dependency.declaration,
+                    logical: logical_id,
+                    resolved,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_optional_path(
+    path: &Path,
+) -> Result<Option<PathBuf>, ProjectRecipeResolutionError> {
+    match path.canonicalize() {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ProjectRecipeResolutionError::SourceFileInvalid),
+    }
+}
+
+fn cargo_manifest_route_if_present(
+    workspace_root: &Path,
+    directory: &Path,
+) -> Result<Option<CargoManifestRoute>, ProjectRecipeResolutionError> {
+    let logical = directory.join("Cargo.toml");
+    match fs::symlink_metadata(&logical) {
+        Ok(_) => {
+            let canonical = logical
+                .canonicalize()
+                .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+            if !canonical.starts_with(workspace_root) || !canonical.is_file() {
+                return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+            }
+            Ok(Some(CargoManifestRoute { logical, canonical }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(ProjectRecipeResolutionError::SourceFileInvalid),
+    }
+}
+
+fn cargo_path_dependency_witnesses(
+    manifest: &toml::Value,
+    manifest_dir: &Path,
+) -> Result<Vec<CargoPathDependencyWitness>, ProjectRecipeResolutionError> {
+    let root = manifest
+        .as_table()
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+    let mut witnesses = BTreeSet::new();
+    for key in CARGO_DEPENDENCY_TABLE_KEYS {
+        collect_path_dependencies(root.get(key), key, manifest_dir, &mut witnesses)?;
+    }
+    if let Some(workspace) = root.get("workspace").and_then(toml::Value::as_table) {
+        collect_path_dependencies(
+            workspace.get("dependencies"),
+            "workspace.dependencies",
+            manifest_dir,
+            &mut witnesses,
+        )?;
+    }
+    if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+        for (target_name, target) in targets {
+            let target = target
+                .as_table()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            for key in CARGO_DEPENDENCY_TABLE_KEYS {
+                collect_path_dependencies(
+                    target.get(key),
+                    &format!("target.{target_name}.{key}"),
+                    manifest_dir,
+                    &mut witnesses,
+                )?;
+            }
+        }
+    }
+    Ok(witnesses.into_iter().collect())
+}
+
+fn collect_path_dependencies(
+    value: Option<&toml::Value>,
+    table_name: &str,
+    manifest_dir: &Path,
+    witnesses: &mut BTreeSet<CargoPathDependencyWitness>,
+) -> Result<(), ProjectRecipeResolutionError> {
+    let Some(dependencies) = value.and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (name, dependency) in dependencies {
+        let Some(path) = dependency
+            .as_table()
+            .and_then(|table| table.get("path"))
+            .and_then(toml::Value::as_str)
+        else {
+            continue;
+        };
+        if path.is_empty() || path.as_bytes().contains(&0) {
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+        }
+        let declared = Path::new(path);
+        witnesses.insert(CargoPathDependencyWitness {
+            declaration: format!("{table_name}.{name}:path={path}"),
+            logical: if declared.is_absolute() {
+                declared.to_path_buf()
+            } else {
+                manifest_dir.join(declared)
+            },
+        });
+        if witnesses.len() > CARGO_ALL_PACKAGES_MAX_TOPOLOGY_ENTRIES {
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn lexical_path_is_within(workspace_root: &Path, path: &Path) -> bool {
+    lexical_normalize(path).starts_with(workspace_root)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn ensure_canonical_manifest_bound(
+    routes: &BTreeSet<CargoManifestRoute>,
+) -> Result<(), ProjectRecipeResolutionError> {
+    let canonical = routes
+        .iter()
+        .map(|route| route.canonical.as_path())
+        .collect::<BTreeSet<_>>();
+    (canonical.len() <= CARGO_ALL_PACKAGES_MAX_MANIFESTS)
+        .then_some(())
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)
+}
+
+fn ensure_manifest_route_bound(
+    routes: &BTreeSet<CargoManifestRoute>,
+) -> Result<(), ProjectRecipeResolutionError> {
+    (routes.len() <= CARGO_ALL_PACKAGES_MAX_TOPOLOGY_ENTRIES)
+        .then_some(())
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)
+}
+
+fn insert_topology(
+    topology: &mut BTreeSet<CargoTopologyEntry>,
+    entry: CargoTopologyEntry,
+) -> Result<(), ProjectRecipeResolutionError> {
+    topology.insert(entry);
+    (topology.len() <= CARGO_ALL_PACKAGES_MAX_TOPOLOGY_ENTRIES)
+        .then_some(())
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn relative_path_identity(
+    workspace_root: &Path,
+    path: &Path,
+) -> Result<Vec<u8>, ProjectRecipeResolutionError> {
+    let relative = path
+        .strip_prefix(workspace_root)
+        .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+    Ok(path_identity(b"project-relative", relative))
+}
+
+fn logical_path_identity(workspace_root: &Path, path: &Path) -> Vec<u8> {
+    match path.strip_prefix(workspace_root) {
+        Ok(relative) => path_identity(b"project-relative", relative),
+        Err(_) => b"outside-project\0".to_vec(),
+    }
+}
+
+fn path_identity(tag: &[u8], path: &Path) -> Vec<u8> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut identity = Vec::with_capacity(tag.len() + 9 + bytes.len());
+    identity.extend_from_slice(tag);
+    identity.push(0);
+    identity.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    identity.extend_from_slice(bytes);
+    identity
+}
+
+fn workspace_pattern_has_glob(pattern: &str) -> bool {
+    pattern
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+fn workspace_component_has_glob(component: &str) -> bool {
+    component
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
 fn cargo_manifest_uses_workspace_inheritance(
     manifest: &toml::Value,
 ) -> Result<bool, ProjectRecipeResolutionError> {
@@ -195,10 +886,12 @@ fn cargo_manifest_uses_workspace_inheritance(
             "keywords",
             "license",
             "license-file",
+            "license_file",
             "publish",
             "readme",
             "repository",
             "rust-version",
+            "rust_version",
             "version",
         ] {
             if package
@@ -222,7 +915,7 @@ fn cargo_manifest_uses_workspace_inheritance(
         }
     }
 
-    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+    for key in CARGO_DEPENDENCY_TABLE_KEYS {
         if cargo_dependency_table_uses_workspace(root.get(key))? {
             return Ok(true);
         }
@@ -236,7 +929,7 @@ fn cargo_manifest_uses_workspace_inheritance(
             let target = target
                 .as_table()
                 .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
-            for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            for key in CARGO_DEPENDENCY_TABLE_KEYS {
                 if cargo_dependency_table_uses_workspace(target.get(key))? {
                     return Ok(true);
                 }
