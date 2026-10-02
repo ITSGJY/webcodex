@@ -641,7 +641,7 @@ fn cargo_all_packages_path_dependency_symlink_escape_fails_closed() {
 }
 
 #[test]
-fn cargo_all_packages_external_path_dependency_remains_allowed() {
+fn cargo_all_packages_unproven_external_path_membership_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let outside = temp.path().join("outside");
@@ -665,7 +665,11 @@ fn cargo_all_packages_external_path_dependency_remains_allowed() {
     let resolved =
         resolve_project_recipe_root(&project, None, Some(ProjectRecipeId::Rust)).unwrap();
 
-    assert!(digest_project_cargo_all_packages_provenance(&resolved).is_ok());
+    assert!(project_recipe_provenance_files(&resolved).is_ok());
+    assert_eq!(
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
 }
 
 #[test]
@@ -1193,5 +1197,123 @@ fn cargo_all_packages_manifest_bound_counts_symlink_targets_by_identity() {
     assert_eq!(
         digest_project_cargo_all_packages_provenance(&resolved).unwrap_err(),
         ProjectRecipeResolutionError::SourceFileInvalid
+    );
+}
+
+#[test]
+fn cargo_all_packages_requires_authority_over_ancestor_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['app','sibling']\nresolver='2'\n",
+    );
+    write(
+        temp.path(),
+        "app/Cargo.toml",
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(
+        temp.path(),
+        "sibling/Cargo.toml",
+        "[package]\nname='sibling'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    let resolved =
+        resolve_project_recipe_root(&temp.path().join("app"), None, Some(ProjectRecipeId::Rust))
+            .unwrap();
+    // Explicit package fields do not opt out of Cargo's parent workspace search.
+    assert!(project_recipe_provenance_files(&resolved).is_ok());
+    assert_eq!(
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
+    // An explicit project-local workspace is positive selection authority.
+    write(
+        temp.path(),
+        "app/Cargo.toml",
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    );
+    assert!(digest_project_cargo_all_packages_provenance(&resolved).is_ok());
+}
+
+#[test]
+fn cargo_all_packages_external_dependency_cannot_claim_workspace_membership() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    write(
+        &project,
+        "Cargo.toml",
+        "[workspace]\nmembers=['app']\nresolver='2'\n",
+    );
+    write(&project, "app/Cargo.toml", "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nshared={path='../../outside'}\n");
+    write(
+        temp.path(),
+        "outside/Cargo.toml",
+        "[package]\nname='shared'\nversion='0.1.0'\nedition='2021'\nworkspace='../project'\n",
+    );
+    let resolved =
+        resolve_project_recipe_root(&project, None, Some(ProjectRecipeId::Rust)).unwrap();
+    // Cargo admits this external dependency as a workspace member. Its manifest
+    // cannot be witnessed under the registered Project's source authority.
+    assert_eq!(
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_all_packages_accepts_contained_root_manifest_symlink() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "manifests/workspace.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n",
+    );
+    write(
+        temp.path(),
+        "member/Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    symlink("manifests/workspace.toml", temp.path().join("Cargo.toml")).unwrap();
+    let resolved =
+        resolve_project_recipe_root(temp.path(), None, Some(ProjectRecipeId::Rust)).unwrap();
+    let before = digest_project_cargo_all_packages_provenance(&resolved).unwrap();
+    write(
+        temp.path(),
+        "manifests/workspace.toml",
+        "[workspace]\nmembers=['member']\nresolver='3'\n",
+    );
+    assert_ne!(
+        before,
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_all_packages_ignores_unrelated_non_manifest_symlinks() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n",
+    );
+    write(
+        temp.path(),
+        "member/Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    let resolved =
+        resolve_project_recipe_root(temp.path(), None, Some(ProjectRecipeId::Rust)).unwrap();
+    let before = digest_project_cargo_all_packages_provenance(&resolved).unwrap();
+    symlink(outside.path(), temp.path().join("documentation")).unwrap();
+    symlink("missing-notes", temp.path().join("notes-link")).unwrap();
+    assert_eq!(
+        before,
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap()
     );
 }

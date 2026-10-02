@@ -408,11 +408,11 @@ fn validate_snapshot(
                     );
                 }
                 if let Some(validation) = snapshot.context.validation.as_ref() {
-                    if validation
-                        .steps
-                        .get(progress.completed)
-                        .is_none_or(|step| step.program != "cargo" || !step.is_canonical())
-                    {
+                    if validation.steps.get(progress.completed).is_none_or(|step| {
+                        step.program != "cargo"
+                            || !(step.is_canonical()
+                                || (validation.is_valid() && step.is_project_workspace_cargo()))
+                    }) {
                         return Err(
                             "job inventory Cargo activity is inconsistent with validation metadata"
                                 .to_string(),

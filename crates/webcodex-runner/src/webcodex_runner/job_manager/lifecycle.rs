@@ -32,7 +32,7 @@ pub(super) fn cargo_activity_from_stderr(
     step: &ShellJobValidationStep,
     stderr: &str,
 ) -> Option<ShellJobActivity> {
-    if step.program != "cargo" || !step.is_canonical() {
+    if step.program != "cargo" || !step.is_canonical_project_step() {
         return None;
     }
     let validation_activity = validation_step_activity(step);

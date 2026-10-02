@@ -176,12 +176,10 @@ fn rust_workspace_root(
 
 /// Resolve and fence the package-selection authority behind portable Cargo
 /// `all_packages`. The effective Cargo workspace must be the exact registered
-/// Project root. Every in-Project Cargo manifest is then bound into provenance,
-/// so workspace membership changes become stale before native execution.
-///
-/// Dependency path/patch/config semantics are intentionally not interpreted
-/// here: they can affect dependency resolution, but they do not by themselves
-/// grant `--workspace` authority over packages outside the registered Project.
+/// Project root. A bounded conservative manifest scan supplies content
+/// witnesses; the digest adds declared member and path-dependency routes.
+/// Parent workspace discovery and external dependency membership must also
+/// remain provably within this Project before `--workspace` can be admitted.
 pub fn project_cargo_all_packages_provenance_files(
     resolved: &ResolvedProjectRecipeRoot,
 ) -> Result<Vec<PathBuf>, ProjectRecipeResolutionError> {
@@ -195,6 +193,20 @@ pub fn project_cargo_all_packages_provenance_files(
 
     let root_manifest_path = workspace_root.join("Cargo.toml");
     let root_manifest = parse_cargo_manifest(&resolved.execution_root, &root_manifest_path)?;
+    if !cargo_manifest_has_workspace(&root_manifest)? {
+        // Cargo searches parents even when a package inherits no fields. Only
+        // probe marker metadata outside the Project; never parse external
+        // manifests. An explicit local [workspace] stops Cargo's parent search.
+        for parent in workspace_root.ancestors().skip(1) {
+            match fs::symlink_metadata(parent.join("Cargo.toml")) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(ProjectRecipeResolutionError::SourceFileInvalid),
+            }
+        }
+    }
+    let canonical_root_manifest = root_manifest_path
+        .canonicalize()
+        .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
     let workspace = root_manifest
         .get("workspace")
         .and_then(toml::Value::as_table);
@@ -245,6 +257,12 @@ pub fn project_cargo_all_packages_provenance_files(
             let mut path = entry.path();
             let mut effective_type = file_type;
             if effective_type.is_symlink() {
+                // Declared directory aliases are witnessed by member/pattern
+                // and dependency traversal. Unrelated links carry no manifest
+                // content authority and must not widen this broad scan.
+                if name != "Cargo.toml" {
+                    continue;
+                }
                 path = path
                     .canonicalize()
                     .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
@@ -265,7 +283,7 @@ pub fn project_cargo_all_packages_provenance_files(
             }
         }
     }
-    if !manifests.contains(&root_manifest_path) {
+    if !manifests.contains(&canonical_root_manifest) {
         return Err(ProjectRecipeResolutionError::SourceFileInvalid);
     }
     let mut files = manifests.into_iter().collect::<Vec<_>>();
@@ -645,10 +663,12 @@ fn add_path_dependency_witnesses(
                     }
                     relative_path_identity(workspace_root, &target)?
                 }
-                Some(_) if lexical_path_is_within(workspace_root, &dependency.logical) => {
+                Some(_) => {
+                    // An external path dependency can opt into this workspace
+                    // with package.workspace. Its membership cannot be proven
+                    // without reading beyond the registered Project authority.
                     return Err(ProjectRecipeResolutionError::SourceFileInvalid);
                 }
-                Some(_) => b"outside-project\0".to_vec(),
                 None => b"missing\0".to_vec(),
             };
             insert_topology(
@@ -767,24 +787,6 @@ fn collect_path_dependencies(
         }
     }
     Ok(())
-}
-
-fn lexical_path_is_within(workspace_root: &Path, path: &Path) -> bool {
-    lexical_normalize(path).starts_with(workspace_root)
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
 }
 
 fn ensure_canonical_manifest_bound(

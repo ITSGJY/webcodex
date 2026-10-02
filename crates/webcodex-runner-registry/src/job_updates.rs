@@ -552,11 +552,11 @@ fn validate_job_activity(
             // Multi-step checks_run plans retain only step names server-side;
             // there the trusted Runner remains the bounded provenance boundary.
             if let Some(validation) = job.validation.as_ref() {
-                if validation
-                    .steps
-                    .get(progress.completed)
-                    .is_none_or(|step| step.program != "cargo" || !step.is_canonical())
-                {
+                if validation.steps.get(progress.completed).is_none_or(|step| {
+                    step.program != "cargo"
+                        || !(step.is_canonical()
+                            || (validation.is_valid() && step.is_project_workspace_cargo()))
+                }) {
                     return invalid_progress("job_activity_invalid");
                 }
             }

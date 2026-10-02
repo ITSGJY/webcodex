@@ -421,3 +421,33 @@ fn project_build_all_packages_recursive_glob_cycle_fails_queue_fence() {
         .unwrap_err()
         .contains("build_plan_stale"));
 }
+
+#[test]
+fn project_build_all_packages_parent_workspace_appearance_fails_queue_fence() {
+    let (tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='standalone'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    let mut req = request();
+    req.adapter = ProjectBuildAdapter::Rust;
+    req.scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+    let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
+    let operation = start_build_operation(&plan, &cwd);
+    project_build::fence(&policy, &registry, &operation).unwrap();
+
+    // The new parent manifest changes Cargo's project unit without changing
+    // any bytes inside the registered Project. Replanning must reject it.
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nmembers=['remote-project']\nresolver='2'\n",
+    )
+    .unwrap();
+    assert!(project_build::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("build_plan_stale"));
+}

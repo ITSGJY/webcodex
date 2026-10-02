@@ -569,3 +569,103 @@ async fn project_validation_readonly_adapters_preserve_source_fence_through_hand
         }
     }
 }
+
+#[tokio::test]
+async fn project_validation_all_packages_dispatches_and_completes_same_wire_job() {
+    for action in [
+        ProjectValidationAction::Check,
+        ProjectValidationAction::Test,
+    ] {
+        let runtime = setup(1).await;
+        let mut request_call = call(action, None);
+        let ToolCall::ProjectValidate { scope, .. } = &mut request_call else {
+            unreachable!()
+        };
+        *scope = Some(ProjectValidationScope {
+            packages: Vec::new(),
+            all_packages: true,
+        });
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .dispatch_with_auth(request_call, Some(&auth_context(None, true)))
+                    .await
+            }
+        });
+        let (request, job_id) = reply_plan(&runtime, "rust", action).await;
+        assert_eq!(request.kind, "start_validation_job");
+        assert_eq!(request.job_id.as_deref(), Some(job_id.as_str()));
+        assert!(request.decode_operation().is_ok());
+        let metadata = request
+            .job_context
+            .as_ref()
+            .unwrap()
+            .validation
+            .as_ref()
+            .unwrap();
+        assert!(metadata.is_valid());
+        assert!(metadata.steps[0]
+            .args
+            .iter()
+            .any(|arg| arg == "--workspace"));
+        assert!(
+            metadata
+                .project_validation
+                .as_ref()
+                .unwrap()
+                .request
+                .scope
+                .as_ref()
+                .unwrap()
+                .all_packages
+        );
+        let pending = task.await.unwrap();
+        assert_eq!(
+            pending.output["continuation"]["arguments"]["items"][0]["job_id"],
+            job_id
+        );
+        let mut running = cargo_test_update(
+            "project-validation",
+            &request.request_id,
+            &job_id,
+            "running",
+            "",
+            "",
+            None,
+            running_progress(action.kind()),
+            false,
+        );
+        running.activity = Some(ShellJobActivity {
+            state: ShellJobActivityState::Working,
+            phase: ShellJobActivityPhase::CargoCompiling,
+            source: ShellJobActivitySource::CargoOutput,
+        });
+        runtime.runner_registry.update_job(running).await.unwrap();
+        let stdout = if action == ProjectValidationAction::Test {
+            "running 1 test\ntest selected ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        } else {
+            ""
+        };
+        runtime
+            .runner_registry
+            .update_job(cargo_test_update(
+                "project-validation",
+                &request.request_id,
+                &job_id,
+                "completed",
+                stdout,
+                "",
+                Some(0),
+                completed_progress(),
+                true,
+            ))
+            .await
+            .unwrap();
+        let status = runtime.job_status_for_auth(job_id, false, None).await;
+        assert_eq!(status.output["validation"]["passed"], true, "{status:?}");
+        assert!(probe_patch_agent_request(&runtime, "project-validation")
+            .await
+            .is_none());
+    }
+}

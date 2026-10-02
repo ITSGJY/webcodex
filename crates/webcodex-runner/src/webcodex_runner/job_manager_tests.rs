@@ -6189,3 +6189,23 @@ fn assert_local_job_stdin_isolated(test_name: &str, validation: bool) {
     );
     assert!(String::from_utf8_lossy(&stdout).contains("1 passed"));
 }
+
+#[test]
+fn project_all_packages_cargo_activity_retains_native_progress() {
+    let mut step = ShellJobValidationStep {
+        name: "check".into(),
+        program: "cargo".into(),
+        args: vec!["check".into(), "--all-targets".into(), "--workspace".into()],
+        env: Vec::new(),
+    };
+    assert_eq!(
+        cargo_activity_from_stderr(&step, "Checking member v0.1.0\n"),
+        Some(ShellJobActivity {
+            state: ShellJobActivityState::Working,
+            phase: ShellJobActivityPhase::CargoChecking,
+            source: ShellJobActivitySource::CargoOutput,
+        })
+    );
+    step.args.extend(["-p".into(), "member".into()]);
+    assert!(cargo_activity_from_stderr(&step, "Checking member v0.1.0\n").is_none());
+}

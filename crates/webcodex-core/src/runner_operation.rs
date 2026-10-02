@@ -1085,7 +1085,7 @@ fn encode_job_operation(
             wire.job_context = Some(operation.context);
         }
         RunnerJobOperation::StartValidation(operation) => {
-            validate_validation_steps(&operation.steps)?;
+            validate_validation_steps(&operation.steps, operation.context.validation.as_ref())?;
             validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
             let names = operation
                 .steps
@@ -1661,7 +1661,7 @@ fn decode_job_operation(wire: &RunnerRequest) -> Result<RunnerJobOperation, Stri
             }
             let steps = serde_json::from_str::<Vec<ShellJobValidationStep>>(&wire.command)
                 .map_err(|error| format!("invalid validation Job plan: {error}"))?;
-            validate_validation_steps(&steps)?;
+            validate_validation_steps(&steps, context.validation.as_ref())?;
             let names = steps
                 .iter()
                 .map(|step| step.name.clone())
@@ -1950,9 +1950,32 @@ fn validate_structured_text_fields(cwd: Option<&str>, stdin: Option<&str>) -> Re
     Ok(())
 }
 
-fn validate_validation_steps(steps: &[ShellJobValidationStep]) -> Result<(), String> {
+fn validate_validation_steps(
+    steps: &[ShellJobValidationStep],
+    metadata: Option<&crate::runner_protocol::ShellJobValidationMetadata>,
+) -> Result<(), String> {
+    let project_all_packages = metadata.is_some_and(|metadata| {
+        metadata.tool == "project_validate"
+            && metadata.steps.as_slice() == steps
+            && metadata.is_valid()
+            && metadata
+                .project_validation
+                .as_ref()
+                .is_some_and(|provenance| {
+                    provenance.backend == "rust"
+                        && provenance.request.scope.as_ref().is_some_and(
+                            crate::project_validation::ProjectValidationScope::selects_all_packages,
+                        )
+                })
+    });
     if !(1..=3).contains(&steps.len())
-        || steps.iter().any(|step| !step.is_canonical())
+        || steps.iter().any(|step| {
+            if project_all_packages {
+                !step.is_canonical_project_step()
+            } else {
+                !step.is_canonical()
+            }
+        })
         || steps.iter().enumerate().any(|(index, step)| {
             steps[..index]
                 .iter()
@@ -2670,6 +2693,122 @@ mod tests {
             wire.decode_operation().unwrap(),
             RunnerOperation::Project(_)
         ));
+    }
+
+    #[test]
+    fn project_all_packages_validation_wire_roundtrip_requires_matching_provenance() {
+        use crate::project_validation::{
+            ProjectValidationAction, ProjectValidationAdapter, ProjectValidationProvenance,
+            ProjectValidationRequest, ProjectValidationScope,
+        };
+        use crate::runner_protocol::ShellJobValidationMetadata;
+
+        for action in [
+            ProjectValidationAction::Check,
+            ProjectValidationAction::Test,
+        ] {
+            let kind = action.kind();
+            let args = if action == ProjectValidationAction::Check {
+                vec!["check".into(), "--all-targets".into(), "--workspace".into()]
+            } else {
+                vec!["test".into(), "--workspace".into()]
+            };
+            let step = ShellJobValidationStep {
+                name: kind.into(),
+                program: "cargo".into(),
+                args,
+                env: Vec::new(),
+            };
+            assert!(!step.is_canonical());
+            let provenance = ProjectValidationProvenance {
+                request: ProjectValidationRequest {
+                    project_id: "demo".into(),
+                    cwd: None,
+                    action,
+                    adapter: ProjectValidationAdapter::Rust,
+                    scope: Some(ProjectValidationScope {
+                        packages: Vec::new(),
+                        all_packages: true,
+                    }),
+                    dependency_policy: None,
+                    test: None,
+                },
+                backend: "rust".into(),
+                recipe_root: ".".into(),
+                root_digest: "a".repeat(64),
+                manifest_digest: "b".repeat(64),
+                invocation_digest: "c".repeat(64),
+            };
+            let (require_tests, minimum_tests) = provenance.request.test_requirements();
+            let mut context = job_context(Some("/repo"));
+            context.validation_steps = vec![kind.into()];
+            context.validation = Some(ShellJobValidationMetadata {
+                project_validation: Some(provenance),
+                tool: "project_validate".into(),
+                kind: kind.into(),
+                adapter: if action == ProjectValidationAction::Check {
+                    "cargo_check"
+                } else {
+                    "cargo_test"
+                }
+                .into(),
+                steps: vec![step.clone()],
+                effective_timeout_secs: 60,
+                sync_wait_secs: 10,
+                validation_target_id: None,
+                source_fence: None,
+                minimum_tests,
+                require_tests,
+                no_run: None,
+            });
+            assert!(context.validation.as_ref().unwrap().is_valid());
+            let operation = RunnerJobValidationOperation {
+                job_id: "all-packages-job".into(),
+                cwd: Some("/repo".into()),
+                steps: vec![step],
+                timeout_secs: 60,
+                context,
+            };
+            let wire = RunnerRequest::from_operation(
+                metadata(),
+                RunnerOperation::Job(RunnerJobOperation::StartValidation(operation.clone())),
+            )
+            .unwrap();
+            let RunnerOperation::Job(RunnerJobOperation::StartValidation(decoded)) =
+                wire.decode_operation().unwrap()
+            else {
+                panic!("expected validation job");
+            };
+            assert_eq!(decoded.steps, operation.steps);
+            assert_eq!(decoded.context.validation, operation.context.validation);
+
+            let mut naked = operation.clone();
+            naked.context.validation = None;
+            assert!(RunnerRequest::from_operation(
+                metadata(),
+                RunnerOperation::Job(RunnerJobOperation::StartValidation(naked))
+            )
+            .is_err());
+            for variant in 0..3 {
+                let mut invalid = wire.clone();
+                let metadata = invalid
+                    .job_context
+                    .as_mut()
+                    .unwrap()
+                    .validation
+                    .as_mut()
+                    .unwrap();
+                match variant {
+                    0 => metadata.project_validation = None,
+                    1 => metadata.project_validation.as_mut().unwrap().request.scope = None,
+                    _ => metadata.steps[0].args.retain(|arg| arg != "--workspace"),
+                }
+                assert!(
+                    invalid.decode_operation().is_err(),
+                    "accepted malformed provenance variant {variant}"
+                );
+            }
+        }
     }
 
     #[test]
