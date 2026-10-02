@@ -666,3 +666,38 @@ fn project_validation_all_packages_parent_workspace_appearance_fails_queue_fence
         .unwrap_err()
         .contains("validation_plan_stale"));
 }
+
+#[test]
+fn project_validation_all_packages_rejects_excluded_recipe_cwd() {
+    for action in [
+        ProjectValidationAction::Check,
+        ProjectValidationAction::Test,
+    ] {
+        let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=['app']\nexclude=['tool']\nresolver='2'\n",
+        )
+        .unwrap();
+        for package in ["app", "tool"] {
+            fs::create_dir_all(root.join(package)).unwrap();
+            fs::write(
+                root.join(package).join("Cargo.toml"),
+                format!("[package]\nname='{package}'\nversion='0.1.0'\nedition='2021'\n"),
+            )
+            .unwrap();
+        }
+        let mut req = request(action);
+        req.adapter = ProjectValidationAdapter::Rust;
+        req.cwd = Some("tool".into());
+        req.scope = Some(ProjectValidationScope {
+            packages: Vec::new(),
+            all_packages: true,
+        });
+        assert!(
+            matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable { code, .. }) if code == "validation_scope_unavailable")
+        );
+        req.cwd = Some("app".into());
+        assert!(project::plan(&policy, &registry, &req).is_ok());
+    }
+}

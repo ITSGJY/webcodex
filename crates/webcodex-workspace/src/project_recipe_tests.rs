@@ -1317,3 +1317,83 @@ fn cargo_all_packages_ignores_unrelated_non_manifest_symlinks() {
         digest_project_cargo_all_packages_provenance(&resolved).unwrap()
     );
 }
+
+#[test]
+fn cargo_all_packages_excluded_cwd_cannot_borrow_workspace_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['app']\nexclude=['tool']\nresolver='2'\n",
+    );
+    for name in ["app", "tool"] {
+        write(
+            temp.path(),
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        );
+    }
+    let app =
+        resolve_project_recipe_root(temp.path(), Some("app"), Some(ProjectRecipeId::Rust)).unwrap();
+    assert!(digest_project_cargo_all_packages_provenance(&app).is_ok());
+    let excluded =
+        resolve_project_recipe_root(temp.path(), Some("tool"), Some(ProjectRecipeId::Rust))
+            .unwrap();
+    assert_eq!(
+        digest_project_cargo_all_packages_provenance(&excluded).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
+    // Cargo gives an explicit member declaration precedence over exclusion.
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['app','tool']\nexclude=['tool']\nresolver='2'\n",
+    );
+    assert!(digest_project_cargo_all_packages_provenance(&excluded).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_all_packages_finite_glob_prunes_unrelated_symlink_routes() {
+    use std::os::unix::fs::symlink;
+    for (pattern, member, irrelevant) in [
+        ("crates/app*", "crates/app", "crates/docs"),
+        ("crates/a*/pkg?", "crates/app/pkg1", "crates/app/docs"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(
+            temp.path(),
+            "Cargo.toml",
+            &format!("[workspace]\nmembers=['{pattern}']\nresolver='2'\n"),
+        );
+        write(
+            temp.path(),
+            &format!("{member}/Cargo.toml"),
+            "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n",
+        );
+        fs::create_dir_all(temp.path().join("notes")).unwrap();
+        let resolved =
+            resolve_project_recipe_root(temp.path(), None, Some(ProjectRecipeId::Rust)).unwrap();
+        let before = digest_project_cargo_all_packages_provenance(&resolved).unwrap();
+        let link = temp.path().join(irrelevant);
+        symlink(outside.path(), &link).unwrap();
+        assert_eq!(
+            before,
+            digest_project_cargo_all_packages_provenance(&resolved).unwrap(),
+            "{pattern}"
+        );
+        fs::remove_file(&link).unwrap();
+        symlink(temp.path().join("notes"), &link).unwrap();
+        assert_eq!(
+            before,
+            digest_project_cargo_all_packages_provenance(&resolved).unwrap(),
+            "{pattern}"
+        );
+        symlink(outside.path(), temp.path().join("crates/app-escape")).unwrap();
+        assert_eq!(
+            digest_project_cargo_all_packages_provenance(&resolved).unwrap_err(),
+            ProjectRecipeResolutionError::SourceFileInvalid
+        );
+    }
+}

@@ -174,6 +174,35 @@ fn rust_workspace_root(
     Ok(resolved.absolute_root.clone())
 }
 
+fn cargo_workspace_excludes_manifest(
+    root_manifest: &toml::Value,
+    workspace_root: &Path,
+    manifest_path: &Path,
+) -> Result<bool, ProjectRecipeResolutionError> {
+    // Cargo's exclusion test uses literal path prefixes. An explicit member
+    // prefix takes precedence; these lists are not an independent glob API.
+    let has_prefix = |key: &str| -> Result<bool, ProjectRecipeResolutionError> {
+        let Some(value) = root_manifest
+            .get("workspace")
+            .and_then(|table| table.get(key))
+        else {
+            return Ok(false);
+        };
+        let values = value
+            .as_array()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        let mut matched = false;
+        for value in values {
+            let path = value
+                .as_str()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            matched |= manifest_path.starts_with(workspace_root.join(path));
+        }
+        Ok(matched)
+    };
+    Ok(has_prefix("exclude")? && !has_prefix("members")?)
+}
+
 /// Resolve and fence the package-selection authority behind portable Cargo
 /// `all_packages`. The effective Cargo workspace must be the exact registered
 /// Project root. A bounded conservative manifest scan supplies content
@@ -193,6 +222,15 @@ pub fn project_cargo_all_packages_provenance_files(
 
     let root_manifest_path = workspace_root.join("Cargo.toml");
     let root_manifest = parse_cargo_manifest(&resolved.execution_root, &root_manifest_path)?;
+    if resolved.absolute_root != workspace_root
+        && cargo_workspace_excludes_manifest(
+            &root_manifest,
+            &workspace_root,
+            &resolved.marker_path(),
+        )?
+    {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
     if !cargo_manifest_has_workspace(&root_manifest)? {
         // Cargo searches parents even when a package inherits no fields. Only
         // probe marker metadata outside the Project; never parse external
@@ -479,6 +517,17 @@ fn workspace_member_witnesses(
 
     let max_depth = (!components.iter().any(|component| *component == "**"))
         .then_some(components.len().saturating_sub(prefix_len));
+    let component_patterns = if max_depth.is_some() {
+        Some(
+            components[prefix_len..]
+                .iter()
+                .map(|component| Pattern::new(component))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?,
+        )
+    } else {
+        None
+    };
     // Cargo expands workspace members with glob::glob(), whose glob_with()
     // path iterator always requires wildcard tokens to respect path-component
     // separators. Match the same rule while retaining our explicit scan bound.
@@ -522,6 +571,16 @@ fn workspace_member_witnesses(
         bounded_entries.sort_by_key(|entry| entry.file_name());
 
         for entry in bounded_entries {
+            // Finite glob expansion only visits matching path components.
+            // Filter before following links or adding topology witnesses.
+            if let Some(patterns) = &component_patterns {
+                let component = patterns
+                    .get(depth)
+                    .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+                if !component.matches_path_with(Path::new(&entry.file_name()), options) {
+                    continue;
+                }
+            }
             let path = entry.path();
             let symlink = entry
                 .file_type()
