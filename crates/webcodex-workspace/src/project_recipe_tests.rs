@@ -739,6 +739,76 @@ fn cargo_all_packages_provenance_recurses_through_nested_path_dependencies() {
 
 #[cfg(unix)]
 #[test]
+fn cargo_all_packages_recursive_glob_cycle_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['a/**/again/target']\nresolver='2'\n",
+    );
+    write(
+        temp.path(),
+        "a/target/Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    symlink(".", temp.path().join("a/again")).unwrap();
+    let resolved =
+        resolve_project_recipe_root(temp.path(), None, Some(ProjectRecipeId::Rust)).unwrap();
+
+    // Silently dropping this route omits a/again/target while the broad scan
+    // prunes a/target. Incomplete recursive witnesses must fail closed.
+    assert_eq!(
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_all_packages_manifest_aliases_share_the_canonical_content_budget() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n",
+    );
+    write(
+        temp.path(),
+        "member/Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    for index in 0..256 {
+        let directory = temp.path().join(format!("alias-{index}"));
+        fs::create_dir_all(&directory).unwrap();
+        symlink("../member/Cargo.toml", directory.join("Cargo.toml")).unwrap();
+    }
+    let resolved =
+        resolve_project_recipe_root(temp.path(), None, Some(ProjectRecipeId::Rust)).unwrap();
+
+    let files = project_cargo_all_packages_provenance_files(&resolved).unwrap();
+    assert_eq!(
+        files.len(),
+        3,
+        "two canonical manifests and the root lockfile"
+    );
+    let before = digest_project_cargo_all_packages_provenance(&resolved).unwrap();
+    write(
+        temp.path(),
+        "member/Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    assert_ne!(
+        before,
+        digest_project_cargo_all_packages_provenance(&resolved).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn cargo_all_packages_recursive_glob_fails_closed_before_traversing_outside_project() {
     use std::os::unix::fs::symlink;
 

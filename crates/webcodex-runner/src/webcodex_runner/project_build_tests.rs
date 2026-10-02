@@ -385,3 +385,39 @@ fn project_build_all_packages_supports_single_rust_package() {
     let (plan, _) = project_build::plan(&policy, &registry, &req).unwrap();
     assert_eq!(plan.process.args, ["build", "--workspace"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn project_build_all_packages_recursive_glob_cycle_fails_queue_fence() {
+    use std::os::unix::fs::symlink;
+
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['a/**/target']\nresolver='2'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("a/member/target")).unwrap();
+    fs::write(
+        root.join("a/member/target/Cargo.toml"),
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+
+    let mut req = request();
+    req.adapter = ProjectBuildAdapter::Rust;
+    req.scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+    let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
+    let operation = start_build_operation(&plan, &cwd);
+    project_build::fence(&policy, &registry, &operation).unwrap();
+
+    // The queued plan must not run after its recursive membership witness
+    // becomes incomplete, even though no manifest bytes have changed.
+    symlink("..", root.join("a/member/back")).unwrap();
+    assert!(project_build::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("build_plan_stale"));
+}

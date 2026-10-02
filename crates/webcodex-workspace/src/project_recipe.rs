@@ -185,9 +185,6 @@ fn rust_workspace_root(
 pub fn project_cargo_all_packages_provenance_files(
     resolved: &ResolvedProjectRecipeRoot,
 ) -> Result<Vec<PathBuf>, ProjectRecipeResolutionError> {
-    const MAX_MANIFESTS: usize = 256;
-    const MAX_SCAN_ENTRIES: usize = 8192;
-
     if resolved.recipe != ProjectRecipeId::Rust {
         return Err(ProjectRecipeResolutionError::SourceFileInvalid);
     }
@@ -213,7 +210,7 @@ pub fn project_cargo_all_packages_provenance_files(
         }
     }
 
-    let mut manifests = Vec::new();
+    let mut manifests = BTreeSet::new();
     let mut pending = vec![workspace_root.clone()];
     let mut visited_dirs = BTreeSet::new();
     let mut scanned = 0usize;
@@ -231,7 +228,7 @@ pub fn project_cargo_all_packages_provenance_files(
         for entry in entries {
             let entry = entry.map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
             scanned += 1;
-            if scanned > MAX_SCAN_ENTRIES {
+            if scanned > CARGO_ALL_PACKAGES_MAX_SCAN_ENTRIES {
                 return Err(ProjectRecipeResolutionError::SourceFileInvalid);
             }
             let name = entry.file_name();
@@ -261,19 +258,19 @@ pub fn project_cargo_all_packages_provenance_files(
             if effective_type.is_dir() {
                 pending.push(path);
             } else if effective_type.is_file() && name == "Cargo.toml" {
-                manifests.push(path);
-                if manifests.len() > MAX_MANIFESTS {
+                manifests.insert(path);
+                if manifests.len() > CARGO_ALL_PACKAGES_MAX_MANIFESTS {
                     return Err(ProjectRecipeResolutionError::SourceFileInvalid);
                 }
             }
         }
     }
-    manifests.sort();
-    if !manifests.iter().any(|path| path == &root_manifest_path) {
+    if !manifests.contains(&root_manifest_path) {
         return Err(ProjectRecipeResolutionError::SourceFileInvalid);
     }
-    manifests.push(workspace_root.join("Cargo.lock"));
-    Ok(manifests)
+    let mut files = manifests.into_iter().collect::<Vec<_>>();
+    files.push(workspace_root.join("Cargo.lock"));
+    Ok(files)
 }
 
 fn validate_workspace_member_pattern(member: &str) -> Result<(), ProjectRecipeResolutionError> {
@@ -483,7 +480,10 @@ fn workspace_member_witnesses(
             return Err(ProjectRecipeResolutionError::SourceFileInvalid);
         }
         if max_depth.is_none() && ancestry.contains(&canonical_directory) {
-            continue;
+            // Recursive glob matches can take a different logical route through
+            // this cycle. Pruning it would certify an incomplete witness set.
+            // Finite-depth patterns remain bounded by their component count.
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
         }
         let mut branch_ancestry = ancestry;
         if max_depth.is_none() {
