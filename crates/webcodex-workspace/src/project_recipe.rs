@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -170,6 +171,127 @@ fn rust_workspace_root(
         return Err(ProjectRecipeResolutionError::SourceFileInvalid);
     }
     Ok(resolved.absolute_root.clone())
+}
+
+/// Resolve and fence the package-selection authority behind portable Cargo
+/// `all_packages`. The effective Cargo workspace must be the exact registered
+/// Project root. Every in-Project Cargo manifest is then bound into provenance,
+/// so workspace membership changes become stale before native execution.
+///
+/// Dependency path/patch/config semantics are intentionally not interpreted
+/// here: they can affect dependency resolution, but they do not by themselves
+/// grant `--workspace` authority over packages outside the registered Project.
+pub fn project_cargo_all_packages_provenance_files(
+    resolved: &ResolvedProjectRecipeRoot,
+) -> Result<Vec<PathBuf>, ProjectRecipeResolutionError> {
+    const MAX_MANIFESTS: usize = 256;
+    const MAX_SCAN_ENTRIES: usize = 8192;
+
+    if resolved.recipe != ProjectRecipeId::Rust {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+    let workspace_root = rust_workspace_root(resolved)?;
+    if workspace_root != resolved.execution_root {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+
+    let root_manifest_path = workspace_root.join("Cargo.toml");
+    let root_manifest = parse_cargo_manifest(&resolved.execution_root, &root_manifest_path)?;
+    let workspace = root_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+    if let Some(members) = workspace.get("members") {
+        let members = members
+            .as_array()
+            .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for member in members {
+            let member = member
+                .as_str()
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            validate_workspace_member_pattern(member)?;
+        }
+    }
+
+    let mut manifests = Vec::new();
+    let mut pending = vec![workspace_root.clone()];
+    let mut visited_dirs = BTreeSet::new();
+    let mut scanned = 0usize;
+    while let Some(directory) = pending.pop() {
+        let canonical_directory = directory
+            .canonicalize()
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        if !canonical_directory.starts_with(&workspace_root)
+            || !visited_dirs.insert(canonical_directory.clone())
+        {
+            continue;
+        }
+        let entries = fs::read_dir(&canonical_directory)
+            .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+            scanned += 1;
+            if scanned > MAX_SCAN_ENTRIES {
+                return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+            }
+            let name = entry.file_name();
+            let file_type = entry
+                .file_type()
+                .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+            if matches!(
+                name.to_str(),
+                Some(".git" | "target" | "node_modules" | ".venv")
+            ) {
+                continue;
+            }
+
+            let mut path = entry.path();
+            let mut effective_type = file_type;
+            if effective_type.is_symlink() {
+                path = path
+                    .canonicalize()
+                    .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?;
+                if !path.starts_with(&workspace_root) {
+                    return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+                }
+                effective_type = fs::metadata(&path)
+                    .map_err(|_| ProjectRecipeResolutionError::SourceFileInvalid)?
+                    .file_type();
+            }
+            if effective_type.is_dir() {
+                pending.push(path);
+            } else if effective_type.is_file() && name == "Cargo.toml" {
+                manifests.push(path);
+                if manifests.len() > MAX_MANIFESTS {
+                    return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+                }
+            }
+        }
+    }
+    manifests.sort();
+    if !manifests.iter().any(|path| path == &root_manifest_path) {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+    manifests.push(workspace_root.join("Cargo.lock"));
+    Ok(manifests)
+}
+
+fn validate_workspace_member_pattern(member: &str) -> Result<(), ProjectRecipeResolutionError> {
+    let path = Path::new(member);
+    if member.is_empty()
+        || member.contains('\0')
+        || member.contains('\\')
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+    }
+    Ok(())
 }
 
 fn cargo_manifest_uses_workspace_inheritance(

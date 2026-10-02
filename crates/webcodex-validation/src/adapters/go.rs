@@ -72,7 +72,7 @@ impl ValidationAdapter for GoTestValidationAdapter {
             args.push(ValidationPlanArg::Literal("-run"));
             args.push(ValidationPlanArg::Value(filter));
         }
-        if explicit_packages {
+        if explicit_packages && !options.all_packages {
             args.extend(packages.into_iter().map(ValidationPlanArg::Value));
         } else {
             debug_assert_eq!(packages.as_slice(), ["./..."]);
@@ -166,7 +166,7 @@ impl ValidationAdapter for GoVetValidationAdapter {
         {
             args.push(ValidationPlanArg::Literal("-mod=readonly"));
         }
-        if explicit_packages {
+        if explicit_packages && !options.all_packages {
             args.extend(packages.into_iter().map(ValidationPlanArg::Value));
         } else {
             debug_assert_eq!(packages.as_slice(), ["./..."]);

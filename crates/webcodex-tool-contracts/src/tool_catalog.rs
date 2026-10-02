@@ -197,7 +197,7 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         summary:
             "Build: prefer project_build for portable Rust/Go builds; use native execution only outside the canonical gateway.",
         manifest_purpose:
-            "Use project_build for canonical Rust cargo build and Go go build with optional bounded package scope. dependency_policy.mode=locked prevents adapter-managed dependency selection updates without implying offline execution. It preserves Runner-owned recipe resolution, provenance, and same-execution Job admission. Use run_process only when the required build is outside this closed contract.",
+            "Use project_build for canonical Rust cargo build and Go go build with portable bounded package or all-packages scope. dependency_policy.mode=locked prevents adapter-managed dependency selection updates without implying offline execution. It preserves Runner-owned recipe resolution, provenance, and same-execution Job admission. Use run_process only when the required build is outside this closed contract.",
         tools: &["project_build", "observe_jobs", "run_process"],
     },
     ToolRecommendedFlow {

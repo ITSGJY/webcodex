@@ -833,6 +833,22 @@ impl RunnerRegistry {
             structured_execution.as_ref(),
             Some(StructuredJobExecution::ProjectBuild(_))
         );
+        let project_all_packages_request = matches!(
+            structured_execution.as_ref(),
+            Some(StructuredJobExecution::ProjectBuild(plan))
+                if plan
+                    .provenance
+                    .request
+                    .scope
+                    .as_ref()
+                    .is_some_and(webcodex_core::project_build::ProjectBuildScope::selects_all_packages)
+        ) || validation
+            .as_ref()
+            .and_then(|metadata| metadata.project_validation.as_ref())
+            .and_then(|provenance| provenance.request.scope.as_ref())
+            .is_some_and(
+                webcodex_core::project_validation::ProjectValidationScope::selects_all_packages,
+            );
         let project_dependency_policy_request = matches!(
             structured_execution.as_ref(),
             Some(StructuredJobExecution::ProjectBuild(plan))
@@ -860,7 +876,13 @@ impl RunnerRegistry {
         }
         let structured_stdin = metadata.stdin;
         if validation_steps.len() > 3
-            || validation_steps.iter().any(|step| !step.is_canonical())
+            || validation_steps.iter().any(|step| {
+                if project_all_packages_request {
+                    !step.is_canonical_project_step()
+                } else {
+                    !step.is_canonical()
+                }
+            })
             || validation_steps
                 .iter()
                 .map(|step| step.name.as_str())
@@ -1261,6 +1283,16 @@ impl RunnerRegistry {
         if project_build_request && !runner.runner_features.supports(RunnerFeature::ProjectBuild) {
             return Err(
                 "capability_unavailable: upgrade target Runner for project_build_v1".to_string(),
+            );
+        }
+        if project_all_packages_request
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectAllPackages)
+        {
+            return Err(
+                "capability_unavailable: upgrade target Runner for project_all_packages_v1"
+                    .to_string(),
             );
         }
         if project_dependency_policy_request

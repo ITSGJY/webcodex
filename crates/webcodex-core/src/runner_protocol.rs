@@ -563,6 +563,13 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_validation_package_scope_v1: bool = false;
     }
+    /// Portable all-packages intent shared by project_build/project_validate.
+    /// Missing on older Runners is false and is never inferred from package scope.
+    ProjectAllPackages => RUNNER_CAPABILITY_PROJECT_ALL_PACKAGES("project_all_packages_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_all_packages_v1: bool = false;
+    }
     /// Additive test filtering and evidence policy on project_validate. Never
     /// inferred from generic validation or existing package-scope support.
     ProjectValidationTestOptions => RUNNER_CAPABILITY_PROJECT_VALIDATION_TEST_OPTIONS("project_validation_test_options_v1"),
@@ -2758,6 +2765,7 @@ mod envelope_tests {
                 project_dependency_policy_v1: false,
                 project_go_single_module_v1: false,
                 project_validation_package_scope_v1: false,
+                project_all_packages_v1: false,
                 project_validation_test_options_v1: false,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,

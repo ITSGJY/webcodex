@@ -7,6 +7,7 @@ use crate::tool_runtime::{ToolCall, ToolRuntime};
 use webcodex_core::project_build::{
     canonical_project_build_process, project_build_invocation_digest, ProjectBuildAdapter,
     ProjectBuildPlan, ProjectBuildPlanningResult, ProjectBuildProvenance, ProjectBuildRequest,
+    ProjectBuildScope,
 };
 
 const CLIENT: &str = "project-build";
@@ -232,6 +233,39 @@ async fn project_build_missing_capability_starts_nothing() {
         .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("project_build_v1"));
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
+async fn project_build_all_packages_requires_additive_runner_capability() {
+    let runtime = runtime_with_agent_project(CLIENT);
+    register_agent(
+        &runtime,
+        CLIENT,
+        None,
+        RunnerCapabilities {
+            project_build_v1: true,
+            project_all_packages_v1: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut scoped = call();
+    let ToolCall::ProjectBuild { scope, .. } = &mut scoped else {
+        unreachable!()
+    };
+    *scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+
+    let result = runtime
+        .dispatch_with_auth(scoped, Some(&auth_context(None, true)))
+        .await;
+    assert!(!result.success);
+    assert!(result.error.unwrap().contains("project_all_packages_v1"));
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
     assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
 }

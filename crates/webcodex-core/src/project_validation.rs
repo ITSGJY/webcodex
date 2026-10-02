@@ -101,6 +101,9 @@ impl ProjectValidationRequest {
         validate_relative(self.cwd.as_deref().unwrap_or("."))?;
         if let Some(scope) = &self.scope {
             scope.validate().map_err(|error| match error {
+                ProjectOperationScopeError::Selection => {
+                    "project validation scope must select packages or all_packages=true".to_string()
+                }
                 ProjectOperationScopeError::PackageCount => {
                     "project validation packages must contain between 1 and 8 items".to_string()
                 }

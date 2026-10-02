@@ -47,6 +47,9 @@ impl ProjectBuildRequest {
         validate_relative(self.cwd.as_deref().unwrap_or("."))?;
         if let Some(scope) = &self.scope {
             scope.validate().map_err(|error| match error {
+                ProjectOperationScopeError::Selection => {
+                    "project build scope must select packages or all_packages=true".to_string()
+                }
                 ProjectOperationScopeError::PackageCount => {
                     "project build packages must contain between 1 and 8 items".to_string()
                 }
@@ -136,7 +139,11 @@ pub fn canonical_project_build_process(
     let packages = request
         .scope
         .as_ref()
-        .map(|scope| scope.packages.as_slice());
+        .and_then(ProjectBuildScope::explicit_packages);
+    let all_packages = request
+        .scope
+        .as_ref()
+        .is_some_and(ProjectBuildScope::selects_all_packages);
     match backend {
         "rust" => {
             let packages = normalize_cargo_packages(None, packages)?;
@@ -147,7 +154,9 @@ pub fn canonical_project_build_process(
             {
                 args.push("--locked".to_string());
             }
-            if let Some(packages) = packages {
+            if all_packages {
+                args.push("--workspace".to_string());
+            } else if let Some(packages) = packages {
                 for package in packages {
                     args.push("-p".to_string());
                     args.push(package);
@@ -159,7 +168,7 @@ pub fn canonical_project_build_process(
             })
         }
         "go" => {
-            let packages = normalize_go_packages(packages)?;
+            let packages = normalize_go_packages(if all_packages { None } else { packages })?;
             let mut args = vec!["build".to_string()];
             if request
                 .dependency_policy

@@ -201,6 +201,7 @@ fn project_validation_package_scope_roundtrips_and_is_bounded() {
         adapter: ProjectValidationAdapter::Auto,
         scope: Some(ProjectValidationScope {
             packages: vec!["package-a".into(), "package-b".into()],
+            all_packages: false,
         }),
         dependency_policy: None,
         test: None,
@@ -217,7 +218,10 @@ fn project_validation_package_scope_roundtrips_and_is_bounded() {
         vec!["bad\npackage".into()],
     ] {
         let mut invalid = input.clone();
-        invalid.scope = Some(ProjectValidationScope { packages });
+        invalid.scope = Some(ProjectValidationScope {
+            packages,
+            all_packages: false,
+        });
         assert!(invalid.validate().is_err());
     }
 }

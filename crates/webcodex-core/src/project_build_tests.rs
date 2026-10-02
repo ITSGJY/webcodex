@@ -61,6 +61,7 @@ fn project_build_scope_and_canonical_processes_are_bounded() {
     let mut rust = request();
     rust.scope = Some(ProjectBuildScope {
         packages: vec!["package-b".into(), "package-a".into(), "package-a".into()],
+        all_packages: false,
     });
     assert_eq!(
         canonical_project_build_process("rust", &rust).unwrap().args,
@@ -70,6 +71,7 @@ fn project_build_scope_and_canonical_processes_are_bounded() {
     let mut go = request();
     go.scope = Some(ProjectBuildScope {
         packages: vec!["./cmd/...".into(), "./internal".into()],
+        all_packages: false,
     });
     assert_eq!(
         canonical_project_build_process("go", &go).unwrap().args,
@@ -83,8 +85,31 @@ fn project_build_scope_and_canonical_processes_are_bounded() {
         vec!["bad\npackage".into()],
     ] {
         let mut invalid = request();
-        invalid.scope = Some(ProjectBuildScope { packages });
+        invalid.scope = Some(ProjectBuildScope {
+            packages,
+            all_packages: false,
+        });
         assert!(invalid.validate().is_err());
+    }
+}
+
+#[test]
+fn project_build_all_packages_maps_to_portable_native_scope() {
+    for (backend, expected) in [
+        ("rust", vec!["build", "--workspace"]),
+        ("go", vec!["build", "./..."]),
+    ] {
+        let mut request = request();
+        request.scope = Some(ProjectBuildScope {
+            packages: Vec::new(),
+            all_packages: true,
+        });
+        assert_eq!(
+            canonical_project_build_process(backend, &request)
+                .unwrap()
+                .args,
+            expected
+        );
     }
 }
 

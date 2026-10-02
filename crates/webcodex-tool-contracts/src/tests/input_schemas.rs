@@ -316,6 +316,11 @@ fn project_build_schema_is_closed_bounded_and_has_no_raw_execution_fields() {
         "timeout_secs": 1800
     });
     assert!(test_support::validate_schema_instance(&valid, &schema).is_ok());
+    assert!(test_support::validate_schema_instance(
+        &serde_json::json!({"project":"demo","scope":{"all_packages":true}}),
+        &schema,
+    )
+    .is_ok());
 
     for forbidden in [
         "executable",
@@ -336,6 +341,9 @@ fn project_build_schema_is_closed_bounded_and_has_no_raw_execution_fields() {
         serde_json::json!({"project":"demo","scope":{"packages":(0..9).map(|i| format!("p-{i}")).collect::<Vec<_>>()}}),
         serde_json::json!({"project":"demo","scope":{"packages":["x".repeat(257)]}}),
         serde_json::json!({"project":"demo","scope":{"packages":["a"],"unknown":true}}),
+        serde_json::json!({"project":"demo","scope":{}}),
+        serde_json::json!({"project":"demo","scope":{"all_packages":false}}),
+        serde_json::json!({"project":"demo","scope":{"packages":["a"],"all_packages":true}}),
         serde_json::json!({"project":"demo","unknown":true}),
     ] {
         assert!(
@@ -354,6 +362,11 @@ fn project_validate_package_scope_schema_is_closed_and_bounded() {
         "scope": {"packages": ["package-a", "package-b"]}
     });
     assert!(test_support::validate_schema_instance(&valid, &schema).is_ok());
+    assert!(test_support::validate_schema_instance(
+        &serde_json::json!({"project":"demo","action":"check","scope":{"all_packages":true}}),
+        &schema,
+    )
+    .is_ok());
 
     for invalid in [
         serde_json::json!({
@@ -361,6 +374,8 @@ fn project_validate_package_scope_schema_is_closed_and_bounded() {
             "action": "check",
             "scope": {"packages": []}
         }),
+        serde_json::json!({"project":"demo","action":"check","scope":{"all_packages":false}}),
+        serde_json::json!({"project":"demo","action":"check","scope":{"packages":["a"],"all_packages":true}}),
         serde_json::json!({
             "project": "demo",
             "action": "check",

@@ -15,6 +15,7 @@ async fn setup(grace_ms: u64) -> ToolRuntime {
             project_validation_v1: true,
             project_go_single_module_v1: true,
             project_validation_package_scope_v1: true,
+            project_all_packages_v1: true,
             project_validation_test_options_v1: true,
             structured_go_test_json: true,
             structured_go_test_tool: true,
@@ -46,7 +47,15 @@ async fn reply_plan(
     let operation = webcodex_validation::project_validation_operation(
         backend,
         check,
-        semantic.scope.as_ref().map(|scope| scope.packages.clone()),
+        semantic
+            .scope
+            .as_ref()
+            .and_then(ProjectValidationScope::explicit_packages)
+            .map(<[String]>::to_vec),
+        semantic
+            .scope
+            .as_ref()
+            .is_some_and(ProjectValidationScope::selects_all_packages),
     )
     .unwrap()
     .with_test_filter(
@@ -100,7 +109,10 @@ fn call_with_scope(
         cwd: None,
         action,
         adapter: None,
-        scope: packages.map(|packages| ProjectValidationScope { packages }),
+        scope: packages.map(|packages| ProjectValidationScope {
+            packages,
+            all_packages: false,
+        }),
         dependency_policy: None,
         test: None,
         timeout_secs: Some(60),
@@ -338,6 +350,7 @@ async fn project_validation_package_scope_requires_additive_runner_capability() 
             structured_validation_argv: true,
             project_validation_v1: true,
             project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
             ..Default::default()
         },
     )
@@ -357,6 +370,44 @@ async fn project_validation_package_scope_requires_additive_runner_capability() 
         .error
         .unwrap()
         .contains("project_validation_package_scope_v1"));
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, "project-validation")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn project_validation_all_packages_requires_additive_runner_capability() {
+    let runtime = runtime_with_agent_project("project-validation");
+    register_agent(
+        &runtime,
+        "project-validation",
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            project_validation_v1: true,
+            project_validation_package_scope_v1: true,
+            project_all_packages_v1: false,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let mut call = call(ProjectValidationAction::Check, None);
+    let ToolCall::ProjectValidate { scope, .. } = &mut call else {
+        unreachable!()
+    };
+    *scope = Some(ProjectValidationScope {
+        packages: Vec::new(),
+        all_packages: true,
+    });
+
+    let result = runtime
+        .dispatch_with_auth(call, Some(&auth_context(None, true)))
+        .await;
+    assert!(!result.success);
+    assert!(result.error.unwrap().contains("project_all_packages_v1"));
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
     assert!(probe_patch_agent_request(&runtime, "project-validation")
         .await
@@ -383,6 +434,7 @@ async fn project_validation_test_options_reject_before_any_plan_on_old_runner() 
             structured_validation_argv: true,
             project_validation_v1: true,
             project_validation_package_scope_v1: true,
+            project_all_packages_v1: true,
             ..Default::default()
         },
     )

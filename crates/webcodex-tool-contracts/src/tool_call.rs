@@ -2901,7 +2901,7 @@ pub enum ToolCall {
         /// Omission means auto. Rust and Go are supported; Node/Python return unavailable.
         #[serde(default)]
         adapter: Option<webcodex_core::project_build::ProjectBuildAdapter>,
-        /// Optional bounded Cargo package selectors or project-relative Go package patterns.
+        /// Optional portable scope: bounded explicit packages or all_packages=true, never both.
         #[serde(default)]
         scope: Option<webcodex_core::project_build::ProjectBuildScope>,
         /// Optional portable dependency-resolution policy. locked forbids adapters from
@@ -2929,9 +2929,8 @@ pub enum ToolCall {
         /// Omission means auto. Rust and Go are supported; Node/Python return unavailable.
         #[serde(default)]
         adapter: Option<webcodex_core::project_validation::ProjectValidationAdapter>,
-        /// Optional portable package scope. Rust check/test map packages to repeated Cargo -p selectors;
-        /// Go check/test map packages to bounded project-relative package patterns. Formatting with package
-        /// scope is not supported.
+        /// Optional portable scope. Explicit packages narrow Rust/Go selection; all_packages=true selects the
+        /// complete Runner-proven project unit. Formatting with package scope is not supported.
         #[serde(default)]
         scope: Option<webcodex_core::project_validation::ProjectValidationScope>,
         /// Optional portable dependency-resolution policy. locked forbids adapters from

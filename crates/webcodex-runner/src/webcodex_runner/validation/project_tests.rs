@@ -152,7 +152,7 @@ fn go_project_validation_identity_is_single_module_domain_separated() {
             ProjectValidationAction::FormatCheck => unreachable!(),
         };
         let operation =
-            webcodex_validation::project_validation_operation("go", semantic, None).unwrap();
+            webcodex_validation::project_validation_operation("go", semantic, None, false).unwrap();
         let native_identity = operation
             .validation_target_id(Some(&plan.provenance.recipe_root))
             .unwrap();
@@ -211,6 +211,7 @@ fn project_validation_package_scope_maps_through_canonical_operations() {
         let mut req = request(action);
         req.scope = Some(ProjectValidationScope {
             packages: packages.into_iter().map(str::to_string).collect(),
+            all_packages: false,
         });
         let (plan, _) = project::plan(&policy, &registry, &req).unwrap();
         assert_eq!(plan.adapter, adapter);
@@ -228,7 +229,13 @@ fn project_validation_package_scope_maps_through_canonical_operations() {
                 .request
                 .scope
                 .as_ref()
-                .map(|scope| scope.packages.clone()),
+                .and_then(ProjectValidationScope::explicit_packages)
+                .map(<[String]>::to_vec),
+            plan.provenance
+                .request
+                .scope
+                .as_ref()
+                .is_some_and(ProjectValidationScope::selects_all_packages),
         )
         .unwrap();
         let native_identity = operation
@@ -260,6 +267,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     let mut format = request(ProjectValidationAction::FormatCheck);
     format.scope = Some(ProjectValidationScope {
         packages: vec!["package-a".into()],
+        all_packages: false,
     });
     assert!(matches!(
         project::plan(&policy, &registry, &format),
@@ -270,6 +278,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     let mut invalid_rust = request(ProjectValidationAction::Check);
     invalid_rust.scope = Some(ProjectValidationScope {
         packages: vec!["-bad".into()],
+        all_packages: false,
     });
     assert!(matches!(
         project::plan(&policy, &registry, &invalid_rust),
@@ -281,6 +290,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     let mut invalid_go = request(ProjectValidationAction::Test);
     invalid_go.scope = Some(ProjectValidationScope {
         packages: vec!["not-relative".into()],
+        all_packages: false,
     });
     assert!(matches!(
         project::plan(&policy, &registry, &invalid_go),
