@@ -10,6 +10,7 @@ impl ToolRuntime {
         call: ToolCall,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
+        structured_handoff_max_secs: Option<u64>,
     ) -> ToolResult {
         let tool_name = call.tool_name();
         let mut result = match call {
@@ -34,6 +35,7 @@ impl ToolRuntime {
                     dependency_policy,
                     test,
                     timeout_secs,
+                    structured_handoff_max_secs,
                     ssh_resource,
                     auth,
                 )

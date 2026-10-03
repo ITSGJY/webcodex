@@ -120,6 +120,65 @@ fn call_with_scope(
     }
 }
 #[tokio::test]
+async fn project_validation_dispatcher_applies_trusted_handoff_cap() {
+    let runtime = setup(1).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_cargo_tool(
+                    call(ProjectValidationAction::Check, None),
+                    None,
+                    Some(&auth_context(None, true)),
+                    Some(4),
+                )
+                .await
+        }
+    });
+    let (request, job_id) = reply_plan(&runtime, "rust", ProjectValidationAction::Check).await;
+    let validation = request
+        .job_context
+        .as_ref()
+        .and_then(|context| context.validation.as_ref())
+        .expect("project validation metadata");
+    assert_eq!(validation.sync_wait_secs, 4);
+    assert_eq!(
+        validation.effective_timeout_secs, 60,
+        "trusted return policy must not shorten execution lifetime"
+    );
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            "project-validation",
+            &request.request_id,
+            &job_id,
+            "running",
+            "Checking project validation handoff\n",
+            "",
+            None,
+            running_progress("check"),
+            false,
+        ))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.success, "{result:?}");
+    assert!(
+        matches!(
+            result.output["execution_state"].as_str(),
+            Some("queued" | "running")
+        ),
+        "handoff may race the Runner running update: {result:?}"
+    );
+    assert_eq!(result.output["sync_wait_secs"], 4);
+    assert_eq!(result.output["effective_timeout_secs"], 60);
+    assert_eq!(
+        result.output["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
+}
+
+#[tokio::test]
 async fn project_validation_fast_rust_check_records_resolved_evidence() {
     let runtime = setup(500).await;
     let session = runtime
