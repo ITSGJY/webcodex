@@ -166,6 +166,13 @@ struct ValidationBudget {
     sync_wait_secs: u64,
 }
 
+/// Project validation has no public sync-wait input. Start from the canonical
+/// structured-execution grace and allow only trusted return policy to shorten it.
+fn project_validation_trusted_sync_wait(structured_handoff_max_secs: Option<u64>) -> Option<u64> {
+    structured_handoff_max_secs
+        .map(|max_handoff_secs| STRUCTURED_EXECUTION_SYNC_WAIT_SECS.min(max_handoff_secs))
+}
+
 /// Resolve a read-only structured validation budget.
 ///
 /// `timeout_secs` is the total runtime budget of the command, not the tool
@@ -262,6 +269,58 @@ mod validation_budget_tests {
 
         assert!(resolve_validation_budget("cargo_check", Some(0), None, 600).is_err());
         assert!(resolve_validation_budget("cargo_check", Some(600), Some(0), 600).is_err());
+
+        let project_default = resolve_validation_budget(
+            "project_validate",
+            Some(600),
+            project_validation_trusted_sync_wait(None),
+            600,
+        )
+        .unwrap();
+        assert_eq!(
+            project_default.sync_wait_secs,
+            STRUCTURED_EXECUTION_SYNC_WAIT_SECS
+        );
+
+        let project_loose_cap = resolve_validation_budget(
+            "project_validate",
+            Some(600),
+            project_validation_trusted_sync_wait(Some(55)),
+            600,
+        )
+        .unwrap();
+        assert_eq!(
+            project_loose_cap.sync_wait_secs,
+            STRUCTURED_EXECUTION_SYNC_WAIT_SECS
+        );
+
+        let project_strict_cap = resolve_validation_budget(
+            "project_validate",
+            Some(600),
+            project_validation_trusted_sync_wait(Some(4)),
+            600,
+        )
+        .unwrap();
+        assert_eq!(project_strict_cap.effective_timeout_secs, 600);
+        assert_eq!(project_strict_cap.sync_wait_secs, 4);
+
+        let project_short_timeout = resolve_validation_budget(
+            "project_validate",
+            Some(3),
+            project_validation_trusted_sync_wait(Some(5)),
+            600,
+        )
+        .unwrap();
+        assert_eq!(project_short_timeout.effective_timeout_secs, 3);
+        assert_eq!(project_short_timeout.sync_wait_secs, 3);
+
+        assert!(resolve_validation_budget(
+            "project_validate",
+            Some(600),
+            project_validation_trusted_sync_wait(Some(0)),
+            600,
+        )
+        .is_err());
     }
 }
 
@@ -386,6 +445,7 @@ impl ToolRuntime {
         dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
         test: Option<webcodex_core::project_validation::ProjectValidationTestOptions>,
         timeout_secs: Option<u64>,
+        structured_handoff_max_secs: Option<u64>,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
@@ -396,7 +456,7 @@ impl ToolRuntime {
         let budget = match resolve_validation_budget(
             "project_validate",
             timeout_secs,
-            None,
+            project_validation_trusted_sync_wait(structured_handoff_max_secs),
             if action == ProjectValidationAction::Test {
                 DEFAULT_CARGO_TEST_TIMEOUT_SECS
             } else {

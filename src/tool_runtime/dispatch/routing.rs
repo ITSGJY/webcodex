@@ -325,7 +325,10 @@ impl ToolRuntime {
             | ToolCall::CargoCheck { .. }
             | ToolCall::CargoTest { .. }
             | ToolCall::ProjectValidate { .. }
-            | ToolCall::GoTest { .. }) => self.dispatch_cargo_tool(call, ssh_resource, auth).await,
+            | ToolCall::GoTest { .. }) => {
+                self.dispatch_cargo_tool(call, ssh_resource, auth, structured_handoff_max_secs)
+                    .await
+            }
 
             call @ (ToolCall::RunJob { .. }
             | ToolCall::StopJob { .. }
