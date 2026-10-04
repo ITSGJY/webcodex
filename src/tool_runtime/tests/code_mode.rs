@@ -345,7 +345,7 @@ async fn e2a_project_validate_handoff_preserves_same_canonical_job_and_source_re
     let task = spawn_code_mode_call(
         &runtime,
         "execute_effectful_code_mode",
-        project,
+        project.clone(),
         session_id,
         "const check=await tools.project_validate({action:'check',timeout_secs:600}); text({job_id:check.output?.job_id??null});".to_string(),
         5_000,
@@ -399,8 +399,26 @@ async fn e2a_project_validate_handoff_preserves_same_canonical_job_and_source_re
     );
     assert_eq!(child["source_state"]["freshness"], "unproven");
     assert_eq!(
-        child["source_state"]["observed_mutation_fence"],
-        "uncrossed"
+        child["source_state"]["observed_mutation_fence"], "unknown",
+        "the sparse child handoff deliberately omits its private source fence"
+    );
+    let job = runtime
+        .runner_registry
+        .get_job_for_auth(None, &job_id)
+        .await
+        .unwrap();
+    let source_fence = job
+        .validation
+        .as_ref()
+        .and_then(|metadata| metadata.source_fence.as_ref())
+        .expect("canonical project validation Job retains source fence");
+    assert_eq!(
+        runtime
+            .validation_sources
+            .observe(&project, Some(source_fence))
+            .observed_mutation_fence,
+        webcodex_core::validation_source::ObservedMutationFence::Uncrossed,
+        "the canonical Job retains the exact fence for later observation"
     );
     assert!(
         probe_patch_agent_request(&runtime, client_id)
