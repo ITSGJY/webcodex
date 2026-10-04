@@ -85,6 +85,7 @@ async fn e2a_validation_runtime(client_id: &str) -> (ToolRuntime, String, String
         RunnerCapabilities {
             async_shell_jobs: true,
             structured_validation_argv: true,
+            project_validation_v1: true,
             ..Default::default()
         },
     )
@@ -181,21 +182,32 @@ fn init_git_repo(path: &std::path::Path) {
 async fn e1_still_rejects_structured_validation_before_runner_dispatch() {
     let client_id = "code-mode-e1-validation-denied";
     let (runtime, project, session_id) = e2a_validation_runtime(client_id).await;
-    let outcome = spawn_code_mode_call(
-        &runtime,
-        "execute_code_mode",
-        project,
-        session_id,
-        "await tools.cargo_check({timeout_secs: 600});".to_string(),
-        5_000,
-    )
-    .await
-    .unwrap();
-    let result = outcome.result.expect("outer E1 ToolResult");
-    assert!(!result.success, "E1 must reject cargo_check: {result:?}");
-    assert!(probe_patch_agent_request(&runtime, client_id)
+    for (tool, source) in [
+        (
+            "cargo_check",
+            "await tools.cargo_check({timeout_secs: 600});",
+        ),
+        (
+            "project_validate",
+            "await tools.project_validate({action:'check',timeout_secs:600});",
+        ),
+    ] {
+        let outcome = spawn_code_mode_call(
+            &runtime,
+            "execute_code_mode",
+            project.clone(),
+            session_id.clone(),
+            source.to_string(),
+            5_000,
+        )
         .await
-        .is_none());
+        .unwrap();
+        let result = outcome.result.expect("outer E1 ToolResult");
+        assert!(!result.success, "E1 must reject {tool}: {result:?}");
+        assert!(probe_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -324,6 +336,78 @@ async fn e2a_cargo_check_handoff_preserves_same_canonical_job_and_sparse_receipt
     let serialized = serde_json::to_string(&summary).unwrap();
     assert!(serialized.contains("cargo_check"));
     assert!(serialized.contains(&job_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2a_project_validate_handoff_preserves_same_canonical_job_and_source_receipt() {
+    let client_id = "code-mode-e2a-project-validate";
+    let (runtime, project, session_id) = e2a_validation_runtime(client_id).await;
+    let task = spawn_code_mode_call(
+        &runtime,
+        "execute_effectful_code_mode",
+        project,
+        session_id,
+        "const check=await tools.project_validate({action:'check',timeout_secs:600}); text({job_id:check.output?.job_id??null});".to_string(),
+        5_000,
+    );
+
+    let (request, job_id) = super::validation_handoff::reply_project_validation_plan(
+        &runtime,
+        client_id,
+        "agent-proj",
+        "rust",
+        webcodex_core::project_validation::ProjectValidationAction::Check,
+    )
+    .await;
+    let request_json = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        request_json["job_context"]["validation"]["sync_wait_secs"], 5,
+        "the #875 return-timing contract must survive canonical Code Mode composition"
+    );
+    assert_eq!(
+        request_json["job_context"]["validation"]["effective_timeout_secs"], 600,
+        "return timing must not shorten project validation execution lifetime"
+    );
+    runtime
+        .runner_registry
+        .update_job(super::validation_handoff::cargo_test_update(
+            client_id,
+            &request.request_id,
+            &job_id,
+            "running",
+            "Checking project validation in E2a\n",
+            "",
+            None,
+            super::validation_handoff::running_progress("check"),
+            false,
+        ))
+        .await
+        .unwrap();
+
+    let outcome = task.await.unwrap();
+    assert!(outcome.success, "{outcome:?}");
+    let result = outcome.result.expect("outer E2a ToolResult");
+    assert!(result.success, "{result:?}");
+    let child = &result.output["effect_receipt"]["children"][0];
+    assert_eq!(child["tool"], "project_validate");
+    assert_eq!(child["outcome"], "job_handoff");
+    assert_eq!(child["job_id"], job_id);
+    assert_eq!(child["continuation"]["tool"], "observe_jobs");
+    assert_eq!(
+        child["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
+    assert_eq!(child["source_state"]["freshness"], "unproven");
+    assert_eq!(
+        child["source_state"]["observed_mutation_fence"],
+        "uncrossed"
+    );
+    assert!(
+        probe_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none(),
+        "the gateway must not redispatch validation after handing off the same Job"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

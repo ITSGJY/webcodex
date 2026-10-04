@@ -1,6 +1,9 @@
 //! E2c uses the real canonical host/kernel, guarded-edit path, and Job registry.
 //! Runner replies are controlled barriers, not concurrent timing assumptions.
-use super::super::validation_handoff::{cargo_test_update, completed_progress, running_progress};
+use super::super::validation_handoff::{
+    cargo_test_update, complete_project_validation_plan_request, completed_progress,
+    running_progress,
+};
 use super::*;
 use crate::tool_runtime::code_mode::{code_mode_orchestration_policy, CodeModeCallableStage};
 
@@ -31,6 +34,7 @@ async fn fixture(client: &str) -> (tempfile::TempDir, ToolRuntime, String, Strin
             internal_posix_script: true,
             async_shell_jobs: true,
             structured_validation_argv: true,
+            project_validation_v1: true,
             apply_text_edit_local_guard_without_sha: true,
             apply_text_edit_occurrence: true,
             apply_text_edit_line_scope: true,
@@ -65,6 +69,18 @@ async fn reach_validation(
                         reply.take().expect("second mutation dispatched"),
                     )
                     .await
+                }
+                "plan_project_validation" => {
+                    assert!(reply.is_none(), "gateway planning dispatched before edit");
+                    complete_project_validation_plan_request(
+                        runtime,
+                        client,
+                        request,
+                        "demo",
+                        "rust",
+                        webcodex_core::project_validation::ProjectValidationAction::Check,
+                    )
+                    .await;
                 }
                 "start_validation_job" => {
                     assert!(reply.is_none(), "validation dispatched before edit");
@@ -229,21 +245,29 @@ fn validator_receipt(result: &ToolResult) -> &Value {
         .as_array()
         .unwrap()
         .iter()
-        .find(|child| matches!(child["tool"].as_str(), Some("cargo_check" | "cargo_test")))
+        .find(|child| {
+            matches!(
+                child["tool"].as_str(),
+                Some("project_validate" | "cargo_check" | "cargo_test")
+            )
+        })
         .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2c_guarded_edit_then_check_or_test_keeps_execution_and_source_truth_separate() {
-    for (tool, noop, exit) in [
-        ("cargo_check", false, 0),
-        ("cargo_test", false, 0),
-        ("cargo_check", true, 0),
-        ("cargo_check", false, 101),
+    for (tool, args, noop, exit) in [
+        ("cargo_check", "{}", false, 0),
+        ("cargo_test", "{}", false, 0),
+        ("cargo_check", "{}", true, 0),
+        ("cargo_check", "{}", false, 101),
+        ("project_validate", "{action:'check'}", false, 0),
+        ("project_validate", "{action:'check'}", true, 0),
+        ("project_validate", "{action:'check'}", false, 101),
     ] {
         let client = format!("e2c-known-{tool}-{noop}-{exit}");
         let (root, runtime, project, session) = fixture(&client).await;
-        let source = format!("{EDIT} const validation = await tools.{tool}({{}}); text({{changed:edit.output.state_changed,success:validation.success,passed:validation.output.passed,source:validation.output.source_state}});");
+        let source = format!("{EDIT} const validation = await tools.{tool}({args}); text({{changed:edit.output.state_changed,success:validation.success,passed:validation.output.passed,source:validation.output.source_state}});");
         let task = spawn_e2b_call(&runtime, &project, &session, &source, None);
         let request = reach_validation(
             &runtime,
@@ -327,7 +351,7 @@ async fn e2c_mcp_direct_and_host_code_mode_keep_internal_five_second_handoff() {
             runtime
         };
         let source = format!(
-            "{EDIT} const validation = await tools.cargo_check({{timeout_secs:600}}); text({{job_id:validation.output?.job_id??null}});"
+            "{EDIT} const validation = await tools.project_validate({{action:'check',timeout_secs:600}}); text({{job_id:validation.output?.job_id??null}});"
         );
         let task = spawn_e2c_mcp_call(&runtime, &project, &session, &source);
         let request =
@@ -373,7 +397,7 @@ async fn e2c_expired_read_revision_rejected_before_write_dispatch_blocks_ignored
         Arc::new(crate::tool_runtime::read_revisions::ReadRevisionRegistry::new());
     fs::write(root.path().join("src/example.rs"), "newer\n").unwrap();
     let source = EDIT.replace("expected_read_revision:revision", &format!("expected_read_revision:{revision}"))
-        + "try {await tools.cargo_check({});} catch(e) {text({edit_success:edit.success,state:edit.output.execution_state,blocked:String(e)});}";
+        + "try {await tools.project_validate({action:'check'});} catch(e) {text({edit_success:edit.success,state:edit.output.execution_state,blocked:String(e)});}";
     let task = spawn_e2b_call(&runtime, &project, &session, &source, None);
     assert_eq!(
         service_e2b_call(&runtime, client, &task, VecDeque::new()).await,
@@ -402,7 +426,7 @@ async fn e2c_expired_read_revision_rejected_before_write_dispatch_blocks_ignored
 async fn e2c_runner_stale_guard_also_blocks_validation_after_known_failed_edit() {
     let client = "e2c-runner-stale";
     let (root, runtime, project, session) = fixture(client).await;
-    let source = format!("{EDIT} try {{await tools.cargo_check({{}});}} catch(e) {{text({{kind:edit.output.error_kind,changed:edit.output.state_changed,blocked:String(e)}});}}");
+    let source = format!("{EDIT} try {{await tools.project_validate({{action:'check'}});}} catch(e) {{text({{kind:edit.output.error_kind,changed:edit.output.state_changed,blocked:String(e)}});}}");
     let task = spawn_e2b_call(&runtime, &project, &session, &source, None);
     assert_eq!(
         service_e2b_call(
@@ -432,7 +456,7 @@ async fn e2c_unknown_mutation_blocks_validation_even_when_js_catches_the_rejecti
     let client = "e2c-unknown";
     let (_root, runtime, project, session) = fixture(client).await;
     let source =
-        format!("{EDIT} try {{await tools.cargo_check({{}});}} catch(e) {{text(String(e));}}");
+        format!("{EDIT} try {{await tools.project_validate({{action:'check'}});}} catch(e) {{text(String(e));}}");
     let task = spawn_e2b_call(&runtime, &project, &session, &source, None);
     loop {
         let request = wait_for_patch_agent_request(&runtime, client).await;
@@ -476,12 +500,18 @@ async fn e2c_unknown_mutation_blocks_validation_even_when_js_catches_the_rejecti
 async fn e2c_validator_requires_edit_and_second_mutation_is_pre_dispatch_rejected() {
     let client = "e2c-order";
     let (_root, runtime, project, session) = fixture(client).await;
-    for tool in ["cargo_check", "cargo_test"] {
+    for (tool, args) in [
+        ("project_validate", "{action:'format_check'}"),
+        ("project_validate", "{action:'check'}"),
+        ("project_validate", "{action:'test'}"),
+        ("cargo_check", "{}"),
+        ("cargo_test", "{}"),
+    ] {
         let task = spawn_e2b_call(
             &runtime,
             &project,
             &session,
-            &format!("await tools.{tool}({{}});"),
+            &format!("await tools.{tool}({args});"),
             None,
         );
         let result = task.await.unwrap();
@@ -510,7 +540,7 @@ async fn e2c_validator_requires_edit_and_second_mutation_is_pre_dispatch_rejecte
 async fn e2c_concurrent_canonical_write_from_another_session_crosses_running_validation() {
     let client = "e2c-concurrent";
     let (_root, runtime, project, session) = fixture(client).await;
-    let source = format!("{EDIT} const r=await tools.cargo_check({{}}); text({{success:r.success,source:r.output.source_state}});");
+    let source = format!("{EDIT} const r=await tools.project_validate({{action:'check'}}); text({{success:r.success,source:r.output.source_state}});");
     let task = spawn_e2b_call(&runtime, &project, &session, &source, None);
     let request = reach_validation(&runtime, client, &task, MutationFixtureReply::ApplyExact).await;
     let other = runtime.sessions.start_session(Some(project.clone()), None);
@@ -559,7 +589,7 @@ async fn e2c_concurrent_canonical_write_from_another_session_crosses_running_val
 async fn e2c_job_handoff_has_exact_continuation_and_later_write_invalidates_terminal_view() {
     let client = "e2c-job";
     let (_root, runtime, project, session) = fixture(client).await;
-    let source = format!("{EDIT} await tools.cargo_check({{}}); try {{await tools.cargo_test({{}});}} catch(e) {{text(String(e));}}");
+    let source = format!("{EDIT} await tools.project_validate({{action:'check'}}); try {{await tools.cargo_test({{}});}} catch(e) {{text(String(e));}}");
     let task = spawn_e2b_call(&runtime, &project, &session, &source, None);
     let request = reach_validation(&runtime, client, &task, MutationFixtureReply::ApplyExact).await;
     validation_reply(&runtime, client, &request, None).await;

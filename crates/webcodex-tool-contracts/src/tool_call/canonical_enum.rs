@@ -687,7 +687,7 @@ pub enum ToolCall {
             pattern = "^(wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})|~s[1-9][0-9]{0,18})$"
         ))]
         session_id: String,
-        /// Experimental E2a JavaScript orchestration source. Admitted tools are the E1 read-only set plus cargo_check and cargo_test. Structured validators may hand off the same execution as ordinary Jobs; no mutation, shell, generic process, Job observation, plugins/MCP, or recursive Code Mode is exposed.
+        /// Experimental E2a JavaScript orchestration source. Admitted tools are the E1 read-only set plus project_validate, cargo_check and cargo_test. Structured validators may hand off the same execution as ordinary Jobs; no mutation, shell/generic process, Job observation, Plugin/MCP gateways, or recursive Code Mode is exposed.
         #[schemars(length(max = 65536))]
         source: String,
         /// Optional orchestration/frontend decision deadline in milliseconds. Defaults to 5000 and is server-clamped to 1..30000. The response may follow after a short bounded drain of already-started canonical child calls needed to report truthful consequential outcomes.
@@ -708,7 +708,7 @@ pub enum ToolCall {
             pattern = "^(wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})|~s[1-9][0-9]{0,18})$"
         ))]
         session_id: String,
-        /// Experimental E2c source: E1 reads, at most one canonical edit_project_files attempt, then cargo_check/cargo_test only after a successful known edit (including no-op). Use read_revision for guarded edits. Inspect source_state independently of execution success. Return Job handoffs to the outer workflow, never wait inside JS. No shell/process, nested Job observation, alternate writes, gateways, recursion or automatic whole-program retry.
+        /// Experimental E2c source: E1 reads, at most one canonical edit_project_files attempt, then project_validate, cargo_check or cargo_test only after a successful known edit (including no-op). Use read_revision for guarded edits. Inspect source_state independently of execution success. Return Job handoffs to the outer workflow, never wait inside JS. No shell/process, nested Job observation, alternate writes, Plugin/MCP gateways, recursion or automatic whole-program retry.
         #[schemars(length(max = 65536))]
         source: String,
         /// Optional frontend decision deadline in milliseconds. Defaults to 5000, clamped to 1..30000. A short bounded drain preserves already-dispatched mutation/validation truth and exact Job continuations; timeout is not rollback or retry authority.
@@ -1514,7 +1514,7 @@ pub enum ToolCall {
         #[serde(default)]
         cwd: Option<String>,
         action: webcodex_core::project_validation::ProjectValidationAction,
-        /// Omission means auto. Rust and Go are supported; Node/Python return unavailable.
+        /// Omission means auto. Rust and Go are supported; Python supports test through pytest; Node returns unavailable.
         #[serde(default)]
         adapter: Option<webcodex_core::project_validation::ProjectValidationAdapter>,
         /// Optional portable scope. Explicit packages narrow Rust/Go selection; all_packages=true selects the
@@ -1524,8 +1524,10 @@ pub enum ToolCall {
         /// Optional portable dependency-resolution policy. locked forbids adapters from
         /// repairing dependency selection state; it does not imply offline execution.
         #[serde(default)]
-        dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,        /// Test-only selector and count postconditions. Rust uses a libtest substring;
-        /// Go uses native -run regexp. Omission preserves unfiltered positive-test proof.
+        dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+        /// Test-only selector and count postconditions. Rust uses a libtest substring,
+        /// Go uses native -run regexp, and Python pytest uses -k. Omission preserves
+        /// unfiltered positive-test proof.
         #[serde(default)]
         test: Option<webcodex_core::project_validation::ProjectValidationTestOptions>,
         /// Total execution budget, clamped to 3600 seconds. Host grace never starts another execution.

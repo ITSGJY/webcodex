@@ -21,6 +21,10 @@ use crate::tool_runtime::sessions::{SessionTransport, DEFAULT_MAX_EVENTS_PER_SES
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::{ObserveJobsItem, ObserveJobsWakeOn, ToolCall, ToolRuntime};
 use serde_json::json;
+use webcodex_core::project_validation::{
+    ProjectValidationAction, ProjectValidationPlan, ProjectValidationPlanningResult,
+    ProjectValidationProvenance, ProjectValidationRequest, ProjectValidationScope,
+};
 
 /// Fetch the `start_validation_job` request that the agent should have polled
 /// and return the job id embedded in it.
@@ -62,6 +66,95 @@ async fn wait_for_runner_request(
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+pub(super) async fn complete_project_validation_plan_request(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    request: crate::runner_protocol::RunnerRequest,
+    expected_project_id: &str,
+    backend: &str,
+    expected_action: ProjectValidationAction,
+) {
+    assert_eq!(request.kind, "plan_project_validation");
+    assert!(request.command.is_empty() && request.cwd.is_none());
+    let semantic: ProjectValidationRequest =
+        serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
+    assert_eq!(semantic.project_id, expected_project_id);
+    assert_eq!(semantic.action, expected_action);
+    let check = match semantic.action {
+        ProjectValidationAction::FormatCheck => webcodex_validation::SemanticCheck::Format,
+        ProjectValidationAction::Check => webcodex_validation::SemanticCheck::Check,
+        ProjectValidationAction::Test => webcodex_validation::SemanticCheck::Test,
+    };
+    let operation = webcodex_validation::project_validation_operation(
+        backend,
+        check,
+        semantic
+            .scope
+            .as_ref()
+            .and_then(ProjectValidationScope::explicit_packages)
+            .map(<[String]>::to_vec),
+        semantic
+            .scope
+            .as_ref()
+            .is_some_and(ProjectValidationScope::selects_all_packages),
+    )
+    .unwrap()
+    .with_test_filter(
+        semantic
+            .test
+            .as_ref()
+            .and_then(|test| test.filter.as_deref()),
+    )
+    .unwrap();
+    let adapter = operation.adapter();
+    let step = operation.build_readonly_plan().unwrap().structured_step;
+    let validation_target_id = operation.validation_target_id(Some(".")).unwrap();
+    let plan = ProjectValidationPlan {
+        provenance: ProjectValidationProvenance {
+            request: semantic,
+            backend: backend.into(),
+            recipe_root: ".".into(),
+            root_digest: "a".repeat(64),
+            manifest_digest: "b".repeat(64),
+            invocation_digest: "c".repeat(64),
+        },
+        adapter: adapter.tool_identity().into(),
+        step,
+        validation_target_id,
+    };
+    complete_sync_shell_lifecycle(
+        runtime,
+        client_id,
+        request.request_id,
+        ShellCommandExecutionState::Completed,
+        Some(0),
+        &serde_json::to_string(&ProjectValidationPlanningResult::Ready { plan }).unwrap(),
+        "",
+        None,
+    )
+    .await;
+}
+
+pub(super) async fn reply_project_validation_plan(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    expected_project_id: &str,
+    backend: &str,
+    expected_action: ProjectValidationAction,
+) -> (crate::runner_protocol::RunnerRequest, String) {
+    let request = wait_for_runner_request(runtime, client_id).await;
+    complete_project_validation_plan_request(
+        runtime,
+        client_id,
+        request,
+        expected_project_id,
+        backend,
+        expected_action,
+    )
+    .await;
+    poll_start_validation_job(runtime, client_id).await
 }
 
 fn assert_agent_observation_upgrades_without_changing_snapshot(

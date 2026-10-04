@@ -325,6 +325,10 @@ struct OrchestrationEffectAccumulator {
     children: BTreeMap<usize, ConsequentialChildReceipt>,
 }
 
+fn is_code_mode_validation_child(tool_name: &str) -> bool {
+    matches!(tool_name, "project_validate" | "cargo_check" | "cargo_test")
+}
+
 impl OrchestrationEffectAccumulator {
     fn begin_if_consequential(&mut self, ordinal: usize, tool_name: &str) {
         if runtime_tool_metadata(tool_name).effect == ToolEffect::Observe {
@@ -356,7 +360,7 @@ impl OrchestrationEffectAccumulator {
         let execution_state = output.get("execution_state").and_then(Value::as_str);
         let failure_kind = output.get("failure_kind").and_then(Value::as_str);
         if let Some(child) = self.children.get_mut(&ordinal) {
-            if matches!(child.tool.as_str(), "cargo_check" | "cargo_test") {
+            if is_code_mode_validation_child(child.tool.as_str()) {
                 child.source_state = Some(
                     output
                         .get("source_state")
@@ -792,7 +796,7 @@ impl CanonicalOrchestrationHost {
                         "a consequential child is unresolved; use its exact outer Job continuation or reconcile unknown effects, never retry the JavaScript program",
                     ));
                 }
-                if matches!(tool_name.as_str(), "cargo_check" | "cargo_test")
+                if is_code_mode_validation_child(tool_name.as_str())
                     && !effects.children.values().any(|child| {
                         child.tool == "edit_project_files"
                             && child.outcome == ConsequentialChildOutcome::KnownResult

@@ -1,5 +1,15 @@
 # Project-validation test selection and count requirements (#599)
 
+## Current tree note
+
+The current tree has advanced beyond the historical slice documented below. Rust/Go
+`project_validate` now supports shared package scope, `all_packages=true` where the
+Runner can prove the complete project unit, and `dependency_policy.mode=locked`.
+Python `project_validate` supports `action=test` through pytest, including bounded
+`test.filter` mapped to pytest `-k`; Python still rejects package scope and dependency
+policy. Node remains unavailable. `project_build` remains a separate Rust/Go gateway.
+The historical implementation record below is retained as the state of that slice.
+
 ## Status and bounded scope
 
 This is one follow-up slice of #599, based on `1006a48206f9a9704114bbad6481f145e486928c`.

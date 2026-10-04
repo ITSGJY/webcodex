@@ -135,7 +135,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 false,
                 super::ToolSessionEvidencePolicy::NONE.validation_identity(super::ToolValidationIdentityKind::Project),
-            ),
+            )
+            .with_composition_policy(super::ToolCompositionPolicy::Sequential)
+            .with_host_orchestration_hint(super::ToolHostOrchestrationHint::sequential()),
             "Portable project validation; Runner owns recipe and argv. Rust/Go: format_check/check/test as supported; Python: test via pytest only; Node unavailable. scope selects packages (1..8) or all_packages=true for Rust/Go check/test; scoped formatting fails closed. Rust all-packages requires a Runner-proven Project-root Cargo workspace; Go keeps ./... single-module scope. Python rejects scope. test.filter is a bounded Rust substring, Go -run regexp or pytest -k expression; require_tests/min_tests govern proven counts. Python uses existing configured/profile/PATH Python 3 and pytest; never installs or falls back. Missing environment is unavailable. dependency_policy.mode=locked maps to Cargo --locked/Go -mod=readonly, not offline; Python and formatting reject it. Additive semantics require Runner support. Go forces GO111MODULE=on/GOWORK=off. No arbitrary executable, argv or shell. Project tests may have effects. Long work keeps the same Job; observe pending, never retry. Advanced options remain on cargo_* / go_test.",    )
     .with_execution(super::ToolExecutionContract::new(
         super::ToolExecutionForm::StructuredValidation,

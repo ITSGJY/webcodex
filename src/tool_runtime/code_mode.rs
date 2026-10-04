@@ -610,7 +610,10 @@ impl ToolRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webcodex_tool_contracts::{lookup_tool_definition, ToolEffect, ToolRisk};
+    use webcodex_tool_contracts::{
+        lookup_tool_definition, runtime_tool_composition_policy, ToolCompositionPolicy, ToolEffect,
+        ToolRisk,
+    };
 
     #[test]
     fn e1_allowlist_remains_canonically_read_only() {
@@ -657,6 +660,13 @@ mod tests {
                 "cargo_test"
             ]
         );
+        for tool in ["project_validate", "cargo_check", "cargo_test"] {
+            assert_eq!(
+                runtime_tool_composition_policy(tool),
+                ToolCompositionPolicy::Sequential,
+                "{tool} is admitted as a consequential Code Mode validation child"
+            );
+        }
         for stage in [
             CodeModeCallableStage::ReadOnly,
             CodeModeCallableStage::Validation,

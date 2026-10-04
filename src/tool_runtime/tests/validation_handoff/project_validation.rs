@@ -35,66 +35,14 @@ async fn reply_plan(
     backend: &str,
     action: ProjectValidationAction,
 ) -> (crate::runner_protocol::RunnerRequest, String) {
-    let request = wait_for_runner_request(runtime, "project-validation").await;
-    assert_eq!(request.kind, "plan_project_validation");
-    assert!(request.command.is_empty() && request.cwd.is_none());
-    let semantic: ProjectValidationRequest =
-        serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
-    assert_eq!(semantic.project_id, "agent-proj");
-    let check = match action {
-        ProjectValidationAction::FormatCheck => webcodex_validation::SemanticCheck::Format,
-        ProjectValidationAction::Check => webcodex_validation::SemanticCheck::Check,
-        ProjectValidationAction::Test => webcodex_validation::SemanticCheck::Test,
-    };
-    let operation = webcodex_validation::project_validation_operation(
-        backend,
-        check,
-        semantic
-            .scope
-            .as_ref()
-            .and_then(ProjectValidationScope::explicit_packages)
-            .map(<[String]>::to_vec),
-        semantic
-            .scope
-            .as_ref()
-            .is_some_and(ProjectValidationScope::selects_all_packages),
-    )
-    .unwrap()
-    .with_test_filter(
-        semantic
-            .test
-            .as_ref()
-            .and_then(|test| test.filter.as_deref()),
-    )
-    .unwrap();
-    let adapter = operation.adapter();
-    let step = operation.build_readonly_plan().unwrap().structured_step;
-    let validation_target_id = operation.validation_target_id(Some(".")).unwrap();
-    let plan = ProjectValidationPlan {
-        provenance: ProjectValidationProvenance {
-            request: semantic,
-            backend: backend.into(),
-            recipe_root: ".".into(),
-            root_digest: "a".repeat(64),
-            manifest_digest: "b".repeat(64),
-            invocation_digest: "c".repeat(64),
-        },
-        adapter: adapter.tool_identity().into(),
-        step,
-        validation_target_id,
-    };
-    complete_sync_shell_lifecycle(
+    super::reply_project_validation_plan(
         runtime,
         "project-validation",
-        request.request_id,
-        ShellCommandExecutionState::Completed,
-        Some(0),
-        &serde_json::to_string(&ProjectValidationPlanningResult::Ready { plan }).unwrap(),
-        "",
-        None,
+        "agent-proj",
+        backend,
+        action,
     )
-    .await;
-    poll_start_validation_job(runtime, "project-validation").await
+    .await
 }
 fn call(action: ProjectValidationAction, session_id: Option<String>) -> ToolCall {
     call_with_scope(action, session_id, None)

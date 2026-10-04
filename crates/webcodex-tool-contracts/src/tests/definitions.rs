@@ -105,6 +105,16 @@ fn experimental_code_mode_effectful_has_conservative_e2a_envelope() {
         .iter()
         .any(|spec| spec.name == "execute_effectful_code_mode"));
     assert_eq!(definition.category, TOOL_CATEGORY_RUNTIME);
+    let description = definition
+        .model_spec
+        .expect("execute_effectful_code_mode model spec")
+        .description;
+    assert!(description.contains("project_validate"));
+    assert!(description.contains("Plugin/MCP gateways"));
+    assert!(
+        description.chars().count() <= MODEL_TOOL_DESCRIPTION_MAX_CHARS,
+        "execute_effectful_code_mode canonical description budget"
+    );
 }
 
 #[cfg(feature = "experimental-code-mode")]
@@ -146,6 +156,17 @@ fn experimental_code_mode_mutating_has_conservative_e2c_combined_authority_envel
     assert!(is_adaptive_runtime_direct_tool(
         "execute_mutating_code_mode"
     ));
+    let description = definition
+        .model_spec
+        .expect("execute_mutating_code_mode model spec")
+        .description;
+    assert!(description.contains("project_validate"));
+    assert!(description.contains("successful no-op"));
+    assert!(description.contains("Plugin/MCP gateways"));
+    assert!(
+        description.chars().count() <= MODEL_TOOL_DESCRIPTION_MAX_CHARS,
+        "execute_mutating_code_mode canonical description budget"
+    );
 }
 
 #[cfg(feature = "experimental-code-mode")]
@@ -174,7 +195,12 @@ fn code_mode_composition_policy_is_canonical_closed_and_independent_from_fronten
         assert_eq!(metadata.risk, ToolRisk::Read, "{name}");
     }
 
-    for name in ["cargo_check", "cargo_test", "edit_project_files"] {
+    for name in [
+        "project_validate",
+        "cargo_check",
+        "cargo_test",
+        "edit_project_files",
+    ] {
         assert_eq!(
             runtime_tool_composition_policy(name),
             ToolCompositionPolicy::Sequential,
