@@ -118,6 +118,11 @@ pub(crate) struct ToolCallOutcome {
     /// Existing privacy-safe audit projection captured before model compaction.
     /// Never serialized into ToolResult or interpreted as execution authority.
     pub(crate) canonical_audit_output: Option<Value>,
+    /// Canonical pre-model-projection state-change truth for request-local
+    /// internal effect accounting. This is never serialized into ToolResult and
+    /// carries no authorization, source-fence, or replay authority.
+    #[cfg_attr(not(feature = "experimental-code-mode"), allow(dead_code))]
+    pub(crate) canonical_state_changed: Option<bool>,
     /// Trusted internal Window/Workflow Session correlation evidence. This is
     /// adapter metadata only and is never part of the public ToolResult.
     pub(crate) correlation: super::window_activity::ToolCallCorrelation,
@@ -132,6 +137,7 @@ fn session_selector_failure(error: super::SessionSelectorError) -> ToolCallOutco
             project: None,
             model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
             correlation: Default::default(),
         },
         super::SessionSelectorError::RetentionExpired { session_id } => ToolCallOutcome {
@@ -143,6 +149,7 @@ fn session_selector_failure(error: super::SessionSelectorError) -> ToolCallOutco
             project: None,
             model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
             correlation: Default::default(),
         },
     }
@@ -447,6 +454,7 @@ impl ToolRuntime {
                     project: None,
                     model_ergonomics: None,
                     canonical_audit_output: None,
+                    canonical_state_changed: None,
                     correlation: Default::default(),
                 }
             }
@@ -487,6 +495,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -501,6 +510,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -521,6 +531,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -535,6 +546,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -560,6 +572,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -582,6 +595,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -605,6 +619,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -626,6 +641,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -644,6 +660,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -664,6 +681,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -738,6 +756,7 @@ impl ToolRuntime {
                     project: None,
                     model_ergonomics: None,
                     canonical_audit_output: None,
+                    canonical_state_changed: None,
                     correlation: Default::default(),
                 };
             }
@@ -773,6 +792,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -787,6 +807,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -825,6 +846,7 @@ impl ToolRuntime {
                         project: None,
                         model_ergonomics: None,
                         canonical_audit_output: None,
+                        canonical_state_changed: None,
                         correlation: Default::default(),
                     };
                 }
@@ -854,6 +876,7 @@ impl ToolRuntime {
                         project: None,
                         model_ergonomics: None,
                         canonical_audit_output: None,
+                        canonical_state_changed: None,
                         correlation: Default::default(),
                     };
                 }
@@ -920,6 +943,7 @@ impl ToolRuntime {
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             };
         }
@@ -938,6 +962,7 @@ impl ToolRuntime {
                     project: None,
                     model_ergonomics: None,
                     canonical_audit_output: None,
+                    canonical_state_changed: None,
                     correlation: Default::default(),
                 };
             }
@@ -989,6 +1014,7 @@ impl ToolRuntime {
                     project: None,
                     model_ergonomics: None,
                     canonical_audit_output: None,
+                    canonical_state_changed: None,
                     correlation: Default::default(),
                 };
             }
@@ -1011,6 +1037,7 @@ impl ToolRuntime {
                     project: None,
                     model_ergonomics: None,
                     canonical_audit_output: None,
+                    canonical_state_changed: None,
                     correlation: Default::default(),
                 };
             }
@@ -1064,6 +1091,7 @@ impl ToolRuntime {
                     project: None,
                     model_ergonomics: None,
                     canonical_audit_output: None,
+                    canonical_state_changed: None,
                     correlation: Default::default(),
                 };
             }
@@ -1237,6 +1265,7 @@ impl ToolRuntime {
                 recorder_ack_requested,
             );
         }
+        let canonical_state_changed = result.output.get("state_changed").and_then(Value::as_bool);
         // Session/permission evidence is sealed above. The response stage owns
         // canonical audit capture, one-shot model projection, and late sidecars.
         let postprocess::PostRecordResult {
@@ -1260,6 +1289,7 @@ impl ToolRuntime {
             project,
             model_ergonomics: None,
             canonical_audit_output,
+            canonical_state_changed,
             correlation,
         }
     }

@@ -237,7 +237,7 @@ async fn direct_edit(
     );
     let result = task.await.unwrap();
     assert!(result.success, "{result:?}");
-    assert_eq!(result.output["state_changed"], true);
+    assert_eq!(result.output["changed"], true);
 }
 
 fn validator_receipt(result: &ToolResult) -> &Value {
@@ -267,7 +267,7 @@ async fn e2c_guarded_edit_then_check_or_test_keeps_execution_and_source_truth_se
     ] {
         let client = format!("e2c-known-{tool}-{noop}-{exit}");
         let (root, runtime, project, session) = fixture(&client).await;
-        let source = format!("{EDIT} const validation = await tools.{tool}({args}); text({{changed:edit.output.state_changed,success:validation.success,passed:validation.output.passed,source:validation.output.source_state}});");
+        let source = format!("{EDIT} const validation = await tools.{tool}({args}); text({{changed:edit.output.changed,success:validation.success,passed:validation.output.passed,source:validation.output.source_state}});");
         let task = spawn_e2b_call(&runtime, &project, &session, &source, None);
         let request = reach_validation(
             &runtime,

@@ -57,6 +57,7 @@ pub(crate) async fn try_dispatch_specialized_gateway(
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation: Default::default(),
             });
         }
@@ -142,6 +143,7 @@ pub(crate) async fn try_dispatch_specialized_gateway(
                 project: None,
                 model_ergonomics: None,
                 canonical_audit_output: None,
+                canonical_state_changed: None,
                 correlation,
             }
         }
@@ -152,6 +154,7 @@ pub(crate) async fn try_dispatch_specialized_gateway(
             project: None,
             model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
             correlation: Default::default(),
         },
         Err(SpecializedGovernanceDenial::Scope {
@@ -167,6 +170,7 @@ pub(crate) async fn try_dispatch_specialized_gateway(
             project: None,
             model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
             correlation: Default::default(),
         },
     })

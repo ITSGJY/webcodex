@@ -298,6 +298,15 @@ jobs:
         env:
           CI_RUST_SHARD: ${{ matrix.shard }}
         run: python3 scripts/ci_rust_test.py --report target/ci-test-reports/${{ matrix.shard }}.json -- cargo test --locked ${{ matrix.packages }}
+      - name: Run experimental Code Mode and receipt tests
+        if: matrix.shard == 'server'
+        run: |
+          CI_RUST_SHARD=experimental-code-mode \
+            python3 scripts/ci_rust_test.py --report target/ci-test-reports/experimental-code-mode.json -- \
+            cargo test --locked -p webcodex --features experimental-code-mode code_mode
+          CI_RUST_SHARD=experimental-code-mode-receipts \
+            python3 scripts/ci_rust_test.py --report target/ci-test-reports/experimental-code-mode-receipts.json -- \
+            cargo test --locked -p webcodex --features experimental-code-mode receipt_tests
       - name: Upload bounded Rust test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

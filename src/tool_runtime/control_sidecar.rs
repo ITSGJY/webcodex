@@ -398,6 +398,7 @@ fn rejection_result(result: ToolResult) -> ToolCallOutcome {
         project: None,
         model_ergonomics: None,
         canonical_audit_output: None,
+        canonical_state_changed: None,
         correlation: Default::default(),
     }
 }

@@ -392,7 +392,7 @@ async fn e2b_read_guarded_edit_post_read_preserves_canonical_mutation_truth() {
         const after = await tools.read_files({items:[{path:"src/example.rs"}]});
         text(JSON.stringify({
             edit_success: edit.success,
-            changed: edit.output.state_changed,
+            changed: edit.output.changed,
             after: after.output.items[0].output.text
         }));
     "#;
@@ -440,7 +440,7 @@ async fn e2b_noop_mutation_is_known_false_without_edit_provenance() {
             kind:"edit", path:"src/example.rs", expected_read_revision:revision,
             edits:[{kind:"replace_exact", old_text:"same", new_text:"same"}]
         }]});
-        text(JSON.stringify({success:edit.success, changed:edit.output.state_changed}));
+        text(JSON.stringify({success:edit.success, changed:edit.output.changed}));
     "#;
     let task = spawn_e2b_call(&runtime, &project, &session_id, source, None);
     service_e2b_call(
@@ -483,7 +483,7 @@ async fn e2b_dry_run_is_known_false_and_never_creates_edit_provenance() {
                 edits:[{kind:"replace_exact", old_text:"before", new_text:"after"}]
             }]
         });
-        text(JSON.stringify({success:edit.success, changed:edit.output.state_changed, would_change:edit.output.would_change}));
+        text(JSON.stringify({success:edit.success, changed:edit.output.changed, would_change:edit.output.would_change}));
     "#;
     let task = spawn_e2b_call(&runtime, &project, &session_id, source, None);
     service_e2b_call(
@@ -1135,7 +1135,7 @@ async fn e2b_nested_edit_drives_real_final_changes_baseline_to_full_final_worksp
             kind:"edit",path:"README.md",expected_read_revision:revision,
             edits:[{kind:"replace_exact",old_text:"base readme",new_text:"E2b readme"}]
         }]});
-        text(JSON.stringify({success:edit.success,changed:edit.output.state_changed}));
+        text(JSON.stringify({success:edit.success,changed:edit.output.changed}));
     "#;
     let e2b = spawn_e2b_call(&runtime, &project, &session.session_id, source, None);
     service_e2b_call(
@@ -1281,7 +1281,7 @@ async fn e2b_outer_only_noop_and_prestart_failure_do_not_create_final_changes_el
         &runtime,
         &project,
         &noop.session_id,
-        "const before=await tools.read_files({items:[{path:'README.md'}]}); const revision=before.output.items[0].output.read_revision; const r=await tools.edit_project_files({changes:[{kind:'edit',path:'README.md',expected_read_revision:revision,edits:[{kind:'replace_exact',old_text:'base',new_text:'base'}]}]}); text(String(r.output.state_changed));",
+        "const before=await tools.read_files({items:[{path:'README.md'}]}); const revision=before.output.items[0].output.read_revision; const r=await tools.edit_project_files({changes:[{kind:'edit',path:'README.md',expected_read_revision:revision,edits:[{kind:'replace_exact',old_text:'base',new_text:'base'}]}]}); text(String(r.output.changed));",
         None,
     );
     service_e2b_call(
@@ -1446,7 +1446,7 @@ async fn e2b_parent_omits_retired_continuity_overlays_after_nested_edit() {
                     arguments: json!({
                         "project": project_for_call,
                         "session_id": session_for_call,
-                        "source": "const before=await tools.read_files({items:[{path:'src/example.rs'}]}); const revision=before.output.items[0].output.read_revision; const e=await tools.edit_project_files({changes:[{kind:'edit',path:'src/example.rs',expected_read_revision:revision,edits:[{kind:'replace_exact',old_text:'before',new_text:'after'}]}]}); text(String(e.output.state_changed));"
+                        "source": "const before=await tools.read_files({items:[{path:'src/example.rs'}]}); const revision=before.output.items[0].output.read_revision; const e=await tools.edit_project_files({changes:[{kind:'edit',path:'src/example.rs',expected_read_revision:revision,edits:[{kind:'replace_exact',old_text:'before',new_text:'after'}]}]}); text(String(e.output.changed));"
                     }),
                 },
                 ToolCallContext {

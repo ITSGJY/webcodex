@@ -355,7 +355,12 @@ impl OrchestrationEffectAccumulator {
         self.children.remove(&ordinal);
     }
 
-    fn finish(&mut self, ordinal: usize, result: &super::ToolResult) {
+    fn finish(
+        &mut self,
+        ordinal: usize,
+        result: &super::ToolResult,
+        canonical_state_changed: Option<bool>,
+    ) {
         let output = &result.output;
         let execution_state = output.get("execution_state").and_then(Value::as_str);
         let failure_kind = output.get("failure_kind").and_then(Value::as_str);
@@ -413,9 +418,7 @@ impl OrchestrationEffectAccumulator {
             .children
             .get(&ordinal)
             .is_some_and(|child| runtime_tool_metadata(&child.tool).effect == ToolEffect::Mutate);
-        let mutation_state_changed = is_mutation
-            .then(|| output.get("state_changed").and_then(Value::as_bool))
-            .flatten();
+        let mutation_state_changed = is_mutation.then_some(canonical_state_changed).flatten();
         if let Some(child) = self.children.get_mut(&ordinal) {
             child.job_id = None;
             child.continuation = None;
@@ -879,7 +882,7 @@ impl CanonicalOrchestrationHost {
             if outcome.error_status.is_some() {
                 effects.remove(child_ordinal);
             } else if let Some(result) = outcome.result.as_ref() {
-                effects.finish(child_ordinal, result);
+                effects.finish(child_ordinal, result, outcome.canonical_state_changed);
             }
         }
         // Publish effect truth before releasing the sequential scheduling fence:
@@ -935,24 +938,52 @@ mod receipt_tests {
     use super::*;
 
     #[test]
-    fn mutation_result_without_authoritative_state_changed_fails_closed() {
-        let mut effects = OrchestrationEffectAccumulator::default();
-        effects.begin_if_consequential(1, "edit_project_files");
-        effects.finish(
-            1,
-            &crate::tool_runtime::ToolResult::ok(serde_json::json!({
-                "execution_state": "completed"
-            })),
-        );
+    fn mutation_result_uses_preprojection_state_changed_truth() {
+        for state_changed in [false, true] {
+            let mut effects = OrchestrationEffectAccumulator::default();
+            effects.begin_if_consequential(1, "edit_project_files");
+            effects.finish(
+                1,
+                &crate::tool_runtime::ToolResult::ok(serde_json::json!({
+                    "changed": state_changed
+                })),
+                Some(state_changed),
+            );
 
-        let receipt = effects.receipt();
-        assert_eq!(receipt.consequential_calls, 1);
-        assert_eq!(receipt.known_results, 0);
-        assert_eq!(receipt.outcome_unknown, 1);
-        assert_eq!(
-            receipt.children[0].outcome,
-            ConsequentialChildOutcome::OutcomeUnknown
-        );
-        assert_eq!(receipt.children[0].state_changed, None);
+            let receipt = effects.receipt();
+            assert_eq!(receipt.consequential_calls, 1);
+            assert_eq!(receipt.known_results, 1);
+            assert_eq!(receipt.outcome_unknown, 0);
+            assert_eq!(
+                receipt.children[0].outcome,
+                ConsequentialChildOutcome::KnownResult
+            );
+            assert_eq!(receipt.children[0].success, Some(true));
+            assert_eq!(receipt.children[0].state_changed, Some(state_changed));
+        }
+    }
+
+    #[test]
+    fn mutation_result_without_authoritative_state_changed_fails_closed() {
+        for projected_state_changed in [None, Some(false), Some(true)] {
+            let mut effects = OrchestrationEffectAccumulator::default();
+            effects.begin_if_consequential(1, "edit_project_files");
+            let mut output = serde_json::json!({"execution_state": "completed"});
+            if let Some(state_changed) = projected_state_changed {
+                output["state_changed"] = serde_json::json!(state_changed);
+            }
+            effects.finish(1, &crate::tool_runtime::ToolResult::ok(output), None);
+
+            let receipt = effects.receipt();
+            assert_eq!(receipt.consequential_calls, 1);
+            assert_eq!(receipt.known_results, 0);
+            assert_eq!(receipt.outcome_unknown, 1);
+            assert_eq!(
+                receipt.children[0].outcome,
+                ConsequentialChildOutcome::OutcomeUnknown
+            );
+            assert_eq!(receipt.children[0].success, None);
+            assert_eq!(receipt.children[0].state_changed, None);
+        }
     }
 }

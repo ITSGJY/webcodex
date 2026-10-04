@@ -99,6 +99,7 @@ impl Fixture {
             project: None,
             model_ergonomics: None,
             canonical_audit_output: None,
+            canonical_state_changed: None,
             correlation: Default::default(),
         };
         execution.decorate(&mut outcome);
