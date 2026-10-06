@@ -30,6 +30,7 @@ STATUS_VALUES = frozenset(("pass", "fail", "partial", "unsupported"))
 DEFAULT_CASES = ("readonly_review", "guarded_multi_file_edit", "long_validation_handoff")
 VARIANTS = ("direct", "code_mode")
 MAX_DRIVER_RECEIPT_BYTES = 64 * 1024
+MAX_DRIVER_SECS = 30 * 60
 
 
 class BenchmarkError(ValueError):
@@ -60,8 +61,11 @@ def _run_driver(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subproces
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=MAX_DRIVER_SECS,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise BenchmarkError("benchmark Host driver exceeded the 30 minute limit") from exc
     except OSError as exc:
         raise BenchmarkError("could not start benchmark Host driver") from exc
 
@@ -110,7 +114,6 @@ def _worktree_remove(repo: Path, path: Path) -> None:
     _run(["git", "worktree", "remove", "--force", str(path)], cwd=repo)
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
-    _run(["git", "worktree", "prune"], cwd=repo)
 
 
 def _workspace_status(workspace: Path) -> str:
@@ -133,19 +136,27 @@ def _fixture_oracle(case: dict[str, Any], workspace: Path) -> dict[str, Any]:
         except OSError:
             checks.append({"path": rel_path, "passed": False, "reason": "file unavailable"})
             continue
-        required = expected.get("required_text") or []
-        forbidden = expected.get("forbidden_text") or []
-        passed = all(item in text for item in required) and all(item not in text for item in forbidden)
+        expected_text = expected.get("expected_text")
+        if isinstance(expected_text, str):
+            passed = text == expected_text
+        else:
+            required = expected.get("required_text") or []
+            forbidden = expected.get("forbidden_text") or []
+            passed = all(item in text for item in required) and all(item not in text for item in forbidden)
         checks.append({"path": rel_path, "passed": passed, "reason": None if passed else "text oracle mismatch"})
 
     expected_changed = sorted(spec.get("changed_files") or [])
     if expected_changed:
-        completed = _run(["git", "diff", "--name-only", "HEAD", "--"], cwd=workspace)
-        changed = sorted(line for line in completed.stdout.splitlines() if line)
+        tracked = _run(["git", "diff", "--name-only", "HEAD", "--"], cwd=workspace)
+        untracked = _run(["git", "ls-files", "--others", "--exclude-standard"], cwd=workspace)
+        changed = sorted(
+            set(line for line in tracked.stdout.splitlines() if line)
+            | set(line for line in untracked.stdout.splitlines() if line)
+        )
         checks.append(
             {
                 "kind": "changed_files",
-                "passed": completed.returncode == 0 and changed == expected_changed,
+                "passed": tracked.returncode == 0 and untracked.returncode == 0 and changed == expected_changed,
                 "expected": expected_changed,
                 "actual": changed,
             }
@@ -165,12 +176,14 @@ def _load_driver_receipt(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise BenchmarkError("driver did not create its result receipt") from exc
+    except UnicodeDecodeError as exc:
+        raise BenchmarkError("driver result must be UTF-8 JSON") from exc
     except json.JSONDecodeError as exc:
         raise BenchmarkError(f"driver result is not valid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise BenchmarkError("driver result must be a JSON object")
     status = value.get("status")
-    if status not in STATUS_VALUES:
+    if not isinstance(status, str) or status not in STATUS_VALUES:
         raise BenchmarkError("driver result status must be pass, fail, partial, or unsupported")
     return value
 
@@ -221,6 +234,7 @@ def _summary_for_receipt(
     base_revision: str,
     receipt: dict[str, Any],
     annotation_path: Path,
+    case_manifest: Path,
 ) -> dict[str, Any] | None:
     if receipt["status"] == "unsupported":
         return None
@@ -235,7 +249,7 @@ def _summary_for_receipt(
         trace_root=Path(trace_root) if isinstance(trace_root, str) and trace_root else None,
         audit_db=Path(audit_db),
         workflow_session_id=workflow_session_id,
-        case_manifest=report.DEFAULT_CASE_MANIFEST,
+        case_manifest=case_manifest,
         case_id=case["id"],
         variant=variant,
         surface=surface,
@@ -283,15 +297,19 @@ def _run_sample(
     pair_index: int,
     ordinal: int,
     base_revision: str,
+    case_manifest: Path,
 ) -> dict[str, Any]:
     label = f"{case['id']}-p{pair_index + 1}-{ordinal + 1}-{variant}"
     workspace = root / "worktrees" / label
     receipt_path = root / "receipts" / f"{label}.json"
     annotation_path = root / "annotations" / f"{label}.json"
-    surface = _surface(case, variant)
-    _worktree_add(repo, workspace, base_revision)
+    surface: str | None = None
+    worktree_added = False
     started = time.time_ns() // 1_000_000
     try:
+        surface = _surface(case, variant)
+        _worktree_add(repo, workspace, base_revision)
+        worktree_added = True
         if _workspace_status(workspace):
             raise BenchmarkError("fresh benchmark worktree is not clean")
         env = dict(os.environ)
@@ -317,6 +335,8 @@ def _run_sample(
                 "status": "fail",
                 "driver_exit_code": completed.returncode,
                 "reason_code": "driver_receipt_missing",
+                "fixture_oracle": {"available": False, "passed": None, "checks": [], "reason": "driver receipt missing"},
+                "summary": None,
             }
 
         receipt = _load_driver_receipt(receipt_path)
@@ -339,11 +359,18 @@ def _run_sample(
             base_revision=base_revision,
             receipt=receipt,
             annotation_path=annotation_path,
+            case_manifest=case_manifest,
         )
         effective_status = receipt["status"]
-        if completed.returncode != 0 and effective_status == "pass":
+        if completed.returncode != 0 and effective_status in ("pass", "partial"):
             effective_status = "fail"
-        if oracle["available"] and oracle["passed"] is not True and effective_status == "pass":
+        if oracle["available"] and oracle["passed"] is not True and effective_status in ("pass", "partial"):
+            effective_status = "fail"
+        if (
+            (case.get("correctness") or {}).get("workspace_must_remain_clean") is True
+            and _workspace_status(workspace)
+            and effective_status in ("pass", "partial")
+        ):
             effective_status = "fail"
         if summary is not None and effective_status == "pass":
             correctness = summary.get("correctness") or {}
@@ -394,11 +421,14 @@ def _run_sample(
             "summary": None,
         }
     finally:
-        _worktree_remove(repo, workspace)
+        if worktree_added:
+            _worktree_remove(repo, workspace)
 
 
 def _comparison(direct: dict[str, Any], code_mode: dict[str, Any]) -> dict[str, Any] | None:
-    if direct["summary"] is None or code_mode["summary"] is None:
+    if direct.get("status") != "pass" or code_mode.get("status") != "pass":
+        return None
+    if direct.get("summary") is None or code_mode.get("summary") is None:
         return None
     return report.compare_reports(direct["summary"], code_mode["summary"])
 
@@ -417,13 +447,14 @@ def run_benchmark(
 ) -> dict[str, Any]:
     if pairs < 1:
         raise BenchmarkError("pairs must be at least 1")
-    manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
-    selected = [_case(manifest, case_id) for case_id in case_ids]
     resolved = _require_exact_revision(repo, base_revision)
     if _head_revision(repo) != resolved:
         raise BenchmarkError(
             "base revision must equal the current checkout HEAD; check out the target commit before benchmarking"
         )
+    case_manifest = repo / "scripts" / "agent_loop_cases.json"
+    manifest = report.load_case_manifest(case_manifest)
+    selected = [_case(manifest, case_id) for case_id in case_ids]
     temp_owner = tempfile.TemporaryDirectory(prefix="webcodex-agent-loop-bench-")
     root = Path(temp_owner.name)
     for name in ("worktrees", "receipts", "annotations"):
@@ -447,6 +478,7 @@ def run_benchmark(
                             pair_index=pair_index,
                             ordinal=ordinal,
                             base_revision=resolved,
+                            case_manifest=case_manifest,
                         )
                     )
                 by_variant = {sample["variant"]: sample for sample in samples}

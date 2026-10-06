@@ -12,6 +12,14 @@ from scripts import agent_loop_report as report
 
 
 class AgentLoopBenchmarkTests(unittest.TestCase):
+    def _install_manifest(self, repo: Path) -> None:
+        target = repo / "scripts/agent_loop_cases.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            report.DEFAULT_CASE_MANIFEST.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
     def test_pair_order_alternates(self) -> None:
         self.assertEqual(benchmark._pair_order(0), ("direct", "code_mode"))
         self.assertEqual(benchmark._pair_order(1), ("code_mode", "direct"))
@@ -103,6 +111,64 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             result = benchmark._fixture_oracle(case, root)
             self.assertFalse(result["passed"])
 
+            (fixture / "beta.txt").write_text(
+                "BENCH_TARGET_BETA=after\nBETA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            (root / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+            result = benchmark._fixture_oracle(case, root)
+            self.assertFalse(result["passed"])
+            changed_check = next(check for check in result["checks"] if check.get("kind") == "changed_files")
+            self.assertIn("unexpected.txt", changed_check["actual"])
+
+    def test_malformed_receipt_status_is_a_contract_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            receipt.write_text('{"status": []}', encoding="utf-8")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "status must be"):
+                benchmark._load_driver_receipt(receipt)
+
+    def test_comparison_requires_two_effective_pass_samples(self) -> None:
+        summary = {"benchmark": {}}
+        self.assertIsNone(
+            benchmark._comparison(
+                {"status": "partial", "summary": summary},
+                {"status": "pass", "summary": summary},
+            )
+        )
+        self.assertIsNone(
+            benchmark._comparison(
+                {"status": "pass", "summary": None},
+                {"status": "pass", "summary": summary},
+            )
+        )
+
+    def test_missing_receipts_are_retained_as_failed_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self._install_manifest(repo)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            result = benchmark.run_benchmark(
+                repo=repo,
+                base_revision=base,
+                driver_argv=[sys.executable, "-c", "pass"],
+                case_ids=["readonly_review"],
+                pairs=1,
+            )
+            self.assertEqual(result["status_counts"]["fail"], 2)
+            for sample in result["cases"][0]["pairs"][0]["samples"]:
+                self.assertEqual(sample["reason_code"], "driver_receipt_missing")
+                self.assertIsNone(sample["summary"])
+            self.assertIsNone(result["cases"][0]["pairs"][0]["comparison"])
+
     def test_unsupported_driver_samples_are_retained_and_worktrees_cleaned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -112,6 +178,7 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
             (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self._install_manifest(repo)
             subprocess.run(["git", "add", "."], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
             base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
@@ -172,6 +239,7 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
             (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self._install_manifest(repo)
             subprocess.run(["git", "add", "."], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
             base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()

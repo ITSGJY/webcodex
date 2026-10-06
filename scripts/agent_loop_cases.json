@@ -76,22 +76,10 @@
           ],
           "files": {
             "tests/fixtures/agent-loop-multi-file/alpha.txt": {
-              "required_text": [
-                "BENCH_TARGET_ALPHA=after",
-                "ALPHA_UNRELATED_SENTINEL=keep"
-              ],
-              "forbidden_text": [
-                "BENCH_TARGET_ALPHA=before"
-              ]
+              "expected_text": "BENCH_TARGET_ALPHA=after\nALPHA_UNRELATED_SENTINEL=keep\n"
             },
             "tests/fixtures/agent-loop-multi-file/beta.txt": {
-              "required_text": [
-                "BENCH_TARGET_BETA=after",
-                "BETA_UNRELATED_SENTINEL=keep"
-              ],
-              "forbidden_text": [
-                "BENCH_TARGET_BETA=before"
-              ]
+              "expected_text": "BENCH_TARGET_BETA=after\nBETA_UNRELATED_SENTINEL=keep\n"
             }
           }
         }
