@@ -30,6 +30,7 @@ STATUS_VALUES = frozenset(("pass", "fail", "partial", "unsupported"))
 DEFAULT_CASES = ("readonly_review", "guarded_multi_file_edit", "long_validation_handoff")
 VARIANTS = ("direct", "code_mode")
 MAX_DRIVER_RECEIPT_BYTES = 64 * 1024
+MAX_FIXTURE_ORACLE_BYTES = 1024 * 1024
 MAX_DRIVER_SECS = 30 * 60
 
 
@@ -142,7 +143,12 @@ def _fixture_oracle(case: dict[str, Any], workspace: Path) -> dict[str, Any]:
     for rel_path, expected in sorted((spec.get("files") or {}).items()):
         target = workspace / rel_path
         try:
-            text = target.read_text(encoding="utf-8")
+            with target.open("rb") as handle:
+                raw = handle.read(MAX_FIXTURE_ORACLE_BYTES + 1)
+            if len(raw) > MAX_FIXTURE_ORACLE_BYTES:
+                checks.append({"path": rel_path, "passed": False, "reason": "file exceeds oracle byte limit"})
+                continue
+            text = raw.decode("utf-8")
         except UnicodeDecodeError:
             checks.append({"path": rel_path, "passed": False, "reason": "file is not UTF-8"})
             continue

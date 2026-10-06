@@ -128,6 +128,12 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             beta_check = next(check for check in result["checks"] if check.get("path", "").endswith("beta.txt"))
             self.assertEqual(beta_check["reason"], "file is not UTF-8")
 
+            (fixture / "beta.txt").write_bytes(b"x" * (benchmark.MAX_FIXTURE_ORACLE_BYTES + 1))
+            result = benchmark._fixture_oracle(case, root)
+            self.assertFalse(result["passed"])
+            beta_check = next(check for check in result["checks"] if check.get("path", "").endswith("beta.txt"))
+            self.assertEqual(beta_check["reason"], "file exceeds oracle byte limit")
+
     def test_malformed_receipt_status_is_a_contract_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             receipt = Path(tmp) / "receipt.json"
