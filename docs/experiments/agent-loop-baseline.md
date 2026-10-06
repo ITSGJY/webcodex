@@ -275,7 +275,9 @@ only reproducibility mechanics:
 - fixture-side disk/diff oracles where the manifest provides one, plus persisted call-count evidence for the multi-file case's single guarded edit and search/read phases;
 - explicit `pass`, `fail`, `partial`, and `unsupported` samples. None are
   silently filtered from the aggregate;
+- non-unsupported `pass` requires non-empty canonical ActionAudit evidence; Code Mode also requires complete persisted composition evidence; missing capture is `partial`, never fabricated success;
 - cleanup of only the worktrees/temp state created by the orchestrator.
+- Host-driver process ownership currently uses POSIX process groups; Windows runs are retained explicitly as `unsupported` until equivalent descendant ownership can be guaranteed.
 
 Example:
 
@@ -292,7 +294,7 @@ For each invocation the driver receives `WEBCODEX_BENCH_WORKSPACE`,
 `WEBCODEX_BENCH_SURFACE`, `WEBCODEX_BENCH_BASE_REVISION`,
 `WEBCODEX_BENCH_CASE_FINGERPRINT`, `WEBCODEX_BENCH_PROMPT`, and
 `WEBCODEX_BENCH_DRIVER_RESULT`. It writes one bounded JSON receipt to the last
-path. The receipt is capped at 64 KiB; driver stdout/stderr is not retained by the orchestrator. `status` is required and is one of `pass/fail/partial/unsupported`.
+path. The receipt is capped at 64 KiB; driver stdout/stderr is not retained by the orchestrator. `status` is required and is one of `pass/fail/partial/unsupported`. Relative `audit_db` and `trace_root` paths are resolved against the fresh sample workspace; absolute paths remain absolute.
 Non-unsupported samples also provide the authoritative ActionAudit database path
 and Workflow Session id; optional trace root, repair-turn annotation, and task timing
 use the existing reporter semantics. Correctness verdicts are optional only when an
@@ -304,9 +306,10 @@ Window, tunnel, or Host-private ids.
 
 The default lane is exactly `readonly_review`, `guarded_multi_file_edit`, and
 `long_validation_handoff`, matching #822. The handoff case is valid only when the
-driver observes a genuine pending validation and follows the same Job to terminal;
-a synchronous completion or substitute pending process must be reported
-`partial`/`unsupported`, not upgraded to success.
+report proves exactly one genuine pending validation, a correlated follow-up for
+that relation, and a same-relation terminal observation with authoritative terminal
+time. A synchronous completion, an uncorrelated/substitute process, or pending
+without terminal evidence remains `partial`/`unsupported`, never upgraded to success.
 The guarded multi-file case is likewise not a pass from final bytes alone: persisted Direct canonical-call or Code Mode composition evidence must show exactly one `edit_project_files` call, at least one admitted search call, and at least two `read_files` calls (pre-edit and post-edit phases). Current composition does not prove nested child ordering, so the benchmark does not claim stronger sequencing evidence than is persisted.
 
 This command coordinates real captures; it is not itself evidence that a model made

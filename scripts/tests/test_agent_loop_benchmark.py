@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import agent_loop_benchmark as benchmark
 from scripts import agent_loop_report as report
@@ -27,6 +28,7 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
         self.assertEqual(benchmark._pair_order(1), ("code_mode", "direct"))
         self.assertEqual(benchmark._pair_order(2), ("direct", "code_mode"))
 
+    @unittest.skipIf(os.name == "nt", "paired Host driver is explicitly POSIX-only")
     def test_driver_stdin_is_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "stdin.txt"
@@ -41,6 +43,68 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                 env={},
             )
             self.assertEqual(output.read_text(encoding="utf-8"), "")
+
+    @unittest.skipIf(os.name == "nt", "paired Host driver is explicitly POSIX-only")
+    def test_driver_interruption_terminates_owned_process_tree(self) -> None:
+        process = mock.Mock()
+        process.pid = 12345
+        process.wait.side_effect = KeyboardInterrupt
+        with (
+            mock.patch.object(benchmark.subprocess, "Popen", return_value=process),
+            mock.patch.object(benchmark, "_terminate_driver_tree") as terminate,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                benchmark._run_driver(
+                    [sys.executable, "-c", "pass"],
+                    cwd=Path("."),
+                    env={},
+                )
+        terminate.assert_called_once_with(process)
+
+    def test_windows_host_driver_fails_closed_as_unsupported(self) -> None:
+        with mock.patch.object(benchmark.os, "name", "nt"):
+            with self.assertRaisesRegex(
+                benchmark.DriverPlatformUnsupported,
+                "POSIX process-group ownership",
+            ):
+                benchmark._run_driver(
+                    [sys.executable, "-c", "pass"],
+                    cwd=Path("."),
+                    env={},
+                )
+
+    def test_runtime_evidence_gate_fails_closed(self) -> None:
+        direct = {
+            "outer_calls": {"total": 1},
+            "canonical_calls": {"total": 1},
+        }
+        self.assertTrue(benchmark._runtime_evidence_proven(direct, "direct"))
+        direct["outer_calls"]["total"] = 0
+        self.assertFalse(benchmark._runtime_evidence_proven(direct, "direct"))
+
+        code_mode = {
+            "outer_calls": {"total": 1},
+            "availability": {"code_mode_composition": {"available": True}},
+            "composition": {"outer_code_mode_calls": 1},
+        }
+        self.assertTrue(benchmark._runtime_evidence_proven(code_mode, "code_mode"))
+        code_mode["availability"]["code_mode_composition"]["available"] = False
+        self.assertFalse(benchmark._runtime_evidence_proven(code_mode, "code_mode"))
+
+    def test_long_handoff_requires_correlated_terminal_evidence(self) -> None:
+        summary = {
+            "job_convergence": {
+                "pending_handoff_count": 1,
+                "pending_followup_known_count": 1,
+                "pending_to_terminal_ms": {"samples": 1},
+            }
+        }
+        self.assertTrue(benchmark._long_handoff_terminal_proven(summary))
+        summary["job_convergence"]["pending_to_terminal_ms"]["samples"] = 0
+        self.assertFalse(benchmark._long_handoff_terminal_proven(summary))
+        summary["job_convergence"]["pending_to_terminal_ms"]["samples"] = 1
+        summary["job_convergence"]["pending_handoff_count"] = 2
+        self.assertFalse(benchmark._long_handoff_terminal_proven(summary))
 
     def test_multi_file_contract_requires_one_edit_search_and_post_read_capacity(self) -> None:
         direct = {
@@ -136,11 +200,86 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             beta_check = next(check for check in result["checks"] if check.get("path", "").endswith("beta.txt"))
             self.assertEqual(beta_check["reason"], "file exceeds oracle byte limit")
 
+    @unittest.skipIf(os.name == "nt", "FIFO is POSIX-only")
+    def test_fixture_oracle_rejects_fifo_without_blocking(self) -> None:
+        manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
+        case = report._case_by_id(manifest, "guarded_multi_file_edit")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=root, check=True)
+            fixture = root / "tests/fixtures/agent-loop-multi-file"
+            fixture.mkdir(parents=True)
+            (fixture / "alpha.txt").write_text(
+                "BENCH_TARGET_ALPHA=after\nALPHA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            beta = fixture / "beta.txt"
+            beta.write_text(
+                "BENCH_TARGET_BETA=before\nBETA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            beta.unlink()
+            os.mkfifo(beta)
+            started = time.monotonic()
+            result = benchmark._fixture_oracle(case, root)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertFalse(result["passed"])
+            beta_check = next(check for check in result["checks"] if check.get("path", "").endswith("beta.txt"))
+            self.assertEqual(beta_check["reason"], "file is not regular")
+
+    def test_multi_file_fixture_is_pinned_to_lf_checkout(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        completed = subprocess.run(
+            [
+                "git",
+                "check-attr",
+                "eol",
+                "--",
+                "tests/fixtures/agent-loop-multi-file/alpha.txt",
+                "tests/fixtures/agent-loop-multi-file/beta.txt",
+            ],
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        lines = [line for line in completed.stdout.splitlines() if line]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(line.endswith(": lf") for line in lines))
+
     def test_malformed_receipt_status_is_a_contract_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             receipt = Path(tmp) / "receipt.json"
             receipt.write_text('{"status": []}', encoding="utf-8")
             with self.assertRaisesRegex(benchmark.BenchmarkError, "status must be"):
+                benchmark._load_driver_receipt(receipt)
+
+    @unittest.skipIf(os.name == "nt", "FIFO is POSIX-only")
+    def test_driver_receipt_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = Path(tmp) / "receipt.json"
+            os.mkfifo(receipt)
+            started = time.monotonic()
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "regular file"):
+                benchmark._load_driver_receipt(receipt)
+            self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_driver_receipt_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target.json"
+            target.write_text('{"status":"pass"}', encoding="utf-8")
+            receipt = root / "receipt.json"
+            try:
+                receipt.symlink_to(target)
+            except OSError:
+                self.skipTest("symlinks unavailable")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "regular file"):
                 benchmark._load_driver_receipt(receipt)
 
     def test_comparison_requires_two_effective_pass_samples(self) -> None:
@@ -157,6 +296,39 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                 {"status": "pass", "summary": summary},
             )
         )
+
+    def test_relative_receipt_artifacts_are_anchored_to_workspace(self) -> None:
+        manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
+        case = report._case_by_id(manifest, "readonly_review")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            annotation = root / "annotation.json"
+            case_manifest = root / "manifest.json"
+            case_manifest.write_text(
+                report.DEFAULT_CASE_MANIFEST.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            receipt = {
+                "status": "pass",
+                "audit_db": ".webcodex/action_audit.db",
+                "trace_root": ".webcodex/traces",
+                "workflow_session_id": "wc_sess_test",
+            }
+            with mock.patch.object(report, "summarize", return_value={"ok": True}) as summarize:
+                value = benchmark._summary_for_receipt(
+                    case,
+                    variant="direct",
+                    surface="direct",
+                    base_revision="0" * 40,
+                    receipt=receipt,
+                    annotation_path=annotation,
+                    case_manifest=case_manifest,
+                    workspace=root,
+                )
+            self.assertEqual(value, {"ok": True})
+            kwargs = summarize.call_args.kwargs
+            self.assertEqual(kwargs["audit_db"], root / ".webcodex/action_audit.db")
+            self.assertEqual(kwargs["trace_root"], root / ".webcodex/traces")
 
     def test_missing_receipts_are_retained_as_failed_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,6 +435,28 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             )
             self.assertEqual(status.returncode, 0, status.stderr)
             subprocess.run(["git", "worktree", "remove", "--force", str(unrelated)], cwd=repo, check=True)
+
+    def test_manifest_blob_is_bounded_and_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=root, check=True)
+            manifest = root / "scripts/agent_loop_cases.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_bytes(b"\xff\xfe")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "bad utf8"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "UTF-8"):
+                benchmark._read_manifest_at_revision(root, base)
+
+            manifest.write_bytes(b"x" * (benchmark.MAX_CASE_MANIFEST_BYTES + 1))
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "too large"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "1 MiB"):
+                benchmark._read_manifest_at_revision(root, base)
 
     def test_case_manifest_is_pinned_to_base_revision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -456,6 +650,46 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             )
             self.assertEqual(sample["status"], "fail")
             self.assertEqual(sample["reason_code"], "driver_receipt_missing")
+
+    def test_driver_timeout_has_distinct_reason_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self._install_manifest(repo)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            manifest_path = repo / "scripts/agent_loop_cases.json"
+            manifest = report.load_case_manifest(manifest_path)
+            case = report._case_by_id(manifest, "readonly_review")
+            bench_root = root / "bench"
+            for name in ("worktrees", "receipts", "annotations"):
+                (bench_root / name).mkdir(parents=True, exist_ok=True)
+
+            with mock.patch.object(
+                benchmark,
+                "_run_driver",
+                side_effect=benchmark.DriverTimeoutError("timeout"),
+            ):
+                sample = benchmark._run_sample(
+                    repo,
+                    bench_root,
+                    [sys.executable, "-c", "pass"],
+                    case,
+                    variant="direct",
+                    pair_index=0,
+                    ordinal=0,
+                    base_revision=base,
+                    case_manifest=manifest_path,
+                )
+            self.assertEqual(sample["status"], "fail")
+            self.assertEqual(sample["reason_code"], "driver_timeout")
+            self.assertIsNone(sample["driver_exit_code"])
 
     def test_contract_error_preserves_driver_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

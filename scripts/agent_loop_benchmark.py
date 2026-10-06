@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import signal
+import stat
 import shutil
 import shlex
 import subprocess
@@ -32,10 +33,19 @@ DEFAULT_CASES = ("readonly_review", "guarded_multi_file_edit", "long_validation_
 VARIANTS = ("direct", "code_mode")
 MAX_DRIVER_RECEIPT_BYTES = 64 * 1024
 MAX_FIXTURE_ORACLE_BYTES = 1024 * 1024
+MAX_CASE_MANIFEST_BYTES = 1024 * 1024
 MAX_DRIVER_SECS = 30 * 60
 
 
 class BenchmarkError(ValueError):
+    pass
+
+
+class DriverTimeoutError(BenchmarkError):
+    pass
+
+
+class DriverPlatformUnsupported(BenchmarkError):
     pass
 
 
@@ -55,21 +65,6 @@ def _run(argv: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> su
     )
 
 def _terminate_driver_tree(process: subprocess.Popen[bytes]) -> None:
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        return
-
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -88,11 +83,10 @@ def _terminate_driver_tree(process: subprocess.Popen[bytes]) -> None:
 
 
 def _run_driver(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
-    kwargs: dict[str, Any] = {}
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
+        raise DriverPlatformUnsupported(
+            "paired benchmark Host driver requires POSIX process-group ownership"
+        )
 
     try:
         process = subprocess.Popen(
@@ -102,7 +96,7 @@ def _run_driver(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subproces
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            **kwargs,
+            start_new_session=True,
         )
     except OSError as exc:
         raise BenchmarkError("could not start benchmark Host driver") from exc
@@ -111,9 +105,11 @@ def _run_driver(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subproces
         returncode = process.wait(timeout=MAX_DRIVER_SECS)
     except subprocess.TimeoutExpired as exc:
         _terminate_driver_tree(process)
-        raise BenchmarkError("benchmark Host driver exceeded the 30 minute limit") from exc
-    if os.name != "nt":
+        raise DriverTimeoutError("benchmark Host driver exceeded the 30 minute limit") from exc
+    except BaseException:
         _terminate_driver_tree(process)
+        raise
+    _terminate_driver_tree(process)
     return subprocess.CompletedProcess(argv, returncode)
 
 
@@ -145,13 +141,30 @@ def _head_revision(repo: Path) -> str:
 
 
 def _read_manifest_at_revision(repo: Path, revision: str) -> str:
-    completed = _run(
-        ["git", "show", f"{revision}:scripts/agent_loop_cases.json"],
-        cwd=repo,
-    )
-    if completed.returncode != 0:
+    object_name = f"{revision}:scripts/agent_loop_cases.json"
+    size_result = _run(["git", "cat-file", "-s", object_name], cwd=repo)
+    if size_result.returncode != 0:
         raise BenchmarkError("could not read benchmark case manifest at base revision")
-    return completed.stdout
+    try:
+        size = int(size_result.stdout.strip())
+    except ValueError as exc:
+        raise BenchmarkError("benchmark case manifest size is invalid") from exc
+    if size < 0 or size > MAX_CASE_MANIFEST_BYTES:
+        raise BenchmarkError("benchmark case manifest exceeds the 1 MiB limit")
+
+    completed = subprocess.run(
+        ["git", "show", object_name],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0 or len(completed.stdout) != size:
+        raise BenchmarkError("could not read benchmark case manifest at base revision")
+    try:
+        return completed.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BenchmarkError("benchmark case manifest must be UTF-8 JSON") from exc
 
 
 def _case(manifest: dict[str, Any], case_id: str) -> dict[str, Any]:
@@ -200,17 +213,43 @@ def _fixture_oracle(
     for rel_path, expected in sorted((spec.get("files") or {}).items()):
         target = workspace / rel_path
         try:
-            with target.open("rb") as handle:
-                raw = handle.read(MAX_FIXTURE_ORACLE_BYTES + 1)
-            if len(raw) > MAX_FIXTURE_ORACLE_BYTES:
-                checks.append({"path": rel_path, "passed": False, "reason": "file exceeds oracle byte limit"})
+            before = target.lstat()
+        except OSError:
+            checks.append({"path": rel_path, "passed": False, "reason": "file unavailable"})
+            continue
+        if not stat.S_ISREG(before.st_mode):
+            checks.append({"path": rel_path, "passed": False, "reason": "file is not regular"})
+            continue
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(target, flags)
+        except OSError:
+            checks.append({"path": rel_path, "passed": False, "reason": "file unavailable"})
+            continue
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+            ):
+                checks.append({"path": rel_path, "passed": False, "reason": "file identity changed"})
                 continue
+            with os.fdopen(fd, "rb", closefd=True) as handle:
+                fd = -1
+                raw = handle.read(MAX_FIXTURE_ORACLE_BYTES + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if len(raw) > MAX_FIXTURE_ORACLE_BYTES:
+            checks.append({"path": rel_path, "passed": False, "reason": "file exceeds oracle byte limit"})
+            continue
+        try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             checks.append({"path": rel_path, "passed": False, "reason": "file is not UTF-8"})
-            continue
-        except OSError:
-            checks.append({"path": rel_path, "passed": False, "reason": "file unavailable"})
             continue
         expected_text = expected.get("expected_text")
         if isinstance(expected_text, str):
@@ -244,14 +283,39 @@ def _fixture_oracle(
 
 def _load_driver_receipt(path: Path) -> dict[str, Any]:
     try:
-        if path.stat().st_size > MAX_DRIVER_RECEIPT_BYTES:
-            raise BenchmarkError("driver result exceeds the 64 KiB receipt limit")
+        before = path.lstat()
     except OSError as exc:
         raise BenchmarkError("driver did not create its result receipt") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise BenchmarkError("driver result must be a regular file")
+    if before.st_size > MAX_DRIVER_RECEIPT_BYTES:
+        raise BenchmarkError("driver result exceeds the 64 KiB receipt limit")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        fd = os.open(path, flags)
     except OSError as exc:
-        raise BenchmarkError("driver did not create its result receipt") from exc
+        raise BenchmarkError("driver result must be a readable regular file") from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+        ):
+            raise BenchmarkError("driver result changed identity before read")
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            raw = handle.read(MAX_DRIVER_RECEIPT_BYTES + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > MAX_DRIVER_RECEIPT_BYTES:
+        raise BenchmarkError("driver result exceeds the 64 KiB receipt limit")
+    try:
+        value = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise BenchmarkError("driver result must be UTF-8 JSON") from exc
     except json.JSONDecodeError as exc:
@@ -311,6 +375,7 @@ def _summary_for_receipt(
     receipt: dict[str, Any],
     annotation_path: Path,
     case_manifest: Path,
+    workspace: Path,
 ) -> dict[str, Any] | None:
     if receipt["status"] == "unsupported":
         return None
@@ -321,9 +386,18 @@ def _summary_for_receipt(
         raise BenchmarkError("non-unsupported driver result requires audit_db")
     if not isinstance(workflow_session_id, str) or not workflow_session_id:
         raise BenchmarkError("non-unsupported driver result requires workflow_session_id")
+
+    audit_path = Path(audit_db)
+    if not audit_path.is_absolute():
+        audit_path = workspace / audit_path
+    trace_path: Path | None = None
+    if isinstance(trace_root, str) and trace_root:
+        trace_path = Path(trace_root)
+        if not trace_path.is_absolute():
+            trace_path = workspace / trace_path
     return report.summarize(
-        trace_root=Path(trace_root) if isinstance(trace_root, str) and trace_root else None,
-        audit_db=Path(audit_db),
+        trace_root=trace_path,
+        audit_db=audit_path,
         workflow_session_id=workflow_session_id,
         case_manifest=case_manifest,
         case_id=case["id"],
@@ -345,6 +419,45 @@ def _tool_count(summary: dict[str, Any], variant: str, tool_name: str) -> int | 
         value = report._get_path(summary, f"composition.nested_tool_counts.{tool_name}")
         return value if isinstance(value, int) else 0
     return None
+
+
+def _runtime_evidence_proven(summary: dict[str, Any], variant: str) -> bool:
+    outer_total = report._get_path(summary, "outer_calls.total")
+    if not isinstance(outer_total, int) or isinstance(outer_total, bool) or outer_total <= 0:
+        return False
+    if variant == "direct":
+        canonical_total = report._get_path(summary, "canonical_calls.total")
+        return (
+            isinstance(canonical_total, int)
+            and not isinstance(canonical_total, bool)
+            and canonical_total > 0
+        )
+    if variant == "code_mode":
+        outer_code_mode = report._get_path(summary, "composition.outer_code_mode_calls")
+        return (
+            report._get_path(summary, "availability.code_mode_composition.available") is True
+            and isinstance(outer_code_mode, int)
+            and not isinstance(outer_code_mode, bool)
+            and outer_code_mode > 0
+        )
+    return False
+
+
+def _long_handoff_terminal_proven(summary: dict[str, Any]) -> bool:
+    pending = report._get_path(summary, "job_convergence.pending_handoff_count")
+    known_followups = report._get_path(summary, "job_convergence.pending_followup_known_count")
+    terminal_samples = report._get_path(summary, "job_convergence.pending_to_terminal_ms.samples")
+    return (
+        isinstance(pending, int)
+        and not isinstance(pending, bool)
+        and pending == 1
+        and isinstance(known_followups, int)
+        and not isinstance(known_followups, bool)
+        and known_followups >= 1
+        and isinstance(terminal_samples, int)
+        and not isinstance(terminal_samples, bool)
+        and terminal_samples >= 1
+    )
 
 
 def _guarded_multi_file_contract_proven(summary: dict[str, Any], variant: str) -> bool:
@@ -440,6 +553,7 @@ def _run_sample(
             receipt=receipt,
             annotation_path=annotation_path,
             case_manifest=case_manifest,
+            workspace=workspace,
         )
         effective_status = receipt["status"]
         reason_code: str | None = None
@@ -470,10 +584,17 @@ def _run_sample(
                 effective_status = "partial"
 
         if (
+            summary is not None
+            and effective_status == "pass"
+            and not _runtime_evidence_proven(summary, variant)
+        ):
+            effective_status = "partial"
+
+        if (
             case["id"] == "long_validation_handoff"
             and summary is not None
             and effective_status == "pass"
-            and report._get_path(summary, "job_convergence.pending_handoff_count") in (None, 0)
+            and not _long_handoff_terminal_proven(summary)
         ):
             effective_status = "partial"
 
@@ -493,6 +614,28 @@ def _run_sample(
             **({"reason_code": reason_code} if reason_code is not None else {}),
             "fixture_oracle": oracle,
             "summary": summary,
+        }
+    except DriverPlatformUnsupported:
+        return {
+            "case_id": case["id"],
+            "variant": variant,
+            "surface": surface,
+            "status": "unsupported",
+            "driver_exit_code": None,
+            "reason_code": "driver_platform_unsupported",
+            "fixture_oracle": {"available": False, "passed": None, "checks": [], "reason": "driver platform unsupported"},
+            "summary": None,
+        }
+    except DriverTimeoutError:
+        return {
+            "case_id": case["id"],
+            "variant": variant,
+            "surface": surface,
+            "status": "fail",
+            "driver_exit_code": None,
+            "reason_code": "driver_timeout",
+            "fixture_oracle": {"available": False, "passed": None, "checks": [], "reason": "driver timed out"},
+            "summary": None,
         }
     except (BenchmarkError, report.ReportError):
         return {
