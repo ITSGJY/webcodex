@@ -136,6 +136,9 @@ def _fixture_oracle(case: dict[str, Any], workspace: Path) -> dict[str, Any]:
         except OSError:
             checks.append({"path": rel_path, "passed": False, "reason": "file unavailable"})
             continue
+        except UnicodeDecodeError:
+            checks.append({"path": rel_path, "passed": False, "reason": "file is not UTF-8"})
+            continue
         expected_text = expected.get("expected_text")
         if isinstance(expected_text, str):
             passed = text == expected_text

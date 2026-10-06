@@ -121,6 +121,13 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             changed_check = next(check for check in result["checks"] if check.get("kind") == "changed_files")
             self.assertIn("unexpected.txt", changed_check["actual"])
 
+            (root / "unexpected.txt").unlink()
+            (fixture / "beta.txt").write_bytes(b"\xff\xfe")
+            result = benchmark._fixture_oracle(case, root)
+            self.assertFalse(result["passed"])
+            beta_check = next(check for check in result["checks"] if check.get("path", "").endswith("beta.txt"))
+            self.assertEqual(beta_check["reason"], "file is not UTF-8")
+
     def test_malformed_receipt_status_is_a_contract_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             receipt = Path(tmp) / "receipt.json"
