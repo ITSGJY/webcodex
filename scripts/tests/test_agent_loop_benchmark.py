@@ -214,6 +214,48 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             worktrees = subprocess.check_output(["git", "worktree", "list", "--porcelain"], cwd=repo, text=True)
             self.assertEqual(worktrees.count("worktree "), 1)
 
+    def test_cleanup_does_not_prune_unrelated_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self._install_manifest(repo)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            unrelated = root / "unrelated"
+            subprocess.run(["git", "worktree", "add", "--detach", str(unrelated), base], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            driver = root / "driver.py"
+            driver.write_text(
+                "import json, os\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['WEBCODEX_BENCH_DRIVER_RESULT']).write_text("
+                "json.dumps({'status':'unsupported'}), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            benchmark.run_benchmark(
+                repo=repo,
+                base_revision=base,
+                driver_argv=[sys.executable, str(driver)],
+                case_ids=["readonly_review"],
+                pairs=1,
+            )
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=unrelated,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(status.returncode, 0, status.stderr)
+            subprocess.run(["git", "worktree", "remove", "--force", str(unrelated)], cwd=repo, check=True)
+
     def test_base_revision_must_match_checkout_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -223,6 +265,7 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
             (repo / "README.md").write_text("one\n", encoding="utf-8")
+            self._install_manifest(repo)
             subprocess.run(["git", "add", "."], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-m", "one"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
             old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()

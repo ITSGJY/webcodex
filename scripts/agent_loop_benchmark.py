@@ -133,6 +133,9 @@ def _fixture_oracle(case: dict[str, Any], workspace: Path) -> dict[str, Any]:
         target = workspace / rel_path
         try:
             text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            checks.append({"path": rel_path, "passed": False, "reason": "file is not UTF-8"})
+            continue
         except OSError:
             checks.append({"path": rel_path, "passed": False, "reason": "file unavailable"})
             continue
@@ -573,7 +576,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.output:
             print(_stable_json(result), end="")
         return 0 if result["status_counts"]["fail"] == 0 else 1
-    except BenchmarkError as exc:
+    except (BenchmarkError, report.ReportError) as exc:
         print(f"agent_loop_benchmark: {exc}", file=sys.stderr)
         return 2
 
