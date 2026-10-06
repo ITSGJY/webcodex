@@ -17,6 +17,49 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
         self.assertEqual(benchmark._pair_order(1), ("code_mode", "direct"))
         self.assertEqual(benchmark._pair_order(2), ("direct", "code_mode"))
 
+    def test_driver_stdin_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "stdin.txt"
+            benchmark._run_driver(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.stdin.read())",
+                    str(output),
+                ],
+                cwd=Path(tmp),
+                env={},
+            )
+            self.assertEqual(output.read_text(encoding="utf-8"), "")
+
+    def test_multi_file_contract_requires_one_edit_search_and_post_read_capacity(self) -> None:
+        direct = {
+            "canonical_calls": {
+                "by_name": {
+                    "edit_project_files": 1,
+                    "search_project_texts": 1,
+                    "read_files": 2,
+                }
+            }
+        }
+        self.assertTrue(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
+        direct["canonical_calls"]["by_name"]["edit_project_files"] = 2
+        self.assertFalse(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
+
+        code_mode = {
+            "availability": {"code_mode_composition": {"available": True}},
+            "composition": {
+                "nested_tool_counts": {
+                    "edit_project_files": 1,
+                    "search_project_texts": 1,
+                    "read_files": 2,
+                }
+            },
+        }
+        self.assertTrue(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
+        code_mode["composition"]["nested_tool_counts"]["read_files"] = 1
+        self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
+
     def test_fixture_oracle_checks_both_files_and_exact_diff(self) -> None:
         manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
         case = report._case_by_id(manifest, "guarded_multi_file_edit")

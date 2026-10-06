@@ -57,6 +57,7 @@ def _run_driver(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subproces
             argv,
             cwd=cwd,
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -243,6 +244,35 @@ def _summary_for_receipt(
     )
 
 
+def _tool_count(summary: dict[str, Any], variant: str, tool_name: str) -> int | None:
+    if variant == "direct":
+        value = report._get_path(summary, f"canonical_calls.by_name.{tool_name}")
+        return value if isinstance(value, int) else 0
+    if variant == "code_mode":
+        available = report._get_path(summary, "availability.code_mode_composition.available")
+        if available is not True:
+            return None
+        value = report._get_path(summary, f"composition.nested_tool_counts.{tool_name}")
+        return value if isinstance(value, int) else 0
+    return None
+
+
+def _guarded_multi_file_contract_proven(summary: dict[str, Any], variant: str) -> bool:
+    edit_count = _tool_count(summary, variant, "edit_project_files")
+    read_count = _tool_count(summary, variant, "read_files")
+    search_counts = [
+        count
+        for name in ("search_project_texts", "search_and_read")
+        if (count := _tool_count(summary, variant, name)) is not None
+    ]
+    return (
+        edit_count == 1
+        and read_count is not None
+        and read_count >= 2
+        and sum(search_counts) >= 1
+    )
+
+
 def _run_sample(
     repo: Path,
     root: Path,
@@ -333,6 +363,14 @@ def _run_sample(
             and summary is not None
             and effective_status == "pass"
             and report._get_path(summary, "job_convergence.pending_handoff_count") in (None, 0)
+        ):
+            effective_status = "partial"
+
+        if (
+            case["id"] == "guarded_multi_file_edit"
+            and summary is not None
+            and effective_status == "pass"
+            and not _guarded_multi_file_contract_proven(summary, variant)
         ):
             effective_status = "partial"
         return {

@@ -272,7 +272,7 @@ only reproducibility mechanics:
 - alternating pair order (`direct/code_mode`, then `code_mode/direct`) to expose
   one-sided process/cache ordering effects;
 - bounded annotation and the existing report/correctness compatibility gates;
-- fixture-side disk/diff oracles where the manifest provides one;
+- fixture-side disk/diff oracles where the manifest provides one, plus persisted call-count evidence for the multi-file case's single guarded edit and search/read phases;
 - explicit `pass`, `fail`, `partial`, and `unsupported` samples. None are
   silently filtered from the aggregate;
 - cleanup of only the worktrees/temp state created by the orchestrator.
@@ -303,6 +303,7 @@ The default lane is exactly `readonly_review`, `guarded_multi_file_edit`, and
 driver observes a genuine pending validation and follows the same Job to terminal;
 a synchronous completion or substitute pending process must be reported
 `partial`/`unsupported`, not upgraded to success.
+The guarded multi-file case is likewise not a pass from final bytes alone: persisted Direct canonical-call or Code Mode composition evidence must show exactly one `edit_project_files` call, at least one admitted search call, and at least two `read_files` calls (pre-edit and post-edit phases). Current composition does not prove nested child ordering, so the benchmark does not claim stronger sequencing evidence than is persisted.
 
 This command coordinates real captures; it is not itself evidence that a model made
 fewer inference turns. Deterministic runtime/script acceptance and fixture oracles
