@@ -34,6 +34,7 @@ VARIANTS = ("direct", "code_mode")
 MAX_DRIVER_RECEIPT_BYTES = 64 * 1024
 MAX_FIXTURE_ORACLE_BYTES = 1024 * 1024
 MAX_CASE_MANIFEST_BYTES = 1024 * 1024
+MAX_JOB_ID_BYTES = 256
 MAX_GIT_PATH_BYTES = 64 * 1024
 MAX_GIT_PATHS = 512
 CODE_MODE_TOOL_BY_SURFACE = {
@@ -398,11 +399,15 @@ def _load_driver_receipt(path: Path) -> dict[str, Any]:
     if len(raw) > MAX_DRIVER_RECEIPT_BYTES:
         raise BenchmarkError("driver result exceeds the 64 KiB receipt limit")
     try:
-        value = json.loads(raw.decode("utf-8"))
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise BenchmarkError("driver result must be UTF-8 JSON") from exc
+    try:
+        value = json.loads(text)
     except json.JSONDecodeError as exc:
         raise BenchmarkError(f"driver result is not valid JSON: {exc}") from exc
+    except (RecursionError, ValueError) as exc:
+        raise BenchmarkError("driver result is not valid bounded JSON") from exc
     if not isinstance(value, dict):
         raise BenchmarkError("driver result must be a JSON object")
     status = value.get("status")
@@ -432,6 +437,13 @@ def _annotation(
             correctness["task_verdict"] = "pass"
         if case["validation"]["required"] is False and correctness.get("validation_verdict") is None:
             correctness["validation_verdict"] = "not_required"
+
+    if correctness:
+        correctness.setdefault("task_verdict", "unavailable")
+        correctness.setdefault(
+            "validation_verdict",
+            "unavailable" if case["validation"]["required"] else "not_required",
+        )
 
     value: dict[str, Any] = {
         "schema_version": report.RUN_ANNOTATION_SCHEMA_VERSION,
@@ -504,6 +516,36 @@ def _tool_count(summary: dict[str, Any], variant: str, tool_name: str) -> int | 
     return None
 
 
+def _bounded_job_id(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(encoded) > MAX_JOB_ID_BYTES:
+        return None
+    return value
+
+
+def _job_identity_evidence_proven(receipt: dict[str, Any]) -> bool:
+    evidence = receipt.get("job_identity_evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "handoff_job_id",
+        "terminal_job_id",
+        "terminal",
+    }:
+        return False
+    handoff = _bounded_job_id(evidence.get("handoff_job_id"))
+    terminal = _bounded_job_id(evidence.get("terminal_job_id"))
+    return (
+        handoff is not None
+        and terminal is not None
+        and handoff == terminal
+        and evidence.get("terminal") is True
+    )
+
+
 def _runtime_evidence_proven(
     summary: dict[str, Any],
     variant: str,
@@ -552,21 +594,46 @@ def _runtime_evidence_proven(
     return False
 
 
-def _long_handoff_terminal_proven(summary: dict[str, Any]) -> bool:
-    pending = report._get_path(summary, "job_convergence.pending_handoff_count")
-    known_followups = report._get_path(summary, "job_convergence.pending_followup_known_count")
-    terminal_samples = report._get_path(summary, "job_convergence.pending_to_terminal_ms.samples")
-    return (
-        isinstance(pending, int)
-        and not isinstance(pending, bool)
-        and pending == 1
-        and isinstance(known_followups, int)
-        and not isinstance(known_followups, bool)
-        and known_followups >= 1
-        and isinstance(terminal_samples, int)
-        and not isinstance(terminal_samples, bool)
-        and terminal_samples >= 1
-    )
+def _long_handoff_terminal_proven(
+    summary: dict[str, Any],
+    variant: str,
+    receipt: dict[str, Any],
+) -> bool:
+    if _tool_count(summary, variant, "cargo_test") != 1:
+        return False
+
+    if variant == "direct":
+        pending = report._get_path(summary, "job_convergence.pending_handoff_count")
+        known_followups = report._get_path(summary, "job_convergence.pending_followup_known_count")
+        terminal_samples = report._get_path(summary, "job_convergence.pending_to_terminal_ms.samples")
+        return (
+            isinstance(pending, int)
+            and not isinstance(pending, bool)
+            and pending == 1
+            and isinstance(known_followups, int)
+            and not isinstance(known_followups, bool)
+            and known_followups >= 1
+            and isinstance(terminal_samples, int)
+            and not isinstance(terminal_samples, bool)
+            and terminal_samples >= 1
+        )
+
+    if variant == "code_mode":
+        job_handoffs = report._get_path(summary, "composition.job_handoffs.total")
+        consequential = report._get_path(summary, "composition.consequential_calls.total")
+        outcome_unknown = report._get_path(summary, "composition.outcome_unknown.total")
+        outer_observes = report._get_path(summary, "tools.outer_by_name.observe_jobs")
+        return (
+            job_handoffs == 1
+            and consequential == 1
+            and outcome_unknown == 0
+            and isinstance(outer_observes, int)
+            and not isinstance(outer_observes, bool)
+            and outer_observes >= 1
+            and _job_identity_evidence_proven(receipt)
+        )
+
+    return False
 
 
 def _guarded_multi_file_contract_proven(summary: dict[str, Any], variant: str) -> bool:
@@ -589,12 +656,29 @@ def _guarded_multi_file_contract_proven(summary: dict[str, Any], variant: str) -
     ):
         return False
 
+    if variant == "direct":
+        if report._get_path(summary, "availability.edit_outcomes.available") is not True:
+            return False
+        if report._get_path(
+            summary,
+            "edit_outcomes.by_tool.edit_project_files.applied",
+        ) != 1:
+            return False
+
     if variant == "code_mode":
         child_failed = report._get_path(summary, "child_calls.failed")
+        consequential = report._get_path(summary, "composition.consequential_calls.total")
+        known_results = report._get_path(summary, "composition.known_results.total")
+        job_handoffs = report._get_path(summary, "composition.job_handoffs.total")
+        outcome_unknown = report._get_path(summary, "composition.outcome_unknown.total")
         if (
             not isinstance(child_failed, int)
             or isinstance(child_failed, bool)
             or child_failed != 0
+            or consequential != 1
+            or known_results != 1
+            or job_handoffs != 0
+            or outcome_unknown != 0
         ):
             return False
 
@@ -724,7 +808,7 @@ def _run_sample(
             case["id"] == "long_validation_handoff"
             and summary is not None
             and effective_status == "pass"
-            and not _long_handoff_terminal_proven(summary)
+            and not _long_handoff_terminal_proven(summary, variant, receipt)
         ):
             effective_status = "partial"
 

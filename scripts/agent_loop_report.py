@@ -71,6 +71,16 @@ INPUT_NORMALIZATION_CODES = frozenset((
     "run_process_bash_lc_to_login_run_shell",
 ))
 INPUT_NORMALIZATION_SCHEMA_VERSION = 13
+EDIT_OUTCOME_SCHEMA_VERSION = 13
+EDIT_OUTCOMES = frozenset((
+    "applied",
+    "dry_run_would_change",
+    "dry_run_no_change",
+    "no_change",
+    "conflict",
+    "uncertain",
+    "rejected",
+))
 
 
 class ReportError(ValueError):
@@ -151,11 +161,17 @@ def validate_case_manifest(value: Any) -> dict[str, Any]:
 
 def load_case_manifest(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ReportError(f"could not read case manifest: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise ReportError(f"case manifest must be UTF-8: {path}") from exc
+    try:
+        value = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ReportError(f"case manifest is not valid JSON: {path}:{exc.lineno}") from exc
+    except (RecursionError, ValueError) as exc:
+        raise ReportError(f"case manifest is not valid bounded JSON: {path}") from exc
     return validate_case_manifest(value)
 
 
@@ -1513,11 +1529,31 @@ def _summarize_audit(
     failure_kinds: Counter[str] = Counter()
     recovery_guidance: Counter[str] = Counter()
     error_kinds: Counter[str] = Counter()
+    edit_outcomes: Counter[str] = Counter()
+    edit_outcomes_by_tool: dict[str, Counter[str]] = {}
+    unrecognized_edit_outcomes = 0
     for _, value in present_telemetries:
         for field, counter in (("failure_kind", failure_kinds), ("recovery_kind", recovery_guidance), ("error_kind", error_kinds)):
             item = value.get(field)
             if isinstance(item, str) and item:
                 counter[item] += 1
+        outcome = value.get("edit_outcome")
+        if outcome is None:
+            continue
+        schema_version = value.get("schema_version")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version < EDIT_OUTCOME_SCHEMA_VERSION
+            or not isinstance(outcome, str)
+            or outcome not in EDIT_OUTCOMES
+        ):
+            unrecognized_edit_outcomes += 1
+            continue
+        edit_outcomes[outcome] += 1
+        tool_name = value.get("tool_name")
+        if isinstance(tool_name, str) and tool_name:
+            edit_outcomes_by_tool.setdefault(tool_name, Counter())[outcome] += 1
 
     gaps, overlap_count, missing_serial = _window_timing(outer, continuity_events)
     host_short_chain, host_short_chain_availability = _summarize_host_short_chains(
@@ -1552,6 +1588,15 @@ def _summarize_audit(
             "total": canonical_total,
             "observed_outer_runtime_records": canonical_observed,
             "by_name": dict(sorted(canonical_by_name.items())),
+        },
+        "edit_outcomes": {
+            "observed": sum(edit_outcomes.values()),
+            "unrecognized": unrecognized_edit_outcomes,
+            "by_outcome": dict(sorted(edit_outcomes.items())),
+            "by_tool": {
+                tool: dict(sorted(counts.items()))
+                for tool, counts in sorted(edit_outcomes_by_tool.items())
+            },
         },
         "composition": composition,
         "host_short_chain": host_short_chain,
@@ -1599,6 +1644,16 @@ def _summarize_audit(
             "tool_runtime_timing": {"available": runtime_duration["total"] is not None, "reason": None if runtime_duration["total"] is not None else "one or more outer calls lack ModelErgonomics runtime duration evidence"},
             "window_timing": {"available": missing_serial == 0, "reason": None if missing_serial == 0 else "one or more canonical serial transitions lack the predecessor timestamps needed for a gap"},
             "canonical_calls": {"available": canonical_total is not None, "reason": canonical_reason},
+            "edit_outcomes": {
+                "available": bool(edit_outcomes) and unrecognized_edit_outcomes == 0,
+                "reason": (
+                    None
+                    if edit_outcomes and unrecognized_edit_outcomes == 0
+                    else "no complete authoritative ModelErgonomics edit outcome evidence"
+                    if not edit_outcomes
+                    else "one or more edit outcome labels are unknown or malformed"
+                ),
+            },
             "code_mode_composition": composition_availability,
             "host_short_chain": host_short_chain_availability,
             "host_same_model_turn_identity": {
@@ -1663,6 +1718,12 @@ def _summarize_trace_only(trace_events: list[dict[str, Any]], variant: str | Non
         "outer_calls": {"total": len(handlers), "meaningful": None, "successful": statuses.get("success", 0), "failed": statuses.get("failed", 0), "timeout_or_unknown": statuses.get("unknown", 0), "by_status": dict(sorted(statuses.items()))},
         "tools": {"outer_by_name": dict(sorted(tools.items()))},
         "canonical_calls": {"total": None, "observed_outer_runtime_records": None, "by_name": {}},
+        "edit_outcomes": {
+            "observed": 0,
+            "unrecognized": 0,
+            "by_outcome": {},
+            "by_tool": {},
+        },
         "composition": composition,
         "host_short_chain": {
             "serial_transitions": None,
@@ -1685,6 +1746,10 @@ def _summarize_trace_only(trace_events: list[dict[str, Any]], variant: str | Non
         "failures": {"error_kind_by_name": {}, "failure_kind_by_name": {}, "recovery_guidance_by_kind": {}, "child_failure_kind_by_name": None, "resolved_recoveries": None},
         "availability": {
             "action_audit": {"available": False, "reason": "no ActionAudit DB evidence was provided"},
+            "edit_outcomes": {
+                "available": False,
+                "reason": "trace metadata does not persist authoritative edit outcome evidence",
+            },
             "model_round_trips": {
                 "available": False,
                 "reason": "events.jsonl does not persist model response/turn identity",

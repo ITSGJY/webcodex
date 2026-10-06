@@ -102,20 +102,52 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             benchmark._runtime_evidence_proven(code_mode, "code_mode", "guarded_edit")
         )
 
-    def test_long_handoff_requires_correlated_terminal_evidence(self) -> None:
-        summary = {
+    def test_long_handoff_requires_one_launch_and_exact_terminal_identity(self) -> None:
+        direct = {
+            "canonical_calls": {"by_name": {"cargo_test": 1}},
             "job_convergence": {
                 "pending_handoff_count": 1,
                 "pending_followup_known_count": 1,
                 "pending_to_terminal_ms": {"samples": 1},
+            },
+        }
+        self.assertTrue(
+            benchmark._long_handoff_terminal_proven(direct, "direct", {})
+        )
+        direct["canonical_calls"]["by_name"]["cargo_test"] = 2
+        self.assertFalse(
+            benchmark._long_handoff_terminal_proven(direct, "direct", {})
+        )
+
+        code_mode = {
+            "availability": {"code_mode_composition": {"available": True}},
+            "composition": {
+                "nested_tool_counts": {"cargo_test": 1},
+                "job_handoffs": {"total": 1},
+                "consequential_calls": {"total": 1},
+                "outcome_unknown": {"total": 0},
+            },
+            "tools": {"outer_by_name": {"execute_effectful_code_mode": 1, "observe_jobs": 1}},
+        }
+        receipt = {
+            "job_identity_evidence": {
+                "handoff_job_id": "job-1",
+                "terminal_job_id": "job-1",
+                "terminal": True,
             }
         }
-        self.assertTrue(benchmark._long_handoff_terminal_proven(summary))
-        summary["job_convergence"]["pending_to_terminal_ms"]["samples"] = 0
-        self.assertFalse(benchmark._long_handoff_terminal_proven(summary))
-        summary["job_convergence"]["pending_to_terminal_ms"]["samples"] = 1
-        summary["job_convergence"]["pending_handoff_count"] = 2
-        self.assertFalse(benchmark._long_handoff_terminal_proven(summary))
+        self.assertTrue(
+            benchmark._long_handoff_terminal_proven(code_mode, "code_mode", receipt)
+        )
+        receipt["job_identity_evidence"]["terminal_job_id"] = "job-2"
+        self.assertFalse(
+            benchmark._long_handoff_terminal_proven(code_mode, "code_mode", receipt)
+        )
+        receipt["job_identity_evidence"]["terminal_job_id"] = "job-1"
+        code_mode["composition"]["nested_tool_counts"]["cargo_test"] = 2
+        self.assertFalse(
+            benchmark._long_handoff_terminal_proven(code_mode, "code_mode", receipt)
+        )
 
     def test_multi_file_contract_requires_one_edit_search_and_post_read_capacity(self) -> None:
         direct = {
@@ -127,11 +159,20 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                 }
             },
             "outer_calls": {"failed": 0, "timeout_or_unknown": 0},
+            "edit_outcomes": {
+                "by_tool": {"edit_project_files": {"applied": 1}},
+            },
+            "availability": {"edit_outcomes": {"available": True}},
         }
         self.assertTrue(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
         direct["outer_calls"]["failed"] = 1
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
         direct["outer_calls"]["failed"] = 0
+        direct["edit_outcomes"]["by_tool"]["edit_project_files"] = {
+            "dry_run_would_change": 1
+        }
+        self.assertFalse(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
+        direct["edit_outcomes"]["by_tool"]["edit_project_files"] = {"applied": 1}
         direct["canonical_calls"]["by_name"]["edit_project_files"] = 2
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
 
@@ -142,7 +183,11 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                     "edit_project_files": 1,
                     "search_project_texts": 1,
                     "read_files": 2,
-                }
+                },
+                "consequential_calls": {"total": 1},
+                "known_results": {"total": 1},
+                "job_handoffs": {"total": 0},
+                "outcome_unknown": {"total": 0},
             },
             "outer_calls": {"failed": 0, "timeout_or_unknown": 0},
             "child_calls": {"failed": 0},
@@ -151,6 +196,9 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
         code_mode["child_calls"]["failed"] = 1
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
         code_mode["child_calls"]["failed"] = 0
+        code_mode["composition"]["consequential_calls"]["total"] = 2
+        self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
+        code_mode["composition"]["consequential_calls"]["total"] = 1
         code_mode["composition"]["nested_tool_counts"]["read_files"] = 1
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
 
@@ -279,6 +327,34 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(benchmark.BenchmarkError, "status must be"):
                 benchmark._load_driver_receipt(receipt)
 
+    def test_driver_receipt_pathological_json_is_a_contract_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, raw in (
+                ("deep.json", '{"status":"unsupported","extra":' + "[" * 10000 + "0" + "]" * 10000 + "}"),
+                ("huge-int.json", '{"status":"unsupported","extra":' + "1" * 10000 + "}"),
+            ):
+                receipt = root / name
+                receipt.write_text(raw, encoding="utf-8")
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "bounded JSON"):
+                    benchmark._load_driver_receipt(receipt)
+
+    def test_job_identity_evidence_is_exact_bounded_and_private(self) -> None:
+        receipt = {
+            "job_identity_evidence": {
+                "handoff_job_id": "private-job-1",
+                "terminal_job_id": "private-job-1",
+                "terminal": True,
+            }
+        }
+        self.assertTrue(benchmark._job_identity_evidence_proven(receipt))
+        receipt["job_identity_evidence"]["terminal_job_id"] = "other-job"
+        self.assertFalse(benchmark._job_identity_evidence_proven(receipt))
+        receipt["job_identity_evidence"]["terminal_job_id"] = "x" * (
+            benchmark.MAX_JOB_ID_BYTES + 1
+        )
+        self.assertFalse(benchmark._job_identity_evidence_proven(receipt))
+
     @unittest.skipIf(os.name == "nt", "FIFO is POSIX-only")
     def test_driver_receipt_rejects_fifo_without_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -315,6 +391,36 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                 {"status": "pass", "summary": None},
                 {"status": "pass", "summary": summary},
             )
+        )
+
+    def test_annotation_normalizes_omitted_correctness_verdicts(self) -> None:
+        manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
+        readonly = report._case_by_id(manifest, "readonly_review")
+        annotation = benchmark._annotation(
+            readonly,
+            variant="direct",
+            surface="direct",
+            base_revision="a" * 40,
+            receipt={"correctness": {"task_verdict": "pass"}},
+            oracle={"available": False, "passed": None, "checks": [], "reason": None},
+        )
+        self.assertEqual(
+            annotation["correctness"],
+            {"task_verdict": "pass", "validation_verdict": "not_required"},
+        )
+
+        validation = report._case_by_id(manifest, "long_validation_handoff")
+        annotation = benchmark._annotation(
+            validation,
+            variant="direct",
+            surface="direct",
+            base_revision="a" * 40,
+            receipt={"correctness": {"task_verdict": "pass"}},
+            oracle={"available": False, "passed": None, "checks": [], "reason": None},
+        )
+        self.assertEqual(
+            annotation["correctness"],
+            {"task_verdict": "pass", "validation_verdict": "unavailable"},
         )
 
     def test_relative_receipt_artifacts_are_anchored_to_workspace(self) -> None:

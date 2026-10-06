@@ -98,6 +98,7 @@ class AgentLoopReportTests(unittest.TestCase):
         readiness: dict[str, object] | None = None,
         job_convergence: dict[str, object] | None = None,
         error_kind: str | None = None,
+        edit_outcome: object | None = None,
         normalization_code: object | None = None,
         schema_version: int = 12,
     ) -> None:
@@ -118,6 +119,8 @@ class AgentLoopReportTests(unittest.TestCase):
             )
         if normalization_code is not None:
             telemetry["input_normalization_code"] = normalization_code
+        if edit_outcome is not None:
+            telemetry["edit_outcome"] = edit_outcome
         if readiness is not None:
             telemetry["readiness"] = readiness
         if job_convergence is not None:
@@ -585,6 +588,46 @@ class AgentLoopReportTests(unittest.TestCase):
             {"inspect_diagnostic": 1},
         )
         self.assertIsNone(result["failures"]["resolved_recoveries"])
+
+    def test_edit_outcomes_are_aggregated_from_authoritative_telemetry(self) -> None:
+        self.insert_event(
+            "applied",
+            tool="edit_project_files",
+            schema_version=13,
+            edit_outcome="applied",
+        )
+        self.insert_event(
+            "dry-run",
+            tool="edit_project_files",
+            schema_version=13,
+            edit_outcome="dry_run_would_change",
+            started=150,
+            handed=170,
+            transition="serial",
+        )
+
+        result = self.summarize()
+        self.assertEqual(result["edit_outcomes"]["observed"], 2)
+        self.assertEqual(result["edit_outcomes"]["unrecognized"], 0)
+        self.assertEqual(
+            result["edit_outcomes"]["by_tool"]["edit_project_files"],
+            {"applied": 1, "dry_run_would_change": 1},
+        )
+        self.assertTrue(result["availability"]["edit_outcomes"]["available"])
+
+        self.insert_event(
+            "unknown",
+            tool="edit_project_files",
+            schema_version=13,
+            edit_outcome="PRIVATE_UNKNOWN",
+            started=200,
+            handed=220,
+            transition="serial",
+        )
+        result = self.summarize()
+        self.assertEqual(result["edit_outcomes"]["unrecognized"], 1)
+        self.assertFalse(result["availability"]["edit_outcomes"]["available"])
+        self.assertNotIn("PRIVATE_UNKNOWN", json.dumps(result))
 
     def test_missing_optional_result_bytes_never_become_zero(self) -> None:
         self.insert_event("known", result_bytes=90)
@@ -1157,6 +1200,22 @@ class AgentLoopReportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(report.ReportError, "duplicate case id"):
             report.validate_case_manifest(manifest)
+
+    def test_manifest_loader_fail_closes_on_pathological_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deep = root / "deep.json"
+            deep.write_text(
+                '{"schema_version":1,"cases":' + "[" * 10000 + "0" + "]" * 10000 + "}",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(report.ReportError, "bounded JSON"):
+                report.load_case_manifest(deep)
+
+            huge_int = root / "huge-int.json"
+            huge_int.write_text("{" + '"schema_version":' + "1" * 10000 + "}", encoding="utf-8")
+            with self.assertRaisesRegex(report.ReportError, "bounded JSON"):
+                report.load_case_manifest(huge_int)
 
     def test_manifest_requires_fields_and_stable_serialization(self) -> None:
         manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)

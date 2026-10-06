@@ -302,15 +302,23 @@ independent fixture oracle can establish the task result. For non-oracle cases, 
 driver-reported pass needs `correctness.task_verdict="pass"`; validation-required
 cases also need the corresponding passing validation verdict, otherwise the sample
 remains partial. The durable benchmark result does not persist runtime Project,
-Window, tunnel, or Host-private ids.
+Window, tunnel, or Host-private ids. For the Code Mode validation-handoff
+case only, the temporary driver receipt also carries bounded
+`job_identity_evidence` with the exact child handoff Job id and terminal-observe
+Job id. The orchestrator compares those values and immediately discards them with
+the temporary run state; neither id is copied into the annotation, sample result, or
+durable benchmark JSON.
 
 The default lane is exactly `readonly_review`, `guarded_multi_file_edit`, and
-`long_validation_handoff`, matching #822. The handoff case is valid only when the
-report proves exactly one genuine pending validation, a correlated follow-up for
-that relation, and a same-relation terminal observation with authoritative terminal
-time. A synchronous completion, an uncorrelated/substitute process, or pending
-without terminal evidence remains `partial`/`unsupported`, never upgraded to success.
-The guarded multi-file case is likewise not a pass from final bytes alone: persisted Direct canonical-call or Code Mode composition evidence must show exactly one `edit_project_files` call, at least one admitted search call, and at least two `read_files` calls (pre-edit and post-edit phases). The outer capture must contain no failed/unknown calls, and Code Mode must report zero nested failures, so a failed guarded edit followed by a shell/process fallback cannot be promoted to a pass by the final-byte oracle. Current composition does not prove nested child ordering, so the benchmark does not claim stronger sequencing evidence than is persisted.
+`long_validation_handoff`, matching #822. The handoff case requires exactly one
+`cargo_test` launch. Direct must prove one canonical pending relation, a correlated
+follow-up, and same-relation terminal timing from ActionAudit. Code Mode must prove
+one validator child and one Job handoff in persisted composition, then match the
+exact transient child Job id to the terminal `observe_jobs` Job id from the Host
+receipt. A synchronous completion, redispatch, uncorrelated/substitute process, or
+pending without terminal evidence remains `partial`/`unsupported`, never upgraded
+to success.
+The guarded multi-file case is likewise not a pass from final bytes alone: persisted Direct canonical-call or Code Mode composition evidence must show exactly one `edit_project_files` call, at least one admitted search call, and at least two `read_files` calls (pre-edit and post-edit phases). Direct additionally requires the existing authoritative ModelErgonomics edit outcome to be exactly `applied`. Code Mode composition does not persist per-child edit outcomes, so it instead requires exactly one consequential known-result child, zero Job handoffs/outcome-unknown/nested failures, and the fixture-side exact-byte oracle; a dry-run edit plus shell/process/write fallback therefore cannot be promoted to a pass. Current composition does not prove nested child ordering, so the benchmark does not claim stronger sequencing evidence than is persisted.
 
 This command coordinates real captures; it is not itself evidence that a model made
 fewer inference turns. Deterministic runtime/script acceptance and fixture oracles
