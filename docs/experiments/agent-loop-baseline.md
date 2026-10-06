@@ -179,12 +179,15 @@ expectation.
 The profiler includes a deterministic case fingerprint so changed case definitions
 cannot silently compare as the same pair.
 
-The corpus contains sixteen cases: ten coding/inspection cases and six general
+The corpus contains seventeen cases: eleven coding/inspection cases and six general
 file/command cases. The coding/inspection cases are:
 
 - `readonly_review`: read-only status/read/search/diff inspection.
 - `focused_edit_validation`: one focused edit, diff review, and successful
   `cargo check`.
+- `guarded_multi_file_edit`: search → selected reads → one guarded two-file edit →
+  post-edit reads/diff, with an independent fixture-side oracle for both changed
+  files and preserved unrelated sentinels.
 - `failed_validation_recovery`: a deliberately failing `cargo test`, diagnostic
   inspection, fix, and successful rerun.
 - `long_validation_handoff`: real same-execution Job handoff and terminal
@@ -254,6 +257,60 @@ For one case, Direct, Host Code Mode, and Code Mode runs must satisfy all of the
 Runtime Project, Workflow Session, Window, tunnel, and host-internal identifiers
 may be used transiently to select authoritative evidence. They must not be written
 into the manifest, docs, tests, run annotation, or durable benchmark result.
+
+## Reproducible paired benchmark command
+
+`scripts/agent_loop_benchmark.py` is a thin orchestration layer over this existing
+manifest and `agent_loop_report.py`. It does not contain another agent loop or a
+benchmark-only WebCodex execution path. A caller-supplied Host driver performs the
+real task using the ordinary Direct or Code Mode contracts. The orchestrator owns
+only reproducibility mechanics:
+
+- one fresh detached Git worktree per sample at one exact base revision;
+- the requested base revision must equal the benchmark checkout's current `HEAD`, so the manifest, fixtures, and code under test come from one revision;
+- the same case fingerprint/prompt/correctness definition for both variants;
+- alternating pair order (`direct/code_mode`, then `code_mode/direct`) to expose
+  one-sided process/cache ordering effects;
+- bounded annotation and the existing report/correctness compatibility gates;
+- fixture-side disk/diff oracles where the manifest provides one;
+- explicit `pass`, `fail`, `partial`, and `unsupported` samples. None are
+  silently filtered from the aggregate;
+- cleanup of only the worktrees/temp state created by the orchestrator.
+
+Example:
+
+```bash
+python3 scripts/agent_loop_benchmark.py \
+  --base-revision "$(git rev-parse HEAD)" \
+  --driver "python3 /path/to/real_host_driver.py" \
+  --pairs 2 \
+  --output /tmp/webcodex-agent-loop-benchmark.json
+```
+
+For each invocation the driver receives `WEBCODEX_BENCH_WORKSPACE`,
+`WEBCODEX_BENCH_CASE_ID`, `WEBCODEX_BENCH_VARIANT`,
+`WEBCODEX_BENCH_SURFACE`, `WEBCODEX_BENCH_BASE_REVISION`,
+`WEBCODEX_BENCH_CASE_FINGERPRINT`, `WEBCODEX_BENCH_PROMPT`, and
+`WEBCODEX_BENCH_DRIVER_RESULT`. It writes one bounded JSON receipt to the last
+path. The receipt is capped at 64 KiB; driver stdout/stderr is not retained by the orchestrator. `status` is required and is one of `pass/fail/partial/unsupported`.
+Non-unsupported samples also provide the authoritative ActionAudit database path
+and Workflow Session id; optional trace root, repair-turn annotation, task timing,
+and correctness verdicts use the existing reporter semantics. The durable benchmark
+result does not persist runtime Project, Window, tunnel, or Host-private ids.
+
+The default lane is exactly `readonly_review`, `guarded_multi_file_edit`, and
+`long_validation_handoff`, matching #822. The handoff case is valid only when the
+driver observes a genuine pending validation and follows the same Job to terminal;
+a synchronous completion or substitute pending process must be reported
+`partial`/`unsupported`, not upgraded to success.
+
+This command coordinates real captures; it is not itself evidence that a model made
+fewer inference turns. Deterministic runtime/script acceptance and fixture oracles
+prove runtime mechanics and final state. Direct-vs-Code Mode ergonomics require a
+real Host/model capture. Exact model round trips remain unavailable unless the Host
+records turn identity; meaningful outer calls remain only the documented proxy.
+Report cold/warm context, pair order, sample count, and dispersion rather than
+treating one run or one ordering as causal proof.
 
 ## Typed Surface v1 observed dogfood — 2026-09-18
 
