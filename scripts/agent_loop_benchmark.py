@@ -90,6 +90,16 @@ def _head_revision(repo: Path) -> str:
     return head
 
 
+def _read_manifest_at_revision(repo: Path, revision: str) -> str:
+    completed = _run(
+        ["git", "show", f"{revision}:scripts/agent_loop_cases.json"],
+        cwd=repo,
+    )
+    if completed.returncode != 0:
+        raise BenchmarkError("could not read benchmark case manifest at base revision")
+    return completed.stdout
+
+
 def _case(manifest: dict[str, Any], case_id: str) -> dict[str, Any]:
     return report._case_by_id(manifest, case_id)
 
@@ -458,13 +468,14 @@ def run_benchmark(
         raise BenchmarkError(
             "base revision must equal the current checkout HEAD; check out the target commit before benchmarking"
         )
-    case_manifest = repo / "scripts" / "agent_loop_cases.json"
-    manifest = report.load_case_manifest(case_manifest)
-    selected = [_case(manifest, case_id) for case_id in case_ids]
     temp_owner = tempfile.TemporaryDirectory(prefix="webcodex-agent-loop-bench-")
     root = Path(temp_owner.name)
     for name in ("worktrees", "receipts", "annotations"):
         (root / name).mkdir(parents=True, exist_ok=True)
+    case_manifest = root / "agent_loop_cases.json"
+    case_manifest.write_text(_read_manifest_at_revision(repo, resolved), encoding="utf-8")
+    manifest = report.load_case_manifest(case_manifest)
+    selected = [_case(manifest, case_id) for case_id in case_ids]
 
     cases_out: list[dict[str, Any]] = []
     try:

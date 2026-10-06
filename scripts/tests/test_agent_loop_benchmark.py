@@ -256,6 +256,45 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             self.assertEqual(status.returncode, 0, status.stderr)
             subprocess.run(["git", "worktree", "remove", "--force", str(unrelated)], cwd=repo, check=True)
 
+    def test_case_manifest_is_pinned_to_base_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self._install_manifest(repo)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            manifest_path = repo / "scripts/agent_loop_cases.json"
+            dirty = json.loads(manifest_path.read_text(encoding="utf-8"))
+            dirty["cases"][0]["prompt"] = "dirty prompt must not be observed"
+            manifest_path.write_text(json.dumps(dirty), encoding="utf-8")
+
+            observed = root / "observed.txt"
+            driver = root / "driver.py"
+            driver.write_text(
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "Path(sys.argv[1]).write_text(os.environ['WEBCODEX_BENCH_PROMPT'], encoding='utf-8')\n"
+                "Path(os.environ['WEBCODEX_BENCH_DRIVER_RESULT']).write_text('{\"status\":\"unsupported\"}', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            benchmark.run_benchmark(
+                repo=repo,
+                base_revision=base,
+                driver_argv=[sys.executable, str(driver), str(observed)],
+                case_ids=["readonly_review"],
+                pairs=1,
+            )
+            pinned = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
+            expected = report._case_by_id(pinned, "readonly_review")["prompt"]
+            self.assertEqual(observed.read_text(encoding="utf-8"), expected)
+
     def test_base_revision_must_match_checkout_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
