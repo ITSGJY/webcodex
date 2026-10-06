@@ -272,11 +272,11 @@ only reproducibility mechanics:
 - alternating pair order (`direct/code_mode`, then `code_mode/direct`) to expose
   one-sided process/cache ordering effects;
 - bounded annotation and the existing report/correctness compatibility gates;
-- fixture-side disk/diff oracles where the manifest provides one, plus persisted call-count evidence for the multi-file case's single guarded edit and search/read phases;
+- fixture-side disk/diff oracles where the manifest provides one; changed-path capture is bounded to 64 KiB / 512 paths, and the multi-file case additionally requires persisted evidence for one successful guarded edit plus its search/read phases;
 - explicit `pass`, `fail`, `partial`, and `unsupported` samples. None are
   silently filtered from the aggregate;
-- non-unsupported `pass` requires non-empty canonical ActionAudit evidence; Code Mode also requires complete persisted composition evidence; missing capture is `partial`, never fabricated success;
-- cleanup of only the worktrees/temp state created by the orchestrator.
+- non-unsupported `pass` requires non-empty canonical ActionAudit evidence and the audited execution lane must match the requested variant/surface (`direct`, `execute_code_mode`, `execute_effectful_code_mode`, or `execute_mutating_code_mode` as applicable); Code Mode also requires complete persisted composition evidence; missing or mismatched capture is `partial`, never fabricated success;
+- cleanup of only the worktrees/temp state created by the orchestrator, including targeted rollback of an owned worktree registration when checkout setup fails; no global `git worktree prune` is used;
 - Host-driver process ownership currently uses POSIX process groups; Windows runs are retained explicitly as `unsupported` until equivalent descendant ownership can be guaranteed.
 
 Example:
@@ -310,7 +310,7 @@ report proves exactly one genuine pending validation, a correlated follow-up for
 that relation, and a same-relation terminal observation with authoritative terminal
 time. A synchronous completion, an uncorrelated/substitute process, or pending
 without terminal evidence remains `partial`/`unsupported`, never upgraded to success.
-The guarded multi-file case is likewise not a pass from final bytes alone: persisted Direct canonical-call or Code Mode composition evidence must show exactly one `edit_project_files` call, at least one admitted search call, and at least two `read_files` calls (pre-edit and post-edit phases). Current composition does not prove nested child ordering, so the benchmark does not claim stronger sequencing evidence than is persisted.
+The guarded multi-file case is likewise not a pass from final bytes alone: persisted Direct canonical-call or Code Mode composition evidence must show exactly one `edit_project_files` call, at least one admitted search call, and at least two `read_files` calls (pre-edit and post-edit phases). The outer capture must contain no failed/unknown calls, and Code Mode must report zero nested failures, so a failed guarded edit followed by a shell/process fallback cannot be promoted to a pass by the final-byte oracle. Current composition does not prove nested child ordering, so the benchmark does not claim stronger sequencing evidence than is persisted.
 
 This command coordinates real captures; it is not itself evidence that a model made
 fewer inference turns. Deterministic runtime/script acceptance and fixture oracles

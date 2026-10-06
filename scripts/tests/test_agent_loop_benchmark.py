@@ -77,19 +77,30 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
         direct = {
             "outer_calls": {"total": 1},
             "canonical_calls": {"total": 1},
+            "availability": {"code_mode_composition": {"available": True}},
+            "tools": {"outer_by_name": {"read_files": 1}},
         }
-        self.assertTrue(benchmark._runtime_evidence_proven(direct, "direct"))
-        direct["outer_calls"]["total"] = 0
-        self.assertFalse(benchmark._runtime_evidence_proven(direct, "direct"))
+        self.assertTrue(benchmark._runtime_evidence_proven(direct, "direct", "direct"))
+        direct["availability"]["code_mode_composition"]["available"] = False
+        self.assertFalse(benchmark._runtime_evidence_proven(direct, "direct", "direct"))
 
         code_mode = {
             "outer_calls": {"total": 1},
             "availability": {"code_mode_composition": {"available": True}},
             "composition": {"outer_code_mode_calls": 1},
+            "tools": {"outer_by_name": {"execute_mutating_code_mode": 1}},
         }
-        self.assertTrue(benchmark._runtime_evidence_proven(code_mode, "code_mode"))
-        code_mode["availability"]["code_mode_composition"]["available"] = False
-        self.assertFalse(benchmark._runtime_evidence_proven(code_mode, "code_mode"))
+        self.assertTrue(
+            benchmark._runtime_evidence_proven(code_mode, "code_mode", "guarded_edit")
+        )
+        self.assertFalse(
+            benchmark._runtime_evidence_proven(code_mode, "code_mode", "read_only")
+        )
+        code_mode["tools"]["outer_by_name"]["execute_code_mode"] = 1
+        code_mode["composition"]["outer_code_mode_calls"] = 2
+        self.assertFalse(
+            benchmark._runtime_evidence_proven(code_mode, "code_mode", "guarded_edit")
+        )
 
     def test_long_handoff_requires_correlated_terminal_evidence(self) -> None:
         summary = {
@@ -114,9 +125,13 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                     "search_project_texts": 1,
                     "read_files": 2,
                 }
-            }
+            },
+            "outer_calls": {"failed": 0, "timeout_or_unknown": 0},
         }
         self.assertTrue(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
+        direct["outer_calls"]["failed"] = 1
+        self.assertFalse(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
+        direct["outer_calls"]["failed"] = 0
         direct["canonical_calls"]["by_name"]["edit_project_files"] = 2
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(direct, "direct"))
 
@@ -129,8 +144,13 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                     "read_files": 2,
                 }
             },
+            "outer_calls": {"failed": 0, "timeout_or_unknown": 0},
+            "child_calls": {"failed": 0},
         }
         self.assertTrue(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
+        code_mode["child_calls"]["failed"] = 1
+        self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
+        code_mode["child_calls"]["failed"] = 0
         code_mode["composition"]["nested_tool_counts"]["read_files"] = 1
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
 
@@ -330,6 +350,48 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             self.assertEqual(kwargs["audit_db"], root / ".webcodex/action_audit.db")
             self.assertEqual(kwargs["trace_root"], root / ".webcodex/traces")
 
+    def test_fixture_oracle_bounds_changed_path_listing(self) -> None:
+        manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
+        case = report._case_by_id(manifest, "guarded_multi_file_edit")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=root, check=True)
+            fixture = root / "tests/fixtures/agent-loop-multi-file"
+            fixture.mkdir(parents=True)
+            (fixture / "alpha.txt").write_text(
+                "BENCH_TARGET_ALPHA=before\nALPHA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            (fixture / "beta.txt").write_text(
+                "BENCH_TARGET_BETA=before\nBETA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "fixture"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            (fixture / "alpha.txt").write_text(
+                "BENCH_TARGET_ALPHA=after\nALPHA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            (fixture / "beta.txt").write_text(
+                "BENCH_TARGET_BETA=after\nBETA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            overflow = root / "overflow"
+            overflow.mkdir()
+            for index in range(benchmark.MAX_GIT_PATHS + 1):
+                (overflow / f"path-{index:04d}.txt").write_text("x", encoding="utf-8")
+
+            result = benchmark._fixture_oracle(case, root)
+            changed = next(
+                check for check in result["checks"] if check.get("kind") == "changed_files"
+            )
+            self.assertFalse(result["passed"])
+            self.assertFalse(changed["passed"])
+            self.assertEqual(changed["reason"], "changed path listing exceeds oracle limit")
+            self.assertIsNone(changed["actual"])
+
     def test_missing_receipts_are_retained_as_failed_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -393,6 +455,53 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
 
             worktrees = subprocess.check_output(["git", "worktree", "list", "--porcelain"], cwd=repo, text=True)
             self.assertEqual(worktrees.count("worktree "), 1)
+
+    @unittest.skipIf(os.name == "nt", "post-checkout hook regression is POSIX-only")
+    def test_failed_worktree_checkout_rolls_back_owned_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "bench@test.local"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Bench"], cwd=repo, check=True)
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            self._install_manifest(repo)
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+            unrelated = root / "unrelated"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(unrelated), base],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            hook = repo / ".git/hooks/post-checkout"
+            hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+
+            result = benchmark.run_benchmark(
+                repo=repo,
+                base_revision=base,
+                driver_argv=[sys.executable, "-c", "pass"],
+                case_ids=["readonly_review"],
+                pairs=1,
+            )
+            self.assertEqual(result["status_counts"]["fail"], 2)
+            worktrees = subprocess.check_output(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=repo,
+                text=True,
+            )
+            self.assertIn(str(unrelated), worktrees)
+            self.assertNotIn("webcodex-agent-loop-bench-", worktrees)
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(unrelated)],
+                cwd=repo,
+                check=True,
+            )
 
     def test_cleanup_does_not_prune_unrelated_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

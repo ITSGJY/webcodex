@@ -34,6 +34,13 @@ VARIANTS = ("direct", "code_mode")
 MAX_DRIVER_RECEIPT_BYTES = 64 * 1024
 MAX_FIXTURE_ORACLE_BYTES = 1024 * 1024
 MAX_CASE_MANIFEST_BYTES = 1024 * 1024
+MAX_GIT_PATH_BYTES = 64 * 1024
+MAX_GIT_PATHS = 512
+CODE_MODE_TOOL_BY_SURFACE = {
+    "read_only": "execute_code_mode",
+    "validation": "execute_effectful_code_mode",
+    "guarded_edit": "execute_mutating_code_mode",
+}
 MAX_DRIVER_SECS = 30 * 60
 
 
@@ -183,21 +190,87 @@ def _surface(case: dict[str, Any], variant: str) -> str:
 
 def _worktree_add(repo: Path, path: Path, base_revision: str) -> None:
     completed = _run(["git", "worktree", "add", "--detach", str(path), base_revision], cwd=repo)
-    if completed.returncode != 0:
-        raise BenchmarkError(completed.stderr.strip() or "git worktree add failed")
+    if completed.returncode == 0:
+        return
+
+    add_error = completed.stderr.strip() or "git worktree add failed"
+    try:
+        _worktree_remove(repo, path)
+    except BenchmarkError as cleanup_error:
+        raise BenchmarkError(f"{add_error}; owned worktree rollback failed: {cleanup_error}") from cleanup_error
+    raise BenchmarkError(add_error)
 
 
 def _worktree_remove(repo: Path, path: Path) -> None:
-    _run(["git", "worktree", "remove", "--force", str(path)], cwd=repo)
+    completed = _run(["git", "worktree", "remove", "--force", str(path)], cwd=repo)
+    if completed.returncode == 0:
+        return
+
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
+    retry = _run(["git", "worktree", "remove", "--force", str(path)], cwd=repo)
+    if retry.returncode == 0:
+        return
+    if not path.exists() and "is not a working tree" in retry.stderr:
+        return
+    raise BenchmarkError(retry.stderr.strip() or "failed to remove owned benchmark worktree")
 
 
-def _workspace_status(workspace: Path) -> str:
-    completed = _run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=workspace)
-    if completed.returncode != 0:
-        raise BenchmarkError(completed.stderr.strip() or "git status failed")
-    return completed.stdout
+def _workspace_status(workspace: Path) -> bool:
+    try:
+        process = subprocess.Popen(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=workspace,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise BenchmarkError("could not start git status") from exc
+
+    assert process.stdout is not None
+    with process.stdout:
+        first = process.stdout.read(1)
+    if first and process.poll() is None:
+        process.kill()
+    returncode = process.wait()
+    if first:
+        return True
+    if returncode != 0:
+        raise BenchmarkError("git status failed")
+    return False
+
+
+def _bounded_git_paths(
+    argv: list[str],
+    *,
+    cwd: Path,
+) -> tuple[bool, bool, list[bytes]]:
+    try:
+        process = subprocess.Popen(
+            ["git", *argv],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise BenchmarkError("could not start bounded Git path query") from exc
+
+    assert process.stdout is not None
+    with process.stdout:
+        raw = process.stdout.read(MAX_GIT_PATH_BYTES + 1)
+    byte_overflow = len(raw) > MAX_GIT_PATH_BYTES
+    if byte_overflow and process.poll() is None:
+        process.kill()
+    returncode = process.wait()
+    if byte_overflow:
+        return returncode == 0, True, []
+
+    paths = [item for item in raw.split(b"\0") if item]
+    if len(paths) > MAX_GIT_PATHS:
+        return returncode == 0, True, []
+    return returncode == 0, False, paths
 
 
 def _fixture_oracle(
@@ -262,18 +335,28 @@ def _fixture_oracle(
 
     expected_changed = sorted(spec.get("changed_files") or [])
     if expected_changed:
-        tracked = _run(["git", "diff", "--name-only", base_revision, "--"], cwd=workspace)
-        untracked = _run(["git", "ls-files", "--others", "--exclude-standard"], cwd=workspace)
-        changed = sorted(
-            set(line for line in tracked.stdout.splitlines() if line)
-            | set(line for line in untracked.stdout.splitlines() if line)
+        tracked_ok, tracked_overflow, tracked_paths = _bounded_git_paths(
+            ["diff", "--name-only", "-z", base_revision, "--"],
+            cwd=workspace,
         )
+        untracked_ok, untracked_overflow, untracked_paths = _bounded_git_paths(
+            ["ls-files", "-z", "--others", "--exclude-standard"],
+            cwd=workspace,
+        )
+        overflow = tracked_overflow or untracked_overflow
+        changed_raw = sorted(set(tracked_paths) | set(untracked_paths)) if not overflow else []
+        expected_raw = sorted(item.encode("utf-8") for item in expected_changed)
+        changed = [
+            item.decode("utf-8", errors="backslashreplace")
+            for item in changed_raw
+        ]
         checks.append(
             {
                 "kind": "changed_files",
-                "passed": tracked.returncode == 0 and untracked.returncode == 0 and changed == expected_changed,
+                "passed": tracked_ok and untracked_ok and not overflow and changed_raw == expected_raw,
                 "expected": expected_changed,
-                "actual": changed,
+                "actual": None if overflow else changed,
+                "reason": "changed path listing exceeds oracle limit" if overflow else None,
             }
         )
 
@@ -421,24 +504,50 @@ def _tool_count(summary: dict[str, Any], variant: str, tool_name: str) -> int | 
     return None
 
 
-def _runtime_evidence_proven(summary: dict[str, Any], variant: str) -> bool:
+def _runtime_evidence_proven(
+    summary: dict[str, Any],
+    variant: str,
+    surface: str | None = None,
+) -> bool:
     outer_total = report._get_path(summary, "outer_calls.total")
     if not isinstance(outer_total, int) or isinstance(outer_total, bool) or outer_total <= 0:
         return False
+
+    composition_available = (
+        report._get_path(summary, "availability.code_mode_composition.available") is True
+    )
     if variant == "direct":
         canonical_total = report._get_path(summary, "canonical_calls.total")
         return (
-            isinstance(canonical_total, int)
+            composition_available
+            and isinstance(canonical_total, int)
             and not isinstance(canonical_total, bool)
             and canonical_total > 0
         )
+
     if variant == "code_mode":
+        expected_tool = CODE_MODE_TOOL_BY_SURFACE.get(surface or "")
         outer_code_mode = report._get_path(summary, "composition.outer_code_mode_calls")
+        outer_by_name = report._get_path(summary, "tools.outer_by_name")
+        if (
+            not composition_available
+            or expected_tool is None
+            or not isinstance(outer_code_mode, int)
+            or isinstance(outer_code_mode, bool)
+            or outer_code_mode <= 0
+            or not isinstance(outer_by_name, dict)
+        ):
+            return False
+        code_mode_counts = {
+            name: count
+            for name in report.CODE_MODE_TOOLS
+            if isinstance((count := outer_by_name.get(name, 0)), int)
+            and not isinstance(count, bool)
+            and count > 0
+        }
         return (
-            report._get_path(summary, "availability.code_mode_composition.available") is True
-            and isinstance(outer_code_mode, int)
-            and not isinstance(outer_code_mode, bool)
-            and outer_code_mode > 0
+            code_mode_counts.get(expected_tool) == outer_code_mode
+            and sum(code_mode_counts.values()) == outer_code_mode
         )
     return False
 
@@ -468,6 +577,27 @@ def _guarded_multi_file_contract_proven(summary: dict[str, Any], variant: str) -
         for name in ("search_project_texts", "search_and_read")
         if (count := _tool_count(summary, variant, name)) is not None
     ]
+    outer_failed = report._get_path(summary, "outer_calls.failed")
+    outer_unknown = report._get_path(summary, "outer_calls.timeout_or_unknown")
+    if (
+        not isinstance(outer_failed, int)
+        or isinstance(outer_failed, bool)
+        or outer_failed != 0
+        or not isinstance(outer_unknown, int)
+        or isinstance(outer_unknown, bool)
+        or outer_unknown != 0
+    ):
+        return False
+
+    if variant == "code_mode":
+        child_failed = report._get_path(summary, "child_calls.failed")
+        if (
+            not isinstance(child_failed, int)
+            or isinstance(child_failed, bool)
+            or child_failed != 0
+        ):
+            return False
+
     return (
         edit_count == 1
         and read_count is not None
@@ -586,7 +716,7 @@ def _run_sample(
         if (
             summary is not None
             and effective_status == "pass"
-            and not _runtime_evidence_proven(summary, variant)
+            and not _runtime_evidence_proven(summary, variant, surface)
         ):
             effective_status = "partial"
 
