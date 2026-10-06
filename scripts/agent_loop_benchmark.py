@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import shlex
 import subprocess
@@ -53,22 +54,67 @@ def _run(argv: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> su
         check=False,
     )
 
-def _run_driver(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+def _terminate_driver_tree(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
+
     try:
-        return subprocess.run(
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+
+
+def _run_driver(argv: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(
             argv,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=MAX_DRIVER_SECS,
-            check=False,
+            **kwargs,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise BenchmarkError("benchmark Host driver exceeded the 30 minute limit") from exc
     except OSError as exc:
         raise BenchmarkError("could not start benchmark Host driver") from exc
+
+    try:
+        returncode = process.wait(timeout=MAX_DRIVER_SECS)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_driver_tree(process)
+        raise BenchmarkError("benchmark Host driver exceeded the 30 minute limit") from exc
+    if os.name != "nt":
+        _terminate_driver_tree(process)
+    return subprocess.CompletedProcess(argv, returncode)
 
 
 def _require_exact_revision(repo: Path, revision: str) -> str:
@@ -79,6 +125,13 @@ def _require_exact_revision(repo: Path, revision: str) -> str:
     if not report._is_exact_git_revision(resolved):
         raise BenchmarkError("resolved base revision is not an exact 40-hex commit")
     return resolved
+
+
+def _git_root(path: Path) -> Path:
+    completed = _run(["git", "rev-parse", "--show-toplevel"], cwd=path)
+    if completed.returncode != 0:
+        raise BenchmarkError("benchmark repo must be inside a Git worktree")
+    return Path(completed.stdout.strip()).resolve()
 
 
 def _head_revision(repo: Path) -> str:
@@ -134,7 +187,11 @@ def _workspace_status(workspace: Path) -> str:
     return completed.stdout
 
 
-def _fixture_oracle(case: dict[str, Any], workspace: Path) -> dict[str, Any]:
+def _fixture_oracle(
+    case: dict[str, Any],
+    workspace: Path,
+    base_revision: str = "HEAD",
+) -> dict[str, Any]:
     spec = (case.get("correctness") or {}).get("fixture_oracle")
     if not isinstance(spec, dict):
         return {"available": False, "passed": None, "checks": [], "reason": "case has no fixture_oracle"}
@@ -155,9 +212,6 @@ def _fixture_oracle(case: dict[str, Any], workspace: Path) -> dict[str, Any]:
         except OSError:
             checks.append({"path": rel_path, "passed": False, "reason": "file unavailable"})
             continue
-        except UnicodeDecodeError:
-            checks.append({"path": rel_path, "passed": False, "reason": "file is not UTF-8"})
-            continue
         expected_text = expected.get("expected_text")
         if isinstance(expected_text, str):
             passed = text == expected_text
@@ -169,7 +223,7 @@ def _fixture_oracle(case: dict[str, Any], workspace: Path) -> dict[str, Any]:
 
     expected_changed = sorted(spec.get("changed_files") or [])
     if expected_changed:
-        tracked = _run(["git", "diff", "--name-only", "HEAD", "--"], cwd=workspace)
+        tracked = _run(["git", "diff", "--name-only", base_revision, "--"], cwd=workspace)
         untracked = _run(["git", "ls-files", "--others", "--exclude-standard"], cwd=workspace)
         changed = sorted(
             set(line for line in tracked.stdout.splitlines() if line)
@@ -325,9 +379,11 @@ def _run_sample(
     workspace = root / "worktrees" / label
     receipt_path = root / "receipts" / f"{label}.json"
     annotation_path = root / "annotations" / f"{label}.json"
+    receipt_path.unlink(missing_ok=True)
+    annotation_path.unlink(missing_ok=True)
     surface: str | None = None
     worktree_added = False
-    started = time.time_ns() // 1_000_000
+    completed: subprocess.CompletedProcess[bytes] | None = None
     try:
         surface = _surface(case, variant)
         _worktree_add(repo, workspace, base_revision)
@@ -347,6 +403,7 @@ def _run_sample(
                 "WEBCODEX_BENCH_DRIVER_RESULT": str(receipt_path),
             }
         )
+        started = time.time_ns() // 1_000_000
         completed = _run_driver(driver_argv, cwd=workspace, env=env)
         ended = time.time_ns() // 1_000_000
         if not receipt_path.exists():
@@ -364,7 +421,8 @@ def _run_sample(
         receipt = _load_driver_receipt(receipt_path)
         if receipt.get("task_timing") is None:
             receipt["task_timing"] = {"started_at_ms": started, "ended_at_ms": ended}
-        oracle = _fixture_oracle(case, workspace)
+        head_changed = _head_revision(workspace) != base_revision
+        oracle = _fixture_oracle(case, workspace, base_revision)
         annotation = _annotation(
             case,
             variant=variant,
@@ -384,6 +442,10 @@ def _run_sample(
             case_manifest=case_manifest,
         )
         effective_status = receipt["status"]
+        reason_code: str | None = None
+        if head_changed:
+            effective_status = "fail"
+            reason_code = "workspace_head_changed"
         if completed.returncode != 0 and effective_status in ("pass", "partial"):
             effective_status = "fail"
         if oracle["available"] and oracle["passed"] is not True and effective_status in ("pass", "partial"):
@@ -428,6 +490,7 @@ def _run_sample(
             "surface": surface,
             "status": effective_status,
             "driver_exit_code": completed.returncode,
+            **({"reason_code": reason_code} if reason_code is not None else {}),
             "fixture_oracle": oracle,
             "summary": summary,
         }
@@ -437,7 +500,7 @@ def _run_sample(
             "variant": variant,
             "surface": surface,
             "status": "fail",
-            "driver_exit_code": None,
+            "driver_exit_code": completed.returncode if completed is not None else None,
             "reason_code": "sample_contract_error",
             "fixture_oracle": {"available": False, "passed": None, "checks": [], "reason": "sample failed before oracle"},
             "summary": None,
@@ -469,19 +532,34 @@ def run_benchmark(
 ) -> dict[str, Any]:
     if pairs < 1:
         raise BenchmarkError("pairs must be at least 1")
+    if len(set(case_ids)) != len(case_ids):
+        raise BenchmarkError("duplicate case ids are not allowed in one benchmark run")
+    repo = _git_root(repo)
     resolved = _require_exact_revision(repo, base_revision)
     if _head_revision(repo) != resolved:
         raise BenchmarkError(
             "base revision must equal the current checkout HEAD; check out the target commit before benchmarking"
         )
     temp_owner = tempfile.TemporaryDirectory(prefix="webcodex-agent-loop-bench-")
-    root = Path(temp_owner.name)
-    for name in ("worktrees", "receipts", "annotations"):
-        (root / name).mkdir(parents=True, exist_ok=True)
-    case_manifest = root / "agent_loop_cases.json"
-    case_manifest.write_text(_read_manifest_at_revision(repo, resolved), encoding="utf-8")
-    manifest = report.load_case_manifest(case_manifest)
-    selected = [_case(manifest, case_id) for case_id in case_ids]
+    try:
+        root = Path(temp_owner.name)
+        for name in ("worktrees", "receipts", "annotations"):
+            (root / name).mkdir(parents=True, exist_ok=True)
+        case_manifest = root / "agent_loop_cases.json"
+        case_manifest.write_text(_read_manifest_at_revision(repo, resolved), encoding="utf-8")
+        manifest = report.load_case_manifest(case_manifest)
+        selected = [_case(manifest, case_id) for case_id in case_ids]
+        unsupported_targets = sorted(
+            {str(case.get("target")) for case in selected if case.get("target") != "webcodex_repository"}
+        )
+        if unsupported_targets:
+            raise BenchmarkError(
+                "paired worktree runner supports only target=webcodex_repository; "
+                f"unsupported target(s): {', '.join(unsupported_targets)}"
+            )
+    except BaseException:
+        temp_owner.cleanup()
+        raise
 
     cases_out: list[dict[str, Any]] = []
     try:

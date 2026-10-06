@@ -294,9 +294,13 @@ For each invocation the driver receives `WEBCODEX_BENCH_WORKSPACE`,
 `WEBCODEX_BENCH_DRIVER_RESULT`. It writes one bounded JSON receipt to the last
 path. The receipt is capped at 64 KiB; driver stdout/stderr is not retained by the orchestrator. `status` is required and is one of `pass/fail/partial/unsupported`.
 Non-unsupported samples also provide the authoritative ActionAudit database path
-and Workflow Session id; optional trace root, repair-turn annotation, task timing,
-and correctness verdicts use the existing reporter semantics. The durable benchmark
-result does not persist runtime Project, Window, tunnel, or Host-private ids.
+and Workflow Session id; optional trace root, repair-turn annotation, and task timing
+use the existing reporter semantics. Correctness verdicts are optional only when an
+independent fixture oracle can establish the task result. For non-oracle cases, a
+driver-reported pass needs `correctness.task_verdict="pass"`; validation-required
+cases also need the corresponding passing validation verdict, otherwise the sample
+remains partial. The durable benchmark result does not persist runtime Project,
+Window, tunnel, or Host-private ids.
 
 The default lane is exactly `readonly_review`, `guarded_multi_file_edit`, and
 `long_validation_handoff`, matching #822. The handoff case is valid only when the
