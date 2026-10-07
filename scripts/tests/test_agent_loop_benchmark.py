@@ -96,28 +96,70 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
         self.assertFalse(
             benchmark._runtime_evidence_proven(code_mode, "code_mode", "read_only")
         )
+        read_only = {
+            "outer_calls": {"total": 2},
+            "availability": {"code_mode_composition": {"available": True}},
+            "composition": {"outer_code_mode_calls": 1},
+            "tools": {
+                "outer_by_name": {
+                    "work_on_project": 1,
+                    "execute_code_mode": 1,
+                }
+            },
+        }
+        self.assertTrue(
+            benchmark._runtime_evidence_proven(read_only, "code_mode", "read_only")
+        )
+        read_only["outer_calls"]["total"] = 3
+        read_only["tools"]["outer_by_name"]["read_tool_manifest"] = 1
+        self.assertTrue(
+            benchmark._runtime_evidence_proven(read_only, "code_mode", "read_only")
+        )
+        read_only["tools"]["outer_by_name"]["read_tool_manifest"] = 2
+        read_only["outer_calls"]["total"] = 4
+        self.assertFalse(
+            benchmark._runtime_evidence_proven(read_only, "code_mode", "read_only")
+        )
+        read_only["tools"]["outer_by_name"]["read_tool_manifest"] = 1
+        read_only["outer_calls"]["total"] = 4
+        read_only["tools"]["outer_by_name"]["read_files"] = 1
+        self.assertFalse(
+            benchmark._runtime_evidence_proven(read_only, "code_mode", "read_only")
+        )
+        del read_only["tools"]["outer_by_name"]["read_files"]
+        del read_only["tools"]["outer_by_name"]["read_tool_manifest"]
+        read_only["outer_calls"]["total"] = 1
+        del read_only["tools"]["outer_by_name"]["work_on_project"]
+        self.assertFalse(
+            benchmark._runtime_evidence_proven(read_only, "code_mode", "read_only")
+        )
         code_mode["tools"]["outer_by_name"]["execute_code_mode"] = 1
         code_mode["composition"]["outer_code_mode_calls"] = 2
         self.assertFalse(
             benchmark._runtime_evidence_proven(code_mode, "code_mode", "guarded_edit")
         )
 
-    def test_long_handoff_requires_one_launch_and_exact_terminal_identity(self) -> None:
+    def test_long_handoff_requires_one_launch_and_exact_terminal_relation(self) -> None:
         direct = {
             "canonical_calls": {"by_name": {"cargo_test": 1}},
             "job_convergence": {
                 "pending_handoff_count": 1,
                 "pending_followup_known_count": 1,
                 "pending_to_terminal_ms": {"samples": 1},
+                "pending_handoff_by_origin_tool": {"cargo_test": 1},
+                "pending_followup_known_by_origin_tool": {"cargo_test": 1},
+                "pending_to_terminal_ms_by_origin_tool": {
+                    "cargo_test": {"samples": 1}
+                },
+                "selected_terminal_by_origin_tool": {"cargo_test": 1},
             },
         }
-        self.assertTrue(
-            benchmark._long_handoff_terminal_proven(direct, "direct", {})
-        )
+        self.assertTrue(benchmark._long_handoff_terminal_proven(direct, "direct"))
+        direct["job_convergence"]["selected_terminal_by_origin_tool"] = {}
+        self.assertFalse(benchmark._long_handoff_terminal_proven(direct, "direct"))
+        direct["job_convergence"]["selected_terminal_by_origin_tool"] = {"cargo_test": 1}
         direct["canonical_calls"]["by_name"]["cargo_test"] = 2
-        self.assertFalse(
-            benchmark._long_handoff_terminal_proven(direct, "direct", {})
-        )
+        self.assertFalse(benchmark._long_handoff_terminal_proven(direct, "direct"))
 
         code_mode = {
             "availability": {"code_mode_composition": {"available": True}},
@@ -125,29 +167,49 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                 "nested_tool_counts": {"cargo_test": 1},
                 "job_handoffs": {"total": 1},
                 "consequential_calls": {"total": 1},
+                "known_results": {"total": 0},
                 "outcome_unknown": {"total": 0},
             },
-            "tools": {"outer_by_name": {"execute_effectful_code_mode": 1, "observe_jobs": 1}},
+            "job_convergence": {
+                "pending_handoff_count": 1,
+                "pending_followup_known_count": 1,
+                "pending_to_terminal_ms": {"samples": 1},
+                "pending_handoff_by_origin_tool": {
+                    "execute_effectful_code_mode": 1
+                },
+                "pending_followup_known_by_origin_tool": {
+                    "execute_effectful_code_mode": 1
+                },
+                "pending_to_terminal_ms_by_origin_tool": {
+                    "execute_effectful_code_mode": {"samples": 1}
+                },
+                "selected_terminal_by_origin_tool": {
+                    "execute_effectful_code_mode": 1
+                },
+            },
         }
-        receipt = {
-            "job_identity_evidence": {
-                "handoff_job_id": "job-1",
-                "terminal_job_id": "job-1",
-                "terminal": True,
-            }
-        }
-        self.assertTrue(
-            benchmark._long_handoff_terminal_proven(code_mode, "code_mode", receipt)
-        )
-        receipt["job_identity_evidence"]["terminal_job_id"] = "job-2"
+        self.assertTrue(benchmark._long_handoff_terminal_proven(code_mode, "code_mode"))
+        code_mode["job_convergence"]["selected_terminal_by_origin_tool"] = {}
         self.assertFalse(
-            benchmark._long_handoff_terminal_proven(code_mode, "code_mode", receipt)
+            benchmark._long_handoff_terminal_proven(code_mode, "code_mode")
         )
-        receipt["job_identity_evidence"]["terminal_job_id"] = "job-1"
+        code_mode["job_convergence"]["selected_terminal_by_origin_tool"] = {
+            "execute_effectful_code_mode": 1
+        }
+        code_mode["job_convergence"]["pending_handoff_by_origin_tool"] = {
+            "run_process": 1
+        }
+        self.assertFalse(
+            benchmark._long_handoff_terminal_proven(code_mode, "code_mode")
+        )
+        code_mode["job_convergence"]["pending_handoff_by_origin_tool"] = {
+            "execute_effectful_code_mode": 1
+        }
+        code_mode["job_convergence"]["pending_to_terminal_ms"]["samples"] = 0
+        self.assertFalse(benchmark._long_handoff_terminal_proven(code_mode, "code_mode"))
+        code_mode["job_convergence"]["pending_to_terminal_ms"]["samples"] = 1
         code_mode["composition"]["nested_tool_counts"]["cargo_test"] = 2
-        self.assertFalse(
-            benchmark._long_handoff_terminal_proven(code_mode, "code_mode", receipt)
-        )
+        self.assertFalse(benchmark._long_handoff_terminal_proven(code_mode, "code_mode"))
 
     def test_multi_file_contract_requires_one_edit_search_and_post_read_capacity(self) -> None:
         direct = {
@@ -188,6 +250,8 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                 "known_results": {"total": 1},
                 "job_handoffs": {"total": 0},
                 "outcome_unknown": {"total": 0},
+                "mutation_state_changed": {"total": 1},
+                "mutation_no_change": {"total": 0},
             },
             "outer_calls": {"failed": 0, "timeout_or_unknown": 0},
             "child_calls": {"failed": 0},
@@ -199,6 +263,9 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
         code_mode["composition"]["consequential_calls"]["total"] = 2
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
         code_mode["composition"]["consequential_calls"]["total"] = 1
+        code_mode["composition"]["mutation_state_changed"]["total"] = 0
+        self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
+        code_mode["composition"]["mutation_state_changed"]["total"] = 1
         code_mode["composition"]["nested_tool_counts"]["read_files"] = 1
         self.assertFalse(benchmark._guarded_multi_file_contract_proven(code_mode, "code_mode"))
 
@@ -267,6 +334,33 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
             self.assertFalse(result["passed"])
             beta_check = next(check for check in result["checks"] if check.get("path", "").endswith("beta.txt"))
             self.assertEqual(beta_check["reason"], "file exceeds oracle byte limit")
+
+    def test_fixture_oracle_reports_git_path_query_failure(self) -> None:
+        manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
+        case = report._case_by_id(manifest, "guarded_multi_file_edit")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / "tests/fixtures/agent-loop-multi-file"
+            fixture.mkdir(parents=True)
+            (fixture / "alpha.txt").write_text(
+                "BENCH_TARGET_ALPHA=after\nALPHA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            (fixture / "beta.txt").write_text(
+                "BENCH_TARGET_BETA=after\nBETA_UNRELATED_SENTINEL=keep\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                benchmark,
+                "_bounded_git_paths",
+                side_effect=[(False, False, []), (True, False, [])],
+            ):
+                result = benchmark._fixture_oracle(case, root)
+            changed = next(
+                check for check in result["checks"] if check.get("kind") == "changed_files"
+            )
+            self.assertFalse(changed["passed"])
+            self.assertEqual(changed["reason"], "changed path query failed")
 
     @unittest.skipIf(os.name == "nt", "FIFO is POSIX-only")
     def test_fixture_oracle_rejects_fifo_without_blocking(self) -> None:
@@ -338,22 +432,6 @@ class AgentLoopBenchmarkTests(unittest.TestCase):
                 receipt.write_text(raw, encoding="utf-8")
                 with self.assertRaisesRegex(benchmark.BenchmarkError, "bounded JSON"):
                     benchmark._load_driver_receipt(receipt)
-
-    def test_job_identity_evidence_is_exact_bounded_and_private(self) -> None:
-        receipt = {
-            "job_identity_evidence": {
-                "handoff_job_id": "private-job-1",
-                "terminal_job_id": "private-job-1",
-                "terminal": True,
-            }
-        }
-        self.assertTrue(benchmark._job_identity_evidence_proven(receipt))
-        receipt["job_identity_evidence"]["terminal_job_id"] = "other-job"
-        self.assertFalse(benchmark._job_identity_evidence_proven(receipt))
-        receipt["job_identity_evidence"]["terminal_job_id"] = "x" * (
-            benchmark.MAX_JOB_ID_BYTES + 1
-        )
-        self.assertFalse(benchmark._job_identity_evidence_proven(receipt))
 
     @unittest.skipIf(os.name == "nt", "FIFO is POSIX-only")
     def test_driver_receipt_rejects_fifo_without_blocking(self) -> None:

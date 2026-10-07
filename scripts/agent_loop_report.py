@@ -60,7 +60,11 @@ CODE_MODE_COMPOSITION_NUMERIC_FIELDS = (
 )
 # Additive fields may be absent from historical ActionAudit rows. They get their
 # own availability/missing accounting and never invalidate the core composition.
-CODE_MODE_COMPOSITION_OPTIONAL_NUMERIC_FIELDS = ("input_bytes",)
+CODE_MODE_COMPOSITION_OPTIONAL_NUMERIC_FIELDS = (
+    "input_bytes",
+    "mutation_state_changed",
+    "mutation_no_change",
+)
 
 # Closed v13 persisted wire vocabulary for this offline consumer, not alias rules.
 # Runtime/schema spellings are owned by ToolInputNormalizationCode in tool-contracts.
@@ -846,6 +850,13 @@ def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dic
     failure_observed: set[str] = set()
     timed: set[str] = set()
     pending_observed: set[str] = set()
+    pending_origin_by_relation: dict[str, str | None] = {}
+    pending_by_origin_tool: Counter[str] = Counter()
+    followup_by_origin_tool: Counter[str] = Counter()
+    timings_by_origin_tool: dict[str, list[int]] = {}
+    timing_missing_by_origin_tool: Counter[str] = Counter()
+    selected_terminal_by_origin_tool: Counter[str] = Counter()
+    selected_terminal_relations: set[str] = set()
 
     def facts(row: dict[str, Any]) -> dict[str, Any]:
         value = (_telemetry(row) or {}).get("job_convergence")
@@ -858,6 +869,19 @@ def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dic
         return [event for event in raw if isinstance(event, dict)
                 and _is_exact_sha256(event.get("relation"))
                 and event.get("kind") in ("pending_handoff", "explicit_observe", "passive_terminal")]
+
+    def origin_tool(row: dict[str, Any]) -> str | None:
+        telemetry = _telemetry(row)
+        if not isinstance(telemetry, dict):
+            return None
+        tool = telemetry.get("tool_name")
+        if (
+            isinstance(tool, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", tool) is not None
+            and tool == row.get("operation")
+        ):
+            return tool
+        return None
 
     def predecessor(row: dict[str, Any]) -> dict[str, Any] | None:
         nonlocal links_remaining
@@ -891,6 +915,28 @@ def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dic
 
     selected_relations = {event["relation"] for row in selected for event in events(row)}
     selected_traces = {row.get("server_trace_id") for row in selected}
+    for row in selected:
+        telemetry = _telemetry(row) or {}
+        version = telemetry.get("schema_version")
+        if (
+            facts(row).get("correlation_complete") is not True
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 10
+        ):
+            continue
+        tool = origin_tool(row)
+        for event in events(row):
+            if event["kind"] != "pending_handoff":
+                continue
+            relation_id = event["relation"]
+            if relation_id not in pending_origin_by_relation:
+                pending_origin_by_relation[relation_id] = tool
+            elif pending_origin_by_relation[relation_id] != tool:
+                pending_origin_by_relation[relation_id] = None
+    for tool in pending_origin_by_relation.values():
+        if tool is not None:
+            pending_by_origin_tool[tool] += 1
     measured_rows = [row for row in rows.values() if row.get("server_trace_id") in selected_traces
                      or any(event["relation"] in selected_relations for event in events(row))]
     # Missing trace/timing still contributes observed invocation counts, but
@@ -907,11 +953,24 @@ def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dic
                 if event["kind"] == "pending_handoff" and event["relation"] in selected_relations:
                     known_followups.add(event["relation"])
     counts["pending_followup_known_count"] = len(known_followups)
+    for relation_id in known_followups:
+        tool = pending_origin_by_relation.get(relation_id)
+        if tool is not None:
+            followup_by_origin_tool[tool] += 1
     for row in measured_rows:
         data = facts(row)
-        for name in ("pending_handoff_count", "passive_terminal_delivery_count", "passive_failure_delivery_count", "wait_for_job_terminal_count"):
+        for name, maximum in (
+            ("pending_handoff_count", 32),
+            ("passive_terminal_delivery_count", 9),
+            ("passive_failure_delivery_count", 9),
+            ("wait_for_job_terminal_count", 1),
+        ):
             value = data.get(name, 0)
-            if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 9:
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= maximum
+            ):
                 counts[name] += value
         if data.get("correlation_complete") is False:
             counts["uncorrelated_calls"] += 1
@@ -924,18 +983,17 @@ def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dic
                     if relation_id not in pending_observed:
                         counts["pending_followed_immediately_by_observe_count"] += 1
                         pending_observed.add(relation_id)
-                if relation_id in failure_observed:
-                    continue
-                for previous in history(row):
-                    matching = [old for old in events(previous) if old["relation"] == relation_id]
-                    if any(old["kind"] == "passive_terminal" and old.get("failure") is True for old in matching):
-                        counts["terminal_failure_followed_by_observe_count"] += 1
-                        failure_observed.add(relation_id)
-                        if any(old.get("validation_failure") is True for old in matching if old["kind"] == "passive_terminal"):
-                            counts["terminal_validation_failure_followed_by_observe_count"] += 1
-                        break
-                    if any(old["kind"] == "pending_handoff" for old in matching):
-                        break
+                if relation_id not in failure_observed:
+                    for previous in history(row):
+                        matching = [old for old in events(previous) if old["relation"] == relation_id]
+                        if any(old["kind"] == "passive_terminal" and old.get("failure") is True for old in matching):
+                            counts["terminal_failure_followed_by_observe_count"] += 1
+                            failure_observed.add(relation_id)
+                            if any(old.get("validation_failure") is True for old in matching if old["kind"] == "passive_terminal"):
+                                counts["terminal_validation_failure_followed_by_observe_count"] += 1
+                            break
+                        if any(old["kind"] == "pending_handoff" for old in matching):
+                            break
             elif event["kind"] == "passive_terminal":
                 counts["passive_validation_failure_delivery_count"] += int(event.get("validation_failure") is True)
                 observed = False
@@ -956,15 +1014,52 @@ def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dic
                         pending = previous
                         break
             if event["kind"] == "passive_terminal" or event.get("terminal_observed_at_ms") is not None:
+                origin = pending_origin_by_relation.get(relation_id)
+                trace_id = row.get("server_trace_id")
+                if (
+                    pending is not None
+                    and origin is not None
+                    and isinstance(trace_id, str)
+                    and trace_id in selected_traces
+                    and relation_id not in selected_terminal_relations
+                ):
+                    selected_terminal_relations.add(relation_id)
+                    selected_terminal_by_origin_tool[origin] += 1
                 if relation_id not in timed:
                     timed.add(relation_id)
                     handed = pending.get("response_handed_at_ms") if pending else None
                     terminal = event.get("terminal_observed_at_ms")
                     if isinstance(handed, int) and isinstance(terminal, int) and terminal >= handed:
-                        timings.append(terminal - handed)
+                        elapsed = terminal - handed
+                        timings.append(elapsed)
+                        if origin is not None:
+                            timings_by_origin_tool.setdefault(origin, []).append(elapsed)
                     else:
                         timing_missing += 1
-    return {**counts, "pending_to_terminal_ms": _metric_distribution(timings, missing=timing_missing)}
+                        if origin is not None:
+                            timing_missing_by_origin_tool[origin] += 1
+    origin_tools = sorted(
+        set(pending_by_origin_tool)
+        | set(followup_by_origin_tool)
+        | set(timings_by_origin_tool)
+        | set(timing_missing_by_origin_tool)
+    )
+    return {
+        **counts,
+        "pending_handoff_by_origin_tool": dict(sorted(pending_by_origin_tool.items())),
+        "pending_followup_known_by_origin_tool": dict(sorted(followup_by_origin_tool.items())),
+        "selected_terminal_by_origin_tool": dict(
+            sorted(selected_terminal_by_origin_tool.items())
+        ),
+        "pending_to_terminal_ms": _metric_distribution(timings, missing=timing_missing),
+        "pending_to_terminal_ms_by_origin_tool": {
+            tool: _metric_distribution(
+                timings_by_origin_tool.get(tool, []),
+                missing=timing_missing_by_origin_tool.get(tool, 0),
+            )
+            for tool in origin_tools
+        },
+    }
 
 
 

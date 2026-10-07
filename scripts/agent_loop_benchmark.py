@@ -34,7 +34,6 @@ VARIANTS = ("direct", "code_mode")
 MAX_DRIVER_RECEIPT_BYTES = 64 * 1024
 MAX_FIXTURE_ORACLE_BYTES = 1024 * 1024
 MAX_CASE_MANIFEST_BYTES = 1024 * 1024
-MAX_JOB_ID_BYTES = 256
 MAX_GIT_PATH_BYTES = 64 * 1024
 MAX_GIT_PATHS = 512
 CODE_MODE_TOOL_BY_SURFACE = {
@@ -357,7 +356,13 @@ def _fixture_oracle(
                 "passed": tracked_ok and untracked_ok and not overflow and changed_raw == expected_raw,
                 "expected": expected_changed,
                 "actual": None if overflow else changed,
-                "reason": "changed path listing exceeds oracle limit" if overflow else None,
+                "reason": (
+                    "changed path listing exceeds oracle limit"
+                    if overflow
+                    else "changed path query failed"
+                    if not tracked_ok or not untracked_ok
+                    else None
+                ),
             }
         )
 
@@ -516,36 +521,6 @@ def _tool_count(summary: dict[str, Any], variant: str, tool_name: str) -> int | 
     return None
 
 
-def _bounded_job_id(value: Any) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError:
-        return None
-    if len(encoded) > MAX_JOB_ID_BYTES:
-        return None
-    return value
-
-
-def _job_identity_evidence_proven(receipt: dict[str, Any]) -> bool:
-    evidence = receipt.get("job_identity_evidence")
-    if not isinstance(evidence, dict) or set(evidence) != {
-        "handoff_job_id",
-        "terminal_job_id",
-        "terminal",
-    }:
-        return False
-    handoff = _bounded_job_id(evidence.get("handoff_job_id"))
-    terminal = _bounded_job_id(evidence.get("terminal_job_id"))
-    return (
-        handoff is not None
-        and terminal is not None
-        and handoff == terminal
-        and evidence.get("terminal") is True
-    )
-
-
 def _runtime_evidence_proven(
     summary: dict[str, Any],
     variant: str,
@@ -587,52 +562,104 @@ def _runtime_evidence_proven(
             and not isinstance(count, bool)
             and count > 0
         }
-        return (
-            code_mode_counts.get(expected_tool) == outer_code_mode
-            and sum(code_mode_counts.values()) == outer_code_mode
-        )
+        if (
+            code_mode_counts.get(expected_tool) != outer_code_mode
+            or sum(code_mode_counts.values()) != outer_code_mode
+        ):
+            return False
+        if surface == "read_only":
+            if any(
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+                for count in outer_by_name.values()
+            ):
+                return False
+            bootstrap_count = outer_by_name.get("work_on_project", 0)
+            manifest_count = outer_by_name.get("read_tool_manifest", 0)
+            allowed = {expected_tool, "work_on_project", "read_tool_manifest"}
+            unexpected = {
+                name: count
+                for name, count in outer_by_name.items()
+                if name not in allowed and count > 0
+            }
+            return (
+                bootstrap_count == 1
+                and manifest_count in (0, 1)
+                and not unexpected
+                and outer_total
+                == outer_code_mode + bootstrap_count + manifest_count
+            )
+        return True
     return False
 
 
-def _long_handoff_terminal_proven(
-    summary: dict[str, Any],
-    variant: str,
-    receipt: dict[str, Any],
-) -> bool:
+def _long_handoff_terminal_proven(summary: dict[str, Any], variant: str) -> bool:
     if _tool_count(summary, variant, "cargo_test") != 1:
         return False
 
+    pending = report._get_path(summary, "job_convergence.pending_handoff_count")
+    known_followups = report._get_path(summary, "job_convergence.pending_followup_known_count")
+    terminal_samples = report._get_path(summary, "job_convergence.pending_to_terminal_ms.samples")
+    if (
+        not isinstance(pending, int)
+        or isinstance(pending, bool)
+        or pending != 1
+        or not isinstance(known_followups, int)
+        or isinstance(known_followups, bool)
+        or known_followups < 1
+        or not isinstance(terminal_samples, int)
+        or isinstance(terminal_samples, bool)
+        or terminal_samples < 1
+    ):
+        return False
+
     if variant == "direct":
-        pending = report._get_path(summary, "job_convergence.pending_handoff_count")
-        known_followups = report._get_path(summary, "job_convergence.pending_followup_known_count")
-        terminal_samples = report._get_path(summary, "job_convergence.pending_to_terminal_ms.samples")
+        origin = "cargo_test"
         return (
-            isinstance(pending, int)
-            and not isinstance(pending, bool)
-            and pending == 1
-            and isinstance(known_followups, int)
-            and not isinstance(known_followups, bool)
-            and known_followups >= 1
-            and isinstance(terminal_samples, int)
-            and not isinstance(terminal_samples, bool)
-            and terminal_samples >= 1
+            report._get_path(
+                summary, f"job_convergence.pending_handoff_by_origin_tool.{origin}"
+            )
+            == 1
+            and report._get_path(
+                summary, f"job_convergence.pending_followup_known_by_origin_tool.{origin}"
+            )
+            == 1
+            and report._get_path(
+                summary,
+                f"job_convergence.pending_to_terminal_ms_by_origin_tool.{origin}.samples",
+            )
+            == 1
+            and report._get_path(
+                summary, f"job_convergence.selected_terminal_by_origin_tool.{origin}"
+            )
+            == 1
         )
-
     if variant == "code_mode":
-        job_handoffs = report._get_path(summary, "composition.job_handoffs.total")
-        consequential = report._get_path(summary, "composition.consequential_calls.total")
-        outcome_unknown = report._get_path(summary, "composition.outcome_unknown.total")
-        outer_observes = report._get_path(summary, "tools.outer_by_name.observe_jobs")
+        origin = "execute_effectful_code_mode"
         return (
-            job_handoffs == 1
-            and consequential == 1
-            and outcome_unknown == 0
-            and isinstance(outer_observes, int)
-            and not isinstance(outer_observes, bool)
-            and outer_observes >= 1
-            and _job_identity_evidence_proven(receipt)
+            report._get_path(summary, "composition.job_handoffs.total") == 1
+            and report._get_path(summary, "composition.consequential_calls.total") == 1
+            and report._get_path(summary, "composition.known_results.total") == 0
+            and report._get_path(summary, "composition.outcome_unknown.total") == 0
+            and report._get_path(
+                summary, f"job_convergence.pending_handoff_by_origin_tool.{origin}"
+            )
+            == 1
+            and report._get_path(
+                summary, f"job_convergence.pending_followup_known_by_origin_tool.{origin}"
+            )
+            == 1
+            and report._get_path(
+                summary,
+                f"job_convergence.pending_to_terminal_ms_by_origin_tool.{origin}.samples",
+            )
+            == 1
+            and report._get_path(
+                summary, f"job_convergence.selected_terminal_by_origin_tool.{origin}"
+            )
+            == 1
         )
-
     return False
 
 
@@ -671,6 +698,12 @@ def _guarded_multi_file_contract_proven(summary: dict[str, Any], variant: str) -
         known_results = report._get_path(summary, "composition.known_results.total")
         job_handoffs = report._get_path(summary, "composition.job_handoffs.total")
         outcome_unknown = report._get_path(summary, "composition.outcome_unknown.total")
+        mutation_changed = report._get_path(
+            summary, "composition.mutation_state_changed.total"
+        )
+        mutation_no_change = report._get_path(
+            summary, "composition.mutation_no_change.total"
+        )
         if (
             not isinstance(child_failed, int)
             or isinstance(child_failed, bool)
@@ -679,6 +712,8 @@ def _guarded_multi_file_contract_proven(summary: dict[str, Any], variant: str) -
             or known_results != 1
             or job_handoffs != 0
             or outcome_unknown != 0
+            or mutation_changed != 1
+            or mutation_no_change != 0
         ):
             return False
 
@@ -808,7 +843,7 @@ def _run_sample(
             case["id"] == "long_validation_handoff"
             and summary is not None
             and effective_status == "pass"
-            and not _long_handoff_terminal_proven(summary, variant, receipt)
+            and not _long_handoff_terminal_proven(summary, variant)
         ):
             effective_status = "partial"
 
