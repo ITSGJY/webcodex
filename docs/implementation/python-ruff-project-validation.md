@@ -75,5 +75,8 @@ Local Rust tests separately cover configuration authority, canonical argv,
 identity/evidence, capability selection and admission, queue-time replanning,
 missing tooling, and workflow-session evidence retention. Stub interpreter
 tests verify process selection and environment wiring; they are not substitutes
-for executing an actual Ruff binary. The contract is Ruff's requested read-only
+for executing an actual Ruff binary. The opt-in real-process module-isolation
+regression requires an existing Python 3 interpreter via
+`WEBCODEX_TEST_RUFF_PYTHON` and the `runner-real-process-tests` feature; run
+it explicitly with `--ignored`. The contract is Ruff's requested read-only
 check/format behavior in a trusted interpreter, not an OS-level filesystem sandbox.

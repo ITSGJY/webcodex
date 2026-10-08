@@ -2670,16 +2670,19 @@ fn project_validation_python_invalid_configured_interpreter_and_missing_ruff_nev
     assert!(!capture.exists());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
-fn project_validation_ruff_system_python_ignores_project_and_pythonpath_impostors() {
+#[ignore = "requires explicitly supplied existing Python 3 environment; never installs tooling"]
+fn runner_real_process_project_validation_ruff_module_isolation() {
     use webcodex_core::runner_protocol::ShellJobValidationStep;
-    // Use a real system interpreter, never an interpreter supplied by the fixture.
-    let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
-        .into_iter()
-        .find(|path| Path::new(path).is_file())
-        .expect("system Python 3 is required for the Ruff isolation regression");
-    let installed_ruff = Command::new(python)
+    // Optional real-process fixture. Keep ordinary unit tests toolchain-neutral.
+    let python = std::env::var("WEBCODEX_TEST_RUFF_PYTHON")
+        .expect("set WEBCODEX_TEST_RUFF_PYTHON to an existing Python 3 interpreter");
+    assert!(
+        Path::new(&python).is_file(),
+        "configured Python interpreter must exist"
+    );
+    let installed_ruff = Command::new(&python)
         .args(["-I", "-B", "-c", "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('ruff') else 42)"])
         .env_clear()
         .output().unwrap().status.success();
@@ -2704,7 +2707,7 @@ fn project_validation_ruff_system_python_ignores_project_and_pythonpath_impostor
         std::fs::write(project.join("pyproject.toml"), "[invalid TOML").unwrap();
         let profile = PreparedShellProfile {
             profile_name: "system-python".into(),
-            program: python.into(),
+            program: python.clone(),
             args: vec![],
             dialect: ShellDialect::Posix,
             env_snapshot: std::collections::HashMap::from([(
@@ -2739,7 +2742,7 @@ fn project_validation_ruff_system_python_ignores_project_and_pythonpath_impostor
                 }
             }
             // Exercise canonical spawn argv even when this system has no installed Ruff.
-            assert!(!Command::new(python)
+            assert!(!Command::new(&python)
                 .args(&step.args)
                 .env_clear()
                 .env("PYTHONPATH", &injected)
