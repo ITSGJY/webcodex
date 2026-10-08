@@ -162,7 +162,8 @@ pub fn resolve_validation_recipe_with_packages(
 }
 
 /// Canonical project gateway planning. Ordinary recipe workflows retain their
-/// existing Python Ruff/mypy/unittest choices; this gateway supports pytest only.
+/// existing Python Ruff/mypy/unittest choices. Project Ruff requires a pinned
+/// local manifest; evidence profiles cannot manufacture this command authority.
 pub fn resolve_project_validation_recipe(
     execution_root: &Path,
     cwd: Option<&str>,
@@ -187,6 +188,14 @@ pub fn resolve_project_validation_recipe(
             dependency_policy,
         );
     }
+    let ruff_digest = if checks.iter().any(|check| *check != SemanticCheck::Test) {
+        Some(project_ruff_manifest_digest(
+            &resolved.execution_root,
+            &resolved.absolute_root,
+        )?)
+    } else {
+        None
+    };
     let mut steps = Vec::with_capacity(checks.len());
     for check in checks {
         let operation = crate::project_validation_operation(
@@ -198,12 +207,14 @@ pub fn resolve_project_validation_recipe(
         .and_then(|operation| operation.with_dependency_policy(dependency_policy))
         .and_then(|operation| operation.with_test_filter(test_filter))
         .map_err(RecipeError::new)?;
-        steps.push(
+        steps.push(if *check == SemanticCheck::Test {
             operation
                 .build_readonly_plan()
                 .map_err(|_| check_unavailable())?
-                .structured_step,
-        );
+                .structured_step
+        } else {
+            ShellJobValidationStep::python_ruff(check.as_str()).ok_or_else(check_unavailable)?
+        });
     }
     let test_filter = test_filter
         .map(webcodex_core::runner_protocol::normalize_pytest_filter)
@@ -213,11 +224,23 @@ pub fn resolve_project_validation_recipe(
     // pytest searches configuration from the invocation directory through its
     // ancestors. Bind every candidate inside the registered Project, and fail
     // closed if that search could escape to an ambient parent configuration.
-    let manifest_digest = digest_project_recipe_files(
-        &resolved.execution_root,
-        pytest_project_provenance_files(&resolved.execution_root, &resolved.absolute_root)?,
-    )
-    .map_err(map_project_recipe_error)?;
+    let pytest_digest = if checks.contains(&SemanticCheck::Test) {
+        Some(
+            digest_project_recipe_files(
+                &resolved.execution_root,
+                pytest_project_provenance_files(&resolved.execution_root, &resolved.absolute_root)?,
+            )
+            .map_err(map_project_recipe_error)?,
+        )
+    } else {
+        None
+    };
+    let manifest_digest = match (pytest_digest, ruff_digest) {
+        (Some(pytest), None) => pytest,
+        (None, Some(ruff)) => ruff,
+        (Some(pytest), Some(ruff)) => format!("{:x}", Sha256::digest(format!("{pytest}\0{ruff}"))),
+        (None, None) => return Err(check_unavailable()),
+    };
     let invocation_digest = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&steps).map_err(|_| manifest_invalid())?)
@@ -230,6 +253,72 @@ pub fn resolve_project_validation_recipe(
         invocation_digest,
         test_filter,
     })
+}
+
+fn project_ruff_manifest_digest(
+    execution_root: &Path,
+    recipe_root: &Path,
+) -> Result<String, RecipeError> {
+    use std::io::Read;
+    let path = recipe_root
+        .join("pyproject.toml")
+        .canonicalize()
+        .map_err(|_| check_unavailable())?;
+    if !path.starts_with(execution_root) {
+        return Err(manifest_invalid());
+    }
+    if !fs::metadata(&path)
+        .map_err(|_| manifest_invalid())?
+        .is_file()
+    {
+        return Err(manifest_invalid());
+    }
+    // Bound both the parse and digest to the same bytes. Never hash a second
+    // read that could differ from the config whose authority was just checked.
+    let mut bytes = Vec::new();
+    const MAX_BYTES: u64 = 1024 * 1024;
+    let file = fs::File::open(&path).map_err(|_| manifest_invalid())?;
+    if !file.metadata().map_err(|_| manifest_invalid())?.is_file() {
+        return Err(manifest_invalid());
+    }
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| manifest_invalid())?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(manifest_invalid());
+    }
+    let value: toml::Value =
+        toml::from_str(std::str::from_utf8(&bytes).map_err(|_| manifest_invalid())?)
+            .map_err(|_| manifest_invalid())?;
+    let ruff = value
+        .get("tool")
+        .and_then(|tool| tool.get("ruff"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(check_unavailable)?;
+    if ruff.contains_key("extend") {
+        return Err(manifest_invalid());
+    }
+    let target = ruff
+        .get("target-version")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(manifest_invalid)?;
+    if !matches!(
+        target,
+        "py37" | "py38" | "py39" | "py310" | "py311" | "py312" | "py313" | "py314"
+    ) {
+        return Err(manifest_invalid());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"webcodex-project-ruff-manifest-v1\0");
+    digest.update(
+        path.strip_prefix(execution_root)
+            .map_err(|_| manifest_invalid())?
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn pytest_project_provenance_files(

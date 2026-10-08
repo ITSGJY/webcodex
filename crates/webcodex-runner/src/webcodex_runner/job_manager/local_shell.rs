@@ -119,6 +119,7 @@ impl JobManager {
         if validation
             && steps.iter().any(|step| {
                 !step.is_structured_pytest()
+                    && !step.is_structured_ruff()
                     && !validation_module_available(
                         &shell,
                         prepared_profile.as_deref(),
@@ -147,6 +148,14 @@ impl JobManager {
                     &shell,
                     prepared_profile.as_deref(),
                     &steps[index].args,
+                    &cwd_path,
+                    Some(self.shutting_down.as_ref()),
+                )
+            } else if validation && steps[index].is_structured_ruff() {
+                crate::webcodex_runner::shell::configured_ruff_job_command(
+                    &shell,
+                    prepared_profile.as_deref(),
+                    &steps[index],
                     &cwd_path,
                     Some(self.shutting_down.as_ref()),
                 )

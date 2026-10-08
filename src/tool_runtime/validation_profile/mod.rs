@@ -18,6 +18,11 @@ pub(crate) struct ValidationRuntimeProfile {
 
 pub(crate) fn runtime_profile(operation: &ReadOnlyValidationOperation) -> ValidationRuntimeProfile {
     match operation {
+        ReadOnlyValidationOperation::PythonRuffCheck | ReadOnlyValidationOperation::PythonRuffFormat => ValidationRuntimeProfile {
+            default_timeout_secs: DEFAULT_CARGO_CHECK_TIMEOUT_SECS,
+            force_agent_handoff: false,
+            invalid_argument_guidance: "use project-local pyproject.toml [tool.ruff] with target-version and no extend; no flags or install.",
+        },
         ReadOnlyValidationOperation::Python(_) => ValidationRuntimeProfile {
             default_timeout_secs: DEFAULT_CARGO_TEST_TIMEOUT_SECS,
             force_agent_handoff: true,

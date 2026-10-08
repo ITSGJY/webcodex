@@ -627,7 +627,7 @@ fn project_validation_python_pytest_detects_explicit_and_auto_and_fences_config(
         req.action = action;
         req.test = None;
         assert!(
-            matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable {code,..}) if code == "validation_action_unsupported")
+            matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable {code,..}) if code == "validation_check_unavailable")
         );
     }
     fs::remove_file(root.join("pyproject.toml")).unwrap();
@@ -860,5 +860,47 @@ fn project_validation_all_packages_rejects_excluded_recipe_cwd() {
         );
         req.cwd = Some("app".into());
         assert!(project::plan(&policy, &registry, &req).is_ok());
+    }
+}
+
+#[test]
+fn project_validation_ruff_auto_and_explicit_plans_share_target_and_fence_configuration() {
+    let (_temp, root, registry, policy) = fixture("pyproject.toml");
+    fs::write(
+        root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    for action in [
+        ProjectValidationAction::Check,
+        ProjectValidationAction::FormatCheck,
+    ] {
+        let auto = request(action);
+        let (baseline, _) = project::plan(&policy, &registry, &auto).unwrap();
+        let mut explicit = auto.clone();
+        explicit.adapter = ProjectValidationAdapter::Python;
+        let (explicit_plan, _) = project::plan(&policy, &registry, &explicit).unwrap();
+        assert_eq!(baseline.step, explicit_plan.step);
+        assert!(baseline.step.is_structured_ruff());
+        assert_eq!(
+            baseline.validation_target_id,
+            explicit_plan.validation_target_id
+        );
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.ruff]\ntarget-version='py311'\nline-length=99\n",
+        )
+        .unwrap();
+        let (changed, _) = project::plan(&policy, &registry, &auto).unwrap();
+        assert_ne!(
+            baseline.provenance.manifest_digest,
+            changed.provenance.manifest_digest
+        );
+        assert_eq!(baseline.validation_target_id, changed.validation_target_id);
+        fs::write(
+            root.join("pyproject.toml"),
+            "[tool.ruff]\ntarget-version='py311'\n",
+        )
+        .unwrap();
     }
 }

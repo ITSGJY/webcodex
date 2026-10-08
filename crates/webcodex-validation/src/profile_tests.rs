@@ -162,7 +162,7 @@ fn semantic_read_only_operations_preserve_legacy_leaf_plans_and_identity_profile
             .build_readonly_plan(legacy_options)
             .unwrap();
         assert_eq!(semantic_plan, legacy_plan, "{tool_name}");
-        assert_eq!(operation.adapter().tool_identity(), tool_name);
+        assert_eq!(operation.evidence_profile().tool_identity(), tool_name);
     }
 }
 
@@ -311,7 +311,7 @@ fn go_check_semantic_operation_uses_canonical_vet_adapter() {
             dependency_mode: None,
         }));
     assert_eq!(operation.compatibility_profile().tool_identity, "go_vet");
-    assert_eq!(operation.adapter().tool_identity(), "go_vet");
+    assert_eq!(operation.evidence_profile().tool_identity(), "go_vet");
     assert_eq!(
         operation
             .build_readonly_plan()
@@ -839,7 +839,7 @@ fn project_validation_python_pytest_owns_filter_plan_and_parser() {
         selected.validation_target_id(Some(".")),
         operation.validation_target_id(Some("."))
     );
-    let adapter = selected.adapter();
+    let adapter = selected.evidence_profile();
     assert_eq!(adapter.tool_identity(), "python:pytest:test");
     assert!(adapter.reports_test_run_metadata());
     assert_eq!(
@@ -856,8 +856,11 @@ fn project_validation_python_pytest_owns_filter_plan_and_parser() {
         .is_none());
     for action in [SemanticCheck::Format, SemanticCheck::Check] {
         assert_eq!(
-            project_validation_operation("python", action, None, false).unwrap_err(),
-            "validation_action_unsupported"
+            project_validation_operation("python", action, None, false)
+                .unwrap()
+                .build_readonly_plan()
+                .unwrap_err(),
+            "Ruff requires Runner-owned project manifest resolution"
         );
     }
     assert_eq!(
@@ -877,7 +880,8 @@ fn project_validation_python_pytest_owns_filter_plan_and_parser() {
             }
         ))
         .is_err());
-    assert!(adapter
+    assert!(validation_adapter_for_tool("python:pytest:test")
+        .unwrap()
         .build_readonly_plan(ValidationCommandOptions {
             all_packages: true,
             ..Default::default()
@@ -944,4 +948,80 @@ fn evidence_profiles_share_direct_adapter_registry_and_recipe_mapping() {
     }
     assert!(validation_evidence_profile_for_tool("unknown_test").is_none());
     assert!(validation_evidence_profile_for_recipe("go", SemanticCheck::Format).is_none());
+}
+
+#[test]
+fn ruff_evidence_profiles_have_no_static_command_authority_or_borrowed_counts() {
+    use crate::{validation_evidence_profile_for_recipe, validation_evidence_profile_for_tool};
+    let mut identities = std::collections::HashSet::new();
+    for (action, tool) in [
+        (SemanticCheck::Check, "python:ruff:check"),
+        (SemanticCheck::Format, "python:ruff:format"),
+    ] {
+        let op = project_validation_operation("python", action, None, false).unwrap();
+        assert!(op.build_readonly_plan().is_err());
+        assert!(validation_adapter_for_tool(tool).is_none());
+        assert!(identities.insert(op.validation_target_id(Some(".")).unwrap()));
+        let retained = webcodex_workflow_session::execution_output_summary_for_tool_result(
+            "project_validate",
+            &serde_json::json!({"adapter": tool, "stdout_tail": "", "stderr_tail": ""}),
+        )
+        .unwrap();
+        assert_eq!(
+            validation_evidence_profile_for_tool(retained["adapter"].as_str().unwrap())
+                .unwrap()
+                .tool_identity(),
+            tool,
+        );
+        let profile = validation_evidence_profile_for_tool(tool).unwrap();
+        assert_eq!(
+            profile.tool_identity(),
+            validation_evidence_profile_for_recipe("python", action)
+                .unwrap()
+                .tool_identity()
+        );
+        assert!(!profile.reports_test_run_metadata());
+        for output in [
+            "test result: ok. 100 passed; 0 failed; 0 ignored",
+            "2 passed in 0.01s",
+            "error[E0308]: secret",
+            "Would reformat: /private/token.py\n1 file would be reformatted\n",
+        ] {
+            let evidence = profile.parse(output, output, false);
+            assert!(evidence.test_summary.is_none());
+            assert!(evidence.diagnostic_count.is_none());
+            assert!(!serde_json::to_string(&evidence)
+                .unwrap()
+                .contains("/private"));
+        }
+    }
+    let profile = validation_evidence_profile_for_tool("python:ruff:check").unwrap();
+    let line = r#"{"code":"F401","location":{"row":1,"column":8},"filename":"/private/token.py","message":"secret_value","fix":{"content":"secret_value"}}"#;
+    let parsed = profile.parse(line, "", false);
+    assert_eq!(parsed.diagnostic_count, Some(1));
+    assert_eq!(parsed.diagnostics[0].code.as_deref(), Some("F401"));
+    let safe = serde_json::to_string(&parsed).unwrap();
+    assert!(!safe.contains("secret_value") && !safe.contains("/private"));
+    assert!(profile.parse(line, "", true).diagnostic_count.is_none());
+    assert!(profile
+        .parse(&format!("{line}\n{{partial"), "", false)
+        .diagnostic_count
+        .is_none());
+    assert!(profile.parse("", "", false).diagnostic_count.is_none());
+    assert_eq!(
+        profile
+            .parse(&format!("{line}\n{line}"), "", false)
+            .diagnostic_count,
+        Some(1)
+    );
+    let lines = (1..=21)
+        .map(|row| line.replace("\"row\":1", &format!("\"row\":{row}")))
+        .collect::<Vec<_>>();
+    let bounded = profile.parse(&lines.join("\n"), "", false);
+    assert_eq!(bounded.diagnostic_count, Some(21));
+    assert_eq!(bounded.returned_diagnostic_count, 20);
+    assert!(bounded.diagnostics_truncated);
+    let oversized = profile.parse(&"x".repeat(64 * 1024 + 1), "", false);
+    assert_eq!(oversized.truncated, Some(true));
+    assert!(oversized.diagnostic_count.is_none());
 }

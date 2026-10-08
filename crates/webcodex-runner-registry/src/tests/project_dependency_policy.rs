@@ -226,6 +226,24 @@ async fn project_validation_base_capability_error_identifies_runner_without_job_
 async fn project_validation_optional_capability_errors_identify_runner_without_dispatch() {
     let cases = [
         (
+            RunnerCapabilityId::ProjectValidationPythonRuff,
+            ProjectValidationRequest {
+                action: ProjectValidationAction::Check,
+                adapter: ProjectValidationAdapter::Python,
+                dependency_policy: None,
+                ..locked_validation_request()
+            },
+        ),
+        (
+            RunnerCapabilityId::ProjectValidationPythonRuff,
+            ProjectValidationRequest {
+                action: ProjectValidationAction::FormatCheck,
+                adapter: ProjectValidationAdapter::Python,
+                dependency_policy: None,
+                ..locked_validation_request()
+            },
+        ),
+        (
             RunnerCapabilityId::ProjectValidationPythonPytest,
             ProjectValidationRequest {
                 action: ProjectValidationAction::Test,
@@ -432,6 +450,59 @@ async fn dependency_policy_is_fenced_again_at_project_validation_job_admission()
             assert!(error.contains("Runner `policy-runner`"), "{error}");
             assert!(error.contains("project_dependency_policy_v1"), "{error}");
             assert!(error.contains("upgrade that Runner"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_validation_python_preplan_selects_capability_by_action() {
+    for action in [
+        ProjectValidationAction::Test,
+        ProjectValidationAction::Check,
+        ProjectValidationAction::FormatCheck,
+    ] {
+        for supported in [false, true] {
+            let registry = RunnerRegistry::default();
+            let mut runner = registration(true);
+            runner.capabilities.project_validation_python_pytest_v1 =
+                if action == ProjectValidationAction::Test {
+                    supported
+                } else {
+                    !supported
+                };
+            runner.capabilities.project_validation_python_ruff_v1 =
+                if action == ProjectValidationAction::Test {
+                    !supported
+                } else {
+                    supported
+                };
+            registry.register(runner).await.unwrap();
+            let result = registry
+                .enqueue_project_validation_plan(
+                    "policy-runner".into(),
+                    ProjectValidationRequest {
+                        action,
+                        adapter: ProjectValidationAdapter::Python,
+                        dependency_policy: None,
+                        ..locked_validation_request()
+                    },
+                    Some(&auth_context(None, true)),
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                supported,
+                "{action:?}, supported={supported}"
+            );
+            let queued = registry
+                .poll(RunnerPollRequest {
+                    client_id: "policy-runner".into(),
+                    runner_instance_id: "inst".into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(queued.is_some(), supported);
             assert!(registry.list_jobs(Some(10)).await.is_empty());
         }
     }

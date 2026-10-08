@@ -427,7 +427,8 @@ pub(crate) fn structured_validation_evidence(
     truncated: bool,
 ) -> StructuredValidationEvidence {
     let combined = format!("{stdout}\n{stderr}");
-    let profile = matches!(kind, "check" | "test")
+    let profile = (matches!(kind, "check" | "test")
+        || (kind == "format" && tool == "python:ruff:format"))
         .then(|| super::validation_profile::validation_evidence_profile_for_tool(tool))
         .flatten()
         .filter(|adapter| adapter.validation_kind() == kind);
@@ -651,7 +652,16 @@ pub(crate) fn validation_job_projection_with_policy(
         }
     }
     let profile_mismatch = profile.is_some_and(|profile| profile.validation_kind() != kind);
-    let mut passed = process_passed && !pytest_contradictory && !profile_mismatch;
+    // Canonical Ruff check disables fixes and exit-code overrides: a reported
+    // lint violation cannot agree with a successful native check.
+    let ruff_contradictory = tool == "python:ruff:check"
+        && process_passed
+        && evidence
+            .diagnostics
+            .as_ref()
+            .is_some_and(|diagnostics| !diagnostics.diagnostics.is_empty());
+    let mut passed =
+        process_passed && !pytest_contradictory && !ruff_contradictory && !profile_mismatch;
     let mut value = json!({
         "tool": tool,
         "kind": kind,

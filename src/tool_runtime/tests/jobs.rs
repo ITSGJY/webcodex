@@ -3248,3 +3248,67 @@ fn run_shell_recovered_terminal_snapshot_stays_rich_after_projection() {
     assert_eq!(result.output["recovered_after_server_restart"], true);
     assert_run_shell_result_matches_schema(&result);
 }
+
+#[test]
+fn validation_ruff_profiles_keep_native_outcomes_and_do_not_borrow_counts() {
+    use crate::tool_runtime::jobs::{structured_validation_evidence, validation_job_projection};
+    for (tool, kind) in [
+        ("python:ruff:check", "check"),
+        ("python:ruff:format", "format"),
+    ] {
+        let stdout = "test result: ok. 20 passed; 0 failed; 0 ignored\n2 passed in 0.01s\n";
+        let evidence =
+            structured_validation_evidence(tool, kind, stdout, "error[E0308]: private", false);
+        assert_eq!(
+            evidence.diagnostics.as_ref().unwrap().parser,
+            "ruff_validation_parser_v1"
+        );
+        assert!(evidence.tests_run_count.is_none());
+        assert!(evidence.errors_count.is_none());
+        assert!(evidence.warnings_count.is_none());
+        for (status, exit, passed) in [
+            ("completed", 0, true),
+            ("failed", 1, false),
+            ("failed", 2, false),
+        ] {
+            let value = validation_job_projection(
+                Some(tool),
+                Some(kind),
+                status,
+                Some(exit),
+                stdout,
+                "",
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(value["passed"], passed);
+        }
+        for status in ["timed_out", "cancelled", "lost"] {
+            let value = validation_job_projection(
+                Some(tool),
+                Some(kind),
+                status,
+                None,
+                stdout,
+                "",
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(value["passed"].is_null());
+        }
+    }
+    let contradiction = validation_job_projection(
+        Some("python:ruff:check"),
+        Some("check"),
+        "completed",
+        Some(0),
+        r#"{"code":"F401","location":{"row":1,"column":1},"filename":"private.py"}"#,
+        "",
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(contradiction["passed"], false);
+}

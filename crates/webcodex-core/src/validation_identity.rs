@@ -23,6 +23,8 @@ pub enum ToolValidationIdentityKind {
     GoTest,
     GoVet,
     PythonPytest,
+    PythonRuffCheck,
+    PythonRuffFormat,
     Project,
 }
 
@@ -36,6 +38,8 @@ impl ToolValidationIdentityKind {
             Self::GoTest => Some("go_test"),
             Self::GoVet => Some("go_vet"),
             Self::PythonPytest => Some("python:pytest:test"),
+            Self::PythonRuffCheck => Some("python:ruff:check"),
+            Self::PythonRuffFormat => Some("python:ruff:format"),
         }
     }
 }
@@ -205,6 +209,10 @@ pub fn structured_validation_target_identity(
                 semantic["filter"] = Value::String(filter);
             }
             semantic
+        }
+        ToolValidationIdentityKind::PythonRuffCheck
+        | ToolValidationIdentityKind::PythonRuffFormat => {
+            serde_json::json!({"tool":tool_name,"kind": if kind == ToolValidationIdentityKind::PythonRuffCheck { "check" } else { "format" },"cwd":cwd})
         }
         ToolValidationIdentityKind::PythonPytest => {
             let filter = match obj.get("filter") {

@@ -19,6 +19,7 @@ async fn setup(grace_ms: u64) -> ToolRuntime {
             project_all_packages_v1: true,
             project_validation_test_options_v1: true,
             project_validation_python_pytest_v1: true,
+            project_validation_python_ruff_v1: true,
             structured_go_test_json: true,
             structured_go_test_tool: true,
             structured_go_test_packages: true,
@@ -604,6 +605,8 @@ async fn project_validation_readonly_adapters_preserve_source_fence_through_hand
         ("go", ProjectValidationAction::Check, "go_vet", ""),
         ("go", ProjectValidationAction::Test, "go_test", "{\"Action\":\"run\",\"Package\":\"example/pkg\",\"Test\":\"TestOne\"}\n{\"Action\":\"pass\",\"Package\":\"example/pkg\",\"Test\":\"TestOne\"}\n{\"Action\":\"pass\",\"Package\":\"example/pkg\"}\n"),
         ("python", ProjectValidationAction::Test, "python:pytest:test", "1 passed in 0.01s\n"),
+        ("python", ProjectValidationAction::Check, "python:ruff:check", ""),
+        ("python", ProjectValidationAction::FormatCheck, "python:ruff:format", "1 file already formatted\n"),
     ] {
         for external_writer in [false, true] {
             let runtime = setup(1).await;

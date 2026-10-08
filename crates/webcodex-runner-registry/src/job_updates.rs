@@ -1396,6 +1396,24 @@ impl RunnerRegistry {
                 RunnerFeature::ProjectValidation,
             ));
         }
+        let python_ruff = validation.as_ref().is_some_and(|v| {
+            matches!(
+                v.adapter.as_str(),
+                "python:ruff:check" | "python:ruff:format"
+            )
+        }) || validation_steps
+            .iter()
+            .any(ShellJobValidationStep::is_structured_ruff);
+        if python_ruff
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectValidationPythonRuff)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectValidationPythonRuff,
+            ));
+        }
         let python_pytest = validation
             .as_ref()
             .is_some_and(|v| v.adapter == "python:pytest:test")
