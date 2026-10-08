@@ -797,9 +797,10 @@ impl ToolRuntime {
         let resolved_cwd = super::helpers::project_relative_runner_cwd(config, &effective_cwd)
             .unwrap_or_else(|_| ".".to_string());
         let actual_shell = "configured";
-        // The adapter owns the canonical read-only execution plan. The same
-        // structured step that produced the compatibility command text is
-        // carried into the Job, so sync and promoted paths cannot drift.
+        // The supplied structured step is the execution authority here. Direct
+        // specialist callers build it through their adapter; project_validate
+        // receives it from the Runner-resolved recipe. Carry that exact step into
+        // the Job so sync and promoted paths cannot drift.
         let dispatched_command = match serde_json::to_string(std::slice::from_ref(&step)) {
             Ok(command) => command,
             Err(_) => {
