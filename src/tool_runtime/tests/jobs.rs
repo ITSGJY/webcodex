@@ -376,6 +376,17 @@ fn passive_validation_projection_separates_execution_result_from_source_freshnes
     metadata.kind = "test".to_string();
     job.exit_code = Some(0);
     job.test_count_evidence = None;
+    let mismatched = runtime
+        .passive_job_validation_projection(&job, None)
+        .expect("mismatched validation profile");
+    assert_eq!(mismatched["passed"], false);
+
+    // A consistent Cargo test identity without count evidence remains
+    // inconclusive, independently of source freshness.
+    let metadata = job.validation.as_mut().unwrap();
+    metadata.adapter = "cargo_test".to_string();
+    metadata.steps[0].name = "test".to_string();
+    metadata.steps[0].args = vec!["test".to_string()];
     let inconclusive = runtime
         .passive_job_validation_projection(&job, None)
         .expect("test validation projection");
