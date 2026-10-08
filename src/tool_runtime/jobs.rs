@@ -1917,6 +1917,7 @@ impl ToolRuntime {
                 status.as_deref(),
                 project.as_deref(),
                 session_id.as_deref(),
+                None,
                 auth,
             )
             .await
@@ -2162,6 +2163,7 @@ impl ToolRuntime {
             .runner_registry
             .list_jobs_for_auth_filtered(
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                None,
                 project,
                 None,
             )
