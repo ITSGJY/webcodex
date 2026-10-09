@@ -576,17 +576,31 @@ fn project_validation_nearest_root_hint_and_ambiguity() {
     );
 }
 #[test]
-fn project_validation_deferred_backends_do_not_resolve_scripts() {
-    for (marker, backend) in [("package.json", "node")] {
-        let (_tmp, _root, registry, policy) = fixture(marker);
+fn project_validation_node_unsupported_actions_do_not_resolve_scripts() {
+    let (_tmp, root, registry, policy) = fixture("package.json");
+    fs::write(root.join("package.json"), "{}").unwrap();
+    // Node now has a bounded native check adapter, but never silently runs a
+    // project-authored test or formatting script as validation evidence.
+    for action in [
+        ProjectValidationAction::Test,
+        ProjectValidationAction::FormatCheck,
+    ] {
         assert_eq!(
-            project::plan(&policy, &registry, &request(ProjectValidationAction::Test)).unwrap_err(),
+            project::plan(&policy, &registry, &request(action)).unwrap_err(),
             ProjectValidationPlanningResult::Unavailable {
-                code: "validation_adapter_unavailable".into(),
-                detected_backend: Some(backend.into())
+                code: "validation_action_unsupported".into(),
+                detected_backend: Some("node".into())
             }
         );
     }
+    // No check/typecheck/lint script remains definitely unavailable.
+    assert_eq!(
+        project::plan(&policy, &registry, &request(ProjectValidationAction::Check)).unwrap_err(),
+        ProjectValidationPlanningResult::Unavailable {
+            code: "validation_check_unavailable".into(),
+            detected_backend: Some("node".into())
+        }
+    );
     let (_tmp, _root, registry, policy) = fixture("go.mod");
     assert!(
         matches!(project::plan(&policy, &registry, &request(ProjectValidationAction::FormatCheck)), Err(ProjectValidationPlanningResult::Unavailable { code, .. }) if code == "validation_action_unsupported")
