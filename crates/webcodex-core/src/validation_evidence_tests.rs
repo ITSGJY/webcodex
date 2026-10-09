@@ -853,10 +853,13 @@ fn node_native_tap_root_plan_and_footer_are_authoritative() {
     const ZERO: &str = "TAP version 13\n1..0\n# tests 0\n# suites 0\n# pass 0\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 0.0\n";
     // Node describe/it has one root suite plan and counts nested test leaves.
     const SUITE: &str = "TAP version 13\n# Subtest: group\n    # Subtest: first\n    ok 1 - first\n    # Subtest: second\n    ok 2 - second\n    1..2\nok 1 - group\n1..1\n# tests 2\n# suites 1\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 35.1\n";
+    // An empty Node suite has one root suite assertion but zero tests.
+    const EMPTY_SUITE: &str = "TAP version 13\n# Subtest: empty\nok 1 - empty\n1..1\n# tests 0\n# suites 1\n# pass 0\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 20.0\n";
     for (output, passed, failed, ignored) in [
         (SIMPLE, 1, 0, 0),
         (NESTED, 3, 0, 0),
         (SUITE, 2, 0, 0),
+        (EMPTY_SUITE, 0, 0, 0),
         (SKIP_TODO, 1, 0, 2),
         (FAILURE, 0, 1, 0),
         (ZERO, 0, 0, 0),
@@ -883,6 +886,15 @@ fn node_native_tap_root_plan_and_footer_are_authoritative() {
         "non-numeric Node diagnostics must not erase proven tests"
     );
     for (case, invalid) in [
+        (
+            "zero root plan but positive test count",
+            ZERO.replace("# tests 0", "# tests 1")
+                .replace("# pass 0", "# pass 1"),
+        ),
+        (
+            "zero root plan but nonzero suite count",
+            ZERO.replace("# suites 0", "# suites 1"),
+        ),
         (
             "nested-only plan",
             SIMPLE.replace("1..1\n# tests", "    1..1\n# tests"),

@@ -306,8 +306,11 @@ fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
     for (i, prefix) in fields.iter().enumerate() {
         values[i] = tail[i].strip_prefix(prefix)?.parse::<u64>().ok()?;
     }
-    let [total, _suites, passed, failed, cancelled, skipped, todo] = values;
-    if cancelled != 0
+    let [total, suites, passed, failed, cancelled, skipped, todo] = values;
+    // With no root assertions, neither nested tests nor suites can exist.
+    // An empty suite remains valid: Node emits one root suite assertion.
+    if (root_count == 0 && (total != 0 || suites != 0))
+        || cancelled != 0
         || passed
             .checked_add(failed)?
             .checked_add(skipped)?

@@ -3451,6 +3451,7 @@ fn node_native_test_evidence_requires_complete_tap_and_agrees_with_process_resul
     for forged in [
         output.replace("\n1..1\n# tests", "\n    1..1\n# tests"),
         output.replace("\n1..1\n# tests", "\n# pass 1\n1..1\n# tests"),
+        output.replace("# Subtest: works\nok 1 - works\n1..1", "1..0"),
     ] {
         for require_tests in [Some(true), Some(false)] {
             let unproven = validation_job_projection_with_policy(
