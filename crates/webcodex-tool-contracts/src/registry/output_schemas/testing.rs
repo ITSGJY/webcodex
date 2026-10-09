@@ -259,6 +259,60 @@ fn cargo_output_schema(tool_name: &str) -> Value {
         .into_iter()
         .map(Value::from)
         .collect::<Vec<_>>();
+    let terminal_not_started_failure_kinds = if tool_name == "project_validate" {
+        json!([
+            "permission_denied",
+            "project_not_found",
+            "cwd_invalid",
+            "sandbox_unavailable",
+            "executor_unavailable",
+            "validation_plan_stale",
+            "validation_unavailable"
+        ])
+    } else {
+        json!([
+            "permission_denied",
+            "project_not_found",
+            "cwd_invalid",
+            "sandbox_unavailable",
+            "executor_unavailable"
+        ])
+    };
+    let prestart_failure_kinds = if tool_name == "project_validate" {
+        json!([
+            "invalid_arguments",
+            "capability_unavailable",
+            "permission_denied",
+            "project_not_found",
+            "cwd_invalid",
+            "sandbox_unavailable",
+            "executor_unavailable",
+            "unknown_project",
+            "invalid_project_path",
+            "validation_recipe_not_found",
+            "validation_recipe_mismatch",
+            "validation_recipe_ambiguous",
+            "validation_manifest_invalid",
+            "validation_adapter_unavailable",
+            "validation_scope_invalid",
+            "validation_scope_unsupported",
+            "validation_scope_unavailable",
+            "validation_action_unsupported",
+            "dependency_policy_unsupported",
+            "test_filter_unsupported",
+            "validation_check_unavailable"
+        ])
+    } else {
+        json!([
+            "invalid_arguments",
+            "capability_unavailable",
+            "permission_denied",
+            "project_not_found",
+            "cwd_invalid",
+            "sandbox_unavailable",
+            "executor_unavailable"
+        ])
+    };
     let output = json!({
         "type": "object",
         "properties": properties,
@@ -431,7 +485,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "command_completed": {"const": false},
                             "execution_state": {"const": "not_started"},
                             "passed": {"const": false},
-                            "failure_kind": {"enum": ["permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
+                            "failure_kind": {"enum": terminal_not_started_failure_kinds},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
                             "continuation": {"enum": []},
@@ -471,7 +525,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                         "properties": {
                             "command_started": {"const": false},
                             "command_completed": {"const": false},
-                            "failure_kind": {"enum": ["invalid_arguments", "capability_unavailable", "permission_denied", "project_not_found", "cwd_invalid", "sandbox_unavailable", "executor_unavailable"]},
+                            "failure_kind": {"enum": prestart_failure_kinds},
                             "job_id": {"enum": []},
                             "job_status": {"enum": []},
                             "continuation": {"enum": []},

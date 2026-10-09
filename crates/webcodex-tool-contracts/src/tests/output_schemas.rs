@@ -3375,6 +3375,75 @@ fn run_skill_resource_success_requires_provenance_and_keeps_lifecycle_constraint
 }
 
 #[test]
+fn project_validate_schema_admits_canonical_planning_and_replan_failures() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "project_validate").output_schema;
+    for failure_kind in [
+        "unknown_project",
+        "invalid_project_path",
+        "validation_recipe_not_found",
+        "validation_recipe_mismatch",
+        "validation_recipe_ambiguous",
+        "validation_manifest_invalid",
+        "validation_adapter_unavailable",
+        "validation_scope_invalid",
+        "validation_scope_unsupported",
+        "validation_scope_unavailable",
+        "validation_action_unsupported",
+        "dependency_policy_unsupported",
+        "test_filter_unsupported",
+        "validation_check_unavailable",
+    ] {
+        let result = json!({
+            "success": false,
+            "output": {
+                "execution_state": "not_started",
+                "command_started": false,
+                "command_completed": false,
+                "failure_kind": failure_kind,
+                "detected_backend": "python"
+            },
+            "error": "project validation planning unavailable"
+        });
+        test_support::validate_schema_instance(&result, schema).unwrap_or_else(|error| {
+            panic!("project_validate schema must admit planning failure {failure_kind}: {error}")
+        });
+    }
+
+    for failure_kind in ["validation_plan_stale", "validation_unavailable"] {
+        let result = json!({
+            "success": false,
+            "output": {
+                "project": "agent:special:demo",
+                "command_summary": "python -I -B -m ruff check",
+                "cwd": ".",
+                "execution_state": "not_started",
+                "exit_code": null,
+                "duration_ms": null,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_lines": 0,
+                "stderr_lines": 0,
+                "stdout_truncated": false,
+                "stderr_truncated": false,
+                "promoted_to_job": false,
+                "terminal": true,
+                "command_started": false,
+                "command_completed": false,
+                "passed": false,
+                "effective_timeout_secs": 60,
+                "sync_wait_secs": 5,
+                "failure_kind": failure_kind
+            },
+            "error": "project validation did not start"
+        });
+        test_support::validate_schema_instance(&result, schema).unwrap_or_else(|error| {
+            panic!("project_validate schema must admit fenced failure {failure_kind}: {error}")
+        });
+    }
+}
+
+#[test]
 fn browser_observation_schema_accepts_canonical_runner_output_and_rejects_private_ids() {
     let observe = crate::output_schema_for_tool("observe_browser");
     let act = crate::output_schema_for_tool("control_browser");
