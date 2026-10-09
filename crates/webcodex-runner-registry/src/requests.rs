@@ -2691,6 +2691,9 @@ impl RunnerRegistry {
                     RunnerFeature::ProjectValidationPythonRuff
                 },
             );
+        let node_capability = (payload.adapter
+            == webcodex_core::project_validation::ProjectValidationAdapter::Node)
+            .then_some(RunnerFeature::ProjectValidationNodeScriptCheck);
         let requires_package_scope = payload
             .scope
             .as_ref()
@@ -2723,6 +2726,11 @@ impl RunnerRegistry {
             ));
         }
         if let Some(capability) = python_capability {
+            if !runner.runner_features.supports(capability) {
+                return Err(capability_upgrade_error(&client_id, capability));
+            }
+        }
+        if let Some(capability) = node_capability {
             if !runner.runner_features.supports(capability) {
                 return Err(capability_upgrade_error(&client_id, capability));
             }

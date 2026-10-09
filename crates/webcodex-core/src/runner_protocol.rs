@@ -616,6 +616,13 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_validation_python_ruff_v1: bool = false;
     }
+    /// Bounded Node native project-script check, with Runner-owned manifest,
+    /// exact Node probe, selected-script identity and durable Job admission.
+    ProjectValidationNodeScriptCheck => RUNNER_CAPABILITY_PROJECT_VALIDATION_NODE_SCRIPT_CHECK("project_validation_node_script_check_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_validation_node_script_check_v1: bool = false;
+    }
     /// The Runner understands the first-class model-facing `go_test` tool identity
     /// and its durable `ShellJobValidationMetadata` contract. This is deliberately
     /// separate from Go JSON parsing support: older Runners may advertise
@@ -2840,6 +2847,7 @@ mod envelope_tests {
                 project_validation_test_options_v1: false,
                 project_validation_python_pytest_v1: false,
                 project_validation_python_ruff_v1: false,
+                project_validation_node_script_check_v1: false,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,
                 structured_process_argv: true,

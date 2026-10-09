@@ -12,6 +12,28 @@ use crate::runner_protocol::{
 use serde_json::json;
 
 #[test]
+fn node_script_check_does_not_infer_lint_or_test_counts_from_arbitrary_output() {
+    use crate::tool_runtime::jobs::structured_validation_evidence;
+    let fake = "test result: ok. 500 passed; 0 failed;\n\
+                warning: suspicious\nerror[E0308]: fake rustc\n\
+                {\"code\":\"E001\",\"message\":\"fake lint\"}";
+    for truncated in [false, true] {
+        let evidence =
+            structured_validation_evidence("node:script:check", "check", fake, fake, truncated);
+        let diagnostics = evidence.diagnostics.unwrap();
+        assert!(!diagnostics.available);
+        assert!(diagnostics.diagnostic_count.is_none());
+        assert!(diagnostics.diagnostics.is_empty());
+        assert_eq!(diagnostics.truncated, Some(truncated));
+        assert_eq!(evidence.tests_run_count, None);
+        assert_eq!(evidence.tests_detected, None);
+        assert_eq!(evidence.tests_failed, None);
+        assert_eq!(evidence.warnings_count, None);
+        assert_eq!(evidence.errors_count, None);
+    }
+}
+
+#[test]
 fn validation_evidence_unknown_profiles_preserve_only_process_success() {
     assert_unproven_validation_profiles(
         &[("unknown_test", "test"), ("unknown_check", "check")],

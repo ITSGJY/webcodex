@@ -3375,6 +3375,97 @@ fn run_skill_resource_success_requires_provenance_and_keeps_lifecycle_constraint
 }
 
 #[test]
+fn node_project_check_success_schema_preserves_unproven_counts_and_native_identity() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "project_validate").output_schema;
+    let rich = json!({
+        "success": true, "error": null,
+        "output": {
+            "source_state":{"freshness":"unproven","observed_mutation_fence":"unknown"},
+            "backend":"node", "action":"check", "adapter":"node:script:check",
+            "validation_target_id":"target:0123456789abcdef01234567",
+            "warnings_count":null, "errors_count":null,
+            "diagnostics":{
+                "available":false,
+                "parser":"structured_validation_parser",
+                "reason":"project script has no trusted structured diagnostics",
+                "diagnostic_count":null,
+                "diagnostics":[],
+                "returned_diagnostic_count":0,
+                "diagnostics_truncated":false,
+                "invalid_diagnostics_omitted":0,
+                "failed_test_details":[],
+                "failed_test_details_truncated":false,
+                "truncated":false
+            }
+        }
+    });
+    test_support::validate_schema_instance(&rich, schema).unwrap();
+    let mut fake_count = rich.clone();
+    fake_count["output"]["warnings_count"] = json!(0);
+    assert!(test_support::validate_schema_instance(&fake_count, schema).is_err());
+    let mut fake_tests = rich.clone();
+    fake_tests["output"]["tests_run_count"] = json!(12);
+    assert!(test_support::validate_schema_instance(&fake_tests, schema).is_err());
+    let mut forged_parser = rich.clone();
+    forged_parser["output"]["diagnostics"]["parser"] = json!("node_script_exit_status_v1");
+    assert!(test_support::validate_schema_instance(&forged_parser, schema).is_err());
+
+    let compact = json!({
+        "success":true, "error":null,
+        "output":{
+            "source_state":{"freshness":"unproven","observed_mutation_fence":"uncrossed"},
+            "adapter":"node:script:check",
+            "validation_target_id":"target:0123456789abcdef01234567"
+        }
+    });
+    test_support::validate_schema_instance(&compact, schema).unwrap();
+    let mut invalid = compact;
+    invalid["output"]["tests_run_count"] = json!(3);
+    assert!(test_support::validate_schema_instance(&invalid, schema).is_err());
+}
+
+#[test]
+fn node_project_check_unavailable_responses_keep_project_validate_schema_closed() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "project_validate").output_schema;
+    for failure_kind in [
+        "validation_manifest_invalid",
+        "validation_check_unavailable",
+        "validation_scope_unsupported",
+        "validation_action_unsupported",
+        "dependency_policy_unsupported",
+    ] {
+        let output = json!({
+            "success": false,
+            "output": {
+                "execution_source": "project_validate",
+                "execution_state": "not_started",
+                "command_started": false,
+                "command_completed": false,
+                "failure_kind": failure_kind,
+                "detected_backend": "node"
+            },
+            "error": "Project validation unavailable"
+        });
+        test_support::validate_schema_instance(&output, schema)
+            .unwrap_or_else(|e| panic!("{failure_kind}: {e}"));
+    }
+    let invalid = json!({
+        "success": false,
+        "output": {
+            "execution_state": "not_started",
+            "command_started": true,
+            "command_completed": false,
+            "failure_kind": "validation_manifest_invalid",
+            "detected_backend": "node"
+        },
+        "error": "invalid lifecycle"
+    });
+    assert!(test_support::validate_schema_instance(&invalid, schema).is_err());
+}
+
+#[test]
 fn project_validate_schema_admits_canonical_planning_and_replan_failures() {
     let specs = registered_tool_specs();
     let schema = &spec_named(&specs, "project_validate").output_schema;

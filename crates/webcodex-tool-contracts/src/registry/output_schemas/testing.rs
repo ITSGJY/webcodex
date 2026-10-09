@@ -189,9 +189,10 @@ fn cargo_output_schema(tool_name: &str) -> Value {
     }
     if tool_name == "project_validate" {
         fields.extend([
-            ("backend", json!({"type":"string", "enum":["rust","go","python"]})),
+            ("execution_source", json!({"const":"project_validate"})),
+            ("backend", json!({"type":"string", "enum":["rust","go","python","node"]})),
             ("action", json!({"type":"string", "enum":["format_check","check","test"]})),
-            ("adapter", json!({"type":"string", "enum":["cargo_fmt","cargo_check","cargo_test","go_vet","go_test","python:pytest:test","python:ruff:check","python:ruff:format"]})),
+            ("adapter", json!({"type":"string", "enum":["cargo_fmt","cargo_check","cargo_test","go_vet","go_test","python:pytest:test","python:ruff:check","python:ruff:format","node:script:check"]})),
             ("validation_target_id", schema_type("string", "Canonical resolved validation target, independent of source freshness.")),
             ("detected_backend", json!({"type":["string","null"], "enum":["rust","go","node","python",null]})),
         ]);
@@ -687,7 +688,13 @@ fn validation_success_evidence_schema(tool: &str, rich_required: &[Value]) -> Va
     if tool == "project_validate" {
         rich["allOf"] = json!([rich_assertion_schema(), {"oneOf":[
             {"properties":{"action":{"const":"format_check"}}},
-            {"properties":{"action":{"const":"check"}},"required":["warnings_count","errors_count","diagnostics"]},
+            {"properties":{"action":{"const":"check"},"adapter":{"not":{"const":"node:script:check"}}},"required":["warnings_count","errors_count","diagnostics"]},
+            {"properties":{"action":{"const":"check"},"adapter":{"const":"node:script:check"},
+                "warnings_count":{"type":"null"},"errors_count":{"type":"null"},
+                "tests_detected":{"enum":[]},"tests_run_count":{"enum":[]},
+                "tests_passed":{"enum":[]},"tests_failed":{"enum":[]},
+                "zero_tests_run":{"enum":[]},"test_count_assertion":{"enum":[]},
+                "require_tests":{"enum":[]},"no_run":{"enum":[]}},"required":["adapter"]},
             {"properties":{"action":{"const":"test"}},"required":["tests_detected","tests_run_count","tests_passed","tests_failed","zero_tests_run","diagnostics"]}
         ]}]);
     }
@@ -727,7 +734,14 @@ fn validation_success_evidence_schema(tool: &str, rich_required: &[Value]) -> Va
                 {"properties":{"adapter":{"const":"cargo_check"},"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
                 {"properties":{"adapter":{"const":"go_vet"},"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
                 {"allOf":[test["oneOf"][0].clone()],"properties":{"adapter":{"const":"cargo_test"},"test_count_assertion":{"enum":[]}}},
-                {"allOf":[test["oneOf"][0].clone()],"properties":{"adapter":{"const":"go_test"},"test_count_assertion":{"enum":[]}}}
+                {"allOf":[test["oneOf"][0].clone()],"properties":{"adapter":{"const":"go_test"},"test_count_assertion":{"enum":[]}}},
+                {"properties":{"adapter":{"const":"node:script:check"},
+                    "tests_run_count":{"enum":[]},"tests_detected":{"enum":[]},
+                    "tests_passed":{"enum":[]},"tests_failed":{"enum":[]},
+                    "zero_tests_run":{"enum":[]},"test_count_assertion":{"enum":[]},
+                    "no_run":{"enum":[]},"require_tests":{"enum":[]},
+                    "warnings_count":{"enum":[]},"errors_count":{"enum":[]},
+                    "diagnostics":{"enum":[]}}}
             ]);
         }
         _ => {

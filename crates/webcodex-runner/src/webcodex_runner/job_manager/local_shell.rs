@@ -120,6 +120,7 @@ impl JobManager {
             && steps.iter().any(|step| {
                 !step.is_structured_pytest()
                     && !step.is_structured_ruff()
+                    && !step.is_structured_node_check()
                     && !validation_module_available(
                         &shell,
                         prepared_profile.as_deref(),
@@ -148,6 +149,14 @@ impl JobManager {
                     &shell,
                     prepared_profile.as_deref(),
                     &steps[index].args,
+                    &cwd_path,
+                    Some(self.shutting_down.as_ref()),
+                )
+            } else if validation && steps[index].is_structured_node_check() {
+                crate::webcodex_runner::shell::configured_node_project_check_job_command(
+                    &shell,
+                    prepared_profile.as_deref(),
+                    &steps[index],
                     &cwd_path,
                     Some(self.shutting_down.as_ref()),
                 )
@@ -215,6 +224,25 @@ impl JobManager {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             commands.push_back(command);
+        }
+        // Profile initialization and interpreter probes may themselves change
+        // project files. For native Node scripts repeat the authoritative
+        // manifest/argv/cwd fence after ALL preparation, immediately before
+        // handing the prepared command to the managed process worker.
+        // Node's later manifest read is not an atomic source snapshot.
+        if validation
+            && steps
+                .iter()
+                .any(ShellJobValidationStep::is_structured_node_check)
+        {
+            if let Err(error) = crate::webcodex_runner::validation::project::fence(
+                &policy,
+                &project_registry_dir,
+                &operation,
+            ) {
+                self.fail_job(&operation, error, None);
+                return;
+            }
         }
         self.start_prepared_shell_job(PreparedShellJob {
             job_id,

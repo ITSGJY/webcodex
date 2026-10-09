@@ -18,6 +18,11 @@ pub(crate) struct ValidationRuntimeProfile {
 
 pub(crate) fn runtime_profile(operation: &ReadOnlyValidationOperation) -> ValidationRuntimeProfile {
     match operation {
+        ReadOnlyValidationOperation::NodeScriptCheck => ValidationRuntimeProfile {
+            default_timeout_secs: DEFAULT_CARGO_CHECK_TIMEOUT_SECS,
+            force_agent_handoff: false,
+            invalid_argument_guidance: "Node >=22.3 must be installed; require one project-local check/typecheck/lint script. Script effects are project-controlled.",
+        },
         ReadOnlyValidationOperation::PythonRuffCheck | ReadOnlyValidationOperation::PythonRuffFormat => ValidationRuntimeProfile {
             default_timeout_secs: DEFAULT_CARGO_CHECK_TIMEOUT_SECS,
             force_agent_handoff: false,

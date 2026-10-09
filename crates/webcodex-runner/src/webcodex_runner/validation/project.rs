@@ -3,11 +3,12 @@ use super::*;
 use sha2::{Digest, Sha256};
 use webcodex_core::project_validation::*;
 use webcodex_core::validation_identity::{
-    contextualize_structured_validation_target_identity, StructuredValidationExecutionContext,
+    contextualize_structured_validation_target_identity, structured_validation_target_identity,
+    StructuredValidationExecutionContext, ToolValidationIdentityKind,
 };
 use webcodex_validation::{
-    detect_validation_recipe, project_validation_operation, resolve_project_validation_recipe,
-    RecipeId, SemanticCheck,
+    detect_validation_recipe, project_validation_operation, resolve_node_native_project_check,
+    resolve_project_validation_recipe, validate_node_project_markers, RecipeId, SemanticCheck,
 };
 
 pub(crate) fn plan(
@@ -32,15 +33,17 @@ pub(crate) fn plan(
         ProjectValidationAdapter::Rust => Some(RecipeId::Rust),
         ProjectValidationAdapter::Go => Some(RecipeId::Go),
         ProjectValidationAdapter::Python => Some(RecipeId::Python),
+        ProjectValidationAdapter::Node => Some(RecipeId::Node),
     };
+    if matches!(
+        request.adapter,
+        ProjectValidationAdapter::Auto | ProjectValidationAdapter::Node
+    ) {
+        validate_node_project_markers(&root, request.cwd.as_deref())
+            .map_err(|e| unavailable(e.code, Some("node")))?;
+    }
     let backend = detect_validation_recipe(&root, request.cwd.as_deref(), hint)
         .map_err(|e| unavailable(e.code, None))?;
-    if matches!(backend, RecipeId::Node) {
-        return Err(unavailable(
-            "validation_adapter_unavailable",
-            Some(backend.as_str()),
-        ));
-    }
     let action = match request.action {
         ProjectValidationAction::FormatCheck => SemanticCheck::Format,
         ProjectValidationAction::Check => SemanticCheck::Check,
@@ -66,23 +69,39 @@ pub(crate) fn plan(
         .and_then(|operation| operation.with_test_filter(filter))
         .map_err(|code| unavailable(code, Some(backend.as_str())))?;
     let profile = operation.compatibility_profile();
-    let resolved = resolve_project_validation_recipe(
-        &root,
-        request.cwd.as_deref(),
-        hint,
-        &[action],
-        filter,
-        request
-            .scope
-            .as_ref()
-            .and_then(ProjectValidationScope::explicit_packages),
-        all_packages,
-        request.dependency_policy,
-    )
+    let resolved = if backend == RecipeId::Node {
+        resolve_node_native_project_check(&root, request.cwd.as_deref())
+    } else {
+        resolve_project_validation_recipe(
+            &root,
+            request.cwd.as_deref(),
+            hint,
+            &[action],
+            filter,
+            request
+                .scope
+                .as_ref()
+                .and_then(ProjectValidationScope::explicit_packages),
+            all_packages,
+            request.dependency_policy,
+        )
+    }
     .map_err(|e| unavailable(e.code, Some(backend.as_str())))?;
-    let identity = operation
-        .validation_target_id(Some(&resolved.recipe_root_relative))
-        .ok_or_else(|| unavailable("validation_scope_invalid", Some(backend.as_str())))?;
+    let identity = if backend == RecipeId::Node {
+        let script = resolved
+            .steps
+            .first()
+            .filter(|step| step.is_structured_node_check())
+            .and_then(|step| step.args.get(1))
+            .ok_or_else(|| unavailable("validation_manifest_invalid", Some(backend.as_str())))?;
+        structured_validation_target_identity(
+            ToolValidationIdentityKind::NodeScriptCheck,
+            &serde_json::json!({"cwd": resolved.recipe_root_relative, "script": script}),
+        )
+    } else {
+        operation.validation_target_id(Some(&resolved.recipe_root_relative))
+    }
+    .ok_or_else(|| unavailable("validation_scope_invalid", Some(backend.as_str())))?;
     let identity = if backend == RecipeId::Go {
         contextualize_structured_validation_target_identity(
             &identity,

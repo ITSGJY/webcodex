@@ -1,6 +1,99 @@
 use crate::project_validation::*;
 use crate::runner_operation::{RunnerInvocationMetadata, RunnerOperation};
 use crate::runner_protocol::RunnerRequest;
+
+#[test]
+fn project_node_check_step_identity_capability_and_metadata_are_closed() {
+    use crate::runner_protocol::{
+        RunnerCapabilities, ShellJobValidationMetadata, ShellJobValidationStep,
+    };
+    use crate::validation_identity::{
+        structured_validation_target_identity, ToolValidationIdentityKind,
+    };
+    let old: RunnerCapabilities =
+        serde_json::from_value(serde_json::json!({"project_validation_v1":true})).unwrap();
+    assert!(!old.project_validation_node_script_check_v1);
+    let mut ids = std::collections::HashSet::new();
+    for script in ["check", "typecheck", "lint"] {
+        let step = ShellJobValidationStep {
+            name: "check".into(),
+            program: "node".into(),
+            args: vec!["--run".into(), script.into()],
+            env: vec![],
+        };
+        assert!(step.is_canonical() && step.is_structured_node_check());
+        let id = structured_validation_target_identity(
+            ToolValidationIdentityKind::NodeScriptCheck,
+            &serde_json::json!({"cwd":".","script":script}),
+        )
+        .unwrap();
+        assert!(ids.insert(id.clone()));
+        let mut metadata = ShellJobValidationMetadata {
+            tool: "project_validate".into(),
+            kind: "check".into(),
+            steps: vec![step],
+            effective_timeout_secs: 60,
+            sync_wait_secs: 1,
+            adapter: "node:script:check".into(),
+            validation_target_id: Some(id),
+            source_fence: None,
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
+            project_validation: Some(ProjectValidationProvenance {
+                request: ProjectValidationRequest {
+                    project_id: "demo".into(),
+                    cwd: None,
+                    action: ProjectValidationAction::Check,
+                    adapter: ProjectValidationAdapter::Node,
+                    scope: None,
+                    dependency_policy: None,
+                    test: None,
+                },
+                backend: "node".into(),
+                recipe_root: ".".into(),
+                root_digest: "a".repeat(64),
+                manifest_digest: "b".repeat(64),
+                invocation_digest: "c".repeat(64),
+            }),
+        };
+        assert!(metadata.is_valid());
+        let wire = serde_json::to_string(&metadata).unwrap();
+        assert!(serde_json::from_str::<ShellJobValidationMetadata>(&wire)
+            .unwrap()
+            .is_valid());
+        metadata.steps[0].args.push("arbitrary".into());
+        assert!(!metadata.is_valid());
+        metadata.steps[0].args.pop();
+        metadata.steps[0]
+            .env
+            .push(("CARGO_TARGET_DIR".into(), "/tmp".into()));
+        assert!(!metadata.is_valid());
+        metadata.steps[0].env.clear();
+        metadata.require_tests = Some(true);
+        assert!(!metadata.is_valid());
+        metadata.require_tests = None;
+        metadata.project_validation.as_mut().unwrap().request.action =
+            ProjectValidationAction::Test;
+        assert!(!metadata.is_valid());
+    }
+    assert!(structured_validation_target_identity(
+        ToolValidationIdentityKind::NodeScriptCheck,
+        &serde_json::json!({"cwd":".","script":"--eval"}),
+    )
+    .is_none());
+    let node = structured_validation_target_identity(
+        ToolValidationIdentityKind::NodeScriptCheck,
+        &serde_json::json!({"cwd":".","script":"check"}),
+    )
+    .unwrap();
+    let ruff = structured_validation_target_identity(
+        ToolValidationIdentityKind::PythonRuffCheck,
+        &serde_json::json!({"cwd":"."}),
+    )
+    .unwrap();
+    assert_ne!(node, ruff);
+}
 #[test]
 fn project_validation_protocol_is_closed_declarative_and_roundtrips() {
     let input = ProjectValidationRequest {

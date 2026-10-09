@@ -1396,6 +1396,24 @@ impl RunnerRegistry {
                 RunnerFeature::ProjectValidation,
             ));
         }
+        // Auto-detected Node scripts need admission recheck against the actual
+        // retained Job adapter and step, including on Runner replacement.
+        let node_script_check = validation
+            .as_ref()
+            .is_some_and(|v| v.adapter == "node:script:check")
+            || validation_steps
+                .iter()
+                .any(ShellJobValidationStep::is_structured_node_check);
+        if node_script_check
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectValidationNodeScriptCheck)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectValidationNodeScriptCheck,
+            ));
+        }
         let python_ruff = validation.as_ref().is_some_and(|v| {
             matches!(
                 v.adapter.as_str(),

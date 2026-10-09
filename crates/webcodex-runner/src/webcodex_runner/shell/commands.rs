@@ -190,6 +190,47 @@ pub(crate) fn configured_prepared_shell_job_command(
 /// Resolve one existing Python runtime and use that exact executable and profile
 /// environment for both the bounded availability probe and actual pytest spawn.
 /// No shell fallback, environment creation or package installation is permitted.
+/// Native Node project-check command. Interpreter resolution is Runner-owned
+/// and the same exact executable is probed and used for the script. An existing
+/// project script may have effects; this does not create a filesystem sandbox.
+pub(crate) fn configured_node_project_check_job_command(
+    shell: &ShellConfig,
+    profile: Option<&PreparedShellProfile>,
+    step: &ShellJobValidationStep,
+    cwd: &Path,
+    stop_requested: Option<&AtomicBool>,
+) -> Result<Command, String> {
+    if !step.is_structured_node_check() {
+        return Err("invalid Node project validation step".into());
+    }
+    let unavailable =
+        || webcodex_core::runner_protocol::VALIDATION_TOOL_UNAVAILABLE_CODE.to_string();
+    let program = super::scripts::configured_validation_node_interpreter(shell, profile)
+        .map_err(|_| unavailable())?;
+    let mut probe = Command::new(&program);
+    probe.arg("--version").current_dir(cwd).stdin(Stdio::null());
+    super::scripts::apply_script_environment(&mut probe, shell, profile)
+        .map_err(|_| unavailable())?;
+    probe.env_remove("NODE_OPTIONS");
+    // Bounded managed process-tree probe: no fallbacks, installs, or package
+    // manager invocations. Version 22.3 added the native root/PATH behavior.
+    let (status, stdout, _) = run_prepare_command(probe, Duration::from_secs(5), stop_requested)
+        .map_err(|_| unavailable())?;
+    let version = super::scripts::parse_node_version(&stdout).ok_or_else(unavailable)?;
+    if !status.success() || version.major < 22 || (version.major == 22 && version.minor < 3) {
+        return Err(unavailable());
+    }
+    let mut command = Command::new(&program);
+    command
+        .args(&step.args)
+        .current_dir(cwd)
+        .stdin(Stdio::null());
+    super::scripts::apply_script_environment(&mut command, shell, profile)
+        .map_err(|_| unavailable())?;
+    command.env_remove("NODE_OPTIONS");
+    Ok(command)
+}
+
 pub(crate) fn configured_pytest_job_command(
     shell: &ShellConfig,
     profile: Option<&PreparedShellProfile>,

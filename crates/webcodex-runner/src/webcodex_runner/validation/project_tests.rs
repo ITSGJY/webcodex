@@ -36,6 +36,157 @@ fn request(action: ProjectValidationAction) -> ProjectValidationRequest {
 }
 
 #[test]
+fn project_node_auto_and_explicit_reject_nonregular_nested_marker() {
+    let (_tmp, root, registry, policy) = fixture("package.json");
+    fs::write(
+        root.join("package.json"),
+        r#"{"scripts":{"check":"echo ancestor"}}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("frontend/src")).unwrap();
+    fs::create_dir(root.join("frontend/package.json")).unwrap();
+    for adapter in [
+        ProjectValidationAdapter::Auto,
+        ProjectValidationAdapter::Node,
+    ] {
+        let mut req = request(ProjectValidationAction::Check);
+        req.adapter = adapter;
+        req.cwd = Some("frontend/src".into());
+        assert!(matches!(
+            project::plan(&policy, &registry, &req),
+            Err(ProjectValidationPlanningResult::Unavailable { code, .. })
+                if code == "validation_manifest_invalid"
+        ));
+    }
+}
+
+#[test]
+fn project_node_script_check_plan_identity_and_queue_fence() {
+    use webcodex_core::runner_operation::{RunnerJobOperation, RunnerJobValidationOperation};
+    use webcodex_core::runner_protocol::{ShellJobContext, ShellJobValidationMetadata};
+
+    let (_tmp, root, registry, policy) = fixture("package.json");
+    fs::write(
+        root.join("package.json"),
+        r#"{"packageManager":"yarn@4","scripts":{"check":"node one.js","lint":"node lint.js"}}"#,
+    )
+    .unwrap();
+    // No lockfile or installed package manager needed for Node's built-in
+    // runner; the native script selection is Runner-owned.
+    let auto = request(ProjectValidationAction::Check);
+    let (baseline, cwd) = project::plan(&policy, &registry, &auto).unwrap();
+    assert_eq!(baseline.adapter, "node:script:check");
+    assert_eq!(baseline.step.args, ["--run", "check"]);
+    assert!(baseline.step.is_structured_node_check());
+    let mut explicit = auto.clone();
+    explicit.adapter = ProjectValidationAdapter::Node;
+    let (selected, _) = project::plan(&policy, &registry, &explicit).unwrap();
+    assert_eq!(baseline.step, selected.step);
+    assert_eq!(baseline.validation_target_id, selected.validation_target_id);
+    let metadata = ShellJobValidationMetadata {
+        project_validation: Some(baseline.provenance.clone()),
+        tool: "project_validate".into(),
+        kind: "check".into(),
+        adapter: baseline.adapter.clone(),
+        steps: vec![baseline.step.clone()],
+        effective_timeout_secs: 60,
+        sync_wait_secs: 1,
+        validation_target_id: Some(baseline.validation_target_id.clone()),
+        source_fence: None,
+        minimum_tests: None,
+        require_tests: None,
+        no_run: None,
+    };
+    assert!(metadata.is_valid());
+    let operation = RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+        job_id: "node-job".into(),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        steps: metadata.steps.clone(),
+        timeout_secs: 60,
+        context: ShellJobContext {
+            runtime_project_id: Some("agent:runner:demo".into()),
+            validation: Some(metadata),
+            workflow_session_id: None,
+            ssh_resource: None,
+            project_cwd: Some(".".into()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            purpose: Some("validation".into()),
+            shell: None,
+            command_preview: "node --run check".into(),
+            validation_steps: vec!["check".into()],
+            structured_execution: None,
+        },
+    });
+    project::fence(&policy, &registry, &operation).unwrap();
+
+    // Changed body: same target, different source digest and failed old fence.
+    fs::write(
+        root.join("package.json"),
+        r#"{"packageManager":"yarn@4","scripts":{"check":"node two.js","lint":"node lint.js"}}"#,
+    )
+    .unwrap();
+    let (changed, _) = project::plan(&policy, &registry, &auto).unwrap();
+    assert_eq!(changed.validation_target_id, baseline.validation_target_id);
+    assert_ne!(
+        changed.provenance.manifest_digest,
+        baseline.provenance.manifest_digest
+    );
+    assert!(project::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("validation_plan_stale"));
+
+    fs::write(
+        root.join("package.json"),
+        r#"{"scripts":{"lint":"node lint.js"}}"#,
+    )
+    .unwrap();
+    let (lint, _) = project::plan(&policy, &registry, &auto).unwrap();
+    assert_eq!(lint.step.args, ["--run", "lint"]);
+    assert_ne!(lint.validation_target_id, baseline.validation_target_id);
+    fs::remove_file(root.join("package.json")).unwrap();
+    assert!(project::fence(&policy, &registry, &operation).is_err());
+}
+
+#[test]
+fn project_node_validation_rejects_other_actions_and_options() {
+    let (_tmp, root, registry, policy) = fixture("package.json");
+    fs::write(
+        root.join("package.json"),
+        r#"{"scripts":{"check":"node check.js"}}"#,
+    )
+    .unwrap();
+    for action in [
+        ProjectValidationAction::Test,
+        ProjectValidationAction::FormatCheck,
+    ] {
+        let request = request(action);
+        assert!(matches!(
+            project::plan(&policy, &registry, &request),
+            Err(ProjectValidationPlanningResult::Unavailable { code, .. })
+                if code == "validation_action_unsupported"
+        ));
+    }
+    let mut request = request(ProjectValidationAction::Check);
+    request.scope = Some(ProjectValidationScope {
+        packages: vec!["app".into()],
+        all_packages: false,
+    });
+    assert!(matches!(
+        project::plan(&policy, &registry, &request),
+        Err(ProjectValidationPlanningResult::Unavailable { code, .. })
+            if code == "validation_scope_unsupported"
+    ));
+    request.scope = None;
+    request.dependency_policy = Some(ProjectDependencyPolicy {
+        mode: ProjectDependencyMode::Locked,
+    });
+    assert!(matches!(
+        project::plan(&policy, &registry, &request),
+        Err(ProjectValidationPlanningResult::Unavailable { code, .. })
+            if code == "dependency_policy_unsupported"
+    ));
+}
+#[test]
 fn project_validation_runner_plans_locked_dependency_policy_for_rust_and_go() {
     for (marker, adapter, expected) in [
         (

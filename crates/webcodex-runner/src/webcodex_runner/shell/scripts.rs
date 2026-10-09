@@ -10,6 +10,14 @@ pub(super) fn configured_script_interpreter(
     select_script_interpreter(shell, profile, language, false)
 }
 
+/// Pin a configured Node interpreter for the production project-check path.
+pub(super) fn configured_validation_node_interpreter(
+    shell: &ShellConfig,
+    profile: Option<&PreparedShellProfile>,
+) -> Result<OsString, String> {
+    select_script_interpreter(shell, profile, ShellScriptLanguage::Javascript, true)
+}
+
 pub(super) fn configured_validation_python_interpreter(
     shell: &ShellConfig,
     profile: Option<&PreparedShellProfile>,

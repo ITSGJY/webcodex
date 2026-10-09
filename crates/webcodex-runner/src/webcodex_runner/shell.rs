@@ -126,9 +126,10 @@ mod search;
 #[cfg(windows)]
 pub(crate) use commands::shell_quote_powershell;
 pub(crate) use commands::{
-    configured_explicit_shell_command, configured_prepared_shell_job_command,
-    configured_pytest_job_command, configured_ruff_job_command, configured_shell_job_command,
-    configured_validation_job_command, explicit_shell_available, shell_quote,
+    configured_explicit_shell_command, configured_node_project_check_job_command,
+    configured_prepared_shell_job_command, configured_pytest_job_command,
+    configured_ruff_job_command, configured_shell_job_command, configured_validation_job_command,
+    explicit_shell_available, shell_quote,
 };
 use commands::{
     configured_prepared_shell_command, configured_process_command, configured_process_path,

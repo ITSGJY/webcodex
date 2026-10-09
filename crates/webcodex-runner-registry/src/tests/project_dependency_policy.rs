@@ -165,6 +165,78 @@ async fn dependency_policy_is_fenced_before_project_build_planning() {
 }
 
 #[tokio::test]
+async fn node_project_check_requires_additive_capability_before_planning() {
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut runner = registration(true);
+        runner.capabilities.project_validation_node_script_check_v1 = supported;
+        registry.register(runner).await.unwrap();
+        let access = auth_context(None, true);
+        let mut request = locked_validation_request();
+        request.adapter = ProjectValidationAdapter::Node;
+        request.dependency_policy = None;
+        let result = registry
+            .enqueue_project_validation_plan("policy-runner".into(), request, Some(&access))
+            .await;
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("project_validation_node_script_check_v1"),
+                "{error}"
+            );
+            assert!(registry
+                .poll(RunnerPollRequest {
+                    client_id: "policy-runner".into(),
+                    runner_instance_id: "inst".into(),
+                })
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn node_auto_job_admission_rechecks_actual_step_capability() {
+    for hint in [
+        ProjectValidationAdapter::Auto,
+        ProjectValidationAdapter::Node,
+    ] {
+        let registry = RunnerRegistry::default();
+        let mut runner = registration(true);
+        runner.capabilities.project_validation_node_script_check_v1 = false;
+        registry.register(runner).await.unwrap();
+        let mut metadata = locked_validation_metadata();
+        let step = ShellJobValidationStep {
+            name: "check".into(),
+            program: "node".into(),
+            args: vec!["--run".into(), "lint".into()],
+            env: vec![],
+        };
+        let validation = metadata.validation.as_mut().unwrap();
+        let provenance = validation.project_validation.as_mut().unwrap();
+        provenance.backend = "node".into();
+        provenance.request.adapter = hint;
+        provenance.request.dependency_policy = None;
+        validation.adapter = "node:script:check".into();
+        validation.steps = vec![step.clone()];
+        metadata.validation_steps = vec![step];
+        assert!(validation.is_valid());
+        let error = registry
+            .start_job_with_metadata(start_request("node --run lint"), "test".into(), metadata)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("project_validation_node_script_check_v1"),
+            "{error}"
+        );
+        assert!(registry.list_jobs(Some(10)).await.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn project_validation_base_capability_error_identifies_runner_without_dispatch() {
     let registry = RunnerRegistry::default();
     let access = auth_context(None, true);

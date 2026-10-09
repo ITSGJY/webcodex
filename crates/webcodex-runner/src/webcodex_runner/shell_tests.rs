@@ -1734,6 +1734,61 @@ fn powershell_plan_uses_ps1_file_and_never_command_text_mode() {
     }));
 }
 
+#[cfg(unix)]
+#[test]
+fn native_node_runner_probe_pins_version_and_strips_ambient_options() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let node = temp.path().join("node");
+    let install_stub = |version: &str| {
+        std::fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = '--version' ] || exit 9\nprintf '{}\\n'\n",
+                version
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let mut shell = ShellConfig::default();
+    shell.program = node.to_string_lossy().into_owned();
+    shell
+        .env
+        .insert("PATH".into(), temp.path().to_string_lossy().into_owned());
+    shell
+        .env
+        .insert("NODE_OPTIONS".into(), "--require=./unsafe.cjs".into());
+    let step = webcodex_core::runner_protocol::ShellJobValidationStep {
+        name: "check".into(),
+        program: "node".into(),
+        args: vec!["--run".into(), "check".into()],
+        env: vec![],
+    };
+    install_stub("v22.2.0");
+    assert!(
+        configured_node_project_check_job_command(&shell, None, &step, temp.path(), None).is_err()
+    );
+
+    install_stub("v22.3.0");
+    let command =
+        configured_node_project_check_job_command(&shell, None, &step, temp.path(), None).unwrap();
+    assert_eq!(PathBuf::from(command.get_program()), node);
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [std::ffi::OsStr::new("--run"), std::ffi::OsStr::new("check")]
+    );
+    assert!(command
+        .get_envs()
+        .any(|(key, value)| { key == std::ffi::OsStr::new("NODE_OPTIONS") && value.is_none() }));
+    let mut forged = step.clone();
+    forged.args.push("--eval".into());
+    assert!(
+        configured_node_project_check_job_command(&shell, None, &forged, temp.path(), None)
+            .is_err()
+    );
+}
+
 #[test]
 fn javascript_temp_file_uses_mjs_and_exact_script_bytes() {
     let payload = ShellScriptPayload {

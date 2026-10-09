@@ -10,7 +10,7 @@ use webcodex_core::runner_protocol::{normalize_rust_test_filter, ShellJobValidat
 use webcodex_workspace::project_recipe::{
     digest_project_cargo_all_packages_provenance, digest_project_recipe_files,
     project_recipe_provenance_files, read_project_recipe_file, resolve_project_recipe_root,
-    ProjectRecipeResolutionError,
+    validate_node_project_marker_chain, ProjectRecipeResolutionError,
 };
 
 pub use webcodex_workspace::project_recipe::ProjectRecipeId as RecipeId;
@@ -567,6 +567,116 @@ fn canonical_adapter_steps(
     Ok(steps)
 }
 
+/// First production Node project validation: native built-in script runner.
+/// The ordinary package-manager recipe below keeps its established semantics.
+/// Shared strict Node marker guard for auto and explicit project planning.
+pub fn validate_node_project_markers(
+    execution_root: &Path,
+    cwd: Option<&str>,
+) -> Result<(), RecipeError> {
+    validate_node_project_marker_chain(execution_root, cwd).map_err(map_project_recipe_error)
+}
+
+pub fn resolve_node_native_project_check(
+    execution_root: &Path,
+    cwd: Option<&str>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    use std::io::Read;
+    const MAX_NODE_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+    validate_node_project_markers(execution_root, cwd)?;
+    let resolved = resolve_project_recipe_root(execution_root, cwd, Some(RecipeId::Node))
+        .map_err(map_project_recipe_error)?;
+    let marker = resolved.marker_path();
+    // Reject link-like and special manifest files; the project must actually own
+    // the selected package.json at its canonical recipe root.
+    if !fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return Err(manifest_invalid());
+    }
+    let canonical = marker.canonicalize().map_err(|_| manifest_invalid())?;
+    if !canonical.starts_with(&resolved.execution_root) {
+        return Err(manifest_invalid());
+    }
+    let file = fs::File::open(&canonical).map_err(|_| manifest_invalid())?;
+    let mut manifest = Vec::new();
+    file.take(MAX_NODE_MANIFEST_BYTES + 1)
+        .read_to_end(&mut manifest)
+        .map_err(|_| manifest_invalid())?;
+    if manifest.len() as u64 > MAX_NODE_MANIFEST_BYTES {
+        return Err(manifest_invalid());
+    }
+    let value: Value = serde_json::from_slice(&manifest).map_err(|_| manifest_invalid())?;
+    let scripts = value
+        .as_object()
+        .ok_or_else(manifest_invalid)?
+        .get("scripts")
+        .map(|value| value.as_object().ok_or_else(manifest_invalid))
+        .transpose()?;
+    let selected = select_node_script(scripts, SemanticCheck::Check)?;
+    if scripts
+        .and_then(|scripts| scripts.get(selected))
+        .and_then(Value::as_str)
+        .is_none_or(|body| body.trim().is_empty())
+    {
+        return Err(manifest_invalid());
+    }
+    let step = ShellJobValidationStep {
+        name: "check".into(),
+        program: "node".into(),
+        args: vec!["--run".into(), selected.into()],
+        env: Vec::new(),
+    };
+    debug_assert!(step.is_structured_node_check());
+    let mut hasher = Sha256::new();
+    let relative = canonical
+        .strip_prefix(&resolved.execution_root)
+        .map_err(|_| manifest_invalid())?;
+    hasher.update(relative.as_os_str().as_encoded_bytes());
+    hasher.update((manifest.len() as u64).to_be_bytes());
+    hasher.update(&manifest);
+    let manifest_digest = format!("{:x}", hasher.finalize());
+    let invocation_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(std::slice::from_ref(&step)).map_err(|_| manifest_invalid())?
+        )
+    );
+    Ok(ResolvedValidationRecipe {
+        recipe_id: "node",
+        recipe_root_relative: resolved.relative_root,
+        steps: vec![step],
+        invocation_digest,
+        manifest_digest,
+        test_filter: None,
+    })
+}
+
+/// Shared first-present script selector. Validation of body contents is separate:
+/// ordinary recipes preserve their old string-only rule; native check rejects
+/// empty/whitespace-only bodies without changing the ordinary workflow.
+fn select_node_script(
+    scripts: Option<&serde_json::Map<String, Value>>,
+    check: SemanticCheck,
+) -> Result<&'static str, RecipeError> {
+    let names: &[&str] = match check {
+        SemanticCheck::Format => &["format:check", "format-check", "check:format"],
+        SemanticCheck::Check => &["check", "typecheck", "lint"],
+        SemanticCheck::Test => &["test"],
+    };
+    let name = names
+        .iter()
+        .copied()
+        .find(|name| scripts.is_some_and(|scripts| scripts.contains_key(*name)))
+        .ok_or_else(check_unavailable)?;
+    if !scripts
+        .and_then(|scripts| scripts.get(name))
+        .is_some_and(Value::is_string)
+    {
+        return Err(manifest_invalid());
+    }
+    Ok(name)
+}
+
 fn node_steps(
     root: &Path,
     manifest: &[u8],
@@ -612,22 +722,7 @@ fn node_steps(
     let manager = managers.into_iter().next().unwrap();
     let mut steps = Vec::with_capacity(checks.len());
     for check in checks {
-        let names: &[&str] = match check {
-            SemanticCheck::Format => &["format:check", "format-check", "check:format"],
-            SemanticCheck::Check => &["check", "typecheck", "lint"],
-            SemanticCheck::Test => &["test"],
-        };
-        let script = names
-            .iter()
-            .copied()
-            .find(|name| scripts.is_some_and(|scripts| scripts.get(*name).is_some()))
-            .ok_or_else(check_unavailable)?;
-        if !scripts
-            .and_then(|scripts| scripts.get(script))
-            .is_some_and(Value::is_string)
-        {
-            return Err(manifest_invalid());
-        }
+        let script = select_node_script(scripts, *check)?;
         let args = vec![
             "run".to_string(),
             "--silent".to_string(),

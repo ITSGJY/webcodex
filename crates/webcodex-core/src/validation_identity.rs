@@ -25,6 +25,7 @@ pub enum ToolValidationIdentityKind {
     PythonPytest,
     PythonRuffCheck,
     PythonRuffFormat,
+    NodeScriptCheck,
     Project,
 }
 
@@ -40,6 +41,7 @@ impl ToolValidationIdentityKind {
             Self::PythonPytest => Some("python:pytest:test"),
             Self::PythonRuffCheck => Some("python:ruff:check"),
             Self::PythonRuffFormat => Some("python:ruff:format"),
+            Self::NodeScriptCheck => Some("node:script:check"),
         }
     }
 }
@@ -213,6 +215,13 @@ pub fn structured_validation_target_identity(
         ToolValidationIdentityKind::PythonRuffCheck
         | ToolValidationIdentityKind::PythonRuffFormat => {
             serde_json::json!({"tool":tool_name,"kind": if kind == ToolValidationIdentityKind::PythonRuffCheck { "check" } else { "format" },"cwd":cwd})
+        }
+        ToolValidationIdentityKind::NodeScriptCheck => {
+            let script = obj.get("script")?.as_str()?;
+            if !matches!(script, "check" | "typecheck" | "lint") {
+                return None;
+            }
+            serde_json::json!({"tool": tool_name, "kind": "check", "cwd": cwd, "script": script, "engine": "node-native-run-v1"})
         }
         ToolValidationIdentityKind::PythonPytest => {
             let filter = match obj.get("filter") {
