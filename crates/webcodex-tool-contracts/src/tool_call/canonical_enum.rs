@@ -1553,7 +1553,9 @@ pub enum ToolCall {
         cwd: Option<String>,
         action: webcodex_core::project_validation::ProjectValidationAction,
         /// Omission means auto. Rust and Go are supported; Python supports test through pytest and
-        /// check/format_check through project-local Ruff with explicit target-version. Node supports native script check and opt-in native TAP test; no caller-selected script names or argv.
+        /// check/format_check through project-local Ruff with explicit target-version.
+        /// Node supports native script check and opt-in native TAP test; no caller-selected
+        /// script names or argv.
         #[serde(default)]
         adapter: Option<webcodex_core::project_validation::ProjectValidationAdapter>,
         /// Optional portable scope. Explicit packages narrow Rust/Go selection; all_packages=true selects the

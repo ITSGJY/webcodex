@@ -263,10 +263,8 @@ fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
         "# todo ",
     ];
     for line in body.iter().skip(1).take(body.len().saturating_sub(2)) {
-        // A prior root plan, another reporter heading, or a previous
-        // accounting entry makes this final trailer non-authoritative.
-        // Native t.diagnostic emits top-level "# pass phase complete" etc.
-        // Only a canonical numeric accounting value is a conflicting footer.
+        // Reject duplicate root plans and numeric accounting while allowing
+        // ordinary t.diagnostic prose such as "# pass phase complete".
         let repeated_count = fields.iter().any(|prefix| {
             line.strip_prefix(prefix)
                 .and_then(|value| value.parse::<u64>().ok())
@@ -324,6 +322,7 @@ fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
         ignored: skipped.checked_add(todo),
     })
 }
+
 /// Parse Go vet's stable relative-file:line:column diagnostics. Compiler prose
 /// without a stable location is not invented into structured evidence.
 pub fn parse_go_vet_diagnostics(stderr: &str, truncated: bool) -> ValidationDiagnostics {
