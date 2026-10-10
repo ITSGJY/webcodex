@@ -1528,10 +1528,13 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
             {
                 return Err("project format planning contains execution fields".into());
             }
-            let payload: crate::project_format::ProjectFormatRequest = serde_json::from_str(
-                bounded_content(wire, crate::project_format::PROJECT_FORMAT_PLAN_MAX_BYTES, "project format request")?,
-            )
-            .map_err(|e| e.to_string())?;
+            let payload: crate::project_format::ProjectFormatRequest =
+                serde_json::from_str(bounded_content(
+                    wire,
+                    crate::project_format::PROJECT_FORMAT_PLAN_MAX_BYTES,
+                    "project format request",
+                )?)
+                .map_err(|e| e.to_string())?;
             payload.validate()?;
             Ok(RunnerOperation::PlanProjectFormat(payload))
         }

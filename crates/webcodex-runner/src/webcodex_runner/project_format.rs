@@ -2,11 +2,11 @@
 //! not confer write authority or advertise an executable formatting capability.
 
 use super::config::RunnerPolicy;
+use super::file_access::{directory_identity, file_identity, file_link_count, open_regular_file};
 use super::projects::find_project_shell_context_by_id;
 use super::shell::cwd_allowed;
 use sha2::{Digest, Sha256};
 use std::fs;
-use super::file_access::{directory_identity, file_identity, file_link_count, open_regular_file};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use webcodex_core::apply_edits_shared::is_sensitive_edit_path;
@@ -50,7 +50,9 @@ fn validate_marker_chain(root: &Path, relative: &str) -> Result<(), &'static str
         let mut found = false;
         for marker in ["Cargo.toml", "pyproject.toml", "package.json", "go.mod"] {
             match fs::symlink_metadata(parent.join(marker)) {
-                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => found = true,
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    found = true
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 _ => return Err("format_manifest_invalid"),
             }
@@ -83,7 +85,11 @@ fn checked_path(root: &Path, relative: &str, directory: bool) -> Result<PathBuf,
         return Err("format_path_invalid");
     }
     let metadata = fs::symlink_metadata(&path).map_err(|_| "format_file_unavailable")?;
-    if if directory { !metadata.is_dir() } else { !metadata.is_file() } {
+    if if directory {
+        !metadata.is_dir()
+    } else {
+        !metadata.is_file()
+    } {
         return Err("format_path_invalid");
     }
     Ok(path)
@@ -97,20 +103,29 @@ fn read_source(root: &Path, relative: &str, max: usize) -> Result<(String, Strin
     }
     let identity = file_identity(&file).map_err(|_| "format_file_unavailable")?;
     let mut bytes = Vec::new();
-    file.take(max as u64 + 1).read_to_end(&mut bytes).map_err(|_| "format_file_unavailable")?;
+    file.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "format_file_unavailable")?;
     if bytes.len() > max {
         return Err("format_input_too_large");
     }
     if checked_path(root, relative, false)? != path
-        || file_identity(&open_regular_file(&path).map_err(|_| "format_file_unavailable")?).map_err(|_| "format_file_unavailable")? != identity
+        || file_identity(&open_regular_file(&path).map_err(|_| "format_file_unavailable")?)
+            .map_err(|_| "format_file_unavailable")?
+            != identity
     {
         return Err("format_plan_stale");
     }
-    Ok((String::from_utf8(bytes).map_err(|_| "format_invalid_utf8")?, digest(&identity)))
+    Ok((
+        String::from_utf8(bytes).map_err(|_| "format_invalid_utf8")?,
+        digest(&identity),
+    ))
 }
 
 fn rust_profile(manifest: &toml::Value) -> Result<ProjectFormatProfile, &'static str> {
-    let package = manifest.get("package").and_then(toml::Value::as_table)
+    let package = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
         .ok_or("format_manifest_unsupported")?;
     // Inherited edition and explicit external workspace topology require an
     // independent profile. Do not silently choose a default edition for them.
@@ -121,7 +136,9 @@ fn rust_profile(manifest: &toml::Value) -> Result<ProjectFormatProfile, &'static
         None => "2015",
         Some(value) => value.as_str().ok_or("format_manifest_unsupported")?,
     };
-    let profile = ProjectFormatProfile::Rust { edition: edition.into() };
+    let profile = ProjectFormatProfile::Rust {
+        edition: edition.into(),
+    };
     if !profile.is_valid() {
         return Err("format_manifest_invalid");
     }
@@ -129,14 +146,21 @@ fn rust_profile(manifest: &toml::Value) -> Result<ProjectFormatProfile, &'static
 }
 
 fn python_profile(manifest: &toml::Value) -> Result<ProjectFormatProfile, &'static str> {
-    let ruff = manifest.get("tool").and_then(|tool| tool.get("ruff"))
-        .and_then(toml::Value::as_table).ok_or("format_manifest_unsupported")?;
+    let ruff = manifest
+        .get("tool")
+        .and_then(|tool| tool.get("ruff"))
+        .and_then(toml::Value::as_table)
+        .ok_or("format_manifest_unsupported")?;
     if ruff.contains_key("extend") {
         return Err("format_manifest_invalid");
     }
-    let target_version = ruff.get("target-version").and_then(toml::Value::as_str)
+    let target_version = ruff
+        .get("target-version")
+        .and_then(toml::Value::as_str)
         .ok_or("format_manifest_invalid")?;
-    let profile = ProjectFormatProfile::Python { target_version: target_version.into() };
+    let profile = ProjectFormatProfile::Python {
+        target_version: target_version.into(),
+    };
     if !profile.is_valid() {
         return Err("format_manifest_invalid");
     }
@@ -174,7 +198,9 @@ pub(crate) fn plan(
     registry: &Path,
     request: &ProjectFormatRequest,
 ) -> Result<PlannedFormat, ProjectFormatPlanningResult> {
-    request.validate().map_err(|_| unavailable("invalid_arguments"))?;
+    request
+        .validate()
+        .map_err(|_| unavailable("invalid_arguments"))?;
     let project = find_project_shell_context_by_id(registry, &request.project_id)
         .ok_or_else(|| unavailable("unknown_project"))?;
     if !project.allow_patch || !policy.allow_raw_shell {
@@ -182,13 +208,16 @@ pub(crate) fn plan(
     }
     let root = PathBuf::from(&project.path);
     cwd_allowed(policy, &root).map_err(|_| unavailable("invalid_project_path"))?;
-    let root = root.canonicalize().map_err(|_| unavailable("invalid_project_path"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|_| unavailable("invalid_project_path"))?;
     let initial_root_digest = root_digest(&root).map_err(unavailable)?;
     checked_path(&root, request.cwd.as_deref().unwrap_or("."), true).map_err(unavailable)?;
     // No manifestless Python fallback and no explicit-adapter bypass of an
     // ambiguous root. Formatting needs a concrete local manifest in all cases.
     validate_marker_chain(&root, request.cwd.as_deref().unwrap_or(".")).map_err(unavailable)?;
-    let resolved = resolve_project_recipe_root(&root, request.cwd.as_deref(), None).map_err(recipe_error)?;
+    let resolved =
+        resolve_project_recipe_root(&root, request.cwd.as_deref(), None).map_err(recipe_error)?;
     let adapter = match resolved.recipe {
         ProjectRecipeId::Rust => ProjectFormatAdapter::Rust,
         ProjectRecipeId::Python => ProjectFormatAdapter::Python,
@@ -197,10 +226,16 @@ pub(crate) fn plan(
     if request.adapter != ProjectFormatAdapter::Auto && request.adapter != adapter {
         return Err(unavailable("format_recipe_mismatch"));
     }
-    let marker = resolved.marker_path().strip_prefix(&root)
-        .map_err(|_| unavailable("format_path_invalid"))?.to_string_lossy().replace('\\', "/");
-    let (manifest, manifest_identity) = read_source(&root, &marker, PROJECT_FORMAT_MANIFEST_MAX_BYTES).map_err(unavailable)?;
-    let value: toml::Value = toml::from_str(&manifest).map_err(|_| unavailable("format_manifest_invalid"))?;
+    let marker = resolved
+        .marker_path()
+        .strip_prefix(&root)
+        .map_err(|_| unavailable("format_path_invalid"))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let (manifest, manifest_identity) =
+        read_source(&root, &marker, PROJECT_FORMAT_MANIFEST_MAX_BYTES).map_err(unavailable)?;
+    let value: toml::Value =
+        toml::from_str(&manifest).map_err(|_| unavailable("format_manifest_invalid"))?;
     let profile = match adapter {
         ProjectFormatAdapter::Rust => {
             reject_custom_rustfmt_config(&resolved.absolute_root).map_err(unavailable)?;
@@ -215,15 +250,25 @@ pub(crate) fn plan(
     let mut total = 0usize;
     for relative in &request.files {
         let path = checked_path(&root, relative, false).map_err(unavailable)?;
-        let parent = path.parent().ok_or_else(|| unavailable("format_path_invalid"))?;
-        let parent = parent.strip_prefix(&root).map_err(|_| unavailable("format_path_invalid"))?;
-        let parent = if parent.as_os_str().is_empty() { ".".into() } else { parent.to_string_lossy().replace('\\', "/") };
+        let parent = path
+            .parent()
+            .ok_or_else(|| unavailable("format_path_invalid"))?;
+        let parent = parent
+            .strip_prefix(&root)
+            .map_err(|_| unavailable("format_path_invalid"))?;
+        let parent = if parent.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            parent.to_string_lossy().replace('\\', "/")
+        };
         validate_marker_chain(&root, &parent).map_err(unavailable)?;
-        let owner = resolve_project_recipe_root(&root, Some(&parent), None).map_err(recipe_error)?;
+        let owner =
+            resolve_project_recipe_root(&root, Some(&parent), None).map_err(recipe_error)?;
         if owner != resolved {
             return Err(unavailable("format_scope_mismatch"));
         }
-        let (source, identity) = read_source(&root, relative, PROJECT_FORMAT_FILE_MAX_BYTES).map_err(unavailable)?;
+        let (source, identity) =
+            read_source(&root, relative, PROJECT_FORMAT_FILE_MAX_BYTES).map_err(unavailable)?;
         if identities.contains(&identity) {
             return Err(unavailable("format_duplicate_file"));
         }
@@ -232,19 +277,33 @@ pub(crate) fn plan(
         if total > PROJECT_FORMAT_TOTAL_MAX_BYTES {
             return Err(unavailable("format_input_too_large"));
         }
-        files.push(ProjectFormatFileWitness { path: relative.clone(), bytes: source.len(), sha256: digest(source.as_bytes()), identity_digest: identity });
+        files.push(ProjectFormatFileWitness {
+            path: relative.clone(),
+            bytes: source.len(),
+            sha256: digest(source.as_bytes()),
+            identity_digest: identity,
+        });
         sources.push(source);
     }
     if root_digest(&root).map_err(unavailable)? != initial_root_digest {
         return Err(unavailable("format_plan_stale"));
     }
     let plan = ProjectFormatPlan {
-        request: request.clone(), recipe_root: resolved.relative_root,
+        request: request.clone(),
+        recipe_root: resolved.relative_root,
         root_digest: initial_root_digest,
-        manifest_digest: digest(&[manifest_identity.as_bytes(), manifest.as_bytes()].concat()), profile, files,
+        manifest_digest: digest(&[manifest_identity.as_bytes(), manifest.as_bytes()].concat()),
+        profile,
+        files,
     };
-    plan.digest().map_err(|_| unavailable("format_scope_mismatch"))?;
-    Ok(PlannedFormat { plan, root, cwd: resolved.absolute_root, sources })
+    plan.digest()
+        .map_err(|_| unavailable("format_scope_mismatch"))?;
+    Ok(PlannedFormat {
+        plan,
+        root,
+        cwd: resolved.absolute_root,
+        sources,
+    })
 }
 
 /// Admission and worker must independently obtain fresh snapshots through this
@@ -283,66 +342,96 @@ pub(crate) fn handle(
     }
 }
 
-/// Dry-run formatter candidate generation.
-/// Runs the trusted installed formatter (e.g. rustfmt) on stdin and captures stdout.
-/// Never mutates project files, never runs arbitrary scripts, and does not leak sources into logs.
+/// Generate bounded formatter candidates without changing project files.
+///
+/// Runner-owned Job execution supplies its generation, total deadline and stop
+/// signal. A single request never receives a fresh timeout for every file.
 pub(crate) fn format_candidates(
     policy: &RunnerPolicy,
     shell: &super::config::ShellConfig,
     registry: &Path,
     planned: &PlannedFormat,
     cache: &super::shell::PreparedShellProfileCache,
+    generation: u64,
+    timeout_secs: u64,
+    stop_requested: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<String>, &'static str> {
-    if !planned.plan.is_valid() {
-        return Err("format_plan_invalid");
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use webcodex_core::runner_protocol::ShellCommandExecutionState;
+
+    if !(1..=PROJECT_FORMAT_TIMEOUT_MAX_SECS).contains(&timeout_secs) {
+        return Err("format_timeout_invalid");
     }
-    if planned.sources.len() != planned.plan.files.len() {
+    if !planned.plan.is_valid() || planned.sources.len() != planned.plan.files.len() {
         return Err("format_plan_invalid");
     }
 
+    let started = Instant::now();
+    let total_budget = Duration::from_secs(timeout_secs);
+    let mut total_output = 0usize;
     let mut candidates = Vec::with_capacity(planned.sources.len());
-    for (index, file_witness) in planned.plan.files.iter().enumerate() {
+    for (index, witness) in planned.plan.files.iter().enumerate() {
+        if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            return Err("format_cancelled");
+        }
+        let remaining = total_budget.saturating_sub(started.elapsed()).as_secs();
+        if remaining == 0 {
+            return Err("format_timeout");
+        }
         let source = &planned.sources[index];
-        let recipe_relative = planned
+        let relative = planned
             .plan
-            .recipe_relative_file(&file_witness.path)
+            .recipe_relative_file(&witness.path)
             .ok_or("format_path_invalid")?;
-        let process_cmd = planned
+        let command = planned
             .plan
             .profile
-            .process(recipe_relative)
+            .process(relative)
             .map_err(|_| "format_profile_invalid")?;
+        let cwd = planned.cwd.to_str().ok_or("format_path_invalid")?;
 
-        let cwd_str = planned.cwd.to_str().ok_or("format_path_invalid")?;
         let result = super::shell::run_process_with_profiles_and_execution_state(
-            1,
+            generation,
             policy,
             shell,
             registry,
             cache,
-            Some(cwd_str),
-            &process_cmd.executable,
-            &process_cmd.args,
+            Some(cwd),
+            &command.executable,
+            &command.args,
             Some(source),
-            PROJECT_FORMAT_TIMEOUT_MAX_SECS,
-            None,
+            remaining,
+            stop_requested,
         );
-
+        if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            return Err("format_cancelled");
+        }
+        match result.execution_state {
+            ShellCommandExecutionState::Completed => {}
+            ShellCommandExecutionState::NotStarted => return Err("format_process_failed"),
+            ShellCommandExecutionState::TimedOut => return Err("format_timeout"),
+            ShellCommandExecutionState::OutcomeUnknown => return Err("format_execution_unknown"),
+        }
         if result.stdout_truncated || result.stderr_truncated {
             return Err("format_output_truncated");
         }
-
-        if result.result.exit_code != Some(0) {
+        if result.result.exit_code != Some(0) || result.result.error.is_some() {
             return Err("format_process_failed");
         }
-
         let stdout = result.result.stdout.ok_or("format_process_failed")?;
-        if stdout.len() > PROJECT_FORMAT_FILE_MAX_BYTES {
+        total_output = total_output
+            .checked_add(stdout.len())
+            .ok_or("format_candidate_too_large")?;
+        if stdout.len() > PROJECT_FORMAT_FILE_MAX_BYTES
+            || total_output > PROJECT_FORMAT_TOTAL_MAX_BYTES
+        {
             return Err("format_candidate_too_large");
         }
-
+        if started.elapsed() > total_budget {
+            return Err("format_timeout");
+        }
         candidates.push(stdout);
     }
-
     Ok(candidates)
 }
