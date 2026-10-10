@@ -559,6 +559,13 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_build_v1: bool = false;
     }
+    /// Complete bounded project formatting lifecycle. Planning support alone
+    /// must never advertise this capability; older Runners default to false.
+    ProjectFormat => RUNNER_CAPABILITY_PROJECT_FORMAT("project_format_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_format_v1: bool = false;
+    }
     /// Additive portable dependency policy for project build/validation gateways.
     /// Missing on older Runners is false; policy-bearing plans must fail closed.
     ProjectDependencyPolicy => RUNNER_CAPABILITY_PROJECT_DEPENDENCY_POLICY("project_dependency_policy_v1"),
@@ -2847,6 +2854,7 @@ mod envelope_tests {
                 structured_go_test_json: true,
                 project_validation_v1: false,
                 project_build_v1: false,
+                project_format_v1: false,
                 project_dependency_policy_v1: false,
                 project_go_single_module_v1: false,
                 project_validation_package_scope_v1: false,
