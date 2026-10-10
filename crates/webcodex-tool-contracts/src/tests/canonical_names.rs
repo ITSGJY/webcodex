@@ -122,7 +122,7 @@ fn canonical_operation_names_are_unique_verb_first_and_route_independent() {
         "manage_",
         "work_on_",
     ];
-    // Provider-specific validation and the two documented portable orchestration
+    // Provider-specific validation and the three documented portable orchestration
     // entries are not noun-first CRUD. Gateways name a distinct callable namespace.
     let domain = [
         "cargo_fmt",
@@ -130,6 +130,7 @@ fn canonical_operation_names_are_unique_verb_first_and_route_independent() {
         "cargo_test",
         "go_test",
         "project_build",
+        "project_format",
         "project_validate",
         "plugin_tool",
     ];

@@ -411,6 +411,7 @@ async fn request_policy_pending_wait_and_terminal_observe_keep_one_execution_wit
             command_execution_state: Some(ShellCommandExecutionState::Completed),
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: true,
         })

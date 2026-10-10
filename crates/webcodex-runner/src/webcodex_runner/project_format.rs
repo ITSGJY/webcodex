@@ -326,11 +326,8 @@ pub(crate) fn handle(
     registry: &Path,
     request: &ProjectFormatRequest,
 ) -> super::output::CommandResult {
-    // Planning is implemented, but a Ready wire response would imply a worker
-    // can consume it. Keep native execution unavailable until exact output,
-    // guarded commit and durable mutation-receipt gates are implemented.
     let result = match plan(policy, registry, request) {
-        Ok(_) => unavailable("format_execution_unavailable"),
+        Ok(planned) => ProjectFormatPlanningResult::Ready { plan: planned.plan },
         Err(error) => error,
     };
     super::output::CommandResult {
@@ -369,6 +366,38 @@ pub(crate) fn format_candidates(
 
     let started = Instant::now();
     let total_budget = Duration::from_secs(timeout_secs);
+    let deadline = started + total_budget;
+
+    let (python_executable, env_overrides, env_removals) = match &planned.plan.profile {
+        ProjectFormatProfile::Rust { .. } => (None, Vec::new(), Vec::new()),
+        ProjectFormatProfile::Python { .. } => {
+            let prepared_profile = super::shell::resolve_prepared_shell_profile(
+                generation,
+                shell,
+                registry,
+                &planned.cwd,
+                true,
+                cache,
+                stop_requested,
+            )
+            .map_err(|_| "format_process_failed")?;
+            let python_path = super::shell::probe_ruff_formatter(
+                shell,
+                prepared_profile.as_deref(),
+                &planned.cwd,
+                deadline,
+                stop_requested,
+            )?;
+            let python_exe = python_path
+                .into_string()
+                .map_err(|_| "format_path_invalid")?;
+            (
+                Some(python_exe),
+                vec![("PYTHONDONTWRITEBYTECODE", "1")],
+                vec!["RUFF_OUTPUT_FILE"],
+            )
+        }
+    };
     let mut total_output = 0usize;
     let mut candidates = Vec::with_capacity(planned.sources.len());
     for (index, witness) in planned.plan.files.iter().enumerate() {
@@ -391,21 +420,32 @@ pub(crate) fn format_candidates(
             .map_err(|_| "format_profile_invalid")?;
         let cwd = planned.cwd.to_str().ok_or("format_path_invalid")?;
 
-        let result = super::shell::run_process_with_profiles_and_execution_state(
+        let exe = python_executable.as_deref().unwrap_or(&command.executable);
+        let result = super::shell::run_format_candidate(
             generation,
             policy,
             shell,
             registry,
             cache,
             Some(cwd),
-            &command.executable,
+            exe,
             &command.args,
             Some(source),
             remaining,
             stop_requested,
+            &env_overrides,
+            &env_removals,
         );
         if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             return Err("format_cancelled");
+        }
+        if let Some(code) = result.result.error.as_deref() {
+            match code {
+                "format_output_truncated" => return Err("format_output_truncated"),
+                "format_output_invalid_utf8" => return Err("format_output_invalid_utf8"),
+                "format_stderr_unexpected" => return Err("format_stderr_unexpected"),
+                _ => {}
+            }
         }
         match result.execution_state {
             ShellCommandExecutionState::Completed => {}
@@ -420,6 +460,9 @@ pub(crate) fn format_candidates(
             return Err("format_process_failed");
         }
         let stdout = result.result.stdout.ok_or("format_process_failed")?;
+        if stdout.contains('\0') || (!source.trim().is_empty() && stdout.trim().is_empty()) {
+            return Err("format_candidate_invalid");
+        }
         total_output = total_output
             .checked_add(stdout.len())
             .ok_or("format_candidate_too_large")?;
@@ -434,4 +477,156 @@ pub(crate) fn format_candidates(
         candidates.push(stdout);
     }
     Ok(candidates)
+}
+
+/// Revalidate exact authority and recipe cwd on both admission and the worker.
+pub(crate) fn fence(
+    policy: &RunnerPolicy,
+    registry: &Path,
+    operation: &webcodex_core::runner_operation::RunnerJobOperation,
+) -> Result<(), String> {
+    let webcodex_core::runner_operation::RunnerJobOperation::StartFormat(operation) = operation
+    else {
+        return Ok(());
+    };
+    let current = replan(policy, registry, &operation.plan).map_err(str::to_string)?;
+    if operation.cwd.as_deref() != current.cwd.to_str() {
+        return Err("format_plan_stale".into());
+    }
+    let context_project = operation
+        .context
+        .runtime_project_id
+        .as_deref()
+        .and_then(|value| value.strip_prefix("agent:"))
+        .and_then(|value| value.split_once(':'))
+        .map(|(_, project)| project);
+    if context_project != Some(operation.plan.request.project_id.as_str()) {
+        return Err("format_scope_mismatch".into());
+    }
+    Ok(())
+}
+
+/// Every error means unknown aggregate mutation, even after an earlier write.
+/// There is deliberately no rollback or second write attempt.
+pub(crate) fn commit_candidates(
+    policy: &RunnerPolicy,
+    registry: &Path,
+    planned: &PlannedFormat,
+    candidates: &[String],
+    deadline: std::time::Instant,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<ProjectFormatMutationReport, &'static str> {
+    commit_candidates_with_hook(
+        policy,
+        registry,
+        planned,
+        candidates,
+        deadline,
+        stop,
+        |_, _| {},
+    )
+}
+
+pub(super) fn commit_candidates_with_hook(
+    policy: &RunnerPolicy,
+    registry: &Path,
+    planned: &PlannedFormat,
+    candidates: &[String],
+    deadline: std::time::Instant,
+    stop: &std::sync::atomic::AtomicBool,
+    mut boundary: impl FnMut(usize, bool),
+) -> Result<ProjectFormatMutationReport, &'static str> {
+    use super::file_access::open_regular_file_for_write;
+    use std::io::{Seek, SeekFrom, Write};
+    let check_stop = || {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("format_cancelled")
+        } else if std::time::Instant::now() >= deadline {
+            Err("format_timeout")
+        } else {
+            Ok(())
+        }
+    };
+    check_stop()?;
+    replan(policy, registry, &planned.plan)?;
+    if candidates.len() != planned.sources.len()
+        || candidates
+            .iter()
+            .any(|s| s.len() > PROJECT_FORMAT_FILE_MAX_BYTES || s.contains('\0'))
+        || candidates.iter().map(String::len).sum::<usize>() > PROJECT_FORMAT_TOTAL_MAX_BYTES
+    {
+        return Err("format_candidate_invalid");
+    }
+    let mut changed = false;
+    for (index, (source, candidate)) in planned.sources.iter().zip(candidates).enumerate() {
+        boundary(index, false);
+        check_stop()?;
+        let witness = &planned.plan.files[index];
+        if root_digest(&planned.root)? != planned.plan.root_digest {
+            return Err("format_plan_stale");
+        }
+        let (current, identity) =
+            read_source(&planned.root, &witness.path, PROJECT_FORMAT_FILE_MAX_BYTES)?;
+        if &current != source || identity != witness.identity_digest {
+            return Err("format_write_conflict");
+        }
+        if source == candidate {
+            continue;
+        }
+        let path = checked_path(&planned.root, &witness.path, false)?;
+        let mut file =
+            open_regular_file_for_write(&path).map_err(|_| "format_write_unavailable")?;
+        if digest(&file_identity(&file).map_err(|_| "format_write_unavailable")?) != identity
+            || file_link_count(&file).map_err(|_| "format_write_unavailable")? != 1
+        {
+            return Err("format_write_conflict");
+        }
+        let mut actual = Vec::new();
+        (&mut file)
+            .take(PROJECT_FORMAT_FILE_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut actual)
+            .map_err(|_| "format_write_unavailable")?;
+        if actual != source.as_bytes() || checked_path(&planned.root, &witness.path, false)? != path
+        {
+            return Err("format_write_conflict");
+        }
+        // Reopen through pinned ancestors immediately before touching the handle.
+        let current = open_regular_file_for_write(&path).map_err(|_| "format_write_conflict")?;
+        if file_identity(&current).map_err(|_| "format_write_conflict")?
+            != file_identity(&file).map_err(|_| "format_write_conflict")?
+        {
+            return Err("format_write_conflict");
+        }
+        drop(current);
+        check_stop()?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| "format_write_failed")?;
+        file.write_all(candidate.as_bytes())
+            .map_err(|_| "format_write_failed")?;
+        file.set_len(candidate.len() as u64)
+            .map_err(|_| "format_write_failed")?;
+        file.sync_all().map_err(|_| "format_write_failed")?;
+        drop(file);
+        changed = true;
+        boundary(index, true);
+        check_stop()?;
+    }
+    // Observe the complete selected set, including no-op inputs, after all writes.
+    // A multi-file operation is never represented as an atomic transaction.
+    for (witness, candidate) in planned.plan.files.iter().zip(candidates) {
+        check_stop()?;
+        let (actual, identity) =
+            read_source(&planned.root, &witness.path, PROJECT_FORMAT_FILE_MAX_BYTES)?;
+        if actual != *candidate || identity != witness.identity_digest {
+            return Err("format_observation_failed");
+        }
+    }
+    if root_digest(&planned.root)? != planned.plan.root_digest {
+        return Err("format_observation_failed");
+    }
+    Ok(if changed {
+        ProjectFormatMutationReport::Changed
+    } else {
+        ProjectFormatMutationReport::Unchanged
+    })
 }

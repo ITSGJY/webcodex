@@ -175,3 +175,110 @@ impl JobManager {
         });
     }
 }
+
+impl JobManager {
+    pub(super) fn start_format_job(&self, start: PendingJobStart) {
+        use webcodex_core::project_format::ProjectFormatMutationReport;
+        let job_id = start.operation.job_id().to_string();
+        let stop = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            if self.shutting_down.load(Ordering::SeqCst) {
+                drop(_lifecycle);
+                self.shutdown_rejection(&start.operation);
+                return;
+            }
+            let mut jobs = lock_unpoison(&self.jobs);
+            let Some(job) = jobs.get_mut(&job_id) else {
+                return;
+            };
+            job.slot_reserved = true;
+            Arc::clone(&job.stop_requested)
+        };
+        let manager = self.clone_for_worker();
+        let guard = self.workers.enter();
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let RunnerJobOperation::StartFormat(operation) = &start.operation else {
+                unreachable!()
+            };
+            let started = Instant::now();
+            let deadline = started
+                + Duration::from_secs(operation.timeout_secs.min(start.policy.max_timeout_secs));
+            let outcome = (|| {
+                crate::webcodex_runner::project_format::fence(
+                    &start.policy,
+                    &start.project_registry_dir,
+                    &start.operation,
+                )
+                .map_err(|_| "format_plan_stale")?;
+                let planned = crate::webcodex_runner::project_format::replan(
+                    &start.policy,
+                    &start.project_registry_dir,
+                    &operation.plan,
+                )?;
+                // This is a single admitted Job, not one execution per file.
+                manager.update_and_send(
+                    &job_id,
+                    RunnerJobDelta {
+                        status: "running".into(),
+                        ..Default::default()
+                    },
+                );
+                let candidates = crate::webcodex_runner::project_format::format_candidates(
+                    &start.policy,
+                    &start.shell,
+                    &start.project_registry_dir,
+                    &planned,
+                    &manager.prepared_profiles,
+                    start.generation,
+                    deadline.saturating_duration_since(Instant::now()).as_secs(),
+                    Some(&stop),
+                )?;
+                crate::webcodex_runner::project_format::commit_candidates(
+                    &start.policy,
+                    &start.project_registry_dir,
+                    &planned,
+                    &candidates,
+                    deadline,
+                    &stop,
+                )
+            })();
+            let (status, execution, report, error) = match outcome {
+                Ok(report) => (
+                    "completed",
+                    ShellCommandExecutionState::Completed,
+                    report,
+                    None,
+                ),
+                Err(code) => (
+                    if code == "format_timeout" {
+                        "timeout"
+                    } else {
+                        "failed"
+                    },
+                    if code == "format_timeout" {
+                        ShellCommandExecutionState::TimedOut
+                    } else {
+                        ShellCommandExecutionState::OutcomeUnknown
+                    },
+                    ProjectFormatMutationReport::Unknown,
+                    Some(code.to_string()),
+                ),
+            };
+            manager.update_and_send(
+                &job_id,
+                RunnerJobDelta {
+                    status: status.into(),
+                    command_execution_state: Some(execution),
+                    exit_code: error.is_none().then_some(0),
+                    error,
+                    format_mutation: Some(report),
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
+                    finished: true,
+                    ..Default::default()
+                },
+            );
+            manager.start_available_queued();
+        });
+    }
+}

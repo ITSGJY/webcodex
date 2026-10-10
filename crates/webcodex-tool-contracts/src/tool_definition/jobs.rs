@@ -16,6 +16,26 @@ use crate::metadata::{
 use webcodex_core::authority::SCOPE_JOB_DETACH;
 
 pub(super) const EXECUTION_DEFINITIONS: &[ToolDefinition] = &[
+    require_all_scopes(
+        permission_risk(
+            adaptive_runtime_direct(
+                model_spec(
+                    def("project_format", super::ToolAuditPolicy::TYPED_CANONICAL,
+                        ModelVisible, TOOL_CATEGORY_EXECUTION, Some(super::RunnerCapabilityRequirement::ProjectFormat),
+                        TOOL_PROVIDER_RUNNER,
+                        super::ToolSemanticContract { effect: super::ToolEffect::Mutate,
+                            risk: crate::metadata::ToolRisk::ProjectWrite,
+                            approval: super::ToolApprovalPolicy::Standard,
+                            idempotency: super::ToolIdempotency::NonIdempotent },
+                        Some(crate::metadata::PROJECT_WRITE), true, NoPath, true, false,
+                        super::ToolSessionEvidencePolicy::NONE),
+                    "Intentionally format 1..8 ordered Project-relative source files under one Runner-resolved recipe root. Requires project:write, job:run and project_format_v1. Rust uses bounded Cargo edition and installed rustfmt stdin/stdout with skip_children; custom configuration and unsupported topology fail closed. Python uses bounded pyproject target-version and isolated Ruff stdin/stdout; extend configuration and unsupported topology fail closed. No workspace traversal, installs, package scripts, arbitrary flags or implied network permission. Candidate bytes stay private; Runner compares source and file identity before each guarded write. A multi-file write is not atomic: failure, cancellation, timeout, conflicting edits or a lost receipt can leave mutation unknown. Known state_changed comes only from the verified executor report, never exit status. One admitted Job owns every phase; retain and observe its exact continuation when pending or uncertain. Never automatically retry or redispatch. Review source before any new mutation. Formatting does not supply the edit_project_files receipt required by Code Mode dependent validation.",
+                ).with_execution(super::ToolExecutionContract::new(super::ToolExecutionForm::ProjectFormat,
+                    super::ToolExecutionLifetime::Runner, super::ToolExecutionStart::SyncFirst,
+                    super::ToolExecutionContinuation::ObserveJobs)),
+                93, super::ToolDirectReason::CoreWorkflow),
+            super::PERMISSION_RISK_WRITE),
+        &[crate::metadata::PROJECT_WRITE, JOB_RUN]),
     adaptive_runtime_direct(
         model_spec(
         def("write_job_input", super::ToolAuditPolicy::TYPED_CANONICAL,

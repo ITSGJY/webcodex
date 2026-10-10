@@ -355,6 +355,7 @@ struct JobPublicMutationSignature {
     command_execution_state: Option<ShellCommandExecutionState>,
     validation_progress: Option<webcodex_core::runner_protocol::ShellJobValidationProgress>,
     test_count_evidence: Option<webcodex_core::runner_protocol::ShellJobTestCountEvidence>,
+    format_mutation: Option<webcodex_core::project_format::ProjectFormatMutationReport>,
     activity: Option<ShellJobActivity>,
     recovered_after_server_restart: bool,
     reconciled_at: Option<i64>,
@@ -375,6 +376,7 @@ fn public_mutation_signature(job: &ShellJobRecord) -> JobPublicMutationSignature
         command_execution_state: job.command_execution_state,
         validation_progress: job.validation_progress.clone(),
         test_count_evidence: job.test_count_evidence.clone(),
+        format_mutation: job.format_mutation,
         activity: job.activity,
         recovered_after_server_restart: job.recovery.recovered_after_server_restart,
         reconciled_at: job.recovery.reconciled_at,
@@ -639,6 +641,10 @@ pub struct ShellJobStartMetadata {
 #[derive(Debug, Clone)]
 pub enum StructuredJobExecution {
     ProjectBuild(webcodex_core::project_build::ProjectBuildPlan),
+    ProjectFormat {
+        plan: webcodex_core::project_format::ProjectFormatPlan,
+        runner_instance_id: String,
+    },
     Process(ShellProcessArgv),
     InteractiveProcess(ShellProcessArgv),
     DetachedProcess(ShellProcessArgv),
@@ -829,6 +835,12 @@ impl RunnerRegistry {
             structured_execution.as_ref(),
             Some(StructuredJobExecution::SkillResource(_))
         );
+        let format_runner_instance = match structured_execution.as_ref() {
+            Some(StructuredJobExecution::ProjectFormat {
+                runner_instance_id, ..
+            }) => Some(runner_instance_id.clone()),
+            _ => None,
+        };
         let project_build_request = matches!(
             structured_execution.as_ref(),
             Some(StructuredJobExecution::ProjectBuild(_))
@@ -909,6 +921,28 @@ impl RunnerRegistry {
         let (safe_command_preview, structured_metadata, job_kind) = match structured_execution
             .as_ref()
         {
+            Some(StructuredJobExecution::ProjectFormat { plan, .. }) => {
+                plan.digest().map_err(str::to_string)?;
+                if structured_stdin.is_some()
+                    || metadata.ssh_resource.is_some()
+                    || metadata.visibility != ShellJobVisibility::Public
+                    || metadata.project_id.as_deref()
+                        != Some(format!("agent:{client_id}:{}", plan.request.project_id).as_str())
+                {
+                    return Err("invalid project format Job authority".into());
+                }
+                validate_structured_job_common(
+                    normalized_job_cwd.as_deref(),
+                    None,
+                    timeout_secs,
+                    webcodex_core::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
+                )?;
+                (
+                    "project_format selected files".into(),
+                    Some(webcodex_core::project_format::structured_metadata()),
+                    "project_format",
+                )
+            }
             Some(StructuredJobExecution::ProjectBuild(plan)) => {
                 if !plan.is_valid() || structured_stdin.is_some() {
                     return Err("invalid typed project build Job plan".to_string());
@@ -1149,6 +1183,17 @@ impl RunnerRegistry {
             Some(StructuredJobExecution::InteractiveProcess(_))
         );
         let job_operation = match structured_execution {
+            Some(StructuredJobExecution::ProjectFormat { plan, .. }) => {
+                RunnerJobOperation::StartFormat(
+                    webcodex_core::runner_operation::RunnerJobFormatOperation {
+                        job_id: job_id.clone(),
+                        cwd: normalized_job_cwd.clone(),
+                        plan,
+                        timeout_secs,
+                        context: job_context,
+                    },
+                )
+            }
             Some(StructuredJobExecution::ProjectBuild(plan)) => {
                 RunnerJobOperation::StartBuild(RunnerJobBuildOperation {
                     job_id: job_id.clone(),
@@ -1279,6 +1324,23 @@ impl RunnerRegistry {
             return Err(format!(
                 "capability_unavailable: runner {client_id} does not support structured_execution_jobs"
             ));
+        }
+        if let Some(expected_instance) = format_runner_instance {
+            if !self.inner.has_receipt_store() {
+                return Err("format_execution_unavailable".into());
+            }
+            if !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectFormat)
+            {
+                return Err(capability_upgrade_error(
+                    &client_id,
+                    RunnerFeature::ProjectFormat,
+                ));
+            }
+            if runner.runner_instance_id != expected_instance {
+                return Err("format_runner_replaced".into());
+            }
         }
         if project_build_request && !runner.runner_features.supports(RunnerFeature::ProjectBuild) {
             return Err(capability_upgrade_error(
@@ -1652,6 +1714,7 @@ impl RunnerRegistry {
             validation,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             last_update_seq: 0,
             visibility: metadata.visibility,
@@ -3027,6 +3090,17 @@ impl RunnerRegistry {
             );
             if let Err(error) = validate_validation_progress(job, &body, incoming_lifecycle)
                 .and_then(|_| validate_test_count_evidence(job, &body, incoming_lifecycle))
+                .and_then(|_| {
+                    webcodex_core::project_format::validate_mutation_report(
+                        &job.kind,
+                        incoming_lifecycle.as_wire(),
+                        body.exit_code,
+                        body.command_execution_state,
+                        body.format_mutation,
+                        body.error.as_deref(),
+                    )
+                    .map_err(|_| ValidationProtocolError("format_mutation_invalid"))
+                })
                 .and_then(|_| validate_command_execution_state(job, &body, incoming_lifecycle))
                 .and_then(|_| validate_job_activity(job, &body, incoming_lifecycle))
             {
@@ -3057,6 +3131,9 @@ impl RunnerRegistry {
                 }
                 if body.validation_progress.is_some() {
                     job.validation_progress = body.validation_progress.clone();
+                }
+                if body.format_mutation.is_some() {
+                    job.format_mutation = body.format_mutation;
                 }
                 if body.test_count_evidence.is_some() {
                     job.test_count_evidence = body.test_count_evidence.clone();

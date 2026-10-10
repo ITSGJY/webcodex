@@ -129,7 +129,7 @@ pub(crate) use commands::{
     configured_explicit_shell_command, configured_node_project_check_job_command,
     configured_prepared_shell_job_command, configured_pytest_job_command,
     configured_ruff_job_command, configured_shell_job_command, configured_validation_job_command,
-    explicit_shell_available, shell_quote,
+    explicit_shell_available, probe_ruff_formatter, shell_quote,
 };
 use commands::{
     configured_prepared_shell_command, configured_process_command, configured_process_path,
@@ -157,7 +157,8 @@ use output::IncrementalUtf8Validator;
 use output::{read_bounded_pipe_tail, BoundedPipeTail};
 use preparation::{run_prepare_command, stderr_tail};
 pub(crate) use process::{
-    prepare_detached_process_launch, run_process_with_profiles_and_execution_state,
+    prepare_detached_process_launch, run_format_candidate,
+    run_process_with_profiles_and_execution_state,
     run_process_with_profiles_and_execution_state_with_internal_env_and_start_hook,
     run_process_with_profiles_and_execution_state_with_start_hook,
 };

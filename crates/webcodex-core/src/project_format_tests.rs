@@ -184,3 +184,132 @@ fn project_format_capability_and_mutation_truth_default_closed() {
         assert_eq!(retained.state_changed(), changed);
     }
 }
+
+#[test]
+fn project_format_pf01_job_wire_is_closed_and_preserves_identity() {
+    use crate::runner_operation::{RunnerJobFormatOperation, RunnerJobOperation};
+    let context = crate::runner_protocol::ShellJobContext {
+        runtime_project_id: Some("agent:runner:demo".into()),
+        workflow_session_id: None,
+        ssh_resource: None,
+        project_cwd: Some(".".into()),
+        cwd: Some("/project".into()),
+        purpose: Some("format".into()),
+        shell: Some("direct_argv".into()),
+        command_preview: "project_format selected files".into(),
+        validation_steps: vec![],
+        validation: None,
+        structured_execution: Some(structured_metadata()),
+    };
+    let format_op = RunnerJobFormatOperation {
+        job_id: "job-format".into(),
+        cwd: context.cwd.clone(),
+        plan: plan(),
+        timeout_secs: 60,
+        context,
+    };
+    let operation = RunnerOperation::Job(RunnerJobOperation::StartFormat(format_op.clone()));
+    let wire = RunnerRequest::from_operation(
+        RunnerInvocationMetadata {
+            request_id: "r".into(),
+            client_id: "runner".into(),
+            requested_by: "test".into(),
+            created_at: 1,
+        },
+        operation,
+    )
+    .unwrap();
+    assert_eq!(wire.kind, "start_format_job");
+    assert!(
+        matches!(wire.decode_operation().unwrap(), RunnerOperation::Job(RunnerJobOperation::StartFormat(decoded)) if decoded == format_op)
+    );
+    for field in ["command", "stdin", "content", "timeout_secs"] {
+        let mut forged = wire.clone();
+        match field {
+            "command" => forged.command = "arbitrary".into(),
+            "stdin" => forged.stdin = Some("source must remain private".into()),
+            "content" => forged.content = Some("{}".into()),
+            _ => forged.timeout_secs = 121,
+        }
+        assert!(forged.decode_operation().is_err(), "{field}");
+    }
+}
+
+#[test]
+fn project_format_pf12_mutation_report_cannot_borrow_exit_success() {
+    use crate::runner_protocol::ShellCommandExecutionState as State;
+    assert_eq!(ProjectFormatMutationReport::default().state_changed(), None);
+    for report in [
+        ProjectFormatMutationReport::Changed,
+        ProjectFormatMutationReport::Unchanged,
+    ] {
+        assert!(validate_mutation_report(
+            "project_format",
+            "completed",
+            Some(0),
+            Some(State::Completed),
+            Some(report),
+            None
+        )
+        .is_ok());
+        for (kind, status, exit, state, error) in [
+            (
+                "project_build",
+                "completed",
+                Some(0),
+                Some(State::Completed),
+                None,
+            ),
+            (
+                "project_format",
+                "failed",
+                Some(0),
+                Some(State::Completed),
+                None,
+            ),
+            (
+                "project_format",
+                "completed",
+                Some(1),
+                Some(State::Completed),
+                None,
+            ),
+            (
+                "project_format",
+                "completed",
+                Some(0),
+                Some(State::OutcomeUnknown),
+                None,
+            ),
+            (
+                "project_format",
+                "completed",
+                Some(0),
+                Some(State::Completed),
+                Some("format_write_conflict"),
+            ),
+        ] {
+            assert!(
+                validate_mutation_report(kind, status, exit, state, Some(report), error).is_err()
+            );
+        }
+    }
+    assert!(validate_mutation_report(
+        "project_format",
+        "completed",
+        Some(0),
+        Some(State::Completed),
+        None,
+        None
+    )
+    .is_ok());
+    assert!(validate_mutation_report(
+        "project_format",
+        "failed",
+        Some(1),
+        Some(State::OutcomeUnknown),
+        None,
+        Some("format_process_failed")
+    )
+    .is_ok());
+}

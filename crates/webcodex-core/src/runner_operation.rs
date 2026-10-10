@@ -105,6 +105,15 @@ pub struct RunnerJobValidationOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerJobFormatOperation {
+    pub job_id: String,
+    pub cwd: Option<String>,
+    pub plan: crate::project_format::ProjectFormatPlan,
+    pub timeout_secs: u64,
+    pub context: ShellJobContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerJobBuildOperation {
     pub job_id: String,
     pub cwd: Option<String>,
@@ -148,6 +157,7 @@ pub enum RunnerJobOperation {
     StartShell(RunnerJobShellOperation),
     StartValidation(RunnerJobValidationOperation),
     StartBuild(RunnerJobBuildOperation),
+    StartFormat(RunnerJobFormatOperation),
     StartProcess(RunnerJobProcessOperation),
     StartInteractiveProcess(RunnerJobProcessOperation),
     StartDetachedProcess(RunnerJobProcessOperation),
@@ -162,6 +172,7 @@ impl RunnerJobOperation {
             Self::StartShell(operation) => &operation.job_id,
             Self::StartValidation(operation) => &operation.job_id,
             Self::StartBuild(operation) => &operation.job_id,
+            Self::StartFormat(operation) => &operation.job_id,
             Self::StartProcess(operation)
             | Self::StartInteractiveProcess(operation)
             | Self::StartDetachedProcess(operation) => &operation.job_id,
@@ -176,6 +187,7 @@ impl RunnerJobOperation {
             Self::StartShell(operation) => Some(&operation.context),
             Self::StartValidation(operation) => Some(&operation.context),
             Self::StartBuild(operation) => Some(&operation.context),
+            Self::StartFormat(operation) => Some(&operation.context),
             Self::StartProcess(operation)
             | Self::StartInteractiveProcess(operation)
             | Self::StartDetachedProcess(operation) => Some(&operation.context),
@@ -190,6 +202,7 @@ impl RunnerJobOperation {
             Self::StartShell(operation) => operation.cwd.as_deref(),
             Self::StartValidation(operation) => operation.cwd.as_deref(),
             Self::StartBuild(operation) => operation.cwd.as_deref(),
+            Self::StartFormat(operation) => operation.cwd.as_deref(),
             Self::StartProcess(operation)
             | Self::StartInteractiveProcess(operation)
             | Self::StartDetachedProcess(operation) => operation.cwd.as_deref(),
@@ -223,6 +236,7 @@ impl RunnerJobOperation {
             })
             .unwrap_or((None, None, None));
         match self {
+            Self::StartFormat(_) => Some(crate::project_format::structured_metadata()),
             Self::StartBuild(operation) => Some(ShellJobStructuredExecutionMetadata {
                 execution_source: "project_build".to_string(),
                 language: None,
@@ -757,6 +771,7 @@ impl RunnerOperation {
                 RunnerJobOperation::StartShell(_) => "start_job",
                 RunnerJobOperation::StartValidation(_) => "start_validation_job",
                 RunnerJobOperation::StartBuild(_) => "start_build_job",
+                RunnerJobOperation::StartFormat(_) => "start_format_job",
                 RunnerJobOperation::StartProcess(_) => "start_process_job",
                 RunnerJobOperation::StartInteractiveProcess(_) => "start_interactive_process_job",
                 RunnerJobOperation::StartDetachedProcess(_) => "start_detached_process_job",
@@ -1105,6 +1120,7 @@ fn encode_job_operation(
         RunnerJobOperation::StartShell(_) => "start_job",
         RunnerJobOperation::StartValidation(_) => "start_validation_job",
         RunnerJobOperation::StartBuild(_) => "start_build_job",
+        RunnerJobOperation::StartFormat(_) => "start_format_job",
         RunnerJobOperation::StartProcess(_) => "start_process_job",
         RunnerJobOperation::StartInteractiveProcess(_) => "start_interactive_process_job",
         RunnerJobOperation::StartDetachedProcess(_) => "start_detached_process_job",
@@ -1145,6 +1161,30 @@ fn encode_job_operation(
             wire.cwd = operation.cwd;
             wire.command = serde_json::to_string(&operation.steps)
                 .map_err(|error| format!("could not encode validation Job plan: {error}"))?;
+            wire.timeout_secs = operation.timeout_secs;
+            wire.job_context = Some(operation.context);
+        }
+        RunnerJobOperation::StartFormat(operation) => {
+            validate_structured_job_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+                crate::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
+            )?;
+            validate_job_context_coherence(operation.cwd.as_deref(), &operation.context)?;
+            operation.plan.digest().map_err(str::to_string)?;
+            if operation.context.ssh_resource.is_some()
+                || operation.context.structured_execution
+                    != Some(crate::project_format::structured_metadata())
+                || !operation.context.validation_steps.is_empty()
+                || operation.context.validation.is_some()
+            {
+                return Err("invalid project format Job context".into());
+            }
+            wire.job_id = Some(operation.job_id);
+            wire.cwd = operation.cwd;
+            wire.content =
+                Some(serde_json::to_string(&operation.plan).map_err(|_| "invalid format plan")?);
             wire.timeout_secs = operation.timeout_secs;
             wire.job_context = Some(operation.context);
         }
@@ -1373,6 +1413,7 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
         "start_job"
         | "start_validation_job"
         | "start_build_job"
+        | "start_format_job"
         | "start_process_job"
         | "start_interactive_process_job"
         | "start_detached_process_job"
@@ -1680,7 +1721,7 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
 fn decode_job_operation(wire: &RunnerRequest) -> Result<RunnerJobOperation, String> {
     if matches!(
         wire.kind.as_str(),
-        "start_skill_resource_job" | "start_build_job"
+        "start_skill_resource_job" | "start_build_job" | "start_format_job"
     ) {
         ensure_no_file_fields_except_content(wire)?;
     } else {
@@ -1747,6 +1788,40 @@ fn decode_job_operation(wire: &RunnerRequest) -> Result<RunnerJobOperation, Stri
                     context,
                 },
             ))
+        }
+        "start_format_job" => {
+            ensure_special_payloads_absent(wire)?;
+            if !wire.command.is_empty()
+                || wire.stdin.is_some()
+                || context.ssh_resource.is_some()
+                || context.validation.is_some()
+                || !context.validation_steps.is_empty()
+                || context.structured_execution
+                    != Some(crate::project_format::structured_metadata())
+            {
+                return Err("invalid project format Job context".into());
+            }
+            validate_structured_job_common(
+                wire.cwd.as_deref(),
+                None,
+                wire.timeout_secs,
+                crate::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
+            )?;
+            let plan: crate::project_format::ProjectFormatPlan =
+                serde_json::from_str(bounded_content(
+                    wire,
+                    crate::project_format::PROJECT_FORMAT_PLAN_MAX_BYTES,
+                    "project format plan",
+                )?)
+                .map_err(|_| "invalid project format plan")?;
+            plan.digest().map_err(str::to_string)?;
+            Ok(RunnerJobOperation::StartFormat(RunnerJobFormatOperation {
+                job_id,
+                cwd: wire.cwd.clone(),
+                plan,
+                timeout_secs: wire.timeout_secs,
+                context,
+            }))
         }
         "start_build_job" => {
             ensure_only_process_payload(wire)?;

@@ -856,7 +856,7 @@ fn model_facing_structured_execution_metadata(
 /// Build a bounded job summary `Value` for an agent-known job. Never includes
 /// stdout/stderr bodies.
 pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
-    json!({
+    let mut summary = json!({
         "job_id": job.job_id,
         "kind": job.kind,
         "status": job.status,
@@ -883,7 +883,11 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
             job.recovery_state.as_deref(),
             job.recovery_reason_code.as_deref(),
         ),
-    })
+    });
+    if job.kind == "project_format" {
+        summary["state_changed"] = json!(job.format_mutation.unwrap_or_default().state_changed());
+    }
+    summary
 }
 
 impl ToolRuntime {
@@ -2924,6 +2928,7 @@ mod recovery_projection_tests {
             result: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             validation: None,
             recovery_state: None,
@@ -2976,6 +2981,7 @@ mod recovery_projection_tests {
             result: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             validation: None,
             recovery_state: Some("lost_after_reconcile".to_string()),

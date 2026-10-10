@@ -64,6 +64,27 @@ impl ToolRuntime {
                     .await
             }
 
+            ToolCall::ProjectFormat {
+                project,
+                session_id,
+                cwd,
+                adapter,
+                files,
+                timeout_secs,
+            } => {
+                self.project_format(
+                    project,
+                    session_id,
+                    cwd,
+                    adapter,
+                    files,
+                    timeout_secs,
+                    structured_handoff_max_secs,
+                    ssh_resource,
+                    auth,
+                )
+                .await
+            }
             ToolCall::ProjectBuild {
                 project,
                 session_id,

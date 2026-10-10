@@ -104,6 +104,22 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Open the same pinned ordinary object for compare-and-write, without truncation.
+pub(crate) fn open_regular_file_for_write(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        open_regular_file_unix_access(path, true, || {})
+    }
+    #[cfg(windows)]
+    {
+        open_regular_file_windows_access(path, true, || {})
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        unsupported_regular_file_open(path)
+    }
+}
+
 #[cfg(any(test, not(any(unix, windows))))]
 pub(crate) fn unsupported_regular_file_open(_path: &Path) -> io::Result<File> {
     Err(io::Error::new(
@@ -114,6 +130,15 @@ pub(crate) fn unsupported_regular_file_open(_path: &Path) -> io::Result<File> {
 
 #[cfg(unix)]
 pub(crate) fn open_regular_file_unix(path: &Path, before_leaf: impl FnOnce()) -> io::Result<File> {
+    open_regular_file_unix_access(path, false, before_leaf)
+}
+
+#[cfg(unix)]
+fn open_regular_file_unix_access(
+    path: &Path,
+    writable: bool,
+    before_leaf: impl FnOnce(),
+) -> io::Result<File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -139,7 +164,13 @@ pub(crate) fn open_regular_file_unix(path: &Path, before_leaf: impl FnOnce()) ->
         libc::openat(
             parent.as_raw_fd(),
             leaf.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            (if writable {
+                libc::O_RDWR
+            } else {
+                libc::O_RDONLY
+            }) | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -267,9 +298,20 @@ pub(crate) fn open_regular_file_windows(
     path: &Path,
     before_leaf: impl FnOnce(),
 ) -> io::Result<File> {
+    open_regular_file_windows_access(path, false, before_leaf)
+}
+
+#[cfg(windows)]
+fn open_regular_file_windows_access(
+    path: &Path,
+    writable: bool,
+    before_leaf: impl FnOnce(),
+) -> io::Result<File> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_SHARE_READ};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     let parent_path = path
         .parent()
@@ -291,8 +333,8 @@ pub(crate) fn open_regular_file_windows(
     let file = match windows_nt_open_relative(
         parent.as_raw_handle() as HANDLE,
         leaf,
-        FILE_GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_GENERIC_READ | if writable { FILE_GENERIC_WRITE } else { 0 },
+        FILE_SHARE_READ | if writable { FILE_SHARE_WRITE } else { 0 },
         WINDOWS_FILE_NON_DIRECTORY_FILE,
     ) {
         Ok(handle) => File::from(handle),

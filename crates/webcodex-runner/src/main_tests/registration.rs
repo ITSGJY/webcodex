@@ -216,6 +216,11 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.project_lifecycle);
     assert!(caps.project_path_registration);
     assert_eq!(
+        caps.project_format_v1,
+        cfg!(any(target_os = "linux", target_os = "macos", windows)),
+        "project formatting capability is advertised on supported native platforms"
+    );
+    assert_eq!(
         caps.computer_observe,
         cfg!(any(target_os = "macos", windows)),
         "computer observation is advertised only when this Runner binary has a supported native implementation"
@@ -368,6 +373,31 @@ fn capability_catalog_does_not_enable_configured_off_implementations() {
     assert_eq!(
         capabilities.supports(RunnerCapabilityId::ComputerControl),
         cfg!(any(target_os = "macos", windows))
+    );
+    assert_eq!(
+        capabilities.supports(RunnerCapabilityId::ProjectFormat),
+        cfg!(any(target_os = "linux", target_os = "macos", windows))
+    );
+}
+
+#[test]
+fn project_format_register_request_announces_platform_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
+    cfg.capabilities = Some(RunnerCapabilities {
+        project_format_v1: false,
+        ..Default::default()
+    });
+    let body = build_register_request(&cfg, "inst-format", 0);
+    assert_eq!(
+        body.capabilities.project_format_v1,
+        cfg!(any(target_os = "linux", target_os = "macos", windows)),
+        "project formatting capability replaces static config with real platform support"
+    );
+    assert_eq!(
+        body.capabilities
+            .supports(RunnerCapabilityId::ProjectFormat),
+        cfg!(any(target_os = "linux", target_os = "macos", windows))
     );
 }
 

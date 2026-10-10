@@ -465,6 +465,7 @@ impl JobManager {
                     stream_limit_bytes: None,
                     validation_progress: final_progress,
                     test_count_evidence,
+                    format_mutation: None,
                     activity: None,
                     finished: true,
                 },

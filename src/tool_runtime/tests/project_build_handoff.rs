@@ -129,6 +129,7 @@ async fn finish_build_job(
             command_execution_state: Some(state),
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: true,
         })
