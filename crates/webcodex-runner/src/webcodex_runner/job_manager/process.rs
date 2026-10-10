@@ -205,17 +205,26 @@ impl JobManager {
             let deadline = started
                 + Duration::from_secs(operation.timeout_secs.min(start.policy.max_timeout_secs));
             let outcome = (|| {
+                if Instant::now() >= deadline {
+                    return Err("format_timeout");
+                }
                 crate::webcodex_runner::project_format::fence(
                     &start.policy,
                     &start.project_registry_dir,
                     &start.operation,
                 )
                 .map_err(|_| "format_plan_stale")?;
+                if Instant::now() >= deadline {
+                    return Err("format_timeout");
+                }
                 let planned = crate::webcodex_runner::project_format::replan(
                     &start.policy,
                     &start.project_registry_dir,
                     &operation.plan,
                 )?;
+                if Instant::now() >= deadline {
+                    return Err("format_timeout");
+                }
                 // This is a single admitted Job, not one execution per file.
                 manager.update_and_send(
                     &job_id,
@@ -224,16 +233,20 @@ impl JobManager {
                         ..Default::default()
                     },
                 );
-                let candidates = crate::webcodex_runner::project_format::format_candidates(
-                    &start.policy,
-                    &start.shell,
-                    &start.project_registry_dir,
-                    &planned,
-                    &manager.prepared_profiles,
-                    start.generation,
-                    deadline.saturating_duration_since(Instant::now()).as_secs(),
-                    Some(&stop),
-                )?;
+                if Instant::now() >= deadline {
+                    return Err("format_timeout");
+                }
+                let candidates =
+                    crate::webcodex_runner::project_format::format_candidates_with_deadline(
+                        &start.policy,
+                        &start.shell,
+                        &start.project_registry_dir,
+                        &planned,
+                        &manager.prepared_profiles,
+                        start.generation,
+                        deadline,
+                        Some(&stop),
+                    )?;
                 crate::webcodex_runner::project_format::commit_candidates(
                     &start.policy,
                     &start.project_registry_dir,

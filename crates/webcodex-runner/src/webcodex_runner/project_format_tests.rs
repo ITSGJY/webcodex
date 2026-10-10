@@ -1,6 +1,7 @@
 use super::config::{RunnerPolicy, ShellConfig};
 use super::project_format::{
-    commit_candidates, format_candidates, handle, plan, replan, PlannedFormat,
+    commit_candidates, format_candidates, format_candidates_with_deadline, handle, plan, replan,
+    PlannedFormat,
 };
 use super::shell::PreparedShellProfileCache;
 use std::fs;
@@ -416,6 +417,42 @@ fn project_format_candidates_returns_formatted_output_and_unchanged_detection() 
     assert_eq!(
         fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
         "fn main() {}\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_candidate_does_not_inherit_user_rustfmt_config() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main(){if true{println!(\"test\");}}\n",
+    )
+    .unwrap();
+    let planned = fixture.plan();
+    let home_config = tempfile::tempdir().unwrap();
+    let rustfmt_config = home_config.path().join("rustfmt");
+    fs::create_dir(&rustfmt_config).unwrap();
+    fs::write(rustfmt_config.join("rustfmt.toml"), "hard_tabs = true\n").unwrap();
+    let mut shell = ShellConfig::default();
+    shell.env.insert(
+        "XDG_CONFIG_HOME".into(),
+        home_config.path().to_string_lossy().into_owned(),
+    );
+    let output = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &PreparedShellProfileCache::default(),
+        1,
+        10,
+        None,
+    )
+    .expect("closed rustfmt profile should not inherit user configuration");
+    assert_eq!(
+        output,
+        vec!["fn main() {\n    if true {\n        println!(\"test\");\n    }\n}\n".to_string()]
     );
 }
 
@@ -1206,4 +1243,89 @@ esac
         None,
     );
     assert_eq!(result, Err("format_output_truncated"));
+}
+
+#[test]
+fn project_format_candidates_succeeds_with_one_second_timeout_budget() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let shell = ShellConfig::default();
+    let cache = PreparedShellProfileCache::default();
+    let candidates = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        1,
+        None,
+    )
+    .expect("valid 1s timeout budget must not fail to floor or spurious validation error");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0], "fn main() {}\n");
+}
+
+#[test]
+fn project_format_candidates_with_deadline_fails_closed_when_deadline_exhausted() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let shell = ShellConfig::default();
+    let cache = PreparedShellProfileCache::default();
+    let past_deadline = std::time::Instant::now() - std::time::Duration::from_millis(50);
+    let result = format_candidates_with_deadline(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        past_deadline,
+        None,
+    );
+    assert_eq!(result, Err("format_timeout"));
+}
+
+#[test]
+fn project_format_candidates_with_deadline_respects_cancellation() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let shell = ShellConfig::default();
+    let cache = PreparedShellProfileCache::default();
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    let future_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let result = format_candidates_with_deadline(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        future_deadline,
+        Some(&stop),
+    );
+    assert_eq!(result, Err("format_cancelled"));
+}
+
+#[test]
+fn project_format_candidates_with_deadline_fails_closed_on_deadline_across_multiple_files() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("src/lib.rs"), "pub fn lib( ){ }\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let shell = ShellConfig::default();
+    let cache = PreparedShellProfileCache::default();
+    let expired_deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    let result = format_candidates_with_deadline(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        expired_deadline,
+        None,
+    );
+    assert_eq!(result, Err("format_timeout"));
 }

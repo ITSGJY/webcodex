@@ -168,8 +168,9 @@ fn python_profile(manifest: &toml::Value) -> Result<ProjectFormatProfile, &'stat
 }
 
 fn reject_custom_rustfmt_config(root: &Path) -> Result<(), &'static str> {
-    // rustfmt searches parents for configuration. Only metadata is inspected
-    // outside the Project; no external configuration is read or authorized.
+    // rustfmt searches parents for configuration. Reject any configuration in
+    // the project hierarchy; user-level and external configurations are separately
+    // pinned and fenced to a verified closed default during candidate formatting.
     for (depth, parent) in root.ancestors().enumerate() {
         if depth >= 64 {
             return Err("format_scope_unavailable");
@@ -343,6 +344,7 @@ pub(crate) fn handle(
 ///
 /// Runner-owned Job execution supplies its generation, total deadline and stop
 /// signal. A single request never receives a fresh timeout for every file.
+#[allow(dead_code)]
 pub(crate) fn format_candidates(
     policy: &RunnerPolicy,
     shell: &super::config::ShellConfig,
@@ -353,61 +355,129 @@ pub(crate) fn format_candidates(
     timeout_secs: u64,
     stop_requested: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<String>, &'static str> {
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
-    use webcodex_core::runner_protocol::ShellCommandExecutionState;
 
     if !(1..=PROJECT_FORMAT_TIMEOUT_MAX_SECS).contains(&timeout_secs) {
         return Err("format_timeout_invalid");
+    }
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    format_candidates_with_deadline(
+        policy,
+        shell,
+        registry,
+        planned,
+        cache,
+        generation,
+        deadline,
+        stop_requested,
+    )
+}
+
+pub(crate) fn format_candidates_with_deadline(
+    policy: &RunnerPolicy,
+    shell: &super::config::ShellConfig,
+    registry: &Path,
+    planned: &PlannedFormat,
+    cache: &super::shell::PreparedShellProfileCache,
+    generation: u64,
+    deadline: std::time::Instant,
+    stop_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<String>, &'static str> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    use webcodex_core::runner_protocol::ShellCommandExecutionState;
+
+    if Instant::now() >= deadline {
+        return Err("format_timeout");
     }
     if !planned.plan.is_valid() || planned.sources.len() != planned.plan.files.len() {
         return Err("format_plan_invalid");
     }
 
-    let started = Instant::now();
-    let total_budget = Duration::from_secs(timeout_secs);
-    let deadline = started + total_budget;
-
-    let (python_executable, env_overrides, env_removals) = match &planned.plan.profile {
-        ProjectFormatProfile::Rust { .. } => (None, Vec::new(), Vec::new()),
-        ProjectFormatProfile::Python { .. } => {
-            let prepared_profile = super::shell::resolve_prepared_shell_profile(
-                generation,
-                shell,
-                registry,
-                &planned.cwd,
-                true,
-                cache,
-                stop_requested,
-            )
-            .map_err(|_| "format_process_failed")?;
-            let python_path = super::shell::probe_ruff_formatter(
-                shell,
-                prepared_profile.as_deref(),
-                &planned.cwd,
-                deadline,
-                stop_requested,
-            )?;
-            let python_exe = python_path
-                .into_string()
-                .map_err(|_| "format_path_invalid")?;
-            (
-                Some(python_exe),
-                vec![("PYTHONDONTWRITEBYTECODE", "1")],
-                vec!["RUFF_OUTPUT_FILE"],
-            )
-        }
-    };
+    let (python_executable, env_overrides, env_removals, rust_config_arg, _rust_fence) =
+        match &planned.plan.profile {
+            ProjectFormatProfile::Rust { .. } => {
+                let fence_dir = tempfile::tempdir().map_err(|_| "format_process_failed")?;
+                let config_path = fence_dir.path().join("rustfmt.toml");
+                fs::write(&config_path, b"").map_err(|_| "format_process_failed")?;
+                let fence_str = fence_dir
+                    .path()
+                    .to_str()
+                    .ok_or("format_path_invalid")?
+                    .to_string();
+                let config_str = config_path
+                    .to_str()
+                    .ok_or("format_path_invalid")?
+                    .to_string();
+                (
+                    None,
+                    vec![
+                        ("XDG_CONFIG_HOME".to_string(), fence_str.clone()),
+                        ("HOME".to_string(), fence_str.clone()),
+                        ("USERPROFILE".to_string(), fence_str.clone()),
+                        ("APPDATA".to_string(), fence_str),
+                    ],
+                    vec!["HOMEDRIVE", "HOMEPATH"],
+                    Some(config_str),
+                    Some(fence_dir),
+                )
+            }
+            ProjectFormatProfile::Python { .. } => {
+                let prepared_profile = super::shell::resolve_prepared_shell_profile(
+                    generation,
+                    shell,
+                    registry,
+                    &planned.cwd,
+                    true,
+                    cache,
+                    stop_requested,
+                )
+                .map_err(|_| "format_process_failed")?;
+                let python_path = super::shell::probe_ruff_formatter(
+                    shell,
+                    prepared_profile.as_deref(),
+                    &planned.cwd,
+                    deadline,
+                    stop_requested,
+                )?;
+                let python_exe = python_path
+                    .into_string()
+                    .map_err(|_| "format_path_invalid")?;
+                (
+                    Some(python_exe),
+                    vec![("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string())],
+                    vec!["RUFF_OUTPUT_FILE"],
+                    None,
+                    None,
+                )
+            }
+        };
+    let env_override_refs: Vec<(&str, &str)> = env_overrides
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let mut total_output = 0usize;
     let mut candidates = Vec::with_capacity(planned.sources.len());
     for (index, witness) in planned.plan.files.iter().enumerate() {
         if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             return Err("format_cancelled");
         }
-        let remaining = total_budget.saturating_sub(started.elapsed()).as_secs();
-        if remaining == 0 {
+        let now = Instant::now();
+        if now >= deadline {
             return Err("format_timeout");
         }
+        let remaining_duration = deadline.duration_since(now);
+        if remaining_duration.is_zero() {
+            return Err("format_timeout");
+        }
+        let remaining_secs =
+            remaining_duration
+                .as_secs()
+                .saturating_add(if remaining_duration.subsec_nanos() > 0 {
+                    1
+                } else {
+                    0
+                });
         let source = &planned.sources[index];
         let relative = planned
             .plan
@@ -421,6 +491,11 @@ pub(crate) fn format_candidates(
         let cwd = planned.cwd.to_str().ok_or("format_path_invalid")?;
 
         let exe = python_executable.as_deref().unwrap_or(&command.executable);
+        let mut args = command.args;
+        if let Some(config_path) = rust_config_arg.as_deref() {
+            args.push("--config-path".into());
+            args.push(config_path.into());
+        }
         let result = super::shell::run_format_candidate(
             generation,
             policy,
@@ -429,15 +504,18 @@ pub(crate) fn format_candidates(
             cache,
             Some(cwd),
             exe,
-            &command.args,
+            &args,
             Some(source),
-            remaining,
+            remaining_secs,
             stop_requested,
-            &env_overrides,
+            &env_override_refs,
             &env_removals,
         );
         if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             return Err("format_cancelled");
+        }
+        if Instant::now() >= deadline {
+            return Err("format_timeout");
         }
         if let Some(code) = result.result.error.as_deref() {
             match code {
@@ -471,10 +549,13 @@ pub(crate) fn format_candidates(
         {
             return Err("format_candidate_too_large");
         }
-        if started.elapsed() > total_budget {
+        if Instant::now() >= deadline {
             return Err("format_timeout");
         }
         candidates.push(stdout);
+    }
+    if Instant::now() >= deadline {
+        return Err("format_timeout");
     }
     Ok(candidates)
 }

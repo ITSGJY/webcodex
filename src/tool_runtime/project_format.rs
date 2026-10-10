@@ -224,7 +224,9 @@ impl ToolRuntime {
             self.structured_execution_sync_wait.min(Duration::from_secs(budget.sync_wait_secs)), auth.cloned()).await {
             Ok(HiddenStructuredJobWait::Terminal { job, .. }) => terminal_result(&job),
             Ok(HiddenStructuredJobWait::Continued { observation, .. }) => ToolResult::ok(json!({
-                "state_changed": null, "job_id": observation.job.job_id,
+                "execution_state": "pending",
+                "state_changed": null,
+                "job_id": observation.job.job_id,
                 "continuation": super::jobs::observe_job_continuation(&observation.job.job_id, observation.job.observation_token.as_deref()),
             })),
             Err(_) => ToolResult::err_with_output("Formatting delivery is uncertain; observe the original Job before another mutation.", json!({

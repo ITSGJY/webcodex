@@ -248,6 +248,38 @@ async fn project_format_fast_success_noop_returns_state_changed_false() {
 }
 
 #[tokio::test]
+async fn project_format_pending_preserves_original_job_and_pending_lifecycle() {
+    let runtime = setup(1, true).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(call(), Some(&auth_context(None, true)))
+                .await
+        }
+    });
+
+    let (_request, job_id) = reply_plan(&runtime).await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("pending handoff must be bounded")
+        .unwrap();
+    assert!(
+        result.success,
+        "pending is not terminal success: {:?}",
+        result.output
+    );
+    assert_eq!(result.output["execution_state"], json!("pending"));
+    assert_eq!(result.output["state_changed"], json!(null));
+    assert_eq!(result.output["job_id"], json!(job_id));
+    assert_eq!(result.output["continuation"]["tool"], json!("observe_jobs"));
+    assert_eq!(
+        result.output["continuation"]["arguments"]["items"][0]["job_id"],
+        json!(job_id)
+    );
+}
+
+#[tokio::test]
 async fn project_format_missing_capability_rejects_without_dispatch() {
     let registry = RunnerRegistry::with_job_receipt_store(
         Arc::new(NoopRunnerRegistryTelemetry),

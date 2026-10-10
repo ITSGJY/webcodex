@@ -993,7 +993,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             let mut schema = wrapped_output_schema(vec![
                 ("state_changed", json!({"type":["boolean","null"], "description":"Executor-verified aggregate mutation. Null is unknown, never retry permission."})),
                 ("failure_kind", json!({"type":"string", "maxLength":80})),
-                ("execution_state", json!({"type":"string", "enum":["not_started","outcome_unknown"]})),
+                ("execution_state", json!({"type":"string", "enum":["not_started","outcome_unknown","pending"]})),
                 ("job_id", schema_type("string", "Original Job identity, never a replacement execution.")),
                 ("continuation", observe_job_continuation_schema()),
             ]);
