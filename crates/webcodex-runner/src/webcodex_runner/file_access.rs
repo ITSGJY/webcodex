@@ -21,7 +21,10 @@ pub(crate) fn file_identity(file: &File) -> io::Result<Vec<u8>> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = file;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "file identity unavailable"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file identity unavailable",
+        ))
     }
 }
 
@@ -48,7 +51,10 @@ pub(crate) fn file_link_count(file: &File) -> io::Result<u64> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = file;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "file link count unavailable"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file link count unavailable",
+        ))
     }
 }
 
@@ -64,7 +70,10 @@ pub(crate) fn directory_identity(path: &Path) -> io::Result<Vec<u8>> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "directory identity unavailable"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory identity unavailable",
+        ))
     }
 }
 
@@ -254,7 +263,10 @@ fn unix_directory_open_flags() -> libc::c_int {
 }
 
 #[cfg(windows)]
-pub(crate) fn open_regular_file_windows(path: &Path, before_leaf: impl FnOnce()) -> io::Result<File> {
+pub(crate) fn open_regular_file_windows(
+    path: &Path,
+    before_leaf: impl FnOnce(),
+) -> io::Result<File> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_SHARE_READ};

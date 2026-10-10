@@ -12,7 +12,9 @@ pub const PROJECT_FORMAT_MANIFEST_MAX_BYTES: usize = 256 * 1024;
 pub const PROJECT_FORMAT_PLAN_MAX_BYTES: usize = 32 * 1024;
 pub const PROJECT_FORMAT_TIMEOUT_MAX_SECS: u64 = 120;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectFormatAdapter {
     #[default]
@@ -108,16 +110,43 @@ impl ProjectFormatProfile {
         let (executable, args) = match self {
             Self::Rust { edition } if recipe_relative_file.ends_with(".rs") => (
                 "rustfmt",
-                vec!["--emit=stdout".into(), format!("--edition={edition}"), "--config".into(), "skip_children=true".into()],
+                vec![
+                    "--emit=stdout".into(),
+                    format!("--edition={edition}"),
+                    "--config".into(),
+                    "skip_children=true".into(),
+                ],
             ),
-            Self::Python { .. } if recipe_relative_file.ends_with(".py") || recipe_relative_file.ends_with(".pyi") => (
-                "python",
-                vec!["-I", "-B", "-m", "ruff", "format", "--no-cache", "--config", "pyproject.toml", "--stdin-filename", recipe_relative_file, "-"]
-                    .into_iter().map(str::to_string).collect(),
-            ),
+            Self::Python { .. }
+                if recipe_relative_file.ends_with(".py")
+                    || recipe_relative_file.ends_with(".pyi") =>
+            {
+                (
+                    "python",
+                    vec![
+                        "-I",
+                        "-B",
+                        "-m",
+                        "ruff",
+                        "format",
+                        "--no-cache",
+                        "--config",
+                        "pyproject.toml",
+                        "--stdin-filename",
+                        recipe_relative_file,
+                        "-",
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                )
+            }
             _ => return Err("project format scope mismatch"),
         };
-        Ok(ShellProcessArgv { executable: executable.into(), args })
+        Ok(ShellProcessArgv {
+            executable: executable.into(),
+            args,
+        })
     }
 }
 
@@ -143,22 +172,37 @@ pub struct ProjectFormatPlan {
 
 impl ProjectFormatPlan {
     pub fn is_valid(&self) -> bool {
-        let digest = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        let digest = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
         self.request.validate().is_ok()
             && valid_format_relative_path(&self.recipe_root, true)
             && digest(&self.root_digest)
             && digest(&self.manifest_digest)
             && self.profile.is_valid()
-            && (self.request.adapter == ProjectFormatAdapter::Auto || self.request.adapter == self.profile.adapter())
+            && (self.request.adapter == ProjectFormatAdapter::Auto
+                || self.request.adapter == self.profile.adapter())
             && self.files.len() == self.request.files.len()
-            && self.files.iter().zip(&self.request.files).all(|(witness, path)| {
-                witness.path == *path
-                    && witness.bytes <= PROJECT_FORMAT_FILE_MAX_BYTES
-                    && digest(&witness.sha256)
-                    && digest(&witness.identity_digest)
-                    && self.recipe_relative_file(path).is_some_and(|relative| self.profile.process(relative).is_ok())
-            })
-            && self.files.iter().try_fold(0usize, |total, file| total.checked_add(file.bytes)).is_some_and(|total| total <= PROJECT_FORMAT_TOTAL_MAX_BYTES)
+            && self
+                .files
+                .iter()
+                .zip(&self.request.files)
+                .all(|(witness, path)| {
+                    witness.path == *path
+                        && witness.bytes <= PROJECT_FORMAT_FILE_MAX_BYTES
+                        && digest(&witness.sha256)
+                        && digest(&witness.identity_digest)
+                        && self
+                            .recipe_relative_file(path)
+                            .is_some_and(|relative| self.profile.process(relative).is_ok())
+                })
+            && self
+                .files
+                .iter()
+                .try_fold(0usize, |total, file| total.checked_add(file.bytes))
+                .is_some_and(|total| total <= PROJECT_FORMAT_TOTAL_MAX_BYTES)
     }
 
     pub fn recipe_relative_file<'a>(&self, path: &'a str) -> Option<&'a str> {

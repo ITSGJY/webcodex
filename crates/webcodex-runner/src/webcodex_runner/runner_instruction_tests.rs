@@ -1,9 +1,9 @@
 use super::*;
-use crate::webcodex_runner::file_access::unsupported_regular_file_open;
 #[cfg(unix)]
 use crate::webcodex_runner::file_access::open_regular_file_unix;
 #[cfg(windows)]
 use crate::webcodex_runner::file_access::open_regular_file_windows;
+use crate::webcodex_runner::file_access::unsupported_regular_file_open;
 use std::path::Path;
 
 fn observe(path: &Path) -> RunnerInstructionSnapshotResponse {

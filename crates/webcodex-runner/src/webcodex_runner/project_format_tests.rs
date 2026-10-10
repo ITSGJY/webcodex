@@ -25,20 +25,37 @@ impl Fixture {
         fs::create_dir(&registry).unwrap();
         fs::write(root.join("Cargo.toml"), MANIFEST).unwrap();
         fs::write(root.join("src/main.rs"), "fn main( ){ }\n").unwrap();
-        let fixture = Self { _temp: temp, root: root.clone(), registry, policy: RunnerPolicy { allowed_roots: vec![root], ..Default::default() } };
+        let fixture = Self {
+            _temp: temp,
+            root: root.clone(),
+            registry,
+            policy: RunnerPolicy {
+                allowed_roots: vec![root],
+                ..Default::default()
+            },
+        };
         fixture.register(true);
         fixture
     }
 
     fn register(&self, allow_patch: bool) {
-        fs::write(self.registry.join("demo.toml"), format!(
-            "id='demo'\npath={}\nallow_patch={allow_patch}\n",
-            serde_json::to_string(self.root.to_str().unwrap()).unwrap(),
-        )).unwrap();
+        fs::write(
+            self.registry.join("demo.toml"),
+            format!(
+                "id='demo'\npath={}\nallow_patch={allow_patch}\n",
+                serde_json::to_string(self.root.to_str().unwrap()).unwrap(),
+            ),
+        )
+        .unwrap();
     }
 
     fn request(&self) -> ProjectFormatRequest {
-        ProjectFormatRequest { project_id: "demo".into(), cwd: None, adapter: ProjectFormatAdapter::Auto, files: vec!["src/main.rs".into()] }
+        ProjectFormatRequest {
+            project_id: "demo".into(),
+            cwd: None,
+            adapter: ProjectFormatAdapter::Auto,
+            files: vec!["src/main.rs".into()],
+        }
     }
 
     fn plan(&self) -> PlannedFormat {
@@ -61,12 +78,21 @@ fn project_format_plan_keeps_source_private_and_replans_exact_bytes() {
     assert_eq!(original.root, fixture.root.canonicalize().unwrap());
     assert_eq!(original.cwd, original.root);
     assert!(original.plan.is_valid());
-    assert!(!serde_json::to_string(&original.plan).unwrap().contains("fn main"));
+    assert!(!serde_json::to_string(&original.plan)
+        .unwrap()
+        .contains("fn main"));
     assert!(replan(&fixture.policy, &fixture.registry, &original.plan).is_ok());
     fs::write(fixture.root.join("src/main.rs"), "fn main() {}\n").unwrap();
-    assert!(matches!(replan(&fixture.policy, &fixture.registry, &original.plan), Err("format_plan_stale")));
+    assert!(matches!(
+        replan(&fixture.policy, &fixture.registry, &original.plan),
+        Err("format_plan_stale")
+    ));
     let updated = fixture.plan();
-    fs::write(fixture.root.join("Cargo.toml"), MANIFEST.replace("2021", "2024")).unwrap();
+    fs::write(
+        fixture.root.join("Cargo.toml"),
+        MANIFEST.replace("2021", "2024"),
+    )
+    .unwrap();
     assert!(replan(&fixture.policy, &fixture.registry, &updated.plan).is_err());
 }
 
@@ -89,12 +115,21 @@ fn project_format_requires_exact_enabled_writable_project_and_process_policy() {
     let mut fixture = Fixture::new();
     let mut unknown = fixture.request();
     unknown.project_id = "other".into();
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &unknown)), "unknown_project");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &unknown)),
+        "unknown_project"
+    );
     fixture.register(false);
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())), "permission_denied");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+        "permission_denied"
+    );
     fixture.register(true);
     fixture.policy.allow_raw_shell = false;
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())), "permission_denied");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+        "permission_denied"
+    );
 }
 
 #[test]
@@ -105,33 +140,69 @@ fn project_format_rejects_cross_recipe_and_ambiguous_roots_without_adapter_fallb
     fs::write(fixture.root.join("nested/main.rs"), "fn main() {}\n").unwrap();
     let mut request = fixture.request();
     request.files.push("nested/main.rs".into());
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &request)), "format_scope_mismatch");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &request)),
+        "format_scope_mismatch"
+    );
     request.files.remove(0);
     request.cwd = Some("nested".into());
-    assert_eq!(plan(&fixture.policy, &fixture.registry, &request).unwrap().plan.recipe_root, "nested");
-    fs::write(fixture.root.join("nested/pyproject.toml"), "[tool.ruff]\ntarget-version='py311'\n").unwrap();
+    assert_eq!(
+        plan(&fixture.policy, &fixture.registry, &request)
+            .unwrap()
+            .plan
+            .recipe_root,
+        "nested"
+    );
+    fs::write(
+        fixture.root.join("nested/pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
     request.adapter = ProjectFormatAdapter::Rust;
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &request)), "format_recipe_ambiguous");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &request)),
+        "format_recipe_ambiguous"
+    );
 }
 
 #[test]
 fn project_format_invalid_nested_markers_never_fall_back_to_parent() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.root.join("src/Cargo.toml")).unwrap();
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())), "format_manifest_invalid");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+        "format_manifest_invalid"
+    );
 }
 
 #[test]
 fn project_format_rejects_custom_config_inherited_edition_and_large_inputs() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("rustfmt.toml"), "max_width=80\n").unwrap();
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())), "format_config_unsupported");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+        "format_config_unsupported"
+    );
     fs::remove_file(fixture.root.join("rustfmt.toml")).unwrap();
-    fs::write(fixture.root.join("Cargo.toml"), "[package]\nname='demo'\nedition.workspace=true\n").unwrap();
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())), "format_manifest_unsupported");
+    fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[package]\nname='demo'\nedition.workspace=true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+        "format_manifest_unsupported"
+    );
     fs::write(fixture.root.join("Cargo.toml"), MANIFEST).unwrap();
-    fs::write(fixture.root.join("src/main.rs"), vec![b' '; PROJECT_FORMAT_FILE_MAX_BYTES + 1]).unwrap();
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())), "format_input_too_large");
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        vec![b' '; PROJECT_FORMAT_FILE_MAX_BYTES + 1],
+    )
+    .unwrap();
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+        "format_input_too_large"
+    );
 }
 
 #[test]
@@ -141,12 +212,22 @@ fn project_format_bounds_total_bytes_and_rejects_invalid_utf8() {
     request.files.clear();
     for index in 0..5 {
         let path = format!("src/file{index}.rs");
-        fs::write(fixture.root.join(&path), vec![b' '; PROJECT_FORMAT_FILE_MAX_BYTES]).unwrap();
+        fs::write(
+            fixture.root.join(&path),
+            vec![b' '; PROJECT_FORMAT_FILE_MAX_BYTES],
+        )
+        .unwrap();
         request.files.push(path);
     }
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &request)), "format_input_too_large");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &request)),
+        "format_input_too_large"
+    );
     fs::write(fixture.root.join("src/main.rs"), [0xff]).unwrap();
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())), "format_invalid_utf8");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+        "format_invalid_utf8"
+    );
 }
 
 #[cfg(feature = "runner-real-process-tests")]
@@ -156,21 +237,52 @@ fn runner_real_process_project_format_rustfmt_stdin_leaves_sources_untouched() {
     use super::config::ShellConfig;
     use super::shell::{run_process_with_profiles_and_execution_state, PreparedShellProfileCache};
     let fixture = Fixture::new();
-    fs::write(fixture.root.join("src/main.rs"), "mod child;\nfn main( ){ }\n").unwrap();
+    fs::write(
+        fixture.root.join("src/main.rs"),
+        "mod child;\nfn main( ){ }\n",
+    )
+    .unwrap();
     fs::write(fixture.root.join("child.rs"), "fn child( ){ }\n").unwrap();
     let planned = fixture.plan();
     let command = planned.plan.profile.process("src/main.rs").unwrap();
     let result = run_process_with_profiles_and_execution_state(
-        1, &fixture.policy, &ShellConfig::default(), &fixture.registry,
-        &PreparedShellProfileCache::default(), planned.cwd.to_str(),
-        &command.executable, &command.args, Some(&planned.sources[0]), 10, None,
+        1,
+        &fixture.policy,
+        &ShellConfig::default(),
+        &fixture.registry,
+        &PreparedShellProfileCache::default(),
+        planned.cwd.to_str(),
+        &command.executable,
+        &command.args,
+        Some(&planned.sources[0]),
+        10,
+        None,
     );
-    assert_eq!(result.result.exit_code, Some(0), "{:?}", result.result.error);
-    assert_eq!(result.result.stdout.as_deref(), Some("mod child;\nfn main() {}\n"));
+    assert_eq!(
+        result.result.exit_code,
+        Some(0),
+        "{:?}",
+        result.result.error
+    );
+    assert_eq!(
+        result.result.stdout.as_deref(),
+        Some("mod child;\nfn main() {}\n")
+    );
     assert!(!result.stdout_truncated && !result.stderr_truncated);
-    assert!(result.result.stderr.as_deref().unwrap_or_default().is_empty());
-    assert_eq!(fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(), planned.sources[0]);
-    assert_eq!(fs::read_to_string(fixture.root.join("child.rs")).unwrap(), "fn child( ){ }\n");
+    assert!(result
+        .result
+        .stderr
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty());
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
+        planned.sources[0]
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("child.rs")).unwrap(),
+        "fn child( ){ }\n"
+    );
 }
 
 #[test]
@@ -181,16 +293,36 @@ fn project_format_python_pins_local_target_and_rejects_extend() {
     let mut request = fixture.request();
     request.adapter = ProjectFormatAdapter::Python;
     request.files = vec!["src/main.py".into()];
-    for manifest in ["[tool.ruff]\n", "[tool.ruff]\ntarget-version='ambient'\n", "[tool.ruff]\ntarget-version='py311'\nextend='other.toml'\n"] {
+    for manifest in [
+        "[tool.ruff]\n",
+        "[tool.ruff]\ntarget-version='ambient'\n",
+        "[tool.ruff]\ntarget-version='py311'\nextend='other.toml'\n",
+    ] {
         fs::write(fixture.root.join("pyproject.toml"), manifest).unwrap();
-        assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &request)), "format_manifest_invalid");
+        assert_eq!(
+            rejection(plan(&fixture.policy, &fixture.registry, &request)),
+            "format_manifest_invalid"
+        );
     }
-    fs::write(fixture.root.join("pyproject.toml"), "[tool.ruff]\ntarget-version='py311'\n").unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
     let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
-    assert_eq!(planned.plan.profile, ProjectFormatProfile::Python { target_version: "py311".into() });
+    assert_eq!(
+        planned.plan.profile,
+        ProjectFormatProfile::Python {
+            target_version: "py311".into()
+        }
+    );
     // A valid static profile is not evidence of installed formatter support.
     let result = handle(&fixture.policy, &fixture.registry, &request);
-    assert_eq!(serde_json::from_str::<serde_json::Value>(result.stdout.as_deref().unwrap()).unwrap()["code"], "format_execution_unavailable");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(result.stdout.as_deref().unwrap()).unwrap()
+            ["code"],
+        "format_execution_unavailable"
+    );
 }
 
 #[cfg(unix)]
@@ -201,15 +333,28 @@ fn project_format_rejects_symlink_hardlink_and_fifo_inputs() {
     let mut request = fixture.request();
     symlink("main.rs", fixture.root.join("src/link.rs")).unwrap();
     request.files = vec!["src/link.rs".into()];
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &request)), "format_path_invalid");
-    fs::hard_link(fixture.root.join("src/main.rs"), fixture.root.join("src/alias.rs")).unwrap();
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &request)),
+        "format_path_invalid"
+    );
+    fs::hard_link(
+        fixture.root.join("src/main.rs"),
+        fixture.root.join("src/alias.rs"),
+    )
+    .unwrap();
     request.files = vec!["src/main.rs".into()];
     // Even a single selected path must not mutate an inode with other aliases.
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &request)), "format_alias_unavailable");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &request)),
+        "format_alias_unavailable"
+    );
     let fifo = fixture.root.join("src/pipe.rs");
     make_fifo(&fifo);
     request.files = vec!["src/pipe.rs".into()];
-    assert_eq!(rejection(plan(&fixture.policy, &fixture.registry, &request)), "format_path_invalid");
+    assert_eq!(
+        rejection(plan(&fixture.policy, &fixture.registry, &request)),
+        "format_path_invalid"
+    );
     // Deterministically replace a checked regular leaf at the protected open
     // boundary. Opening the FIFO must return an error without waiting for stdin.
     let target = fixture.root.canonicalize().unwrap().join("src/main.rs");
@@ -239,6 +384,9 @@ fn project_format_candidates_returns_formatted_output_and_unchanged_detection() 
         &fixture.registry,
         &planned,
         &cache,
+        1,
+        10,
+        None,
     )
     .expect("dry-run rustfmt candidate formatting succeeded");
     assert_eq!(candidates.len(), 1);
@@ -254,6 +402,9 @@ fn project_format_candidates_returns_formatted_output_and_unchanged_detection() 
         &fixture.registry,
         &planned_formatted,
         &cache,
+        1,
+        10,
+        None,
     )
     .expect("dry-run formatting formatted source succeeds");
     assert_eq!(candidates_formatted.len(), 1);
@@ -279,6 +430,9 @@ fn project_format_candidates_fails_on_nonzero_exit_syntax_error() {
         &fixture.registry,
         &planned,
         &cache,
+        1,
+        10,
+        None,
     );
     assert_eq!(result, Err("format_process_failed"));
 }
@@ -298,6 +452,9 @@ fn project_format_candidates_fails_on_truncated_output() {
         &fixture.registry,
         &planned,
         &cache,
+        1,
+        10,
+        None,
     );
     assert_eq!(result, Err("format_output_truncated"));
 }
@@ -308,7 +465,9 @@ fn project_format_candidates_fails_on_missing_rustfmt() {
     let planned = fixture.plan();
     let mut shell = ShellConfig::default();
     // Restrict PATH to an empty directory so rustfmt cannot be located
-    shell.env.insert("PATH".into(), "/nonexistent_bin_path_12345".into());
+    shell
+        .env
+        .insert("PATH".into(), "/nonexistent_bin_path_12345".into());
     shell.environment_mode = super::config::ShellEnvironmentMode::Isolated;
     let cache = PreparedShellProfileCache::default();
     let result = format_candidates(
@@ -317,6 +476,44 @@ fn project_format_candidates_fails_on_missing_rustfmt() {
         &fixture.registry,
         &planned,
         &cache,
+        1,
+        10,
+        None,
     );
     assert_eq!(result, Err("format_process_failed"));
+}
+
+#[test]
+fn project_format_candidates_enforces_deadline_and_stop_before_dispatch() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let shell = ShellConfig::default();
+    let cache = PreparedShellProfileCache::default();
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let cancelled = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        10,
+        Some(&cancel),
+    );
+    assert_eq!(cancelled, Err("format_cancelled"));
+    let invalid_budget = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        0,
+        None,
+    );
+    assert_eq!(invalid_budget, Err("format_timeout_invalid"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
+        planned.sources[0]
+    );
 }
