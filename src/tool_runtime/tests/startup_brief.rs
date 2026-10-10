@@ -1139,6 +1139,7 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
             command_execution_state: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: false,
         })
@@ -1277,6 +1278,7 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
             command_execution_state: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: true,
         })

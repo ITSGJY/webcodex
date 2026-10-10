@@ -246,9 +246,12 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     capabilities.set(RunnerCapabilityId::StructuredGoTestJson, true);
     capabilities.set(RunnerCapabilityId::ProjectValidation, true);
     capabilities.set(RunnerCapabilityId::ProjectBuild, true);
-    // Static config cannot claim the format lifecycle before the worker,
-    // guarded commit and durable mutation report are implemented together.
-    capabilities.set(RunnerCapabilityId::ProjectFormat, false);
+    // Complete format lifecycle with bounded planning, worker, guarded commit
+    // and durable mutation report is supported across native platforms.
+    capabilities.set(
+        RunnerCapabilityId::ProjectFormat,
+        cfg!(any(target_os = "linux", target_os = "macos", windows)),
+    );
     capabilities.set(RunnerCapabilityId::ProjectDependencyPolicy, true);
     // Go project gateways pin GO111MODULE=on and GOWORK=off after prepared shell/profile env is
     // applied. Keep this independent for mixed Server/Runner rolling upgrades.

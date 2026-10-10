@@ -131,6 +131,9 @@ pub struct RunnerJobUpdateRequest {
     pub validation_progress: Option<ShellJobValidationProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_count_evidence: Option<ShellJobTestCountEvidence>,
+    /// Executor-owned formatting truth. Missing historical evidence is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_mutation: Option<crate::project_format::ProjectFormatMutationReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ShellJobActivity>,
     #[serde(default)]
@@ -1101,6 +1104,7 @@ impl ShellJobStructuredExecutionMetadata {
                     && self.validation_tool.is_none()
                     && self.assertion_name.is_none()
             }
+            "project_format" => self == &crate::project_format::structured_metadata(),
             "project_build" => {
                 self.language.is_none()
                     && self.script_bytes.is_none()
@@ -1251,6 +1255,9 @@ pub struct ShellJobSnapshot {
     pub validation_progress: Option<ShellJobValidationProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_count_evidence: Option<ShellJobTestCountEvidence>,
+    /// Executor-owned formatting truth. Missing historical evidence is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_mutation: Option<crate::project_format::ProjectFormatMutationReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ShellJobActivity>,
 }
@@ -1335,6 +1342,9 @@ pub struct ShellJobInfo {
     pub validation_progress: Option<ShellJobValidationProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_count_evidence: Option<ShellJobTestCountEvidence>,
+    /// Executor-owned formatting truth. Missing historical evidence is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_mutation: Option<crate::project_format::ProjectFormatMutationReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<ShellJobActivity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

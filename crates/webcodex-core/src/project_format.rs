@@ -252,3 +252,42 @@ impl ProjectFormatMutationReport {
         }
     }
 }
+
+/// Safe Job correlation only; never executable instructions or source bytes.
+pub fn structured_metadata() -> crate::runner_protocol::ShellJobStructuredExecutionMetadata {
+    crate::runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "project_format".into(),
+        language: None,
+        script_bytes: None,
+        arg_count: 0,
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    }
+}
+
+/// Missing historical receipts remain unknown. Known reports require complete
+/// executor success and can never be attached to another kind of Job.
+pub fn validate_mutation_report(
+    kind: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    execution: Option<crate::runner_protocol::ShellCommandExecutionState>,
+    report: Option<ProjectFormatMutationReport>,
+    error: Option<&str>,
+) -> Result<(), &'static str> {
+    if let Some(report) = report {
+        if kind != "project_format"
+            || (report != ProjectFormatMutationReport::Unknown
+                && (status != "completed"
+                    || exit_code != Some(0)
+                    || execution
+                        != Some(crate::runner_protocol::ShellCommandExecutionState::Completed)
+                    || error.is_some()))
+        {
+            return Err("format_mutation_invalid");
+        }
+    }
+    Ok(())
+}

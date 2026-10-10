@@ -306,6 +306,7 @@ pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "execute_mutating_code_mode",
     // Portable project build plus ordinary execution specialists.
     "project_build",
+    "project_format",
     "run_process",
     "run_script",
     "run_shell",

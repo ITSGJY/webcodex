@@ -351,6 +351,7 @@ fn snapshot_from_request(
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
         test_count_evidence: None,
+        format_mutation: None,
         activity: None,
     }
 }
@@ -379,6 +380,7 @@ fn update(
         command_execution_state: None,
         validation_progress: None,
         test_count_evidence: None,
+        format_mutation: None,
         activity: None,
         finished,
     }
@@ -540,6 +542,7 @@ async fn validation_progress_accepts_sequence_only_heartbeats_and_coalesced_gaps
                 failed_step: None,
             }),
             test_count_evidence: None,
+            format_mutation: None,
             activity,
             finished,
         }
@@ -2853,6 +2856,7 @@ fn standalone_snapshot(job_id: &str, status: &str) -> ShellJobSnapshot {
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
         test_count_evidence: None,
+        format_mutation: None,
         activity: None,
     }
 }

@@ -43,7 +43,7 @@ impl RetainedJobReceipt {
             || !text(&self.kind, 128)
             || !matches!(
                 self.kind.as_str(),
-                "shell" | "project_build" | "run_process" | "run_script"
+                "shell" | "project_build" | "project_format" | "run_process" | "run_script"
             )
             || self.terminal_observed_at <= 0
             || self.terminal_observed_at > now
@@ -91,6 +91,20 @@ impl RetainedJobReceipt {
         {
             return Err("invalid receipt terminal snapshot");
         }
+        if self.kind == "project_format"
+            && snapshot.context.structured_execution.as_ref()
+                != Some(&crate::project_format::structured_metadata())
+        {
+            return Err("invalid format receipt context");
+        }
+        crate::project_format::validate_mutation_report(
+            &self.kind,
+            &snapshot.status,
+            snapshot.exit_code,
+            snapshot.command_execution_state,
+            snapshot.format_mutation,
+            snapshot.error.as_deref(),
+        )?;
         let context = &snapshot.context;
         if context.runtime_project_id.as_ref().is_some_and(|project| {
             project

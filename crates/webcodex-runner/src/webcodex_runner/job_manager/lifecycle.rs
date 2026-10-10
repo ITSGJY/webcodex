@@ -87,6 +87,7 @@ pub(super) fn job_prestart_lifecycle(
     match operation {
         RunnerJobOperation::StartShell(_)
         | RunnerJobOperation::StartBuild(_)
+        | RunnerJobOperation::StartFormat(_)
         | RunnerJobOperation::StartProcess(_)
         | RunnerJobOperation::StartInteractiveProcess(_)
         | RunnerJobOperation::StartDetachedProcess(_)

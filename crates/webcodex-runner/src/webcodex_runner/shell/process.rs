@@ -144,6 +144,78 @@ pub(crate) fn run_process_with_profiles_and_execution_state_with_internal_env_an
     env_overrides: &[(&str, &str)],
     on_started: Option<&dyn Fn()>,
 ) -> ShellCommandResult {
+    run_process_with_output(
+        generation,
+        policy,
+        shell,
+        project_registry_dir,
+        cache,
+        cwd,
+        executable,
+        args,
+        stdin,
+        timeout_secs,
+        stop_requested,
+        env_overrides,
+        &[],
+        on_started,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_format_candidate(
+    generation: u64,
+    policy: &RunnerPolicy,
+    shell: &ShellConfig,
+    project_registry_dir: &Path,
+    cache: &PreparedShellProfileCache,
+    cwd: Option<&str>,
+    executable: &str,
+    args: &[String],
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    stop_requested: Option<&AtomicBool>,
+    env_overrides: &[(&str, &str)],
+    env_removals: &[&str],
+) -> ShellCommandResult {
+    run_process_with_output(
+        generation,
+        policy,
+        shell,
+        project_registry_dir,
+        cache,
+        cwd,
+        executable,
+        args,
+        stdin,
+        timeout_secs,
+        stop_requested,
+        env_overrides,
+        env_removals,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_process_with_output(
+    generation: u64,
+    policy: &RunnerPolicy,
+    shell: &ShellConfig,
+    project_registry_dir: &Path,
+    cache: &PreparedShellProfileCache,
+    cwd: Option<&str>,
+    executable: &str,
+    args: &[String],
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    stop_requested: Option<&AtomicBool>,
+    env_overrides: &[(&str, &str)],
+    env_removals: &[&str],
+    on_started: Option<&dyn Fn()>,
+    exact_utf8: bool,
+) -> ShellCommandResult {
     // Structured execution intentionally receives the same policy treatment
     // as run_shell. Absence of shell syntax is not a permission bypass.
     if !policy.allow_raw_shell {
@@ -207,10 +279,13 @@ pub(crate) fn run_process_with_profiles_and_execution_state_with_internal_env_an
             })
         }
     };
+    for key in env_removals {
+        cmd.env_remove(key);
+    }
     for (key, value) in env_overrides {
         cmd.env(key, value);
     }
-    execute_configured_command(
+    super::execution::execute_configured_command_with_output(
         policy,
         cmd,
         &cwd_path,
@@ -220,5 +295,6 @@ pub(crate) fn run_process_with_profiles_and_execution_state_with_internal_env_an
         start,
         "failed to spawn structured process",
         on_started,
+        exact_utf8,
     )
 }

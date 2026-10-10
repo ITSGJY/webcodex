@@ -54,6 +54,7 @@ pub(super) fn canonical_execution_project_binding(
         | ToolCall::CargoCheck { project, .. }
         | ToolCall::CargoTest { project, .. }
         | ToolCall::ProjectBuild { project, .. }
+        | ToolCall::ProjectFormat { project, .. }
         | ToolCall::ProjectValidate { project, .. }
         | ToolCall::GoTest { project, .. }
         | ToolCall::ListProjectFiles { project, .. }

@@ -409,6 +409,9 @@ pub(super) struct JobObservationState {
     pub(super) terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
     /// Fixed historical deadline, also identifies a receipt with no live lease.
     pub(super) receipt_expires_at: Option<i64>,
+    /// Durability visibility barrier shared with the post-unlock receipt writer.
+    /// This is storage acknowledgement, not a second mutation verdict.
+    pub(super) receipt_persisted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl JobObservationState {
@@ -422,6 +425,7 @@ impl JobObservationState {
             receipt_candidates: None,
             terminal_event_candidates: None,
             receipt_expires_at: None,
+            receipt_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -485,6 +489,7 @@ pub(super) struct ShellJobRecord {
     pub(super) validation: Option<webcodex_core::runner_protocol::ShellJobValidationMetadata>,
     pub(super) validation_progress: Option<ShellJobValidationProgress>,
     pub(super) test_count_evidence: Option<ShellJobTestCountEvidence>,
+    pub(super) format_mutation: Option<webcodex_core::project_format::ProjectFormatMutationReport>,
     /// Last Runner-authoritative bounded activity for an active Job. Cleared on
     /// terminal/recovery transitions; never used as execution authority.
     pub(super) activity: Option<ShellJobActivity>,

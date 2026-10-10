@@ -1984,6 +1984,7 @@ pub const SCRIPT_TIMEOUT_MAX_SECS: u64 = 7 * 24 * 60 * 60;
 /// validation, shell, and Skill Job kinds retain the shared 1-hour ceiling.
 pub fn job_execution_timeout_max_secs(kind: &str) -> u64 {
     match kind {
+        "project_format" => crate::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
         "project_build" | "run_process" | "run_detached_process" => PROCESS_TIMEOUT_MAX_SECS,
         "run_script" => SCRIPT_TIMEOUT_MAX_SECS,
         _ => STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
@@ -3304,6 +3305,7 @@ mod envelope_tests {
                 stderr: ShellJobStreamSnapshot::default(),
                 validation_progress: None,
                 test_count_evidence: None,
+                format_mutation: None,
                 activity: None,
             }],
         }
@@ -3989,6 +3991,7 @@ mod envelope_tests {
                 command_execution_state: None,
                 validation_progress: None,
                 test_count_evidence: None,
+                format_mutation: None,
                 activity: None,
                 finished: false,
             },
@@ -4317,6 +4320,7 @@ mod envelope_tests {
             command_execution_state: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: false,
         };

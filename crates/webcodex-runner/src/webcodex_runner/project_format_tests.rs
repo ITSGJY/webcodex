@@ -1,5 +1,7 @@
 use super::config::{RunnerPolicy, ShellConfig};
-use super::project_format::{format_candidates, handle, plan, replan, PlannedFormat};
+use super::project_format::{
+    commit_candidates, format_candidates, handle, plan, replan, PlannedFormat,
+};
 use super::shell::PreparedShellProfileCache;
 use std::fs;
 #[cfg(unix)]
@@ -316,12 +318,12 @@ fn project_format_python_pins_local_target_and_rejects_extend() {
             target_version: "py311".into()
         }
     );
-    // A valid static profile is not evidence of installed formatter support.
     let result = handle(&fixture.policy, &fixture.registry, &request);
+    let planning: ProjectFormatPlanningResult =
+        serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(result.stdout.as_deref().unwrap()).unwrap()
-            ["code"],
-        "format_execution_unavailable"
+        planning,
+        ProjectFormatPlanningResult::Ready { plan: planned.plan }
     );
 }
 
@@ -516,4 +518,692 @@ fn project_format_candidates_enforces_deadline_and_stop_before_dispatch() {
         fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
         planned.sources[0]
     );
+}
+
+fn commit(
+    fixture: &Fixture,
+    planned: &PlannedFormat,
+    candidates: &[String],
+) -> Result<ProjectFormatMutationReport, &'static str> {
+    super::project_format::commit_candidates(
+        &fixture.policy,
+        &fixture.registry,
+        planned,
+        candidates,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+#[test]
+fn project_format_pf07_noop_performs_no_write() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let before = fs::metadata(fixture.root.join("src/main.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        commit(&fixture, &planned, &planned.sources),
+        Ok(ProjectFormatMutationReport::Unchanged)
+    );
+    assert_eq!(
+        fs::metadata(fixture.root.join("src/main.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn project_format_pf08_guarded_write_changes_only_selected_files() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("src/other.rs"), "fn other( ){ }\n").unwrap();
+    let planned = fixture.plan();
+    assert_eq!(
+        commit(&fixture, &planned, &["fn main() {}\n".into()]),
+        Ok(ProjectFormatMutationReport::Changed)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
+        "fn main() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("src/other.rs")).unwrap(),
+        "fn other( ){ }\n"
+    );
+    assert_eq!(
+        commit(&fixture, &planned, &["fn main() {}\n".into()]),
+        Err("format_plan_stale")
+    );
+}
+
+#[test]
+fn project_format_pf09_candidate_commit_detects_source_and_manifest_conflicts() {
+    for manifest in [false, true] {
+        let fixture = Fixture::new();
+        let planned = fixture.plan();
+        if manifest {
+            fs::write(
+                fixture.root.join("Cargo.toml"),
+                MANIFEST.replace("2021", "2024"),
+            )
+            .unwrap();
+        } else {
+            fs::write(fixture.root.join("src/main.rs"), "fn concurrent() {}\n").unwrap();
+        }
+        assert_eq!(
+            commit(&fixture, &planned, &["fn main() {}\n".into()]),
+            Err("format_plan_stale")
+        );
+    }
+}
+
+#[test]
+fn project_format_pf10_partial_write_and_failed_observation_stay_unknown() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for scenario in 0..3 {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("src/other.rs"), "fn other( ){ }\n").unwrap();
+        let mut request = fixture.request();
+        request.files.push("src/other.rs".into());
+        let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+        let stop = AtomicBool::new(false);
+        let result = super::project_format::commit_candidates_with_hook(
+            &fixture.policy,
+            &fixture.registry,
+            &planned,
+            &["fn main() {}\n".into(), "fn other() {}\n".into()],
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            &stop,
+            |index, after| {
+                if index == 0 && after {
+                    match scenario {
+                        0 => {
+                            fs::write(fixture.root.join("src/other.rs"), "concurrent modification")
+                                .unwrap();
+                        }
+                        1 => {
+                            fs::write(fixture.root.join("src/main.rs"), "postwrite conflict")
+                                .unwrap();
+                        }
+                        _ => stop.store(true, Ordering::SeqCst),
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            result,
+            Err(match scenario {
+                0 => "format_write_conflict",
+                1 => "format_observation_failed",
+                _ => "format_cancelled",
+            })
+        );
+        assert_ne!(
+            fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
+            planned.sources[0]
+        );
+    }
+}
+
+#[test]
+fn project_format_pf09_replaced_object_with_same_contents_never_receives_write() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let result = super::project_format::commit_candidates_with_hook(
+        &fixture.policy,
+        &fixture.registry,
+        &planned,
+        &["fn main() {}\n".into()],
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        &std::sync::atomic::AtomicBool::new(false),
+        |_, after| {
+            if !after {
+                fs::rename(
+                    fixture.root.join("src/main.rs"),
+                    fixture.root.join("src/original.rs"),
+                )
+                .unwrap();
+                fs::write(fixture.root.join("src/main.rs"), &planned.sources[0]).unwrap();
+            }
+        },
+    );
+    assert_eq!(result, Err("format_write_conflict"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
+        planned.sources[0]
+    );
+}
+
+#[test]
+fn project_format_pf06_python_execution_remains_unavailable() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let mut shell = ShellConfig::default();
+    // Controlled isolated PATH ensures missing interpreter fail-closed behavior
+    // without relying on the ambient environment lacking Python.
+    shell
+        .env
+        .insert("PATH".into(), "/nonexistent/isolated/bin".into());
+    assert_eq!(
+        format_candidates(
+            &fixture.policy,
+            &shell,
+            &fixture.registry,
+            &planned,
+            &PreparedShellProfileCache::default(),
+            1,
+            10,
+            None
+        ),
+        Err("format_tool_unavailable")
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("main.py")).unwrap(),
+        "x=1\n"
+    );
+}
+
+#[test]
+fn project_format_handle_returns_ready_for_valid_rust_request() {
+    let fixture = Fixture::new();
+    let request = fixture.request();
+    let result = handle(&fixture.policy, &fixture.registry, &request);
+    assert_eq!(result.exit_code, Some(0));
+    let planning: ProjectFormatPlanningResult =
+        serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
+    let ProjectFormatPlanningResult::Ready { plan } = planning else {
+        panic!("expected Ready format plan");
+    };
+    assert!(plan.is_valid());
+    assert_eq!(plan.request, request);
+}
+
+#[test]
+fn project_format_fence_validates_authority_and_stale_detection() {
+    use webcodex_core::runner_operation::{RunnerJobFormatOperation, RunnerJobOperation};
+    use webcodex_core::runner_protocol::ShellJobContext;
+
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let context = ShellJobContext {
+        runtime_project_id: Some("agent:runner:demo".into()),
+        workflow_session_id: None,
+        ssh_resource: None,
+        project_cwd: Some(".".into()),
+        cwd: Some(planned.cwd.to_string_lossy().into()),
+        purpose: Some("format".into()),
+        shell: Some("direct_argv".into()),
+        command_preview: "project_format selected files".into(),
+        validation_steps: vec![],
+        validation: None,
+        structured_execution: Some(structured_metadata()),
+    };
+    let operation = RunnerJobOperation::StartFormat(RunnerJobFormatOperation {
+        job_id: "job-1".into(),
+        cwd: context.cwd.clone(),
+        plan: planned.plan.clone(),
+        timeout_secs: 60,
+        context: context.clone(),
+    });
+    assert!(super::project_format::fence(&fixture.policy, &fixture.registry, &operation).is_ok());
+
+    // Mismatched project ID
+    let mut mismatched_proj = operation.clone();
+    if let RunnerJobOperation::StartFormat(ref mut op) = mismatched_proj {
+        op.context.runtime_project_id = Some("agent:runner:other".into());
+    }
+    assert_eq!(
+        super::project_format::fence(&fixture.policy, &fixture.registry, &mismatched_proj),
+        Err("format_scope_mismatch".into())
+    );
+
+    // Mismatched cwd
+    let mut mismatched_cwd = operation.clone();
+    if let RunnerJobOperation::StartFormat(ref mut op) = mismatched_cwd {
+        op.cwd = Some("/wrong/path".into());
+    }
+    assert_eq!(
+        super::project_format::fence(&fixture.policy, &fixture.registry, &mismatched_cwd),
+        Err("format_plan_stale".into())
+    );
+
+    // Stale plan on disk
+    fs::write(fixture.root.join("src/main.rs"), "fn modified() {}\n").unwrap();
+    assert_eq!(
+        super::project_format::fence(&fixture.policy, &fixture.registry, &operation),
+        Err("format_plan_stale".into())
+    );
+}
+
+#[test]
+fn project_format_candidates_fails_on_missing_python() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let mut shell = ShellConfig::default();
+    shell
+        .env
+        .insert("PATH".into(), "/nonexistent_bin_path_12345".into());
+    shell.environment_mode = super::config::ShellEnvironmentMode::Isolated;
+    let cache = PreparedShellProfileCache::default();
+    assert_eq!(
+        format_candidates(
+            &fixture.policy,
+            &shell,
+            &fixture.registry,
+            &planned,
+            &cache,
+            1,
+            10,
+            None,
+        ),
+        Err("format_tool_unavailable")
+    );
+}
+
+#[test]
+fn project_format_candidates_fails_on_missing_ruff_module() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let cache = PreparedShellProfileCache::default();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::tests::executable_tempdir();
+        // Exit 42 models python present without the ruff module installed
+        let script = "#!/bin/sh\nexit 42\n";
+        let mock_py = temp.path().join("python3");
+        fs::write(&mock_py, script).unwrap();
+        fs::set_permissions(&mock_py, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut shell = ShellConfig::default();
+        shell.path_prepend = vec![temp.path().to_path_buf()];
+        assert_eq!(
+            format_candidates(
+                &fixture.policy,
+                &shell,
+                &fixture.registry,
+                &planned,
+                &cache,
+                1,
+                10,
+                None,
+            ),
+            Err("format_tool_unavailable")
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let mut shell = ShellConfig::default();
+        shell
+            .env
+            .insert("PATH".into(), "/nonexistent/isolated/bin".into());
+        assert_eq!(
+            format_candidates(
+                &fixture.policy,
+                &shell,
+                &fixture.registry,
+                &planned,
+                &cache,
+                1,
+                10,
+                None,
+            ),
+            Err("format_tool_unavailable")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_candidates_python_ruff_probe_timeout_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    // Script sleeps longer than total timeout budget
+    let script = r#"#!/bin/sh
+sleep 2
+exit 0
+"#;
+    let mock_py = temp.path().join("python3");
+    fs::write(&mock_py, script).unwrap();
+    fs::set_permissions(&mock_py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+
+    let mut shell = ShellConfig::default();
+    shell.path_prepend = vec![temp.path().to_path_buf()];
+    let cache = PreparedShellProfileCache::default();
+
+    // 1 second timeout budget: probe must count against budget and yield format_timeout
+    let result = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        1,
+        None,
+    );
+    assert_eq!(result, Err("format_timeout"));
+}
+
+#[test]
+fn project_format_candidates_real_ruff_opt_in_when_installed() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x = 1+2\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let shell = ShellConfig::default();
+    let cache = PreparedShellProfileCache::default();
+    let probe_ok = std::process::Command::new("python3")
+        .args([
+            "-I",
+            "-B",
+            "-c",
+            "import sys,importlib.util;sys.exit(0 if sys.version_info.major == 3 and importlib.util.find_spec('ruff') else 42)",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !probe_ok {
+        return;
+    }
+    let candidates = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        10,
+        None,
+    )
+    .unwrap();
+    assert_eq!(candidates, vec!["x = 1 + 2\n".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_candidates_python_ruff_mock_fixture_formats_and_detects_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let script = r#"#!/bin/sh
+if [ -n "$RUFF_OUTPUT_FILE" ]; then
+    echo "RUFF_OUTPUT_FILE was not removed" >&2
+    exit 55
+fi
+if [ "$PYTHONDONTWRITEBYTECODE" != "1" ]; then
+    echo "PYTHONDONTWRITEBYTECODE not set" >&2
+    exit 56
+fi
+case "$*" in
+    *"find_spec('ruff')"*)
+        exit 0
+        ;;
+    *"-m ruff format"*)
+        printf 'formatted = True\n'
+        exit 0
+        ;;
+    *)
+        exit 42
+        ;;
+esac
+"#;
+    let mock_py = temp.path().join("python3");
+    fs::write(&mock_py, script).unwrap();
+    fs::set_permissions(&mock_py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "formatted=False\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+
+    let mut shell = ShellConfig::default();
+    shell.path_prepend = vec![temp.path().to_path_buf()];
+    let cache = PreparedShellProfileCache::default();
+
+    let candidates = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        10,
+        None,
+    )
+    .unwrap();
+    assert_eq!(candidates, vec!["formatted = True\n".to_string()]);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let report = commit_candidates(
+        &fixture.policy,
+        &fixture.registry,
+        &planned,
+        &candidates,
+        deadline,
+        &stop,
+    )
+    .unwrap();
+    assert_eq!(report, ProjectFormatMutationReport::Changed);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("main.py")).unwrap(),
+        "formatted = True\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_candidates_python_ruff_syntax_error_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let script = r#"#!/bin/sh
+case "$*" in
+    *"find_spec('ruff')"*)
+        exit 0
+        ;;
+    *"-m ruff format"*)
+        echo "syntax error: unclosed parenthesis" >&2
+        exit 1
+        ;;
+    *)
+        exit 42
+        ;;
+esac
+"#;
+    let mock_py = temp.path().join("python3");
+    fs::write(&mock_py, script).unwrap();
+    fs::set_permissions(&mock_py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "def foo(\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+
+    let mut shell = ShellConfig::default();
+    shell.path_prepend = vec![temp.path().to_path_buf()];
+    let cache = PreparedShellProfileCache::default();
+
+    let result = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        10,
+        None,
+    );
+    assert_eq!(result, Err("format_process_failed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_candidates_fails_on_unexpected_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let script = r#"#!/bin/sh
+case "$*" in
+    *"find_spec('ruff')"*)
+        exit 0
+        ;;
+    *"-m ruff format"*)
+        cat > /dev/null
+        printf 'warning: something unexpected\n' >&2
+        printf 'x = 1\n'
+        exit 0
+        ;;
+    *)
+        exit 42
+        ;;
+esac
+"#;
+    let mock_py = temp.path().join("python3");
+    fs::write(&mock_py, script).unwrap();
+    fs::set_permissions(&mock_py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+
+    let mut shell = ShellConfig::default();
+    shell.path_prepend = vec![temp.path().to_path_buf()];
+    let cache = PreparedShellProfileCache::default();
+
+    let result = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        10,
+        None,
+    );
+    assert_eq!(result, Err("format_stderr_unexpected"));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_candidates_nonzero_exit_with_truncated_stderr_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let script = r#"#!/bin/sh
+case "$*" in
+    *"find_spec('ruff')"*)
+        exit 0
+        ;;
+    *"-m ruff format"*)
+        cat > /dev/null
+        printf 'very long error message exceeding max output bytes\n' >&2
+        exit 1
+        ;;
+    *)
+        exit 42
+        ;;
+esac
+"#;
+    let mock_py = temp.path().join("python3");
+    fs::write(&mock_py, script).unwrap();
+    fs::set_permissions(&mock_py, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "def foo(\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+
+    let mut shell = ShellConfig::default();
+    shell.path_prepend = vec![temp.path().to_path_buf()];
+    let mut policy = fixture.policy.clone();
+    policy.max_output_bytes = 10;
+    let cache = PreparedShellProfileCache::default();
+
+    let result = format_candidates(
+        &policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &cache,
+        1,
+        10,
+        None,
+    );
+    assert_eq!(result, Err("format_output_truncated"));
 }
