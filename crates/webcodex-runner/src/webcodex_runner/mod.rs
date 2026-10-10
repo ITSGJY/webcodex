@@ -14,6 +14,7 @@ pub(crate) mod execution_io;
 pub(crate) mod exit_diagnostics;
 pub(crate) mod external_tools;
 pub(crate) mod file_dispatch;
+pub(crate) mod file_access;
 pub(crate) mod files;
 pub(crate) mod job_manager;
 pub(crate) mod lsp;
@@ -25,6 +26,9 @@ pub(crate) mod patches;
 pub(crate) mod persistent_shell;
 pub(crate) mod plugin;
 pub(crate) mod project_build;
+pub(crate) mod project_format;
+#[cfg(test)]
+mod project_format_tests;
 #[cfg(test)]
 mod project_build_tests;
 pub(crate) mod projects;

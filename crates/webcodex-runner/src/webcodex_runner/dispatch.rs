@@ -739,6 +739,11 @@ pub(crate) fn dispatch_request_with_outcome(
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
+        RunnerOperation::PlanProjectFormat(payload) => {
+            let result = super::project_format::handle(policy, project_registry_dir, &payload);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
         RunnerOperation::Validation { payload, .. } => {
             let result = handle_validation_request(
                 policy,

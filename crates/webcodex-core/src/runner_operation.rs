@@ -725,6 +725,7 @@ pub enum RunnerOperation {
     Browser(RunnerBrowserOperation),
     PlanProjectValidation(crate::project_validation::ProjectValidationRequest),
     PlanProjectBuild(crate::project_build::ProjectBuildRequest),
+    PlanProjectFormat(crate::project_format::ProjectFormatRequest),
     Validation {
         payload: ValidationBridgeRequest,
         timeout_secs: u64,
@@ -769,6 +770,7 @@ impl RunnerOperation {
             Self::Browser(operation) => operation.kind.wire_kind(),
             Self::PlanProjectValidation(_) => "plan_project_validation",
             Self::PlanProjectBuild(_) => "plan_project_build",
+            Self::PlanProjectFormat(_) => "plan_project_format",
             Self::Validation { .. } => crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND,
             Self::Lsp { .. } => crate::lsp_bridge::AGENT_LSP_REQUEST_KIND,
             Self::PersistentShell(_) => "persistent_shell",
@@ -992,6 +994,11 @@ fn encode_operation(
             wire.timeout_secs = 30;
         }
         RunnerOperation::PlanProjectBuild(payload) => {
+            payload.validate()?;
+            wire.content = Some(serde_json::to_string(&payload).map_err(|e| e.to_string())?);
+            wire.timeout_secs = 30;
+        }
+        RunnerOperation::PlanProjectFormat(payload) => {
             payload.validate()?;
             wire.content = Some(serde_json::to_string(&payload).map_err(|e| e.to_string())?);
             wire.timeout_secs = 30;
@@ -1507,6 +1514,26 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
             .map_err(|e| e.to_string())?;
             payload.validate()?;
             Ok(RunnerOperation::PlanProjectBuild(payload))
+        }
+        "plan_project_format" => {
+            ensure_special_payloads_absent(wire)?;
+            ensure_no_file_fields_except_content(wire)?;
+            if !wire.command.is_empty()
+                || wire.cwd.is_some()
+                || wire.stdin.is_some()
+                || wire.job_context.is_some()
+                || wire.job_id.is_some()
+                || wire.shell.is_some()
+                || wire.login
+            {
+                return Err("project format planning contains execution fields".into());
+            }
+            let payload: crate::project_format::ProjectFormatRequest = serde_json::from_str(
+                bounded_content(wire, crate::project_format::PROJECT_FORMAT_PLAN_MAX_BYTES, "project format request")?,
+            )
+            .map_err(|e| e.to_string())?;
+            payload.validate()?;
+            Ok(RunnerOperation::PlanProjectFormat(payload))
         }
         crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND => {
             ensure_only_validation_payload(wire)?;
