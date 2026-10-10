@@ -1,49 +1,46 @@
-# Project formatting lifecycle — #962 contract freeze
+# Bounded project formatting lifecycle (#962)
 
-Status: **pre-implementation v1 contract and regression boundary**. This document belongs to the eventual full feature PR; it is **not** a standalone planning PR. Base: upstream/main `8c7a1c3fd1cf8baeac40652ca8b252cc89e2c685` (includes #1004).
+**Contract freeze v1 (2026-10-10)**. Base: `8c7a1c3fd1cf8baeac40652ca8b252cc89e2c685`; this design and implementation live in **one complete PR**, not separate design/API/runtime PRs. Preliminary independent source audit found full-project Cargo/Ruff output-set discovery cannot be proven by simply scanning source roots; v1 therefore selects explicit files.
 
-## Product goal and authority
+## Product and scope
 
-Expose **one** ordinary `project_format` lifecycle that actually applies supported formatters and reports observed mutation truth, rather than requiring callers to choose `cargo_fmt` or an unconstrained process. Keep `project_validate(action=format_check)` separate and unchanged.
+Expose a model-facing `project_format` with exact Runner Project, optional project-relative cwd, adapter `auto|rust|python`, and **required** bounded ordered file paths (1..8) under the selected recipe root. File selection is explicit; no implicit workspace/project traversal, package-manager script selection or arbitrary CLI flags. Rust `.rs` and Python `.py/.pyi` are supported only when their installed formatter and local configuration satisfy the closed profile. More expansive project/workspace formatting is unavailable, not silently approximated.
 
-Initial backend target: Rust/Cargo and Python/Ruff, **only if both satisfy this contract**. If a backend cannot prove bounded selection and truthful effects, fail closed or defer that backend rather than weakening the contract for parity. No Node/Go, arbitrary script, user-provided executable/argv, formatter installation, network fallback, workspace-wide exclusions, or new model-visible aliases.
+The tool is an intentional source **Mutate** operation with non-idempotent dispatch and both `project:write` and `job:run` authorization. It is distinct from `project_validate(action=format_check)`, existing `cargo_fmt`, and the canonical `edit_project_files` receipt; do not change their behavior or fake their authority. A formatting subprocess is not an OS sandbox or an assertion that no other filesystem effects are possible.
 
-An intentional writer MUST be independently authorized as a source mutation (`project:write`) and as Runner execution (`job:run`) under canonical permission/Runner capability checks. Public effect = **Mutate**; idempotency must not imply safe replay. This is **not** read-only validation, and no status code or truncated stdout alone proves what files changed. Do not rewrite legacy `cargo_fmt` behavior without a separate demonstrated compatibility need.
+## Trusted execution
 
-## Single execution contract
+- Runner resolves exact registered Project and nearest unambiguous recipe root, refuses cross-root, symlink and nonregular inputs; filenames have length/count bounds, files have per-file and total-byte caps, and inputs stay private.
+- Runner computes a closed plan from project/cwd/adapter/selected files, bounded manifest/config, exact fixed command choices and content witnesses. The plan and files are revalidated at admission and immediately before worker execution. Any stale plan is rejected before writes.
+- Rust path: selected files only; run trusted installed `rustfmt` on **stdin**, with `--emit=stdout`, fixed edition from bounded local Cargo manifest and `skip_children=true`; project custom rustfmt configs and unsupported source/manifest topology are unavailable unless an exact bounded configuration rule is independently proven. This is **not** workspace `cargo fmt`.
+- Python path: selected files only; use existing Runner-authorized isolated Python interpreter and installed Ruff module. Run `python -I -B -m ruff format --no-cache --config pyproject.toml --stdin-filename <selected-file> -` with bounded UTF-8 stdin/stdout; inherit the existing Ruff manifest requirements (local `[tool.ruff]`, explicit target-version, no `extend`) and environment sanitization, with no installs/fallback. Validate actual tool version/behavior before adding backend support. Treat stderr failures/oversized output as unknown and never write.
+- The native formatters generate **candidate bytes**, never edit project files directly. Compare exact original bytes: identical candidate -> known no-op. If changed, Runner performs guarded compare-and-write to each exact selected file, verifying file type, canonical path and source content immediately before commit. Multi-file write is not falsely described as atomic; on a partial failure, interrupted write, changed path/contents, timeout or lost receipt, mutation truth becomes **unknown**, not false/success. Only complete verified outcomes return `state_changed=true|false`.
+- All formatting phases belong to **one durable Runner Job**, created before execution. At most one write attempt per file per Job. Sync completion may return a terminal result; pending returns the **same** Job for observe/recovery. Runner persists a bounded three-state mutation report in the canonical Job/receipt before projecting it to the model. Host kernel may capture the authoritative `state_changed` before projection, never infer it from user-visible status or exit 0. Crash windows remain unknowable; **at-most-once admission, not cross-crash exactly-once completion**.
+- Preserve source mutation observation, session identity, runner capability gates, replacement Runner fail-closed behavior and existing Code Mode dependent-validation gate (which still requires `edit_project_files`). Never auto retry or redispatch a mutating Job. No network permission is inferred from a successful formatter.
 
-1. Model inputs are the exact registered Project, optional project-relative cwd, closed adapter choice (`auto|rust|python`) and bounded timing only. No options implying arbitrary command execution. Auto must fail closed on ambiguous or mismatched recipes.
-2. Runner resolves the owning recipe root, selected formatter/configuration and fixed argv, validates containment and bounded manifest inputs, computes a deterministic plan identity/provenance. Unsupported versions or missing installed tooling are **not started**; never install or silently switch executables.
-3. The admission path and the worker immediately before execution independently re-resolve the plan against the authoritative Project root and manifest/lock/config/target facts. Invalidated plans never write.
-4. A single Runner-owned execution identity governs the precheck, optional mutation, and post-execution evidence. Precheck passes -> known no-op only if a bounded, complete file witness establishes no mutation; stable formatter diff -> mutate once; other precheck results -> no mutation. Never run a second independent operation after a lost first result. Preserve same Job for asynchronous continuation, cancellation, timeouts and disconnects.
-5. Before *potential* mutation, collect a **bounded** manifest/source witness of the exact permitted candidate files (canonical path, regular-file type, size/content digest). Reject links, escaped paths, unsupported source topologies or oversized scans instead of following them. After the operation compare against a complete bounded witness. Only complete trustworthy before/after comparisons may establish `state_changed=true|false`. Missing/partial/changed file set, concurrent interference, truncated observation, uncertain dispatch and incomplete postflight -> unknown; never infer `state_changed=true` from exit 0. Explicitly do not claim OS-level confinement of a formatter binary or all external filesystem effects.
-6. Formatter execution is project-authored toolchain code: a successful exit attests to the selected native formatter run, not independent assurance of source safety. Ruff retains pinned local pyproject.toml, explicit target-version, rejected extend, isolated interpreter/module and cache/bytecode/output-file safeguards; `cargo fmt` retains its native mode/edition and project-root constraints. No public test-run counts or validation diagnostics are invented.
-7. The existing `edit_project_files` canonical mutation receipt remains a separate, authoritative producer. The new operation must not synthesize that receipt or weaken the Code Mode dependent-validation gate. Canonical mutation truth is captured internally **before** model-result projection, and result fields stay minimal.
-8. An unknown outcome requires observing the original Job and inspecting workspace state before any new write. No automatic retry, re-dispatch, detached duplicate, ambient SSH resource, or shell fallback. Maintain version/capability and replacement-runner fail-closed behavior.
+## Regression boundary — included in the same feature PR
 
-## Regression boundary (must be in the same feature PR)
+| ID | Acceptance |
+|---|---|
+| PF01 | ToolSpec/ToolCall/input-output schema has one closed `project_format` and Mutate + ProjectWrite + JobRun authority, non-idempotent. |
+| PF02 | Missing capability, old Runner, wrong auth, changed Runner identity and unauthorized project reject without dispatch. |
+| PF03 | Recipe/cwd auto vs explicit, ambiguous root, cross-root path, traversal, Windows separators, control/NUL and extension mismatch fail closed. |
+| PF04 | Too many, duplicate, oversized, unreadable, symlink or nonregular file targets reject without writing. |
+| PF05 | Valid Rust edition selection and fixed stdin/stdout rustfmt behavior; external/config-extended/custom rustfmt topology unavailable. |
+| PF06 | Ruff missing/unsupported interpreter/module, pyproject missing target, invalid/extend config, injected output/cache env fail closed. |
+| PF07 | Output identical to input proves no-op without write, not a guessed zero. |
+| PF08 | Formatter candidate differs and guarded write commits only selected files, proving positive change. |
+| PF09 | Manifest/file/source change between plan and enqueue/worker rejects; between candidate and guarded write detects conflict. |
+| PF10 | Formatter failure/truncation, unexpected stdout, concurrent modification, postwrite observation failure and multi-file partial failure never claim known full completion. |
+| PF11 | Cancellation, timeout, dropped Server response, reconnection and replacement use original Job; unknown cannot authorize replay. |
+| PF12 | Durable terminal report and synchronous result retain the same mutation truth; missing old receipt defaults unknown. |
+| PF13 | Kernel pre-projection canonical truth, model sparse result, Code Mode receipt and source invalidation preserve authority boundaries. |
+| PF14 | Exact failure kind, no test counts or validation-summary reuse; process logs and model output bounded. |
+| PF15 | Existing `project_validate`, `project_build`, `cargo_fmt`, editors and unrelated languages stay unchanged. |
+| PF16 | Focused regression, native formatter fixtures, Windows/Linux/macOS CI, independent reviews and fork full CI before upstream PR. |
 
-| ID | Requirement |
-| --- | --- |
-| PF01 | ToolSpec, ToolCall, schema and metadata recognize one `project_format` Mutate operation, with both write+execute permissions. |
-| PF02 | Missing/legacy Runner capability and unauthorized scopes reject without dispatch, including auto backend. |
-| PF03 | Project/cwd exact authority, explicit vs auto adapter, nested/ambiguous recipes and mismatched markers reject correctly. |
-| PF04 | Rust/Ruff supported version, fixed executable/argv and no user-provided script, environment or dependency installation. |
-| PF05 | Ruff config nonregular/extend/missing target-version and missing interpreter/module fail closed. |
-| PF06 | Bounded files, path traversal, symlink, external workspace/project members and oversized content reject before mutation. |
-| PF07 | Clean precheck performs no mutation and reports a proven no-op, not a fabricated diff count. |
-| PF08 | Stable native diff leads to exactly one formatting pass and a demonstrably changed content witness. |
-| PF09 | Precheck tool failure, timeout or ambiguous exit never starts mutation. |
-| PF10 | Manifest, selected source file, cwd, root, registered Project or configuration changes after planning, while queued, or before worker start reject stale plan. |
-| PF11 | Missing/partial after-witness, a changed candidate set, concurrent source changes or formatter partial failure do not invent known change truth. |
-| PF12 | Complete known *zero* change and complete known *positive* change remain distinguishable from unknown outcomes. |
-| PF13 | Worker timeout/cancel/Runner interruption uses original Job identity and no effect redispatch or blanket retry. |
-| PF14 | Model-facing projection, full/sparse Job result, Session/Window correlation and canonical internal `state_changed` do not disagree. |
-| PF15 | Code Mode mutation accounting respects authoritative internal facts and does not masquerade as `edit_project_files`. |
-| PF16 | Other project validation/build paths and existing `cargo_fmt` remain unchanged and cross-platform builds/tests pass. |
+## Execution sequence
 
-## Implementation and review sequence
+Implement **vertically within one branch/one PR**: Core typed plan and durable mutation report → Runner plan/probe/admission/guarded writer → Runner Job protocol/persistence/recovery → Registry capability/permission → ToolCall/ToolSpec/Host projection → tests and real formatter cases → review/Codex/agy/fork complete CI. No new abstraction duplicating `project_build` planning, no universal task tool, no implicit full-workspace scanning. If a critical source-truth gate cannot be closed, keep feature branch unsubmitted and report exact blocker; do not ship a misleading API.
 
-Within the **same** multi-commit feature branch and one future PR: first review the frozen contract against code; then typed contract/schemas/auth/capability; Runner planning/admission/source witnesses; durable execution/result truth and Host integration; focused tests + actual formatter probes + docs; self-review + independent Codex/agy review; fork full CI for exact final SHA. **Do not open an upstream PR without user approval** and complete review/CI evidence.
-
-Open preimplementation gates: identify the exact existing durable Job and result-truth extension points, prove the source-witness candidate set can cover native Rust/Cargo and Ruff without changing unrelated files, and verify how Runner-side mutation facts survive Job observation. Failure of any gate requires a narrower honest capability, not invented guarantees.
+No automatic push, fork PR, or upstream PR until staged evidence is ready and upstream submission is explicitly approved.
