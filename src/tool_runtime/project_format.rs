@@ -52,7 +52,7 @@ pub(crate) fn valid_failure_code(code: &str) -> bool {
             || code == "invalid_project_path")
         && code
             .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 pub(crate) fn project_format_safe_failure_kind(job: &ShellJobInfo) -> Option<&str> {

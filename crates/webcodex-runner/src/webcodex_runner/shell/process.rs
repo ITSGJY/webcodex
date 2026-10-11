@@ -160,6 +160,7 @@ pub(crate) fn run_process_with_profiles_and_execution_state_with_internal_env_an
         &[],
         on_started,
         false,
+        None,
     )
 }
 
@@ -178,6 +179,7 @@ pub(crate) fn run_format_candidate(
     stop_requested: Option<&AtomicBool>,
     env_overrides: &[(&str, &str)],
     env_removals: &[&str],
+    deadline: Option<Instant>,
 ) -> ShellCommandResult {
     run_process_with_output(
         generation,
@@ -195,6 +197,7 @@ pub(crate) fn run_format_candidate(
         env_removals,
         None,
         true,
+        deadline,
     )
 }
 
@@ -215,6 +218,7 @@ fn run_process_with_output(
     env_removals: &[&str],
     on_started: Option<&dyn Fn()>,
     exact_utf8: bool,
+    deadline: Option<Instant>,
 ) -> ShellCommandResult {
     // Structured execution intentionally receives the same policy treatment
     // as run_shell. Absence of shell syntax is not a permission bypass.
@@ -241,7 +245,7 @@ fn run_process_with_output(
     }
     let timeout_secs = timeout_secs.min(policy.max_timeout_secs).max(1);
     let start = Instant::now();
-    let profile = match resolve_prepared_shell_profile(
+    let profile = match resolve_prepared_shell_profile_with_deadline(
         generation,
         shell,
         project_registry_dir,
@@ -249,6 +253,7 @@ fn run_process_with_output(
         cwd.is_some(),
         cache,
         stop_requested,
+        deadline,
     ) {
         Ok(profile) => profile,
         Err(error) => {

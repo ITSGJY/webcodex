@@ -168,7 +168,9 @@ use process_tree::{
 };
 #[cfg(test)]
 use profiles::powershell_profile_prepare_script;
-pub(crate) use profiles::resolve_prepared_shell_profile;
+pub(crate) use profiles::{
+    resolve_prepared_shell_profile, resolve_prepared_shell_profile_with_deadline,
+};
 #[cfg(test)]
 use run::run_shell_impl;
 pub(crate) use run::run_shell_with_profiles_and_execution_state;

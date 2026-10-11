@@ -982,6 +982,126 @@ fn project_format_candidates_fails_on_missing_ruff_module() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "real shell-profile subprocess timing; run the explicit project format deadline evidence lane"]
+fn project_format_rust_profile_preparation_obeys_total_job_deadline() {
+    use super::config::ShellProfileConfig;
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let mut shell = ShellConfig::default();
+    shell.default_profile = Some("slow".into());
+    shell.profiles.insert(
+        "slow".into(),
+        ShellProfileConfig {
+            init_script: Some("sleep 5".into()),
+            ..Default::default()
+        },
+    );
+    let start = Instant::now();
+    let result = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &PreparedShellProfileCache::default(),
+        1,
+        1,
+        None,
+    );
+    assert_eq!(result, Err("format_timeout"));
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "rust profile preparation exceeded the total Job deadline"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "real shell-profile subprocess timing; run the explicit project format deadline evidence lane"]
+fn project_format_python_profile_preparation_obeys_total_job_deadline() {
+    use super::config::ShellProfileConfig;
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+
+    let mut shell = ShellConfig::default();
+    shell.default_profile = Some("slow".into());
+    shell.profiles.insert(
+        "slow".into(),
+        ShellProfileConfig {
+            init_script: Some("sleep 5".into()),
+            ..Default::default()
+        },
+    );
+    let start = Instant::now();
+    let result = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &PreparedShellProfileCache::default(),
+        1,
+        1,
+        None,
+    );
+    assert_eq!(result, Err("format_timeout"));
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "shell profile preparation exceeded the 1-second Job deadline"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_python_profile_error_text_is_not_job_timeout() {
+    use super::config::ShellProfileConfig;
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[tool.ruff]\ntarget-version='py311'\n",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let mut shell = ShellConfig::default();
+    shell.default_profile = Some("invalid".into());
+    shell.profiles.insert(
+        "invalid".into(),
+        ShellProfileConfig {
+            init_script: Some("printf 'timed out from profile' >&2; exit 42".into()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        format_candidates(
+            &fixture.policy,
+            &shell,
+            &fixture.registry,
+            &planned,
+            &PreparedShellProfileCache::default(),
+            1,
+            10,
+            None,
+        ),
+        Err("format_process_failed"),
+        "a profile's stderr text cannot impersonate the total Job timeout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn project_format_candidates_python_ruff_probe_timeout_fails_closed() {
     use std::os::unix::fs::PermissionsExt;
     let temp = crate::tests::executable_tempdir();

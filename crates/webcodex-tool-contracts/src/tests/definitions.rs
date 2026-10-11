@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn project_format_preserves_session_shell_and_write_guards() {
+    let definition = lookup_tool_definition("project_format").expect("project_format definition");
+    assert!(
+        definition.is_write_like(),
+        "formatter can mutate source files"
+    );
+    assert!(
+        definition.is_shell_like(),
+        "formatter and profile initialization launch native processes"
+    );
+    assert_eq!(definition.metadata().risk, ToolRisk::ProjectWrite);
+    assert_eq!(definition.permission_risk(), PERMISSION_RISK_WRITE);
+}
+
+#[test]
 fn tool_definition_source_has_no_module_wide_dead_code_allowance() {
     let source = include_str!("../tool_definition.rs");
     assert!(
