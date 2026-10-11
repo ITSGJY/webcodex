@@ -167,6 +167,37 @@ fn python_profile(manifest: &toml::Value) -> Result<ProjectFormatProfile, &'stat
     Ok(profile)
 }
 
+fn check_no_rustfmt_config_in_dir(dir: &Path) -> Result<(), &'static str> {
+    for name in ["rustfmt.toml", ".rustfmt.toml"] {
+        match fs::symlink_metadata(dir.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("format_config_unsupported"),
+        }
+    }
+    Ok(())
+}
+
+fn reject_file_local_rustfmt_config(
+    recipe_root: &Path,
+    file_path: &Path,
+) -> Result<(), &'static str> {
+    let mut current = file_path.parent().ok_or("format_path_invalid")?;
+    for depth in 0..64 {
+        if !current.starts_with(recipe_root) || current == recipe_root {
+            break;
+        }
+        check_no_rustfmt_config_in_dir(current)?;
+        match current.parent() {
+            Some(p) => current = p,
+            None => break,
+        }
+        if depth == 63 {
+            return Err("format_scope_unavailable");
+        }
+    }
+    Ok(())
+}
+
 fn reject_custom_rustfmt_config(root: &Path) -> Result<(), &'static str> {
     // rustfmt searches parents for configuration. Reject any configuration in
     // the project hierarchy; user-level and external configurations are separately
@@ -175,12 +206,7 @@ fn reject_custom_rustfmt_config(root: &Path) -> Result<(), &'static str> {
         if depth >= 64 {
             return Err("format_scope_unavailable");
         }
-        for name in ["rustfmt.toml", ".rustfmt.toml"] {
-            match fs::symlink_metadata(parent.join(name)) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                _ => return Err("format_config_unsupported"),
-            }
-        }
+        check_no_rustfmt_config_in_dir(parent)?;
     }
     Ok(())
 }
@@ -251,6 +277,10 @@ pub(crate) fn plan(
     let mut total = 0usize;
     for relative in &request.files {
         let path = checked_path(&root, relative, false).map_err(unavailable)?;
+        if adapter == ProjectFormatAdapter::Rust {
+            reject_file_local_rustfmt_config(&resolved.absolute_root, &path)
+                .map_err(unavailable)?;
+        }
         let parent = path
             .parent()
             .ok_or_else(|| unavailable("format_path_invalid"))?;
@@ -411,13 +441,8 @@ pub(crate) fn format_candidates_with_deadline(
                     .to_string();
                 (
                     None,
-                    vec![
-                        ("XDG_CONFIG_HOME".to_string(), fence_str.clone()),
-                        ("HOME".to_string(), fence_str.clone()),
-                        ("USERPROFILE".to_string(), fence_str.clone()),
-                        ("APPDATA".to_string(), fence_str),
-                    ],
-                    vec!["HOMEDRIVE", "HOMEPATH"],
+                    vec![("XDG_CONFIG_HOME".to_string(), fence_str)],
+                    Vec::new(),
                     Some(config_str),
                     Some(fence_dir),
                 )
@@ -655,6 +680,11 @@ pub(super) fn commit_candidates_with_hook(
             continue;
         }
         let path = checked_path(&planned.root, &witness.path, false)?;
+        if matches!(planned.plan.profile, ProjectFormatProfile::Rust { .. }) {
+            reject_custom_rustfmt_config(&planned.cwd).map_err(|_| "format_plan_stale")?;
+            reject_file_local_rustfmt_config(&planned.cwd, &path)
+                .map_err(|_| "format_plan_stale")?;
+        }
         let mut file =
             open_regular_file_for_write(&path).map_err(|_| "format_write_unavailable")?;
         if digest(&file_identity(&file).map_err(|_| "format_write_unavailable")?) != identity

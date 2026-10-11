@@ -886,6 +886,8 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
     });
     if job.kind == "project_format" {
         summary["state_changed"] = json!(job.format_mutation.unwrap_or_default().state_changed());
+        summary["failure_kind"] =
+            json!(super::project_format::project_format_safe_failure_kind(job));
     }
     summary
 }
@@ -1854,7 +1856,7 @@ impl ToolRuntime {
                 ) {
                     validation["validation_target_id"] = json!(target_id);
                 }
-                ToolResult::ok(json!({
+                let mut output = json!({
                     "job_id": job.job_id,
                     "project": job.project_id,
                     "status": job.status,
@@ -1911,7 +1913,15 @@ impl ToolRuntime {
                     "command_summary": command_summary,
                     "detected_summary": detected_summary,
                     "validation": validation,
-                }))
+                });
+                if job.kind == "project_format" {
+                    output["state_changed"] =
+                        json!(job.format_mutation.unwrap_or_default().state_changed());
+                    output["failure_kind"] = json!(
+                        super::project_format::project_format_safe_failure_kind(&job)
+                    );
+                }
+                ToolResult::ok(output)
             }
             Err(error) => agent_job_log_error_result(&job_id, error),
         }

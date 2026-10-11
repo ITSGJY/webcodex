@@ -179,6 +179,27 @@ fn project_format_invalid_nested_markers_never_fall_back_to_parent() {
 }
 
 #[test]
+fn project_format_rejects_file_local_rustfmt_config_and_stale_plan() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    for config in ["src/rustfmt.toml", "src/.rustfmt.toml"] {
+        let path = fixture.root.join(config);
+        fs::write(&path, "hard_tabs = true\n").unwrap();
+        assert_eq!(
+            rejection(plan(&fixture.policy, &fixture.registry, &fixture.request())),
+            "format_config_unsupported",
+            "a selected source must not silently ignore {config}"
+        );
+        assert_eq!(
+            replan(&fixture.policy, &fixture.registry, &planned.plan).err(),
+            Some("format_plan_stale"),
+            "new source-local format configuration invalidates the existing plan"
+        );
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 fn project_format_rejects_custom_config_inherited_edition_and_large_inputs() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("rustfmt.toml"), "max_width=80\n").unwrap();
@@ -453,6 +474,45 @@ fn project_format_candidate_does_not_inherit_user_rustfmt_config() {
     assert_eq!(
         output,
         vec!["fn main() {\n    if true {\n        println!(\"test\");\n    }\n}\n".to_string()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_format_candidate_preserves_home_for_rustup_style_formatter() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join(".rustup")).unwrap();
+    fs::write(home.join(".rustup/settings.toml"), "configured\n").unwrap();
+    let fake_rustfmt = temp.path().join("rustfmt");
+    fs::write(
+        &fake_rustfmt,
+        "#!/bin/sh\nif [ ! -f \"$HOME/.rustup/settings.toml\" ]; then\n  echo 'rustup home unavailable' >&2\n  exit 42\nfi\ncat\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_rustfmt, fs::Permissions::from_mode(0o755)).unwrap();
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let mut shell = ShellConfig::default();
+    shell.path_prepend = vec![temp.path().to_path_buf()];
+    shell
+        .env
+        .insert("HOME".into(), home.to_string_lossy().into_owned());
+    let actual = format_candidates(
+        &fixture.policy,
+        &shell,
+        &fixture.registry,
+        &planned,
+        &PreparedShellProfileCache::default(),
+        1,
+        10,
+        None,
+    );
+    assert_eq!(
+        actual,
+        Ok(planned.sources),
+        "formatter toolchain lookup must retain its configured HOME"
     );
 }
 
