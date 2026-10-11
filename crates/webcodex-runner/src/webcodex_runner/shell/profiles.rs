@@ -101,9 +101,21 @@ pub(super) fn capture_profile_env_snapshot(
     prepare_cwd: &Path,
     initial_env: HashMap<String, String>,
     stop_requested: Option<&AtomicBool>,
+    deadline: Option<Instant>,
 ) -> Result<HashMap<String, String>, String> {
     let Some(init_script) = profile.init_script.as_deref() else {
         return Ok(initial_env);
+    };
+    let cap = Duration::from_secs(SHELL_PROFILE_PREPARE_TIMEOUT_SECS);
+    let timeout = match deadline {
+        Some(deadline) => {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("profile prepare timed out before launch".to_string());
+            }
+            cap.min(deadline.duration_since(now))
+        }
+        None => cap,
     };
     let marker = format!("__WEBCODEX_ENV_START_{}__", uuid::Uuid::new_v4().simple());
     let prepare_script = match dialect {
@@ -121,19 +133,15 @@ pub(super) fn capture_profile_env_snapshot(
     for (key, value) in initial_env {
         cmd.env(key, value);
     }
-    let (status, stdout, stderr) = run_prepare_command(
-        cmd,
-        Duration::from_secs(SHELL_PROFILE_PREPARE_TIMEOUT_SECS),
-        stop_requested,
-    )
-    .map_err(|e| {
-        format!(
-            "failed to prepare shell profile '{}' at {}: {}",
-            profile_name,
-            prepare_cwd.display(),
-            e
-        )
-    })?;
+    let (status, stdout, stderr) =
+        run_prepare_command(cmd, timeout, stop_requested).map_err(|e| {
+            format!(
+                "failed to prepare shell profile '{}' at {}: {}",
+                profile_name,
+                prepare_cwd.display(),
+                e
+            )
+        })?;
     if !status.success() {
         return Err(format!(
             "failed to prepare shell profile '{}' at {}: exit code {}; stderr tail: {}",
@@ -180,6 +188,27 @@ impl PreparedShellProfileCache {
         prepare_cwd: &Path,
         stop_requested: Option<&AtomicBool>,
     ) -> Result<Arc<PreparedShellProfile>, String> {
+        self.get_or_prepare_with_deadline(
+            generation,
+            shell,
+            profile_name,
+            project_key,
+            prepare_cwd,
+            stop_requested,
+            None,
+        )
+    }
+
+    pub(super) fn get_or_prepare_with_deadline(
+        &self,
+        generation: u64,
+        shell: &ShellConfig,
+        profile_name: &str,
+        project_key: String,
+        prepare_cwd: &Path,
+        stop_requested: Option<&AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Result<Arc<PreparedShellProfile>, String> {
         let key = PreparedShellProfileKey {
             generation,
             project_key,
@@ -218,6 +247,7 @@ impl PreparedShellProfileCache {
             prepare_cwd,
             initial_env,
             stop_requested,
+            deadline,
         )?;
         let prepared = Arc::new(PreparedShellProfile {
             profile_name: profile_name.to_string(),
@@ -336,6 +366,28 @@ pub(crate) fn resolve_prepared_shell_profile(
     cache: &PreparedShellProfileCache,
     stop_requested: Option<&AtomicBool>,
 ) -> Result<Option<Arc<PreparedShellProfile>>, String> {
+    resolve_prepared_shell_profile_with_deadline(
+        generation,
+        shell,
+        project_registry_dir,
+        cwd_path,
+        request_has_cwd,
+        cache,
+        stop_requested,
+        None,
+    )
+}
+
+pub(crate) fn resolve_prepared_shell_profile_with_deadline(
+    generation: u64,
+    shell: &ShellConfig,
+    project_registry_dir: &Path,
+    cwd_path: &Path,
+    request_has_cwd: bool,
+    cache: &PreparedShellProfileCache,
+    stop_requested: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+) -> Result<Option<Arc<PreparedShellProfile>>, String> {
     let project = request_has_cwd
         .then(|| find_project_shell_context(project_registry_dir, cwd_path))
         .flatten();
@@ -365,13 +417,14 @@ pub(crate) fn resolve_prepared_shell_profile(
         &prepare_cwd,
     );
     cache
-        .get_or_prepare(
+        .get_or_prepare_with_deadline(
             generation,
             shell,
             profile_name,
             project_key,
             &prepare_cwd,
             stop_requested,
+            deadline,
         )
         .map(Some)
 }

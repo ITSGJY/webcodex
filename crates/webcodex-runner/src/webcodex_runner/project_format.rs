@@ -424,6 +424,36 @@ pub(crate) fn format_candidates_with_deadline(
         return Err("format_plan_invalid");
     }
 
+    let prepared_profile = match super::shell::resolve_prepared_shell_profile_with_deadline(
+        generation,
+        shell,
+        registry,
+        &planned.cwd,
+        true,
+        cache,
+        stop_requested,
+        Some(deadline),
+    ) {
+        Ok(profile) => {
+            if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+                return Err("format_cancelled");
+            }
+            if Instant::now() >= deadline {
+                return Err("format_timeout");
+            }
+            profile
+        }
+        Err(_) => {
+            if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+                return Err("format_cancelled");
+            }
+            if Instant::now() >= deadline {
+                return Err("format_timeout");
+            }
+            return Err("format_process_failed");
+        }
+    };
+
     let (python_executable, env_overrides, env_removals, rust_config_arg, _rust_fence) =
         match &planned.plan.profile {
             ProjectFormatProfile::Rust { .. } => {
@@ -448,16 +478,6 @@ pub(crate) fn format_candidates_with_deadline(
                 )
             }
             ProjectFormatProfile::Python { .. } => {
-                let prepared_profile = super::shell::resolve_prepared_shell_profile(
-                    generation,
-                    shell,
-                    registry,
-                    &planned.cwd,
-                    true,
-                    cache,
-                    stop_requested,
-                )
-                .map_err(|_| "format_process_failed")?;
                 let python_path = super::shell::probe_ruff_formatter(
                     shell,
                     prepared_profile.as_deref(),
@@ -535,6 +555,7 @@ pub(crate) fn format_candidates_with_deadline(
             stop_requested,
             &env_override_refs,
             &env_removals,
+            Some(deadline),
         );
         if stop_requested.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             return Err("format_cancelled");

@@ -13,6 +13,53 @@ use webcodex_core::project_format::{
 };
 use webcodex_runner_registry::{JobReceiptStore, NoopRunnerRegistryTelemetry, RetainedJobReceipt};
 
+#[tokio::test]
+async fn project_format_session_shell_guard_rejection_matches_registered_schema() {
+    let runtime = setup(1, true).await;
+    let project = agent_test_project_id(CLIENT);
+    let session = runtime.sessions.start_session_with_guards(
+        Some(project.clone()),
+        None,
+        webcodex_core::workflow_session_contract::SessionMode::Normal,
+        crate::tool_runtime::sessions::SessionGuards {
+            deny_write_tools: false,
+            deny_shell_tools: true,
+        },
+    );
+    let call = ToolCall::ProjectFormat {
+        project,
+        session_id: Some(session.session_id.clone()),
+        cwd: None,
+        adapter: Some(ProjectFormatAdapter::Rust),
+        files: vec!["src/main.rs".into()],
+        timeout_secs: Some(60),
+    };
+    let result = runtime
+        .dispatch_with_auth(call, Some(&auth_context(None, true)))
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], json!("session_guard_denied"));
+    assert_eq!(result.output["guard"], json!("deny_shell_tools"));
+    assert_eq!(result.output["command_started"], json!(false));
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("project_format");
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &serde_json::to_value(&result).unwrap(),
+        &schema,
+    )
+    .expect("the real kernel shell-guard rejection must match project_format output schema");
+}
+
+#[test]
+fn project_format_retain_utf8_failure_codes() {
+    assert!(super::super::project_format::valid_failure_code(
+        "format_invalid_utf8"
+    ));
+    assert!(super::super::project_format::valid_failure_code(
+        "format_output_invalid_utf8"
+    ));
+}
+
 const CLIENT: &str = "project-format";
 
 #[derive(Debug, Default)]
@@ -528,6 +575,12 @@ async fn project_format_missing_capability_rejects_without_dispatch() {
         result.output["failure_kind"],
         json!("capability_unavailable")
     );
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("project_format");
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &serde_json::to_value(&result).unwrap(),
+        &schema,
+    )
+    .expect("real Runner capability denial must match project_format output schema");
     assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
 }
 
