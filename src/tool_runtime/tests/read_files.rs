@@ -2299,6 +2299,7 @@ async fn ordinary_read_delivers_terminal_attention_without_host_continuation_sup
             command_execution_state: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: true,
         })

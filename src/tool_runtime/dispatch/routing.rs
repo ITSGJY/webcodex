@@ -178,6 +178,7 @@ impl ToolRuntime {
             | ToolCall::RunScript { .. }
             | ToolCall::RunShell { .. }
             | ToolCall::ProjectBuild { .. }
+            | ToolCall::ProjectFormat { .. }
             | ToolCall::OpenSessionShell { .. }
             | ToolCall::SessionShellExec { .. }
             | ToolCall::SessionShellStatus { .. }

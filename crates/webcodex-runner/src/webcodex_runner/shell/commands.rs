@@ -254,6 +254,57 @@ pub(crate) fn configured_ruff_job_command(
     configured_python_module_job_command(shell, profile, &step.args, cwd, stop_requested, true)
 }
 
+pub(crate) fn probe_ruff_formatter(
+    shell: &ShellConfig,
+    profile: Option<&PreparedShellProfile>,
+    cwd: &Path,
+    deadline: Instant,
+    stop_requested: Option<&AtomicBool>,
+) -> Result<OsString, &'static str> {
+    if Instant::now() >= deadline {
+        return Err("format_timeout");
+    }
+    let program = super::scripts::configured_validation_python_interpreter(shell, profile)
+        .map_err(|_| "format_tool_unavailable")?;
+    let mut probe = Command::new(&program);
+    const RUFF_PROBE: &str = "import sys,importlib.util;sys.exit(0 if sys.version_info.major == 3 and importlib.util.find_spec('ruff') else 42)";
+    probe.args(["-I", "-B", "-c", RUFF_PROBE]);
+    probe.current_dir(cwd);
+    probe.stdin(Stdio::null());
+    probe.stdout(Stdio::null());
+    probe.stderr(Stdio::null());
+    super::scripts::apply_script_environment(&mut probe, shell, profile)
+        .map_err(|_| "format_tool_unavailable")?;
+    probe.env_remove("RUFF_OUTPUT_FILE");
+    probe.env("PYTHONDONTWRITEBYTECODE", "1");
+    if stop_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("format_cancelled");
+    }
+    let mut child = ManagedChild::spawn(&mut probe).map_err(|_| "format_tool_unavailable")?;
+    let available = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None)
+                if Instant::now() < deadline
+                    && !stop_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => break false,
+        }
+    };
+    if terminate_child_process_tree(&mut child).is_err() || !available {
+        if stop_requested.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err("format_cancelled");
+        }
+        if Instant::now() >= deadline {
+            return Err("format_timeout");
+        }
+        return Err("format_tool_unavailable");
+    }
+    Ok(program)
+}
+
 fn configured_python_module_job_command(
     shell: &ShellConfig,
     profile: Option<&PreparedShellProfile>,

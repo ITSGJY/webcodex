@@ -201,6 +201,7 @@ impl ToolRuntime {
                             | ToolCall::CargoCheck { .. }
                             | ToolCall::CargoTest { .. }
                             | ToolCall::ProjectBuild { .. }
+                            | ToolCall::ProjectFormat { .. }
                             | ToolCall::ProjectValidate { .. }
                             | ToolCall::GoTest { .. }
                     ) {

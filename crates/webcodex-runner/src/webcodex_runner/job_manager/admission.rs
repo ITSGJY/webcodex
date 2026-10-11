@@ -139,6 +139,17 @@ pub(super) fn validate_runner_job_context_operation(
         RunnerJobOperation::StartShell(operation) => {
             runner_protocol::validate_raw_shell_wire_command(&operation.command)?;
         }
+        RunnerJobOperation::StartFormat(operation) => {
+            if context.ssh_resource.is_some() || !operation.plan.is_valid() {
+                return Err("invalid project format Job".into());
+            }
+            validate_runner_structured_common(
+                operation.cwd.as_deref(),
+                None,
+                operation.timeout_secs,
+                webcodex_core::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
+            )?;
+        }
         RunnerJobOperation::StartBuild(operation) => {
             if context.ssh_resource.is_some() {
                 return Err("typed project build Job request shape is invalid".to_string());
@@ -324,6 +335,7 @@ impl JobManager {
                 command_execution_state,
                 validation_progress: None,
                 test_count_evidence: None,
+                format_mutation: None,
                 activity: None,
                 finished: true,
             });
@@ -359,6 +371,13 @@ impl JobManager {
             )
             .and_then(|_| {
                 crate::webcodex_runner::project_build::fence(
+                    &start.policy,
+                    &start.project_registry_dir,
+                    &start.operation,
+                )
+            })
+            .and_then(|_| {
+                crate::webcodex_runner::project_format::fence(
                     &start.policy,
                     &start.project_registry_dir,
                     &start.operation,
@@ -411,6 +430,7 @@ impl JobManager {
                         stderr: ShellJobStreamSnapshot::default(),
                         validation_progress: None,
                         test_count_evidence: None,
+                        format_mutation: None,
                         activity: None,
                     },
                     child: None,
@@ -452,6 +472,7 @@ impl JobManager {
         match &start.operation {
             RunnerJobOperation::StartInteractiveProcess(_) => self.start_interactive_process(start),
             RunnerJobOperation::StartDetachedProcess(_) => self.start_detached_process_job(start),
+            RunnerJobOperation::StartFormat(_) => self.start_format_job(start),
             RunnerJobOperation::StartBuild(_)
             | RunnerJobOperation::StartProcess(_)
             | RunnerJobOperation::StartScript(_)

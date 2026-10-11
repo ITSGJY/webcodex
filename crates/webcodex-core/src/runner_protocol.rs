@@ -559,6 +559,13 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_build_v1: bool = false;
     }
+    /// Complete bounded project formatting lifecycle. Planning support alone
+    /// must never advertise this capability; older Runners default to false.
+    ProjectFormat => RUNNER_CAPABILITY_PROJECT_FORMAT("project_format_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_format_v1: bool = false;
+    }
     /// Additive portable dependency policy for project build/validation gateways.
     /// Missing on older Runners is false; policy-bearing plans must fail closed.
     ProjectDependencyPolicy => RUNNER_CAPABILITY_PROJECT_DEPENDENCY_POLICY("project_dependency_policy_v1"),
@@ -1977,6 +1984,7 @@ pub const SCRIPT_TIMEOUT_MAX_SECS: u64 = 7 * 24 * 60 * 60;
 /// validation, shell, and Skill Job kinds retain the shared 1-hour ceiling.
 pub fn job_execution_timeout_max_secs(kind: &str) -> u64 {
     match kind {
+        "project_format" => crate::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
         "project_build" | "run_process" | "run_detached_process" => PROCESS_TIMEOUT_MAX_SECS,
         "run_script" => SCRIPT_TIMEOUT_MAX_SECS,
         _ => STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
@@ -2847,6 +2855,7 @@ mod envelope_tests {
                 structured_go_test_json: true,
                 project_validation_v1: false,
                 project_build_v1: false,
+                project_format_v1: false,
                 project_dependency_policy_v1: false,
                 project_go_single_module_v1: false,
                 project_validation_package_scope_v1: false,
@@ -3296,6 +3305,7 @@ mod envelope_tests {
                 stderr: ShellJobStreamSnapshot::default(),
                 validation_progress: None,
                 test_count_evidence: None,
+                format_mutation: None,
                 activity: None,
             }],
         }
@@ -3981,6 +3991,7 @@ mod envelope_tests {
                 command_execution_state: None,
                 validation_progress: None,
                 test_count_evidence: None,
+                format_mutation: None,
                 activity: None,
                 finished: false,
             },
@@ -4309,6 +4320,7 @@ mod envelope_tests {
             command_execution_state: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: false,
         };

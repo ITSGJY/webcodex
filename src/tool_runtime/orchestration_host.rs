@@ -1090,4 +1090,35 @@ mod receipt_tests {
             assert_eq!(receipt.children[0].state_changed, None);
         }
     }
+
+    #[test]
+    fn project_format_pending_handoff_emits_job_handoff_receipt() {
+        let mut effects = OrchestrationEffectAccumulator::default();
+        effects.begin_if_consequential(1, "project_format");
+        let result = super::super::ToolResult::ok(serde_json::json!({
+            "execution_state": "pending",
+            "state_changed": null,
+            "job_id": "job-format-test",
+            "continuation": {
+                "tool": "observe_jobs",
+                "arguments": {
+                    "items": [{ "job_id": "job-format-test" }]
+                }
+            }
+        }));
+        effects.finish(1, &result, None);
+        let receipt = effects.receipt();
+        assert_eq!(receipt.consequential_calls, 1);
+        assert_eq!(receipt.job_handoffs, 1);
+        assert_eq!(receipt.known_results, 0);
+        assert_eq!(receipt.outcome_unknown, 0);
+        assert_eq!(
+            receipt.children[0].outcome,
+            ConsequentialChildOutcome::JobHandoff
+        );
+        assert_eq!(
+            receipt.children[0].job_id.as_deref(),
+            Some("job-format-test")
+        );
+    }
 }

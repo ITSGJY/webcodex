@@ -489,6 +489,7 @@ impl ToolCall {
             Self::CargoCheck { .. } => "cargo_check",
             Self::CargoTest { .. } => "cargo_test",
             Self::ProjectBuild { .. } => "project_build",
+            Self::ProjectFormat { .. } => "project_format",
             Self::ProjectValidate { .. } => "project_validate",
             Self::GoTest { .. } => "go_test",
             Self::ReadFiles { .. } => "read_files",
@@ -653,6 +654,7 @@ impl ToolCall {
             | Self::CargoCheck { session_id, .. }
             | Self::CargoTest { session_id, .. }
             | Self::ProjectBuild { session_id, .. }
+            | Self::ProjectFormat { session_id, .. }
             | Self::ProjectValidate { session_id, .. }
             | Self::GoTest { session_id, .. }
             | Self::ReadFiles { session_id, .. }
@@ -754,6 +756,7 @@ impl ToolCall {
             | Self::RunScript { cwd, .. }
             | Self::RunSkillResource { cwd, .. }
             | Self::ProjectBuild { cwd, .. }
+            | Self::ProjectFormat { cwd, .. }
                 if cwd.is_none() =>
             {
                 *cwd = execution_context.default_cwd.clone();
@@ -811,6 +814,7 @@ impl ToolCall {
             | Self::CargoCheck { project, .. }
             | Self::CargoTest { project, .. }
             | Self::ProjectBuild { project, .. }
+            | Self::ProjectFormat { project, .. }
             | Self::ProjectValidate { project, .. }
             | Self::GoTest { project, .. }
             | Self::ReadFiles { project, .. }

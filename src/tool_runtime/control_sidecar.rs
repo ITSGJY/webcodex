@@ -842,4 +842,24 @@ mod tests {
         let control = json!({"main": {"success": true, "execution_state": "succeeded", "state_changed": null}, "after_success": projection});
         webcodex_tool_contracts::test_support::validate_schema_instance(&control, &schema).unwrap();
     }
+
+    #[test]
+    fn project_format_pending_main_execution_state_becomes_started() {
+        let result = ToolResult::ok(json!({
+            "execution_state": "pending",
+            "state_changed": null,
+            "job_id": "job-format-pending",
+            "continuation": {
+                "tool": "observe_jobs",
+                "arguments": {
+                    "items": [{ "job_id": "job-format-pending" }]
+                }
+            }
+        }));
+        assert_eq!(main_execution_state(&result, true), "started");
+        assert_eq!(
+            main_execution_state(&result, false),
+            "definitely_not_started"
+        );
+    }
 }

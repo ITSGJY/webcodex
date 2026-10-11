@@ -235,6 +235,7 @@ async fn passive_attention_requires_exact_business_relation_and_deduplicates_sta
             command_execution_state: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: true,
         })
@@ -359,6 +360,7 @@ async fn initiating_handoff_is_cursor_baseline_then_terminal_is_delivered_once()
             command_execution_state: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             finished: true,
         })
@@ -438,6 +440,7 @@ async fn passive_attention_projects_process_failure_stop_and_timeout_without_log
                 command_execution_state: None,
                 validation_progress: None,
                 test_count_evidence: None,
+                format_mutation: None,
                 activity: None,
                 finished: true,
             })

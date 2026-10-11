@@ -215,6 +215,7 @@ fn submit_invalid_job_start(sink: &RunnerSink, request: &RunnerRequest, error: S
         command_execution_state,
         validation_progress: None,
         test_count_evidence: None,
+        format_mutation: None,
         activity: None,
         finished: true,
     });
@@ -736,6 +737,11 @@ pub(crate) fn dispatch_request_with_outcome(
         }
         RunnerOperation::PlanProjectBuild(payload) => {
             let result = super::project_build::handle(policy, project_registry_dir, &payload);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::PlanProjectFormat(payload) => {
+            let result = super::project_format::handle(policy, project_registry_dir, &payload);
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }

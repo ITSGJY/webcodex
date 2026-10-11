@@ -285,6 +285,7 @@ pub(super) fn cargo_test_update(
         command_execution_state: None,
         validation_progress: Some(progress),
         test_count_evidence: None,
+        format_mutation: None,
         activity,
         finished,
     }

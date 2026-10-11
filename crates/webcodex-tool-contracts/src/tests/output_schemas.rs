@@ -86,6 +86,15 @@ fn project_build_schema_accepts_same_job_queued_handoff() {
 }
 
 #[test]
+fn project_format_output_schema_admits_pending_job_handoff() {
+    let schema = output_schema_for_tool("project_format");
+    let states = schema["properties"]["output"]["properties"]["execution_state"]["enum"]
+        .as_array()
+        .expect("project_format lifecycle states");
+    assert!(states.contains(&json!("pending")));
+}
+
+#[test]
 fn suggested_tool_call_schema_recognizer_is_strict_and_structural() {
     let valid_generated = json!({
         "follow_up_kind": "mechanically_followable",

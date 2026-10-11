@@ -5,6 +5,32 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_configured_command(
     policy: &RunnerPolicy,
+    cmd: Command,
+    cwd_path: &Path,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    stop_requested: Option<&AtomicBool>,
+    start: Instant,
+    spawn_error_prefix: &str,
+    on_started: Option<&dyn Fn()>,
+) -> ShellCommandResult {
+    execute_configured_command_with_output(
+        policy,
+        cmd,
+        cwd_path,
+        stdin,
+        timeout_secs,
+        stop_requested,
+        start,
+        spawn_error_prefix,
+        on_started,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_configured_command_with_output(
+    policy: &RunnerPolicy,
     mut cmd: Command,
     cwd_path: &Path,
     stdin: Option<&str>,
@@ -13,6 +39,7 @@ pub(super) fn execute_configured_command(
     start: Instant,
     spawn_error_prefix: &str,
     on_started: Option<&dyn Fn()>,
+    exact_utf8: bool,
 ) -> ShellCommandResult {
     cmd.current_dir(cwd_path)
         .stdout(Stdio::piped())
@@ -88,7 +115,7 @@ pub(super) fn execute_configured_command(
         None => None,
     };
     loop {
-        if let Err(error) = poll_stdin_writer(&mut stdin_writer) {
+        if let Err(error) = poll_stdin_writer(&mut stdin_writer, exact_utf8) {
             let cleanup = terminate_and_collect_pipes(child, drains).err();
             return ShellCommandResult::outcome_unknown(CommandResult {
                 exit_code: None,
@@ -189,7 +216,7 @@ pub(super) fn execute_configured_command(
             }
         }
     }
-    if let Err(error) = finish_stdin_writer(stdin_writer) {
+    if let Err(error) = finish_stdin_writer(stdin_writer, exact_utf8) {
         let cleanup = terminate_and_collect_pipes(child, drains).err();
         return ShellCommandResult::outcome_unknown(CommandResult {
             exit_code: None,
@@ -204,6 +231,37 @@ pub(super) fn execute_configured_command(
     }
     match terminate_and_collect_pipes(child, drains) {
         Ok((status, stdout, stderr)) => {
+            if exact_utf8 {
+                let code = if stdout.raw_truncated
+                    || stderr.raw_truncated
+                    || stdout.bytes.len() > policy.max_output_bytes
+                    || stderr.bytes.len() > policy.max_output_bytes
+                {
+                    Some("format_output_truncated")
+                } else if std::str::from_utf8(&stdout.bytes).is_err()
+                    || std::str::from_utf8(&stderr.bytes).is_err()
+                {
+                    Some("format_output_invalid_utf8")
+                } else if status.code() == Some(0) && !stderr.bytes.is_empty() {
+                    Some("format_stderr_unexpected")
+                } else {
+                    None
+                };
+                if let Some(code) = code {
+                    return spawned_output_failure(start, code.into());
+                }
+                return ShellCommandResult::completed(CommandResult {
+                    exit_code: Some(status.code().unwrap_or(-1)),
+                    stdout: Some(String::from_utf8(stdout.bytes).expect("checked UTF-8")),
+                    stderr: if stderr.bytes.is_empty() {
+                        None
+                    } else {
+                        Some(String::from_utf8(stderr.bytes).expect("checked UTF-8"))
+                    },
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: None,
+                });
+            }
             let (stdout, stdout_truncated) =
                 stdout.normalize_with_truncation(policy.max_output_bytes);
             let (stderr, stderr_truncated) =
@@ -223,6 +281,7 @@ pub(super) fn execute_configured_command(
 
 pub(super) fn poll_stdin_writer(
     receiver: &mut Option<mpsc::Receiver<std::io::Result<()>>>,
+    exact_utf8: bool,
 ) -> Result<(), String> {
     let Some(active) = receiver.as_ref() else {
         return Ok(());
@@ -232,7 +291,7 @@ pub(super) fn poll_stdin_writer(
             *receiver = None;
             Ok(())
         }
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+        Ok(Err(error)) if !exact_utf8 && error.kind() == std::io::ErrorKind::BrokenPipe => {
             // The child may deliberately close stdin before exiting. Its
             // terminal status and output remain the source of truth.
             *receiver = None;
@@ -252,13 +311,14 @@ pub(super) fn poll_stdin_writer(
 
 pub(super) fn finish_stdin_writer(
     receiver: Option<mpsc::Receiver<std::io::Result<()>>>,
+    exact_utf8: bool,
 ) -> Result<(), String> {
     let Some(receiver) = receiver else {
         return Ok(());
     };
     match receiver.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Ok(Err(error)) if !exact_utf8 && error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Ok(Err(error)) => Err(error.to_string()),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             Err("stdin writer did not finish after process exit".to_string())
