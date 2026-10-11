@@ -591,7 +591,9 @@ fn observe_jobs_output_schema() -> Value {
                     {"type": "object", "additionalProperties": true},
                     {"type": "null"}
                 ]
-            }
+            },
+            "state_changed": nullable_schema("boolean", "Authoritative file mutation outcome for project_format."),
+            "failure_kind": nullable_schema("string", "Safe closed failure kind for project_format.")
         },
         "required": [
             "job_id", "status", "exit_code", "stdout_tail", "stderr_tail",
@@ -666,7 +668,9 @@ fn observe_jobs_output_schema() -> Value {
             "purpose": nullable_schema("string", "Declared purpose retained on baseline/reset observations for disambiguation."),
             "command_summary": nullable_schema("string", "Bounded safe command summary retained on baseline/reset observations for disambiguation."),
             "detected_summary": {"type": "object", "additionalProperties": true},
-            "validation": validation_job_projection_schema()
+            "validation": validation_job_projection_schema(),
+            "state_changed": nullable_schema("boolean", "Authoritative file mutation outcome for project_format."),
+            "failure_kind": nullable_schema("string", "Safe closed failure kind for project_format.")
         },
         "required": [
             "job_id", "status", "terminal", "changed", "meaningful_changed", "heartbeat_changed", "log_delta_status",

@@ -280,6 +280,228 @@ async fn project_format_pending_preserves_original_job_and_pending_lifecycle() {
 }
 
 #[tokio::test]
+async fn project_format_pending_observation_does_not_report_failure() {
+    let runtime = setup(1, true).await;
+    let auth = auth_context(None, true);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move { runtime.dispatch_with_auth(call(), Some(&auth)).await }
+    });
+    let (_request, job_id) = reply_plan(&runtime).await;
+    let pending = task.await.unwrap();
+    assert_eq!(pending.output["execution_state"], json!("pending"));
+    let detailed = runtime
+        .job_log_for_auth(job_id.clone(), None, Some(20), Some(&auth), None, None)
+        .await;
+    assert!(detailed.success);
+    assert_eq!(detailed.output["terminal"], json!(false));
+    assert_eq!(detailed.output["state_changed"], json!(null));
+    assert_eq!(
+        detailed.output["failure_kind"],
+        json!(null),
+        "an active Job is not a known failure: {}",
+        detailed.output["status"]
+    );
+    let call =
+        ToolCall::from_tool_name("observe_jobs", json!({"items": [{"job_id": job_id}]})).unwrap();
+    let mut observed = runtime.dispatch_with_auth(call, Some(&auth)).await;
+    assert_eq!(
+        observed.output["items"][0]["output"]["failure_kind"],
+        json!(null)
+    );
+    super::super::observe_jobs::sparsify_observe_jobs_model_result(&mut observed);
+    assert_eq!(observed.output["items"][0]["failure_kind"], json!(null));
+}
+
+#[tokio::test]
+async fn project_format_active_running_and_stop_requested_observation_does_not_report_failure() {
+    for status in ["running", "stop_requested"] {
+        let runtime = setup(1, true).await;
+        let auth = auth_context(None, true);
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let auth = auth.clone();
+            async move { runtime.dispatch_with_auth(call(), Some(&auth)).await }
+        });
+        let (request, job_id) = reply_plan(&runtime).await;
+        let pending = task.await.unwrap();
+        assert_eq!(pending.output["execution_state"], json!("pending"));
+
+        runtime
+            .runner_registry
+            .update_job(RunnerJobUpdateRequest {
+                client_id: CLIENT.into(),
+                runner_instance_id: "inst".into(),
+                update_seq: None,
+                job_id: job_id.clone(),
+                request_id: Some(request.request_id.clone()),
+                status: status.into(),
+                stdout_chunk: None,
+                stderr_chunk: None,
+                log_snapshot: None,
+                exit_code: None,
+                duration_ms: None,
+                error: None,
+                command_execution_state: None,
+                validation_progress: None,
+                test_count_evidence: None,
+                format_mutation: None,
+                activity: None,
+                finished: false,
+            })
+            .await
+            .unwrap();
+
+        let detailed = runtime
+            .job_log_for_auth(job_id.clone(), None, Some(20), Some(&auth), None, None)
+            .await;
+        assert!(detailed.success);
+        assert_eq!(detailed.output["terminal"], json!(false));
+        assert_eq!(detailed.output["state_changed"], json!(null));
+        assert_eq!(
+            detailed.output["failure_kind"],
+            json!(null),
+            "an active Job is not a known failure: {}",
+            detailed.output["status"]
+        );
+
+        let call = ToolCall::from_tool_name("observe_jobs", json!({"items": [{"job_id": job_id}]}))
+            .unwrap();
+        let mut observed = runtime.dispatch_with_auth(call, Some(&auth)).await;
+        assert_eq!(
+            observed.output["items"][0]["output"]["failure_kind"],
+            json!(null)
+        );
+        super::super::observe_jobs::sparsify_observe_jobs_model_result(&mut observed);
+        assert_eq!(observed.output["items"][0]["failure_kind"], json!(null));
+    }
+}
+
+#[tokio::test]
+async fn project_format_continuation_observes_authoritative_mutation_and_failure() {
+    for (status, state, exit_code, error, mutation, changed, failure_kind) in [
+        (
+            "completed",
+            ShellCommandExecutionState::Completed,
+            Some(0),
+            None,
+            ProjectFormatMutationReport::Changed,
+            json!(true),
+            json!(null),
+        ),
+        (
+            "completed",
+            ShellCommandExecutionState::Completed,
+            Some(0),
+            None,
+            ProjectFormatMutationReport::Unchanged,
+            json!(false),
+            json!(null),
+        ),
+        (
+            "failed",
+            ShellCommandExecutionState::OutcomeUnknown,
+            Some(1),
+            Some("format_write_conflict"),
+            ProjectFormatMutationReport::Unknown,
+            json!(null),
+            json!("format_write_conflict"),
+        ),
+    ] {
+        let runtime = setup(1, true).await;
+        let auth = auth_context(None, true);
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let auth = auth.clone();
+            async move { runtime.dispatch_with_auth(call(), Some(&auth)).await }
+        });
+        let (request, job_id) = reply_plan(&runtime).await;
+        let pending = task.await.unwrap();
+        assert!(pending.success);
+        assert_eq!(pending.output["execution_state"], json!("pending"));
+        finish_format_job(
+            &runtime,
+            &request,
+            &job_id,
+            status,
+            state,
+            exit_code,
+            error,
+            Some(mutation),
+        )
+        .await;
+
+        let detailed = runtime
+            .job_log_for_auth(job_id.clone(), None, Some(20), Some(&auth), None, None)
+            .await;
+        assert!(detailed.success, "{detailed:?}");
+        assert_eq!(detailed.output["state_changed"], changed);
+        assert_eq!(detailed.output["failure_kind"], failure_kind);
+
+        for summary_only in [false, true] {
+            let args = json!({
+                "items": [{"job_id": job_id}],
+                "summary_only": summary_only,
+            });
+            let call = ToolCall::from_tool_name("observe_jobs", args).unwrap();
+            let mut observed = runtime.dispatch_with_auth(call, Some(&auth)).await;
+            assert!(observed.success, "{observed:?}");
+            assert_eq!(
+                observed.output["items"][0]["output"]["state_changed"],
+                changed
+            );
+            assert_eq!(
+                observed.output["items"][0]["output"]["failure_kind"],
+                failure_kind
+            );
+            super::super::observe_jobs::sparsify_observe_jobs_model_result(&mut observed);
+            assert_eq!(observed.output["items"][0]["state_changed"], changed);
+            assert_eq!(observed.output["items"][0]["failure_kind"], failure_kind);
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_format_sparse_observation_has_single_mutation_evidence_path() {
+    let runtime = setup(1, true).await;
+    let auth = auth_context(None, true);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move { runtime.dispatch_with_auth(call(), Some(&auth)).await }
+    });
+    let (request, job_id) = reply_plan(&runtime).await;
+    assert_eq!(
+        task.await.unwrap().output["execution_state"],
+        json!("pending")
+    );
+    finish_format_job(
+        &runtime,
+        &request,
+        &job_id,
+        "completed",
+        ShellCommandExecutionState::Completed,
+        Some(0),
+        None,
+        Some(ProjectFormatMutationReport::Changed),
+    )
+    .await;
+
+    let call =
+        ToolCall::from_tool_name("observe_jobs", json!({"items": [{"job_id": job_id}]})).unwrap();
+    let mut observed = runtime.dispatch_with_auth(call, Some(&auth)).await;
+    super::super::observe_jobs::sparsify_observe_jobs_model_result(&mut observed);
+    let item = &observed.output["items"][0];
+    assert_eq!(item["state_changed"], json!(true));
+    assert_eq!(item["failure_kind"], json!(null));
+    assert!(
+        item.get("output").is_none(),
+        "sparse observation must expose one canonical mutation evidence path"
+    );
+}
+
+#[tokio::test]
 async fn project_format_missing_capability_rejects_without_dispatch() {
     let registry = RunnerRegistry::with_job_receipt_store(
         Arc::new(NoopRunnerRegistryTelemetry),

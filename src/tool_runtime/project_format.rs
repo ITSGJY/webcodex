@@ -10,6 +10,7 @@ use crate::runner_protocol::{ShellCommandExecutionState, ShellJobInfo, ShellJobO
 use serde_json::json;
 use std::time::Duration;
 use webcodex_core::project_format::*;
+use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 
 fn rejected(code: &str) -> ToolResult {
     ToolResult::err_with_output(
@@ -32,13 +33,7 @@ pub(super) fn terminal_result(job: &ShellJobInfo) -> ToolResult {
     if success {
         return ToolResult::ok(output);
     }
-    // Only the closed executor failure code may reach the model; never source,
-    // candidates, process diagnostics or an inferred validation summary.
-    let code = job
-        .error
-        .as_deref()
-        .filter(|code| valid_failure_code(code))
-        .unwrap_or("format_execution_unknown");
+    let code = project_format_safe_failure_kind(job).unwrap_or("format_execution_unknown");
     output["failure_kind"] = json!(code);
     output["execution_state"] = json!("outcome_unknown");
     output["job_id"] = json!(job.job_id);
@@ -47,7 +42,7 @@ pub(super) fn terminal_result(job: &ShellJobInfo) -> ToolResult {
     ToolResult::err_with_output("Formatting did not produce a complete verified mutation receipt. Observe the original Job and source before another mutation.", output)
 }
 
-fn valid_failure_code(code: &str) -> bool {
+pub(crate) fn valid_failure_code(code: &str) -> bool {
     code.len() <= 80
         && (code.starts_with("format_")
             || code == "capability_unavailable"
@@ -58,6 +53,31 @@ fn valid_failure_code(code: &str) -> bool {
         && code
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+pub(crate) fn project_format_safe_failure_kind(job: &ShellJobInfo) -> Option<&str> {
+    let report = job.format_mutation.unwrap_or_default();
+    let known = report.state_changed();
+    let success = job.status == "completed"
+        && job.exit_code == Some(0)
+        && job.command_execution_state == Some(ShellCommandExecutionState::Completed)
+        && job.error.is_none()
+        && known.is_some();
+    let active = job.status == "recovering"
+        || job.recovery_state.as_deref() == Some("recovering")
+        || RunnerJobLifecycle::from_wire(&job.status).is_ok_and(RunnerJobLifecycle::is_active);
+    if success {
+        None
+    } else if active && job.error.is_none() {
+        None
+    } else {
+        Some(
+            job.error
+                .as_deref()
+                .filter(|code| valid_failure_code(code))
+                .unwrap_or("format_execution_unknown"),
+        )
+    }
 }
 
 impl ToolRuntime {
