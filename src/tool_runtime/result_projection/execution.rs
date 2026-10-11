@@ -25,7 +25,8 @@ pub(super) fn capture(call: &ToolCall) -> Option<CapturedProjection> {
             no_run: *no_run,
             min_tests: *min_tests,
         },
-        ToolCall::ProjectBuild { .. }
+        ToolCall::ProjectFormat { .. }
+        | ToolCall::ProjectBuild { .. }
         | ToolCall::RunProcess { .. }
         | ToolCall::RunSkillResource { .. }
         | ToolCall::RunScript { .. }

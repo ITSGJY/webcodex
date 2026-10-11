@@ -83,6 +83,7 @@ pub(crate) mod permissions;
 mod presentation;
 mod process;
 mod project_build;
+mod project_format;
 mod project_resolution;
 mod projection_text;
 pub(crate) mod window_collaboration;

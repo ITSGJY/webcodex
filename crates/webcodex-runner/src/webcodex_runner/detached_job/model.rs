@@ -629,6 +629,7 @@ pub(crate) fn snapshot_from_detached_record(
         stderr: stream(&record.stderr),
         validation_progress: None,
         test_count_evidence: None,
+        format_mutation: None,
         activity,
     })
 }

@@ -1514,6 +1514,26 @@ pub enum ToolCall {
         sync_wait_secs: Option<u64>,
     },
 
+    /// Format an explicit bounded set of source files in one Runner Project.
+    ProjectFormat {
+        /// Exact registered Runner Project.
+        project: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Optional Project-relative recipe selection directory.
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        adapter: Option<webcodex_core::project_format::ProjectFormatAdapter>,
+        /// Ordered Project-relative files, all under one recipe root. No globbing.
+        #[schemars(length(min = 1, max = 8))]
+        files: Vec<String>,
+        /// Total Job budget, 1..120 seconds. Pending continues the original Job.
+        #[serde(default)]
+        #[schemars(range(min = 1, max = 120))]
+        timeout_secs: Option<u64>,
+    },
+
     /// Run one portable project build. The Runner resolves the nearest supported
     /// Rust/Go recipe, plans canonical argv, and admits one typed build Job.
     ProjectBuild {

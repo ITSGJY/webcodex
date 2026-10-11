@@ -293,6 +293,16 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         result,
         validation_progress: job.validation_progress.clone(),
         test_count_evidence: job.test_count_evidence.clone(),
+        format_mutation: if job.kind == "project_format"
+            && !job
+                .observation
+                .receipt_persisted
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Some(webcodex_core::project_format::ProjectFormatMutationReport::Unknown)
+        } else {
+            job.format_mutation
+        },
         activity: job.activity,
         validation: job.validation.clone(),
         recovery_state: job.recovery.public_state().map(str::to_string),

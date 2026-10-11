@@ -458,6 +458,7 @@ fn job_structured_execution_metadata_schema() -> Value {
                             "run_detached_process",
                             "run_script",
                             "project_build",
+                            "project_format",
                             "run_skill_resource"
                         ]
                     },
@@ -590,7 +591,9 @@ fn observe_jobs_output_schema() -> Value {
                     {"type": "object", "additionalProperties": true},
                     {"type": "null"}
                 ]
-            }
+            },
+            "state_changed": nullable_schema("boolean", "Authoritative file mutation outcome for project_format."),
+            "failure_kind": nullable_schema("string", "Safe closed failure kind for project_format.")
         },
         "required": [
             "job_id", "status", "exit_code", "stdout_tail", "stderr_tail",
@@ -665,7 +668,9 @@ fn observe_jobs_output_schema() -> Value {
             "purpose": nullable_schema("string", "Declared purpose retained on baseline/reset observations for disambiguation."),
             "command_summary": nullable_schema("string", "Bounded safe command summary retained on baseline/reset observations for disambiguation."),
             "detected_summary": {"type": "object", "additionalProperties": true},
-            "validation": validation_job_projection_schema()
+            "validation": validation_job_projection_schema(),
+            "state_changed": nullable_schema("boolean", "Authoritative file mutation outcome for project_format."),
+            "failure_kind": nullable_schema("string", "Safe closed failure kind for project_format.")
         },
         "required": [
             "job_id", "status", "terminal", "changed", "meaningful_changed", "heartbeat_changed", "log_delta_status",
@@ -986,6 +991,17 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                         }
                     }));
             }
+            Some(schema)
+        }
+        "project_format" => {
+            let mut schema = wrapped_output_schema(vec![
+                ("state_changed", json!({"type":["boolean","null"], "description":"Executor-verified aggregate mutation. Null is unknown, never retry permission."})),
+                ("failure_kind", json!({"type":"string", "maxLength":80})),
+                ("execution_state", json!({"type":"string", "enum":["not_started","outcome_unknown","pending"]})),
+                ("job_id", schema_type("string", "Original Job identity, never a replacement execution.")),
+                ("continuation", observe_job_continuation_schema()),
+            ]);
+            schema["properties"]["output"]["additionalProperties"] = json!(false);
             Some(schema)
         }
         "project_build" => {

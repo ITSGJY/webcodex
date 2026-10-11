@@ -11,7 +11,9 @@ use webcodex_core::runner_protocol::{
 
 /// Synchronous, best-effort historical persistence, invoked only after unlocking
 /// registry state. Implementations must keep writes bounded and first-write-wins;
-/// errors must never affect the accepted execution verdict. No execution methods.
+/// errors must never affect the accepted execution verdict for ordinary Jobs.
+/// Formatting exposes known mutation only after this same store commits its
+/// receipt. Write failure leaves its projection unknown. No execution methods.
 pub trait JobReceiptStore: std::fmt::Debug + Send + Sync {
     fn upsert(&self, receipt: &RetainedJobReceipt) -> Result<(), String>;
     fn load(&self, now: i64) -> Result<Vec<RetainedJobReceipt>, String>;
@@ -89,6 +91,10 @@ impl ReceiptRegistryState {
         }
     }
 
+    pub(crate) fn has_receipt_store(&self) -> bool {
+        self.store.is_some()
+    }
+
     pub(crate) fn capture_candidates(&self) -> Option<ReceiptCandidates> {
         self.store.as_ref().map(|_| self.candidates.clone())
     }
@@ -148,6 +154,11 @@ impl DerefMut for ReceiptRegistryGuard<'_> {
         self.guard.as_mut().unwrap()
     }
 }
+impl ReceiptRegistryGuard<'_> {
+    pub(crate) fn has_receipt_store(&self) -> bool {
+        self.state.has_receipt_store()
+    }
+}
 impl Drop for ReceiptRegistryGuard<'_> {
     fn drop(&mut self) {
         // Publish only touched Job lifecycle changes; reads never scan terminal history.
@@ -157,7 +168,10 @@ impl Drop for ReceiptRegistryGuard<'_> {
             std::mem::take(&mut *self.state.terminal_event_candidates.lock().unwrap());
         let receipts: Vec<_> = ids
             .iter()
-            .filter_map(|id| self.jobs_by_id.get(id).and_then(capture))
+            .filter_map(|id| {
+                let job = self.jobs_by_id.get(id)?;
+                Some((capture(job)?, job.observation.clone()))
+            })
             .collect();
         let terminal_events: Vec<_> = terminal_ids
             .iter()
@@ -172,10 +186,25 @@ impl Drop for ReceiptRegistryGuard<'_> {
         if let Some(store) = &self.state.store {
             let mut failed = 0;
             let mut retry_ids = Vec::new();
-            for receipt in receipts {
+            for (receipt, observation) in receipts {
                 if store.upsert(&receipt).is_err() {
                     failed += 1;
                     retry_ids.push(receipt.snapshot.job_id);
+                } else if !observation
+                    .receipt_persisted
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    && receipt.kind == "project_format"
+                {
+                    // Publish durability only after unlocking and committing.
+                    // This advances observation, never execution or a retry.
+                    let revision = observation
+                        .revision
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    observation
+                        .last_meaningful_revision
+                        .store(revision, std::sync::atomic::Ordering::SeqCst);
+                    observation.notify.notify_waiters();
                 }
             }
             if !retry_ids.is_empty() {
@@ -341,6 +370,7 @@ fn capture(job: &ShellJobRecord) -> Option<RetainedJobReceipt> {
             // A test count without that provenance is not reusable correctness
             // evidence, so keep it only in Runner-owned snapshots/inventory.
             test_count_evidence: None,
+            format_mutation: job.format_mutation,
             activity: None,
         },
     };
@@ -412,6 +442,9 @@ impl RunnerRegistry {
                 job.kind = receipt.kind;
                 job.observation.terminal_observed_at = Some(receipt.terminal_observed_at);
                 job.observation.receipt_expires_at = Some(receipt.expires_at);
+                job.observation
+                    .receipt_persisted
+                    .store(true, std::sync::atomic::Ordering::Release);
                 crate::jobs::replace_log_from_snapshot(&mut job.stdout, &receipt.snapshot.stdout);
                 crate::jobs::replace_log_from_snapshot(&mut job.stderr, &receipt.snapshot.stderr);
                 // Only a terminal record; no mapping, waiter, queue, intent or lease.

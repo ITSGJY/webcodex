@@ -856,7 +856,7 @@ fn model_facing_structured_execution_metadata(
 /// Build a bounded job summary `Value` for an agent-known job. Never includes
 /// stdout/stderr bodies.
 pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
-    json!({
+    let mut summary = json!({
         "job_id": job.job_id,
         "kind": job.kind,
         "status": job.status,
@@ -883,7 +883,13 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
             job.recovery_state.as_deref(),
             job.recovery_reason_code.as_deref(),
         ),
-    })
+    });
+    if job.kind == "project_format" {
+        summary["state_changed"] = json!(job.format_mutation.unwrap_or_default().state_changed());
+        summary["failure_kind"] =
+            json!(super::project_format::project_format_safe_failure_kind(job));
+    }
+    summary
 }
 
 impl ToolRuntime {
@@ -1850,7 +1856,7 @@ impl ToolRuntime {
                 ) {
                     validation["validation_target_id"] = json!(target_id);
                 }
-                ToolResult::ok(json!({
+                let mut output = json!({
                     "job_id": job.job_id,
                     "project": job.project_id,
                     "status": job.status,
@@ -1907,7 +1913,15 @@ impl ToolRuntime {
                     "command_summary": command_summary,
                     "detected_summary": detected_summary,
                     "validation": validation,
-                }))
+                });
+                if job.kind == "project_format" {
+                    output["state_changed"] =
+                        json!(job.format_mutation.unwrap_or_default().state_changed());
+                    output["failure_kind"] = json!(
+                        super::project_format::project_format_safe_failure_kind(&job)
+                    );
+                }
+                ToolResult::ok(output)
             }
             Err(error) => agent_job_log_error_result(&job_id, error),
         }
@@ -2924,6 +2938,7 @@ mod recovery_projection_tests {
             result: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             validation: None,
             recovery_state: None,
@@ -2976,6 +2991,7 @@ mod recovery_projection_tests {
             result: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             validation: None,
             recovery_state: Some("lost_after_reconcile".to_string()),
