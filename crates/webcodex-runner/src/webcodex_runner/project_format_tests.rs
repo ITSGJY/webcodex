@@ -1205,6 +1205,7 @@ case "$*" in
         exit 0
         ;;
     *"-m ruff format"*)
+        cat > /dev/null
         printf 'formatted = True\n'
         exit 0
         ;;
@@ -1275,6 +1276,7 @@ case "$*" in
         exit 0
         ;;
     *"-m ruff format"*)
+        cat > /dev/null
         echo "syntax error: unclosed parenthesis" >&2
         exit 1
         ;;

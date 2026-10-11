@@ -173,20 +173,29 @@ fn execute_configured_command_impl(
         },
         None => None,
     };
+    let mut stdin_broken_pipe: Option<std::io::Error> = None;
     let mut output_bounded = false;
     loop {
-        if let Err(error) = poll_stdin_writer(&mut stdin_writer, exact_utf8) {
-            let cleanup = terminate_and_collect_pipes(child, drains).err();
-            return ShellCommandResult::outcome_unknown(CommandResult {
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(with_cleanup_error(
-                    format!("failed to write command stdin: {error}"),
-                    cleanup,
-                )),
-            });
+        match poll_stdin_writer(&mut stdin_writer, exact_utf8) {
+            Ok(Some(error)) => {
+                if stdin_broken_pipe.is_none() {
+                    stdin_broken_pipe = Some(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_and_collect_pipes(child, drains).err();
+                return ShellCommandResult::outcome_unknown(CommandResult {
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some(with_cleanup_error(
+                        format!("failed to write command stdin: {error}"),
+                        cleanup,
+                    )),
+                });
+            }
         }
         if stop_requested
             .map(|flag| flag.load(Ordering::SeqCst))
@@ -280,23 +289,39 @@ fn execute_configured_command_impl(
             }
         }
     }
-    if let Err(error) = finish_stdin_writer(stdin_writer, exact_utf8) {
-        let cleanup = terminate_and_collect_pipes(child, drains).err();
-        return ShellCommandResult::outcome_unknown(CommandResult {
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(with_cleanup_error(
-                format!("failed to write command stdin: {error}"),
-                cleanup,
-            )),
-        });
+    match finish_stdin_writer(stdin_writer, exact_utf8) {
+        Ok(Some(error)) => {
+            if stdin_broken_pipe.is_none() {
+                stdin_broken_pipe = Some(error);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let cleanup = terminate_and_collect_pipes(child, drains).err();
+            return ShellCommandResult::outcome_unknown(CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(with_cleanup_error(
+                    format!("failed to write command stdin: {error}"),
+                    cleanup,
+                )),
+            });
+        }
     }
     let limit_reached = Arc::clone(&drains.stdout_limit_reached);
     match terminate_and_collect_pipes(child, drains) {
         Ok((status, stdout, stderr)) => {
             if exact_utf8 {
+                if let Some(error) = stdin_broken_pipe {
+                    if status.code() == Some(0) {
+                        return spawned_output_failure(
+                            start,
+                            format!("failed to write command stdin: {error}"),
+                        );
+                    }
+                }
                 let code = if stdout.raw_truncated
                     || stderr.raw_truncated
                     || stdout.bytes.len() > policy.max_output_bytes
@@ -362,26 +387,30 @@ fn execute_configured_command_impl(
 pub(super) fn poll_stdin_writer(
     receiver: &mut Option<mpsc::Receiver<std::io::Result<()>>>,
     exact_utf8: bool,
-) -> Result<(), String> {
+) -> Result<Option<std::io::Error>, String> {
     let Some(active) = receiver.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     match active.try_recv() {
         Ok(Ok(())) => {
             *receiver = None;
-            Ok(())
+            Ok(None)
         }
-        Ok(Err(error)) if !exact_utf8 && error.kind() == std::io::ErrorKind::BrokenPipe => {
-            // The child may deliberately close stdin before exiting. Its
-            // terminal status and output remain the source of truth.
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
             *receiver = None;
-            Ok(())
+            if exact_utf8 {
+                Ok(Some(error))
+            } else {
+                // The child may deliberately close stdin before exiting. Its
+                // terminal status and output remain the source of truth.
+                Ok(None)
+            }
         }
         Ok(Err(error)) => {
             *receiver = None;
             Err(error.to_string())
         }
-        Err(mpsc::TryRecvError::Empty) => Ok(()),
+        Err(mpsc::TryRecvError::Empty) => Ok(None),
         Err(mpsc::TryRecvError::Disconnected) => {
             *receiver = None;
             Err("stdin writer ended without a result".to_string())
@@ -392,13 +421,19 @@ pub(super) fn poll_stdin_writer(
 pub(super) fn finish_stdin_writer(
     receiver: Option<mpsc::Receiver<std::io::Result<()>>>,
     exact_utf8: bool,
-) -> Result<(), String> {
+) -> Result<Option<std::io::Error>, String> {
     let Some(receiver) = receiver else {
-        return Ok(());
+        return Ok(None);
     };
     match receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) if !exact_utf8 && error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Ok(Ok(())) => Ok(None),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            if exact_utf8 {
+                Ok(Some(error))
+            } else {
+                Ok(None)
+            }
+        }
         Ok(Err(error)) => Err(error.to_string()),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             Err("stdin writer did not finish after process exit".to_string())
