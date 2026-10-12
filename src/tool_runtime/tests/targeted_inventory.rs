@@ -777,6 +777,72 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
 }
 
 #[tokio::test]
+async fn runtime_status_focused_job_counts_do_not_leak_other_runners() {
+    let runtime = test_runtime();
+    for (client_id, count) in [("selected", 2), ("other", 3), ("empty", 0)] {
+        register_target_agent(
+            &runtime,
+            client_id,
+            vec![registered_project("root", &format!("/tmp/{client_id}"))],
+            None,
+        )
+        .await;
+        for _ in 0..count {
+            runtime
+                .runner_registry
+                .start_job_with_metadata(
+                    crate::runner_protocol::ShellJobOpRequest {
+                        login: false,
+                        op: "start".into(),
+                        client_id: Some(client_id.into()),
+                        cwd: None,
+                        command: Some("echo fixture".into()),
+                        timeout_secs: Some(60),
+                        job_id: None,
+                        since_stdout_line: None,
+                        since_stderr_line: None,
+                        tail_lines: None,
+                        limit: None,
+                        codex: None,
+                    },
+                    "fixture".into(),
+                    webcodex_runner_registry::ShellJobStartMetadata {
+                        project_id: Some(format!("agent:{client_id}:root")),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+    for (compact, summary_only) in [(false, false), (true, false), (false, true)] {
+        let fleet = runtime
+            .runtime_status_with_options(None, compact, summary_only, None)
+            .await;
+        assert!(fleet.success, "{:?}", fleet.error);
+        assert_eq!(fleet.output["jobs"]["active_count"], 5);
+        for (client_id, count) in [("selected", 2), ("other", 3), ("empty", 0)] {
+            let focused = runtime
+                .runtime_status_with_options(None, compact, summary_only, Some(client_id.into()))
+                .await;
+            assert!(focused.success, "{:?}", focused.error);
+            assert_eq!(
+                focused.output["jobs"]["active_count"], count,
+                "client={client_id} compact={compact} summary_only={summary_only}"
+            );
+            assert_eq!(focused.output["jobs"]["queued_count"], count);
+            for field in [
+                "running_count",
+                "recovering_count",
+                "lost_after_reconcile_count",
+            ] {
+                assert_eq!(focused.output["jobs"][field], 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
     let runtime = test_runtime();
     let special_build = RunnerBuildInfo {

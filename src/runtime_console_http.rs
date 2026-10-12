@@ -23,7 +23,7 @@ use crate::tool_runtime::{ToolCall, ToolRuntime};
 use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 
@@ -1146,22 +1146,74 @@ fn compare_recent_sessions(
         .then_with(|| left.session.session_id.cmp(&right.session.session_id))
 }
 
-fn finalize_recent_sessions(
-    mut candidates: Vec<RuntimeConsoleRecentSession>,
-    scan_truncated: bool,
-) -> RuntimeConsoleRecentSessions {
-    candidates.sort_by(compare_recent_sessions);
-    let candidate_count = candidates.len();
-    candidates.truncate(HOME_RECENT_SESSION_LIMIT);
-    RuntimeConsoleRecentSessions {
-        returned: candidates.len(),
-        candidate_count,
-        truncated: candidate_count > HOME_RECENT_SESSION_LIMIT,
-        scan_truncated,
-        sessions: candidates,
+struct RankedRecentSession {
+    position: usize,
+    row: RuntimeConsoleRecentSession,
+}
+impl PartialEq for RankedRecentSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for RankedRecentSession {}
+impl PartialOrd for RankedRecentSession {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RankedRecentSession {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_recent_sessions(&self.row, &other.row)
+            .then_with(|| self.position.cmp(&other.position))
     }
 }
 
+/// Bounded top-K retention with the same stable rank/tie ordering as a full sort.
+#[derive(Default)]
+struct RecentSessionsCollector {
+    heap: BinaryHeap<RankedRecentSession>,
+    candidate_count: usize,
+}
+impl RecentSessionsCollector {
+    fn push(&mut self, row: RuntimeConsoleRecentSession) {
+        let entry = RankedRecentSession {
+            position: self.candidate_count,
+            row,
+        };
+        self.candidate_count += 1;
+        if self.heap.len() < HOME_RECENT_SESSION_LIMIT {
+            self.heap.push(entry);
+        } else if self.heap.peek().is_some_and(|worst| entry < *worst) {
+            self.heap.pop();
+            self.heap.push(entry);
+        }
+    }
+    fn finish(self, scan_truncated: bool) -> RuntimeConsoleRecentSessions {
+        let sessions = self
+            .heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|entry| entry.row)
+            .collect::<Vec<_>>();
+        RuntimeConsoleRecentSessions {
+            returned: sessions.len(),
+            candidate_count: self.candidate_count,
+            truncated: self.candidate_count > HOME_RECENT_SESSION_LIMIT,
+            scan_truncated,
+            sessions,
+        }
+    }
+}
+fn finalize_recent_sessions(
+    candidates: Vec<RuntimeConsoleRecentSession>,
+    scan_truncated: bool,
+) -> RuntimeConsoleRecentSessions {
+    let mut collector = RecentSessionsCollector::default();
+    for candidate in candidates {
+        collector.push(candidate);
+    }
+    collector.finish(scan_truncated)
+}
 struct RuntimeConsoleHomeScan {
     workflow: RuntimeConsoleWorkflowAggregate,
     recent_sessions: RuntimeConsoleRecentSessions,
@@ -1180,7 +1232,7 @@ fn scan_runtime_home(
         projects_total: visible.total,
         ..Default::default()
     };
-    let mut recent_candidates = Vec::new();
+    let mut recent_candidates = RecentSessionsCollector::default();
     let mut projected_projects = Vec::new();
     let mut runner_sessions: HashMap<String, WorkflowSessionConsoleAggregate> = HashMap::new();
     let mut runner_projects_scanned: HashMap<String, usize> = HashMap::new();
@@ -1217,25 +1269,22 @@ fn scan_runtime_home(
             .and_modify(|count| *count = count.saturating_add(1))
             .or_insert(1);
 
-        recent_candidates.extend(list.sessions.into_iter().map(|session| {
-            RuntimeConsoleRecentSession {
+        for session in list.sessions {
+            recent_candidates.push(RuntimeConsoleRecentSession {
                 client_id: project.client_id.clone(),
                 project_id: project.id.clone(),
                 project_name: project.name.clone(),
                 session,
-            }
-        }));
-
+            });
+        }
         let mut projected = project.clone();
         projected.sessions = Some(aggregate);
         projected_projects.push(projected);
     }
 
     workflow.truncated |= project_scan_truncated || session_scan_truncated;
-    let recent_sessions = finalize_recent_sessions(
-        recent_candidates,
-        project_scan_truncated || session_scan_truncated,
-    );
+    let recent_sessions =
+        recent_candidates.finish(project_scan_truncated || session_scan_truncated);
     RuntimeConsoleHomeScan {
         workflow,
         recent_sessions,

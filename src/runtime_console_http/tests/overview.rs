@@ -32,6 +32,53 @@ fn runtime_home_recent_ranking_is_working_then_updated_at_then_identity() {
 }
 
 #[test]
+fn runtime_home_recent_bounded_topk_matches_stable_full_sort() {
+    let template = recent_test_row("runner", "agent:runner:p", "seed", 0, false, false, false);
+    let mut collector = RecentSessionsCollector::default();
+    let mut reference = Vec::new();
+    for index in 0..10_000 {
+        let mut row = template.clone();
+        // Deliberately repeat exact rank identities with differing labels to
+        // prove that full-sort stability survives the heap selection boundary.
+        row.client_id = format!("runner-{}", index % 7);
+        row.project_id = format!("agent:runner:p-{}", index % 23);
+        row.project_name = Some(format!("label-{index}"));
+        row.session.session_id = format!("session-{}", index % 47);
+        row.session.updated_at = ((index * 19) % 101) as i64;
+        row.session.running_call = index % 17 == 0;
+        row.session.running_jobs = usize::from(index % 29 == 0);
+        if index >= 9_600 {
+            row.client_id = "runner-tie".to_string();
+            row.project_id = "agent:runner:tie".to_string();
+            row.session.session_id = "same-rank".to_string();
+            row.session.updated_at = 100_000;
+            row.session.running_call = true;
+            row.session.running_jobs = 0;
+        }
+        reference.push(row.clone());
+        collector.push(row);
+    }
+    reference.sort_by(compare_recent_sessions);
+    reference.truncate(HOME_RECENT_SESSION_LIMIT);
+    let actual = collector.finish(true);
+    assert_eq!(actual.candidate_count, 10_000);
+    assert_eq!(
+        actual.sessions[0].project_name.as_deref(),
+        Some("label-9600")
+    );
+    assert_eq!(
+        actual.sessions[99].project_name.as_deref(),
+        Some("label-9699")
+    );
+    assert_eq!(actual.returned, HOME_RECENT_SESSION_LIMIT);
+    assert!(actual.truncated);
+    assert!(actual.scan_truncated);
+    assert_eq!(
+        serde_json::to_value(&actual.sessions).unwrap(),
+        serde_json::to_value(reference).unwrap(),
+    );
+}
+#[test]
 fn runtime_home_recent_and_project_scans_are_explicitly_bounded() {
     let recent = finalize_recent_sessions(
         (0..HOME_RECENT_SESSION_LIMIT + 3)
@@ -390,4 +437,100 @@ async fn runtime_home_recent_sessions_follow_project_authority() {
     assert!(!serialized.contains("agent:runner-b:proj-b"));
     assert!(serialized.contains("/private/a"));
     assert!(!serialized.contains("/private/b"));
+}
+
+#[test]
+#[ignore = "manual full Runtime overview scan warm/cold comparison with synthetic retained Session histories"]
+fn runtime_home_full_scan_repeated_cold_sessions_cost_comparison() {
+    use crate::tool_runtime::sessions::{session_tool_contract, SessionTransport};
+    use std::time::Instant;
+
+    let runtime = test_runtime();
+    let contract = session_tool_contract("read_files");
+    let mut benchmark_projects = Vec::new();
+    let mut session_count = 0usize;
+    for project_index in 0..3 {
+        let project_id = format!("agent:bench:project-{project_index}");
+        benchmark_projects.push(RuntimeConsoleProject {
+            id: project_id.clone(),
+            client_id: "bench".to_string(),
+            project_ref: None,
+            name: Some(format!("Project {project_index}")),
+            path: None,
+            registration_source: None,
+            lineage: None,
+            connected: true,
+            runner_status: Some("online".to_string()),
+            sessions: None,
+        });
+        for session_index in 0..16 {
+            let session = runtime.sessions.start_session(
+                Some(project_id.clone()),
+                Some(format!("Session {session_index}")),
+            );
+            for event_index in 0..60 {
+                let start = runtime.sessions.record_tool_call_started(
+                    Some(&session.session_id),
+                    SessionTransport::Api,
+                    "read_files",
+                    &serde_json::json!({
+                        "project": project_id,
+                        "items": [{"path":format!("src/item_{event_index}.rs")}]
+                    }),
+                    contract,
+                );
+                runtime.sessions.record_tool_call_finished(
+                    start,
+                    true,
+                    &serde_json::json!({"ok":true}),
+                    None,
+                    None,
+                );
+            }
+            runtime.sessions.close_session(&session.session_id).unwrap();
+            session_count += 1;
+        }
+    }
+    let visible = RuntimeConsoleProjects {
+        projects: benchmark_projects,
+        total: 3,
+        truncated: false,
+    };
+    let running = RunningJobSnapshot::default();
+    let started = Instant::now();
+    let first = scan_runtime_home(&runtime, &visible, &running);
+    let first_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let baseline = serde_json::to_value((
+        &first.workflow,
+        &first.recent_sessions,
+        &first.projects,
+        &first.runner_sessions,
+        &first.runner_projects_scanned,
+    ))
+    .unwrap();
+    assert_eq!(first.workflow.projects_scanned, 3);
+    assert_eq!(first.recent_sessions.candidate_count, session_count);
+    let mut repeated_ms = 0.0;
+    for _ in 0..8 {
+        let started = Instant::now();
+        let refreshed = scan_runtime_home(&runtime, &visible, &running);
+        repeated_ms += started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            serde_json::to_value((
+                &refreshed.workflow,
+                &refreshed.recent_sessions,
+                &refreshed.projects,
+                &refreshed.runner_sessions,
+                &refreshed.runner_projects_scanned,
+            ))
+            .unwrap(),
+            baseline
+        );
+    }
+    let warm_ms = repeated_ms / 8.0;
+    println!(
+        "RUNTIME_HOME_FULL_SCAN projects=3 closed_sessions={} events_per_session=120 first_ms={first_ms:.3} refreshed_avg_ms={warm_ms:.3} first_to_warm_ratio={:.2}x",
+        session_count,
+        first_ms / warm_ms,
+    );
 }

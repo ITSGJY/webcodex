@@ -236,3 +236,138 @@ async fn ten_thousand_terminal_jobs_do_not_enter_project_count_refresh() {
     );
     eprintln!("ACTIVE_JOB_INDEX terminal=10000 active=5 requested_projects=1 refreshed={refreshed} visible_count=1");
 }
+
+fn expected_runtime_job_aggregate(
+    jobs: &[webcodex_core::runner_protocol::ShellJobInfo],
+) -> crate::RuntimeJobAggregateSnapshot {
+    use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+    let mut result = crate::RuntimeJobAggregateSnapshot::default();
+    for job in jobs {
+        let status = job.status.as_str();
+        let lifecycle = RunnerJobLifecycle::from_wire(status);
+        let active = crate::job_status::job_status_is_active(status);
+        let running = matches!(
+            lifecycle,
+            Ok(RunnerJobLifecycle::Running | RunnerJobLifecycle::StartedLegacy)
+        );
+        let queued = matches!(
+            lifecycle,
+            Ok(RunnerJobLifecycle::Queued | RunnerJobLifecycle::RunnerQueued)
+        );
+        let slot = lifecycle.is_ok_and(RunnerJobLifecycle::occupies_execution_slot);
+        result.active_count += usize::from(active);
+        result.running_count += usize::from(running);
+        result.queued_count += usize::from(queued);
+        result.recovering_count += usize::from(status == "recovering");
+        result.lost_after_reconcile_count += usize::from(
+            status == "lost"
+                && matches!(
+                    job.recovery_reason_code.as_deref(),
+                    Some(
+                        "runner_inventory_missing"
+                            | "runner_instance_replaced"
+                            | "runner_recovery_deadline_exceeded"
+                    )
+                ),
+        );
+        if active || slot || queued {
+            let row = result.by_runner.entry(job.client_id.clone()).or_default();
+            row.active += usize::from(active);
+            row.running += usize::from(slot);
+            row.queued += usize::from(queued);
+        }
+    }
+    result
+}
+
+async fn populated_runtime_job_aggregate_fixture(count: usize) -> RunnerRegistry {
+    let (registry, id) = fixture().await;
+    {
+        let mut inner = registry.inner.lock().await;
+        let template = inner.jobs_by_id[&id].clone();
+        for index in 0..count {
+            let mut job = template.clone();
+            job.job_id = format!("historical-runtime-{index}");
+            job.lifecycle = match index % 6 {
+                0 => JobLifecycleState::Completed,
+                1 => JobLifecycleState::Failed,
+                2 => JobLifecycleState::Stopped,
+                3 => JobLifecycleState::Lost,
+                4 => JobLifecycleState::Cancelled,
+                _ => JobLifecycleState::TimedOut,
+            };
+            job.command_preview = "read-only synthetic job metadata".repeat(45);
+            job.validation_steps = vec!["validation evidence".repeat(16); 10];
+            inner.jobs_by_id.insert(job.job_id.clone(), job);
+        }
+    }
+    registry
+}
+
+#[tokio::test]
+async fn runtime_status_aggregate_matches_full_visible_job_projection_without_log_copies() {
+    let registry = populated_runtime_job_aggregate_fixture(240).await;
+    for auth in [
+        None,
+        Some(auth_context(Some("alice"), false)),
+        Some(auth_context(Some("bob"), false)),
+    ] {
+        let access = auth.as_ref();
+        let old = registry.list_all_jobs_for_auth(access).await;
+        for client_id in [None, Some("oe"), Some("missing")] {
+            let selected = old
+                .iter()
+                .filter(|job| client_id.is_none_or(|id| job.client_id == id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let expected = expected_runtime_job_aggregate(&selected);
+            let actual = registry
+                .runtime_job_aggregate_for_auth(access, client_id)
+                .await;
+            assert_eq!(actual, expected, "client_id={client_id:?}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual 1,500-job typed status aggregate versus full Job DTO cost comparison"]
+async fn runtime_status_aggregate_cost_comparison() {
+    use std::time::Instant;
+    let registry = populated_runtime_job_aggregate_fixture(1_500).await;
+    let auth = auth_context(Some("alice"), false);
+    let reference = registry.list_all_jobs_for_auth(Some(&auth)).await;
+    let expected = expected_runtime_job_aggregate(&reference);
+    assert_eq!(
+        registry
+            .runtime_job_aggregate_for_auth(Some(&auth), None)
+            .await,
+        expected
+    );
+    let mut full_ns = 0_u128;
+    let mut aggregate_ns = 0_u128;
+    let rounds = 16_u128;
+    for index in 0..rounds {
+        if index % 2 == 0 {
+            let t = Instant::now();
+            std::hint::black_box(registry.list_all_jobs_for_auth(Some(&auth)).await);
+            full_ns += t.elapsed().as_nanos();
+        }
+        let t = Instant::now();
+        std::hint::black_box(
+            registry
+                .runtime_job_aggregate_for_auth(Some(&auth), None)
+                .await,
+        );
+        aggregate_ns += t.elapsed().as_nanos();
+        if index % 2 != 0 {
+            let t = Instant::now();
+            std::hint::black_box(registry.list_all_jobs_for_auth(Some(&auth)).await);
+            full_ns += t.elapsed().as_nanos();
+        }
+    }
+    println!("RUNTIME_STATUS_JOB_AGGREGATE retained_jobs=1500 full_ms={:.3} aggregate_ms={:.3} speedup={:.2}x",
+        full_ns as f64 / rounds as f64 / 1e6,
+        aggregate_ns as f64 / rounds as f64 / 1e6,
+        full_ns as f64 / aggregate_ns as f64,
+    );
+}

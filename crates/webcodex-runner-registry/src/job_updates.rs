@@ -45,6 +45,25 @@ use webcodex_core::workflow_session_contract::ExecutionShell;
 #[derive(Clone, Copy)]
 struct ValidationProtocolError(&'static str);
 
+/// Minimal typed facts for Runtime compact status. No Job DTO, command
+/// preview, validation payload, stream cursor or terminal history is retained.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeJobAggregateSnapshot {
+    pub active_count: usize,
+    pub running_count: usize,
+    pub queued_count: usize,
+    pub recovering_count: usize,
+    pub lost_after_reconcile_count: usize,
+    pub by_runner: HashMap<String, RuntimeJobRunnerCounts>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeJobRunnerCounts {
+    pub active: usize,
+    pub running: usize,
+    pub queued: usize,
+}
+
 /// Outcome of a bounded `job_log`/`job_tail` wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2157,6 +2176,70 @@ impl RunnerRegistry {
             .take(limit.unwrap_or(20).clamp(1, 100))
             .map(|job| job_view(&job))
             .collect()
+    }
+
+    /// Compact runtime status over all authorized Jobs without cloning or
+    /// sorting full historical records and per-Job DTO metadata.
+    pub async fn runtime_job_aggregate_for_auth(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        client_id: Option<&str>,
+    ) -> RuntimeJobAggregateSnapshot {
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.full_job_history_scan_count
+            .fetch_add(1, Ordering::Relaxed);
+        let mut inner = self.inner.lock().await;
+        let ids = inner.jobs_by_id.keys().cloned().collect::<Vec<_>>();
+        for id in ids {
+            refresh_job_status_locked(&mut inner, &id);
+        }
+        let mut result = RuntimeJobAggregateSnapshot::default();
+        for job in inner.jobs_by_id.values().filter(|job| {
+            job.visibility == ShellJobVisibility::Public
+                && shell_job_visible_to_auth(auth, &inner, job)
+                && client_id.is_none_or(|id| job.client_id == id)
+        }) {
+            let status = job.public_status();
+            let lifecycle =
+                webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::from_wire(status);
+            let active = super::job_status::job_status_is_active(status);
+            let running =
+                matches!(
+                lifecycle,
+                Ok(webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::Running
+                    | webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::StartedLegacy)
+            );
+            let queued = matches!(
+                lifecycle,
+                Ok(
+                    webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::Queued
+                        | webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::RunnerQueued
+                )
+            );
+            let in_slot = lifecycle.is_ok_and(|state| state.occupies_execution_slot());
+            result.active_count += usize::from(active);
+            result.running_count += usize::from(running);
+            result.queued_count += usize::from(queued);
+            result.recovering_count += usize::from(status == "recovering");
+            result.lost_after_reconcile_count += usize::from(
+                status == "lost"
+                    && matches!(
+                        job.recovery.public_reason(),
+                        Some(
+                            "runner_inventory_missing"
+                                | "runner_instance_replaced"
+                                | "runner_recovery_deadline_exceeded"
+                        )
+                    ),
+            );
+            if active || in_slot || queued {
+                let runner = result.by_runner.entry(job.client_id.clone()).or_default();
+                runner.active += usize::from(active);
+                runner.running += usize::from(in_slot);
+                runner.queued += usize::from(queued);
+            }
+        }
+        result
     }
 
     /// Complete caller-visible Runner Job set for aggregate observability.

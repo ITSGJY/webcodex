@@ -72,11 +72,14 @@ export function useAgentWorkspace(
   const [conversationDetail, setConversationDetail] = useState<ConversationDetail | null>(null);
   const [endpoints, setEndpoints] = useState<Map<string, AgentEndpoint>>(new Map());
   const [inbox, setInbox] = useState<InboxDelivery[]>([]);
+  const [inboxRevision, setInboxRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   const [revision, setRevision] = useState(0);
   const request = useRef<AbortController | null>(null);
   const refreshQueued = useRef(false);
+  const inboxPending = useRef<AbortController | null>(null);
+  const inboxRefreshQueued = useRef(false);
   const pendingAgentCreate = useRef<PendingKey>(null);
   const pendingConversationCreate = useRef<PendingKey>(null);
   const pendingMessage = useRef<PendingKey>(null);
@@ -194,12 +197,19 @@ export function useAgentWorkspace(
     return () => controller.abort();
   }, [client, enabled, onUnauthorized, refresh, selectedConversation?.last_seq, selectedConversationId, revision]);
 
-  useEffect(() => {
+  const refreshInbox = useCallback(() => {
     if (!enabled || !selectedAgentId || !endpoint) {
       setInbox([]);
       return;
     }
+    // Inventory/manual refreshes share the inbox's single-flight boundary.
+    // A refresh is not a scope change and must not abort a slow observation.
+    if (inboxPending.current) {
+      inboxRefreshQueued.current = true;
+      return;
+    }
     const controller = new AbortController();
+    inboxPending.current = controller;
     void fetchInbox(client, selectedAgentId, endpoint, controller.signal).then((response) => {
       if (controller.signal.aborted || !response) return;
       if (response.status === 401) {
@@ -222,9 +232,35 @@ export function useAgentWorkspace(
       if (response.ok && response.data) {
         setInbox(Array.isArray(response.data.deliveries) ? response.data.deliveries : []);
       }
+    }).finally(() => {
+      if (inboxPending.current !== controller) return;
+      inboxPending.current = null;
+      if (inboxRefreshQueued.current) {
+        inboxRefreshQueued.current = false;
+        // Foreground resumption will refresh a paused view. Do not start a
+        // queued observation after the page has become hidden.
+        if (document.visibilityState !== "hidden") setInboxRevision((value) => value + 1);
+      }
     });
-    return () => controller.abort();
-  }, [client, enabled, endpoint?.controller_generation, endpoint?.endpoint_id, onUnauthorized, selectedAgentId, revision]);
+  }, [client, enabled, endpoint?.controller_generation, endpoint?.endpoint_id, onUnauthorized, selectedAgentId]);
+
+  // Only identity/client/authority changes and disposal cancel an inbox read.
+  // Ordinary refresh revisions are deliberately absent from this cleanup.
+  useEffect(() => () => {
+    inboxPending.current?.abort();
+    inboxPending.current = null;
+    inboxRefreshQueued.current = false;
+  }, [refreshInbox]);
+
+  useEffect(() => { refreshInbox(); }, [refreshInbox, revision, inboxRevision]);
+
+  // An attached, foreground Agent needs prompt delivery observations. Poll
+  // only the selected inbox, not full Agent/Conversation inventories; never
+  // overlap an unresolved read. Hidden pages remain quiescent. Keep Endpoint
+  // lease renewal on its separate 30s lifecycle below.
+  useVisibleRefresh(enabled && Boolean(selectedAgentId && endpoint), () => {
+    if (!inboxPending.current) setInboxRevision((value) => value + 1);
+  }, 10_000);
 
   // Data observation pauses when hidden. Endpoint renewal below is a lease
   // lifecycle, not a UI poll: do not bind it to document visibility.

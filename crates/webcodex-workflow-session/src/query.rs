@@ -10,58 +10,77 @@ use super::model::{
 use super::util::bound_chars;
 
 pub(super) fn build_messages_summary(record: &SessionRecord) -> SessionMessagesSummary {
-    let total = record.messages.len();
-    let open = record
-        .messages
-        .iter()
-        .filter(|message| message.status == SessionMessageStatus::Open)
-        .count();
+    let counts = build_discussion_counts(record);
     SessionMessagesSummary {
-        total,
-        open,
-        resolved: total.saturating_sub(open),
-        pending_guidance: count_open_kind(record, SessionMessageKind::Guidance),
-        open_questions: count_open_kind(record, SessionMessageKind::Question),
-        open_risks: count_open_kind(record, SessionMessageKind::Risk),
-        open_todos: count_open_kind(record, SessionMessageKind::Todo),
+        total: counts.total,
+        open: counts.open,
+        resolved: counts.resolved,
+        pending_guidance: counts.open_guidance,
+        open_questions: counts.open_questions,
+        open_risks: counts.open_risks,
+        open_todos: counts.open_todos,
         recent_progress: take_recent_kind(
             record,
             SessionMessageKind::Progress,
             None,
             SUMMARY_MESSAGE_GROUP_LIMIT,
         ),
-        guidance: count_kind(record, SessionMessageKind::Guidance),
-        progress: count_kind(record, SessionMessageKind::Progress),
-        risk: count_kind(record, SessionMessageKind::Risk),
-        todo: count_kind(record, SessionMessageKind::Todo),
-        question: count_kind(record, SessionMessageKind::Question),
-        decision: count_kind(record, SessionMessageKind::Decision),
+        guidance: counts.guidance,
+        progress: counts.progress,
+        risk: counts.risk,
+        todo: counts.todo,
+        question: counts.question,
+        decision: counts.decision,
     }
 }
 
 pub(super) fn build_discussion_counts(record: &SessionRecord) -> SessionDiscussionCounts {
-    let total = record.messages.len();
-    let open = record
-        .messages
-        .iter()
-        .filter(|message| message.status == SessionMessageStatus::Open)
-        .count();
-    SessionDiscussionCounts {
-        total,
-        open,
-        resolved: total.saturating_sub(open),
-        guidance: count_kind(record, SessionMessageKind::Guidance),
-        progress: count_kind(record, SessionMessageKind::Progress),
-        risk: count_kind(record, SessionMessageKind::Risk),
-        todo: count_kind(record, SessionMessageKind::Todo),
-        question: count_kind(record, SessionMessageKind::Question),
-        answer: count_kind(record, SessionMessageKind::Answer),
-        decision: count_kind(record, SessionMessageKind::Decision),
-        open_guidance: count_open_kind(record, SessionMessageKind::Guidance),
-        open_questions: count_open_kind(record, SessionMessageKind::Question),
-        open_risks: count_open_kind(record, SessionMessageKind::Risk),
-        open_todos: count_open_kind(record, SessionMessageKind::Todo),
+    let mut counts = SessionDiscussionCounts {
+        total: record.messages.len(),
+        open: 0,
+        resolved: 0,
+        guidance: 0,
+        progress: 0,
+        risk: 0,
+        todo: 0,
+        question: 0,
+        answer: 0,
+        decision: 0,
+        open_guidance: 0,
+        open_questions: 0,
+        open_risks: 0,
+        open_todos: 0,
+    };
+    // One pass for both summary and discussion projections. Retain the original
+    // unknown-kind behavior and count every non-open status as resolved.
+    for message in &record.messages {
+        let open = message.status == SessionMessageStatus::Open;
+        counts.open += usize::from(open);
+        match message.kind {
+            SessionMessageKind::Guidance => {
+                counts.guidance += 1;
+                counts.open_guidance += usize::from(open);
+            }
+            SessionMessageKind::Progress => counts.progress += 1,
+            SessionMessageKind::Risk => {
+                counts.risk += 1;
+                counts.open_risks += usize::from(open);
+            }
+            SessionMessageKind::Todo => {
+                counts.todo += 1;
+                counts.open_todos += usize::from(open);
+            }
+            SessionMessageKind::Question => {
+                counts.question += 1;
+                counts.open_questions += usize::from(open);
+            }
+            SessionMessageKind::Answer => counts.answer += 1,
+            SessionMessageKind::Decision => counts.decision += 1,
+            SessionMessageKind::Note | SessionMessageKind::Proposal => {}
+        }
     }
+    counts.resolved = counts.total.saturating_sub(counts.open);
+    counts
 }
 
 pub(super) fn build_discussion_summary(
@@ -172,22 +191,6 @@ pub(super) fn priority_rank(priority: SessionMessagePriority) -> u8 {
         SessionMessagePriority::Normal => 1,
         SessionMessagePriority::High => 2,
     }
-}
-
-pub(super) fn count_kind(record: &SessionRecord, kind: SessionMessageKind) -> usize {
-    record
-        .messages
-        .iter()
-        .filter(|message| message.kind == kind)
-        .count()
-}
-
-pub(super) fn count_open_kind(record: &SessionRecord, kind: SessionMessageKind) -> usize {
-    record
-        .messages
-        .iter()
-        .filter(|message| message.kind == kind && message.status == SessionMessageStatus::Open)
-        .count()
 }
 
 fn take_recent_messages(
@@ -319,4 +322,123 @@ pub(super) fn validate_message_tags(
         }
     }
     Ok(tags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::PostSessionMessageInput;
+    use crate::store::SessionStore;
+    use std::sync::Arc;
+
+    fn mixed_messages(count: usize) -> SessionRecord {
+        let store = SessionStore::new(1, 10);
+        let session = store.start_session(Some("project".into()), Some("messages".into()));
+        let id = session.session_id;
+        let template = store
+            .post_message(PostSessionMessageInput {
+                session_id: id.clone(),
+                kind: SessionMessageKind::Progress,
+                message: "progress".into(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: SessionMessagePriority::Normal,
+            })
+            .unwrap();
+        let mut record = store
+            .with_record_for_query(&id, |record, _| record.clone())
+            .unwrap();
+        record.messages.clear();
+        let kinds = [
+            SessionMessageKind::Note,
+            SessionMessageKind::Proposal,
+            SessionMessageKind::Question,
+            SessionMessageKind::Answer,
+            SessionMessageKind::Decision,
+            SessionMessageKind::Risk,
+            SessionMessageKind::Progress,
+            SessionMessageKind::Guidance,
+            SessionMessageKind::Todo,
+        ];
+        for index in 0..count {
+            let mut message = template.clone();
+            message.kind = kinds[index % kinds.len()];
+            message.status = if index % 3 == 0 {
+                SessionMessageStatus::Resolved
+            } else {
+                SessionMessageStatus::Open
+            };
+            message.message_id = format!("message-{index}");
+            message.message = format!("progress-{index}");
+            record.messages.push_back(Arc::new(message));
+        }
+        record
+    }
+
+    fn reference_counts(record: &SessionRecord) -> SessionDiscussionCounts {
+        let total = record.messages.len();
+        let open = record
+            .messages
+            .iter()
+            .filter(|m| m.status == SessionMessageStatus::Open)
+            .count();
+        let count = |kind| record.messages.iter().filter(|m| m.kind == kind).count();
+        let open_kind = |kind| {
+            record
+                .messages
+                .iter()
+                .filter(|m| m.kind == kind && m.status == SessionMessageStatus::Open)
+                .count()
+        };
+        SessionDiscussionCounts {
+            total,
+            open,
+            resolved: total - open,
+            guidance: count(SessionMessageKind::Guidance),
+            progress: count(SessionMessageKind::Progress),
+            risk: count(SessionMessageKind::Risk),
+            todo: count(SessionMessageKind::Todo),
+            question: count(SessionMessageKind::Question),
+            answer: count(SessionMessageKind::Answer),
+            decision: count(SessionMessageKind::Decision),
+            open_guidance: open_kind(SessionMessageKind::Guidance),
+            open_questions: open_kind(SessionMessageKind::Question),
+            open_risks: open_kind(SessionMessageKind::Risk),
+            open_todos: open_kind(SessionMessageKind::Todo),
+        }
+    }
+
+    #[test]
+    fn message_summary_single_pass_preserves_all_counts_and_recent_progress() {
+        for size in [0, 1, 9, 100, 200] {
+            let record = mixed_messages(size);
+            let original = reference_counts(&record);
+            let optimized = build_discussion_counts(&record);
+            assert_eq!(
+                serde_json::to_value(original).unwrap(),
+                serde_json::to_value(&optimized).unwrap()
+            );
+            let summary = build_messages_summary(&record);
+            assert_eq!(summary.total, optimized.total);
+            assert_eq!(summary.open, optimized.open);
+            assert_eq!(summary.resolved, optimized.resolved);
+            assert_eq!(summary.pending_guidance, optimized.open_guidance);
+            assert_eq!(summary.open_questions, optimized.open_questions);
+            assert_eq!(summary.open_risks, optimized.open_risks);
+            assert_eq!(summary.open_todos, optimized.open_todos);
+            assert_eq!(summary.guidance, optimized.guidance);
+            assert_eq!(summary.progress, optimized.progress);
+            assert_eq!(summary.risk, optimized.risk);
+            assert_eq!(summary.todo, optimized.todo);
+            assert_eq!(summary.question, optimized.question);
+            assert_eq!(summary.decision, optimized.decision);
+            let recent = take_recent_kind(
+                &record,
+                SessionMessageKind::Progress,
+                None,
+                SUMMARY_MESSAGE_GROUP_LIMIT,
+            );
+            assert_eq!(summary.recent_progress, recent);
+        }
+    }
 }

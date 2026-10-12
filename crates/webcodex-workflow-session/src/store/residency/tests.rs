@@ -312,3 +312,150 @@ fn active_residency_corrupt_payload_fails_closed_without_replacing_identity() {
     assert_eq!(store.lifecycle_state(&id), Some(SessionLifecycle::Active));
     assert_eq!(store.status().capacity_evictions, 0);
 }
+
+#[test]
+fn cold_revision_snapshot_tracks_active_closed_and_rejects_replaced_raw() {
+    let store = SessionStore::new(1, 2_000);
+    let id = store.start_session(Some("project".into()), None).session_id;
+    store.post_message(message(&id)).unwrap();
+    let original = store
+        .with_record_for_query(&id, |record, _| {
+            (record.events_observed, record.message_observation_revision)
+        })
+        .unwrap();
+    assert!(original.1 > 0);
+    assert_eq!(store.handoff_revision(&id), Some(original));
+
+    churn(&store);
+    assert!(store.cold_payload_bytes_for_test(&id).is_some());
+    assert_eq!(store.retained_revisions(&id), Some(original));
+    let old = store.with_record_for_query(&id, |record, _| {
+        (record.events_observed, record.message_observation_revision)
+    });
+    assert_eq!(store.retained_revisions(&id), old);
+
+    // A legitimate mutation hydrates an Active Cold identity before updating
+    // its observed revisions. The lightweight path must never return its stale
+    // pre-mutation snapshot.
+    store.post_message(message(&id)).unwrap();
+    let changed = store
+        .with_record_for_query(&id, |record, _| {
+            (record.events_observed, record.message_observation_revision)
+        })
+        .unwrap();
+    assert!(changed.1 > original.1);
+    assert_eq!(store.handoff_revision(&id), Some(changed));
+
+    store.close_session(&id).unwrap();
+    let closed = store
+        .with_record_for_query(&id, |record, _| {
+            (record.events_observed, record.message_observation_revision)
+        })
+        .unwrap();
+    assert_eq!(store.handoff_revision(&id), Some(closed));
+    assert!(closed.0 >= changed.0);
+
+    {
+        let mut inner = store.inner.lock().unwrap();
+        let StoredSession::Cold(cold) = inner.sessions.get_mut(&id).unwrap() else {
+            panic!("Closed identity must be Cold");
+        };
+        cold.raw = Arc::from(serde_json::value::to_raw_value(&json!({"corrupted":true})).unwrap());
+    }
+    assert_eq!(store.retained_revisions(&id), None);
+    assert_eq!(store.handoff_revision(&id), None);
+}
+
+#[test]
+fn cold_revision_snapshot_survives_durable_restart_without_raw_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("revisions.json");
+    let store = SessionStore::with_persistence_limits(&ledger, 1, 20, 40);
+    let id = store.start_session(Some("project".into()), None).session_id;
+    store.post_message(message(&id)).unwrap();
+    let expected = store.handoff_revision(&id).unwrap();
+    store.flush_persistence();
+    drop(store);
+
+    let reopened = SessionStore::with_persistence_limits(&ledger, 1, 20, 40);
+    assert_eq!(reopened.handoff_revision(&id), Some(expected));
+    assert!(reopened.cold_payload_bytes_for_test(&id).is_some());
+    assert_eq!(
+        reopened.with_record_for_query(&id, |record, _| {
+            (record.events_observed, record.message_observation_revision)
+        }),
+        Some(expected)
+    );
+}
+
+#[test]
+#[ignore = "manual synthetic Cold Session revision read comparison"]
+fn cold_revision_snapshot_cost_comparison() {
+    use std::time::Instant;
+    let store = SessionStore::new(1, 2_000);
+    let id = store.start_session(Some("project".into()), None).session_id;
+    let contract = SessionToolContract {
+        risk_class: "read_only",
+        read_like: true,
+        write_like: false,
+        shell_like: false,
+        git_like: false,
+        change_summary_like: false,
+        project_write: false,
+        path_hint: crate::events::SessionPathHint::SinglePath,
+    };
+    for i in 0..1_000 {
+        let start = store.record_tool_call_started(
+            Some(&id),
+            SessionTransport::Api,
+            "read_files",
+            &json!({"project":"project", "items":[{"path":format!("file_{i}.rs")}]}),
+            contract,
+        );
+        store.record_tool_call_finished(start, true, &json!({}), None, None);
+    }
+    churn(&store);
+    assert!(store.cold_payload_bytes_for_test(&id).is_some());
+    let reference = store
+        .with_record_for_query(&id, |record, _| {
+            (record.events_observed, record.message_observation_revision)
+        })
+        .unwrap();
+    assert_eq!(store.retained_revisions(&id), Some(reference));
+    let loops = 20_u128;
+    let mut baseline = 0_u128;
+    let mut fast = 0_u128;
+    for i in 0..loops {
+        if i % 2 == 0 {
+            let t = Instant::now();
+            std::hint::black_box(
+                store
+                    .with_record_for_query(&id, |record, _| {
+                        (record.events_observed, record.message_observation_revision)
+                    })
+                    .unwrap(),
+            );
+            baseline += t.elapsed().as_nanos();
+        }
+        let t = Instant::now();
+        std::hint::black_box(store.handoff_revision(&id).unwrap());
+        fast += t.elapsed().as_nanos();
+        if i % 2 != 0 {
+            let t = Instant::now();
+            std::hint::black_box(
+                store
+                    .with_record_for_query(&id, |record, _| {
+                        (record.events_observed, record.message_observation_revision)
+                    })
+                    .unwrap(),
+            );
+            baseline += t.elapsed().as_nanos();
+        }
+    }
+    println!(
+        "cold_revision events=2000 legacy_avg_ms={:.3} indexed_avg_ms={:.5} ratio={:.1}x",
+        baseline as f64 / loops as f64 / 1e6,
+        fast as f64 / loops as f64 / 1e6,
+        baseline as f64 / fast as f64
+    );
+}

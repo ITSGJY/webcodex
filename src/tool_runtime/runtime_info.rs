@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use webcodex_core::coding_agent::safe_provider_inventory;
 use webcodex_core::desktop_runtime_contract::{ProtocolCompatibility, DESKTOP_RUNTIME_CONTRACT};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_runner_registry::RuntimeJobAggregateSnapshot;
 
 const LIST_RUNNERS_MAX_CLIENT_IDS: usize = 8;
 const TARGET_CLIENT_ID_MAX_CHARS: usize = 128;
@@ -383,14 +384,17 @@ impl ToolRuntime {
             .list_runners_for_auth(access.as_ref())
             .await;
 
+        if sparse {
+            let summary = self
+                .runner_registry
+                .runtime_job_aggregate_for_auth(access.as_ref(), None)
+                .await;
+            return ToolResult::ok(self.sparse_runtime_status(&clients, &summary, None));
+        }
         let runner_jobs = self
             .runner_registry
             .list_all_jobs_for_auth(access.as_ref())
             .await;
-
-        if sparse {
-            return ToolResult::ok(self.sparse_runtime_status(&clients, &runner_jobs, None));
-        }
 
         // -- Projects summary -------------------------------------------------
         let runner_registered_count: usize = clients
@@ -608,7 +612,7 @@ impl ToolRuntime {
     fn sparse_runtime_status(
         &self,
         clients: &[RunnerView],
-        jobs: &[ShellJobInfo],
+        jobs: &RuntimeJobAggregateSnapshot,
         focus: Option<&RunnerView>,
     ) -> Value {
         let build = crate::build_info::runtime_build_info();
@@ -633,7 +637,13 @@ impl ToolRuntime {
             "build": {"git_commit": build.git_commit, "git_dirty": build.git_dirty},
             "mcp_host": {"profile": self.deployment_mcp_host_policy.profile.as_str()},
             "projects": {"count": projects, "online_count": online_projects, "status": if projects > 0 { "ok" } else { "no_projects" }},
-            "jobs": sparse_job_counts(&runtime_job_counts(jobs)),
+            "jobs": {
+                "active_count": jobs.active_count,
+                "running_count": jobs.running_count,
+                "queued_count": jobs.queued_count,
+                "recovering_count": jobs.recovering_count,
+                "lost_after_reconcile_count": jobs.lost_after_reconcile_count
+            },
             "connection": connection
         });
         if let Some(client) = focus {
@@ -642,7 +652,11 @@ impl ToolRuntime {
                 "connected": client.connected,
                 "status": client.status,
                 "project_count": projects,
-                "job_concurrency": job_concurrency_for_client(client, jobs),
+                "job_concurrency": {
+                    "limit": client.job_concurrency_limit,
+                    "running": jobs.by_runner.get(&client.client_id).map_or(0, |count| count.running),
+                    "queued": jobs.by_runner.get(&client.client_id).map_or(0, |count| count.queued)
+                },
                 "runner_protocol_generation": client.runner_protocol_generation.get(),
                 "protocol_compatibility": compatibility["protocol_compatibility"],
                 "build_alignment": compatibility["build_alignment"],
@@ -691,6 +705,14 @@ impl ToolRuntime {
                 json!({"error_kind": "unknown_client_id", "client_id": client_id}),
             );
         };
+        let clients = std::slice::from_ref(client);
+        if sparse {
+            let summary = self
+                .runner_registry
+                .runtime_job_aggregate_for_auth(access.as_ref(), Some(&client.client_id))
+                .await;
+            return ToolResult::ok(self.sparse_runtime_status(clients, &summary, Some(client)));
+        }
         let visible_jobs = self
             .runner_registry
             .list_all_jobs_for_auth(access.as_ref())
@@ -699,14 +721,6 @@ impl ToolRuntime {
             .into_iter()
             .filter(|job| job.client_id == client.client_id)
             .collect();
-        let clients = std::slice::from_ref(client);
-        if sparse {
-            return ToolResult::ok(self.sparse_runtime_status(
-                clients,
-                &selected_jobs,
-                Some(client),
-            ));
-        }
         let now = chrono::Utc::now().timestamp();
         let project_count = enabled_projects_count(client);
         let online_project_count = if client.connected { project_count } else { 0 };

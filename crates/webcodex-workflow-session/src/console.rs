@@ -20,10 +20,31 @@ use webcodex_tool_contracts::{
     ToolActivityPresentation,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConsoleValidationHooks {
     pub event_observes_validation_activity: fn(&SessionEvent) -> bool,
     pub validation_summary_from_events: fn(&[SessionEvent], usize) -> serde_json::Value,
+}
+
+impl ConsoleValidationHooks {
+    pub(super) fn same_callbacks(self, other: Self) -> bool {
+        std::ptr::fn_addr_eq(
+            self.event_observes_validation_activity,
+            other.event_observes_validation_activity,
+        ) && std::ptr::fn_addr_eq(
+            self.validation_summary_from_events,
+            other.validation_summary_from_events,
+        )
+    }
+}
+
+/// Cache one base list projection per immutable Closed Session. The current
+/// Runner Job overlay is applied separately by the caller, never cached.
+#[derive(Debug)]
+pub(super) struct CachedConsoleList {
+    pub raw: std::sync::Arc<serde_json::value::RawValue>,
+    pub hooks: ConsoleValidationHooks,
+    pub row: WorkflowSessionConsoleListItem,
 }
 
 // The Console is a human-facing view over an already bounded durable ledger.
@@ -378,15 +399,24 @@ fn build_overview(
                 .is_some_and(validation.event_observes_validation_activity)
     });
 
-    let retained_events = record
+    // The canonical validation extractor cannot emit evidence when none of the
+    // retained events observes validation activity. Avoid deep-cloning an entire
+    // (potentially 2,000-event) Session history in this common case. Validation
+    // sessions still use the untouched canonical evidence and reconciliation path.
+    let validation_summary = if record
         .events
         .iter()
-        .map(|event| event.as_ref().clone())
-        .collect::<Vec<_>>();
-    // The validation module owns validation identity, parser, terminality, and
-    // historical failure resolution. Console deliberately narrows that existing
-    // aggregate instead of interpreting validation output itself.
-    let validation_summary = (validation.validation_summary_from_events)(&retained_events, 1);
+        .any(|event| (validation.event_observes_validation_activity)(event))
+    {
+        let retained_events = record
+            .events
+            .iter()
+            .map(|event| event.as_ref().clone())
+            .collect::<Vec<_>>();
+        (validation.validation_summary_from_events)(&retained_events, 1)
+    } else {
+        (validation.validation_summary_from_events)(&[], 1)
+    };
     let validation_available = validation_summary
         .get("available")
         .and_then(serde_json::Value::as_bool)

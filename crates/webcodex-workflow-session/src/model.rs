@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use webcodex_core::project_instructions::{
     ProjectInstructionsSnapshot, ProjectInstructionsSummarySnapshot,
@@ -226,12 +226,22 @@ pub struct ColdSessionRecord {
     pub updated_at: i64,
     pub project_instructions: Option<ProjectInstructionsSummarySnapshot>,
     pub raw: Arc<RawValue>,
+    /// A single bounded, lazy Console projection for immutable Closed history.
+    /// Active Cold Sessions never populate it; the raw-byte identity guards
+    /// against reusing a view after any internal record replacement.
+    pub(crate) console_list_cache: Arc<Mutex<Option<super::console::CachedConsoleList>>>,
     /// Process-local instruction bodies are not part of the durable ledger. Keep
     /// them across Active compaction so an incomplete future scan can retain rules.
     pub resident_instructions: Option<Arc<ProjectInstructionsSnapshot>>,
     /// The durable format omits historical no-fence completion entries. A live
     /// residency round trip must preserve those entries rather than sanitize them.
     pub unfenced_completion_ids: Vec<String>,
+    /// Immutable revision index from the same canonical Cold bytes. The weak
+    /// allocation identity prevents a replaced/corrupt raw body from being
+    /// answered using metadata belonging to an earlier snapshot.
+    pub(crate) revision_raw: std::sync::Weak<RawValue>,
+    pub(crate) retained_events_observed: u64,
+    pub(crate) retained_message_revision: u64,
 }
 
 impl StoredSession {

@@ -25,8 +25,9 @@ use super::assignment::{
 };
 use super::console::{
     build_detail as build_console_detail, build_list_item as build_console_list_item,
-    normalize_console_activity_limit, normalize_console_session_limit, ConsoleValidationHooks,
-    WorkflowSessionConsoleDetail, WorkflowSessionConsoleList,
+    normalize_console_activity_limit, normalize_console_session_limit, CachedConsoleList,
+    ConsoleValidationHooks, WorkflowSessionConsoleDetail, WorkflowSessionConsoleList,
+    WorkflowSessionConsoleListItem,
 };
 use super::events::{
     actual_failure_kind_for_tool_result, changed_paths_for_tool_call,
@@ -894,7 +895,8 @@ impl SessionStore {
     }
 
     /// Scan retained identities once for an already-authorized set of projects.
-    /// Each project keeps its own ordering and limit; no cross-request cache is kept.
+    /// Each project keeps its own ordering and limit. Only immutable Closed
+    /// records may reuse a small base Console projection across repeated reads.
     pub fn console_lists_for_projects(
         &self,
         projects: &[&str],
@@ -932,11 +934,7 @@ impl SessionStore {
                 let sessions = candidates
                     .into_iter()
                     .filter_map(|(session_id, _)| {
-                        self.with_record_for_query(&session_id, |record, _| {
-                            (record.project.as_deref() == Some(project))
-                                .then(|| build_console_list_item(record, project, validation))
-                        })
-                        .flatten()
+                        self.console_list_item_for_project(&session_id, project, validation)
                     })
                     .collect::<Vec<_>>();
                 (
@@ -950,6 +948,63 @@ impl SessionStore {
                 )
             })
             .collect()
+    }
+
+    /// Reuse only a Closed Session's immutable base row (never a live Job
+    /// overlay). Cache identity includes the cold raw allocation and both
+    /// validation hooks, so replacements and alternate validation projections
+    /// cannot return stale evidence. One row maximum per retained Closed identity.
+    fn console_list_item_for_project(
+        &self,
+        session_id: &str,
+        project: &str,
+        validation: ConsoleValidationHooks,
+    ) -> Option<WorkflowSessionConsoleListItem> {
+        let (cold, max_events_per_session) = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.touch(session_id);
+            let max_events_per_session = inner.max_events_per_session;
+            match inner.sessions.get(session_id)? {
+                StoredSession::Hot(record) => {
+                    return (record.project.as_deref() == Some(project))
+                        .then(|| build_console_list_item(record, project, validation));
+                }
+                StoredSession::Cold(record) => (record.clone(), max_events_per_session),
+            }
+        };
+
+        if cold.project.as_deref() != Some(project) {
+            return None;
+        }
+        let immutable = cold.lifecycle == SessionLifecycle::Closed;
+        if immutable {
+            let cache = cold
+                .console_list_cache
+                .lock()
+                .expect("cold Console projection cache mutex poisoned");
+            if let Some(cached) = cache.as_ref() {
+                if Arc::ptr_eq(&cached.raw, &cold.raw) && cached.hooks.same_callbacks(validation) {
+                    return Some(cached.row.clone());
+                }
+            }
+        }
+
+        let record = materialize_cold_session(&cold, max_events_per_session)?;
+        if record.project.as_deref() != Some(project) {
+            return None;
+        }
+        let row = build_console_list_item(&record, project, validation);
+        if immutable {
+            *cold
+                .console_list_cache
+                .lock()
+                .expect("cold Console projection cache mutex poisoned") = Some(CachedConsoleList {
+                raw: cold.raw.clone(),
+                hooks: validation,
+                row: row.clone(),
+            });
+        }
+        Some(row)
     }
 
     /// Bounded, read-only human timeline for one exact project-scoped Session.
@@ -1045,6 +1100,36 @@ impl SessionStore {
     /// advance events_observed; collaboration mutations advance
     /// message_observation_revision. Never serialized or accepted from a caller.
     pub fn handoff_revision(&self, session_id: &str) -> Option<(u64, u64)> {
+        self.retained_revisions(session_id)
+    }
+
+    /// Cold JSON is canonical and immutable after admission, so scalar
+    /// revisions need not materialize its entire (up to 2,000-event) body.
+    /// Keep the same LRU read touch as with_record_for_query. If an internal
+    /// repair/test replaced raw bytes, fall through to the original checked
+    /// materialization path rather than returning stale revision metadata.
+    pub(super) fn retained_revisions(&self, session_id: &str) -> Option<(u64, u64)> {
+        {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.touch(session_id);
+            match inner.sessions.get(session_id)? {
+                StoredSession::Hot(record) => {
+                    return Some((record.events_observed, record.message_observation_revision));
+                }
+                StoredSession::Cold(cold)
+                    if std::ptr::eq(
+                        std::sync::Weak::as_ptr(&cold.revision_raw),
+                        Arc::as_ptr(&cold.raw),
+                    ) =>
+                {
+                    return Some((
+                        cold.retained_events_observed,
+                        cold.retained_message_revision,
+                    ));
+                }
+                StoredSession::Cold(_) => {}
+            }
+        }
         self.with_record_for_query(session_id, |record, _| {
             (record.events_observed, record.message_observation_revision)
         })

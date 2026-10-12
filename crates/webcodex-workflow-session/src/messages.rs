@@ -491,7 +491,8 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<u64, SessionMessageObservationError> {
-        self.with_record_for_query(session_id, |record, _| record.message_observation_revision)
+        self.retained_revisions(session_id)
+            .map(|(_, revision)| revision)
             .ok_or(SessionMessageObservationError::UnknownSession)
     }
 

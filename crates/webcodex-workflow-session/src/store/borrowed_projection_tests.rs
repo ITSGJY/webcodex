@@ -1,6 +1,7 @@
 //! Borrowed projection parity and an opt-in cost comparison against the parent.
 use super::*;
 use serde_json::json;
+mod console_no_validation_tests;
 mod reference;
 use reference::reference_summary;
 
@@ -173,4 +174,253 @@ fn borrowed_projection_cost_comparison() {
             "eliminated_event_deep_clones_per_call":2000,"scope":"synthetic in-process projection, not end-to-end latency"})
         );
     }
+}
+
+fn cache_no_validation_activity(_: &SessionEvent) -> bool {
+    false
+}
+
+fn cache_not_run_summary(_: &[SessionEvent], _: usize) -> serde_json::Value {
+    json!({"available":false, "latest_status":"not_run"})
+}
+
+fn cache_passed_summary(_: &[SessionEvent], _: usize) -> serde_json::Value {
+    json!({"available":true, "latest_status":"passed"})
+}
+
+fn cache_hooks(passed: bool) -> crate::console::ConsoleValidationHooks {
+    crate::console::ConsoleValidationHooks {
+        event_observes_validation_activity: cache_no_validation_activity,
+        validation_summary_from_events: if passed {
+            cache_passed_summary
+        } else {
+            cache_not_run_summary
+        },
+    }
+}
+
+#[test]
+fn closed_console_list_cache_preserves_project_hooks_and_immutable_source_identity() {
+    let store = SessionStore::new(1, 2_000);
+    let record = fixture(200);
+    let id = record.session_id.clone();
+    store.inner.lock().unwrap().insert_session(record);
+    store.close_session(&id).unwrap();
+
+    {
+        let inner = store.inner.lock().unwrap();
+        let StoredSession::Cold(cold) = inner.sessions.get(&id).unwrap() else {
+            panic!("Closed Session should be Cold");
+        };
+        assert!(cold.console_list_cache.lock().unwrap().is_none());
+    }
+    let no_validation = cache_hooks(false);
+    let original = store
+        .with_record_for_query(&id, |record, _| {
+            crate::console::build_list_item(record, "project", no_validation)
+        })
+        .unwrap();
+    let first = store.console_list_for_project("project", None, no_validation);
+    assert_eq!(first.returned, 1);
+    assert_eq!(
+        serde_json::to_value(&first.sessions[0]).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    for _ in 0..3 {
+        let cached = store.console_list_for_project("project", None, no_validation);
+        assert_eq!(
+            serde_json::to_value(&cached).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+    }
+    assert_eq!(
+        store
+            .console_list_for_project("different-project", None, no_validation)
+            .returned,
+        0
+    );
+
+    // Hook identity prevents presenting a cached result from a different
+    // validation projection even when the cold bytes have not changed.
+    let passed = store.console_list_for_project("project", None, cache_hooks(true));
+    assert_eq!(passed.sessions[0].overview.validation.state, "passed");
+    let again = store.console_list_for_project("project", None, no_validation);
+    assert_eq!(again.sessions[0].overview.validation.state, "not_run");
+
+    // A raw replacement cannot re-expose the earlier cached row. In production
+    // Cold raw bytes are immutable, but this guards internal repair/test paths.
+    {
+        let mut inner = store.inner.lock().unwrap();
+        let StoredSession::Cold(cold) = inner.sessions.get_mut(&id).unwrap() else {
+            panic!("Closed Session should remain Cold");
+        };
+        cold.raw = std::sync::Arc::from(
+            serde_json::value::to_raw_value(&json!({"broken":"raw cold payload"})).unwrap(),
+        );
+    }
+    assert_eq!(
+        store
+            .console_list_for_project("project", None, no_validation)
+            .returned,
+        0
+    );
+
+    // The cache does not outlive its retained Session identity.
+    let weak = {
+        let inner = store.inner.lock().unwrap();
+        let StoredSession::Cold(cold) = inner.sessions.get(&id).unwrap() else {
+            panic!("Closed Session should remain Cold");
+        };
+        std::sync::Arc::downgrade(&cold.console_list_cache)
+    };
+    drop(store);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn active_cold_console_list_does_not_retain_any_cache() {
+    let store = SessionStore::new(1, 2_000);
+    let record = fixture(100);
+    let id = record.session_id.clone();
+    store.inner.lock().unwrap().insert_session(record);
+    store.start_session(Some("other".into()), None);
+    let list = store.console_list_for_project("project", None, cache_hooks(false));
+    assert_eq!(list.returned, 1);
+    let inner = store.inner.lock().unwrap();
+    let StoredSession::Cold(cold) = inner.sessions.get(&id).unwrap() else {
+        panic!("Active history should be compacted to Cold");
+    };
+    assert!(cold.console_list_cache.lock().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "manual 2,000-event Closed Session cache benchmark and retained row size"]
+fn closed_console_list_cache_repeated_read_cost_comparison() {
+    let store = SessionStore::new(1, 2_000);
+    let record = fixture(2_000);
+    let id = record.session_id.clone();
+    store.inner.lock().unwrap().insert_session(record);
+    store.close_session(&id).unwrap();
+    let hooks = cache_hooks(false);
+    let baseline = store
+        .with_record_for_query(&id, |record, _| {
+            crate::console::build_list_item(record, "project", hooks)
+        })
+        .unwrap();
+    let warm = store.console_list_for_project("project", None, hooks);
+    assert_eq!(
+        serde_json::to_value(&baseline).unwrap(),
+        serde_json::to_value(&warm.sessions[0]).unwrap()
+    );
+    let payload_bytes = serde_json::to_vec(&warm.sessions[0]).unwrap().len();
+    let rounds = 16_u128;
+    let mut legacy_ns = 0_u128;
+    let mut cached_ns = 0_u128;
+    for iteration in 0..rounds {
+        if iteration % 2 == 0 {
+            let t = Instant::now();
+            std::hint::black_box(
+                store
+                    .with_record_for_query(&id, |record, _| {
+                        crate::console::build_list_item(record, "project", hooks)
+                    })
+                    .unwrap(),
+            );
+            legacy_ns += t.elapsed().as_nanos();
+        }
+        let t = Instant::now();
+        std::hint::black_box(store.console_list_for_project("project", None, hooks));
+        cached_ns += t.elapsed().as_nanos();
+        if iteration % 2 != 0 {
+            let t = Instant::now();
+            std::hint::black_box(
+                store
+                    .with_record_for_query(&id, |record, _| {
+                        crate::console::build_list_item(record, "project", hooks)
+                    })
+                    .unwrap(),
+            );
+            legacy_ns += t.elapsed().as_nanos();
+        }
+    }
+    println!(
+        "closed_console_list events=2000 legacy_avg_ms={:.3} cached_avg_ms={:.3} speedup={:.1}x retained_row_json_bytes={}",
+        legacy_ns as f64 / rounds as f64 / 1e6,
+        cached_ns as f64 / rounds as f64 / 1e6,
+        legacy_ns as f64 / cached_ns as f64,
+        payload_bytes,
+    );
+}
+
+#[test]
+#[ignore = "manual repeated multi-Session Console inventory benchmark with 60 Closed identities"]
+fn closed_console_multi_session_batch_cost_comparison() {
+    let store = SessionStore::new_in_memory_with_limits(2, 100, 2_000);
+    let ids = (0..60)
+        .map(|_| {
+            let record = fixture(200);
+            let id = record.session_id.clone();
+            store.inner.lock().unwrap().insert_session(record);
+            store.close_session(&id).unwrap();
+            id
+        })
+        .collect::<Vec<_>>();
+    let hooks = cache_hooks(false);
+    let projects = ["project"];
+    let initial = store.console_lists_for_projects(&projects, Some(100), hooks);
+    assert_eq!(initial["project"].returned, ids.len());
+    assert!(initial["project"]
+        .sessions
+        .iter()
+        .all(|row| row.lifecycle == "closed"));
+    let encoded = serde_json::to_vec(&initial).unwrap();
+    let mut uncached_ns = 0_u128;
+    let mut cached_ns = 0_u128;
+    let iterations = 8_u128;
+    for round in 0..iterations {
+        // The actual batch inventory implementation is identical in both
+        // cases; only the transient memoized Closed projections are cleared.
+        if round % 2 == 0 {
+            {
+                let inner = store.inner.lock().unwrap();
+                for id in &ids {
+                    let StoredSession::Cold(cold) = inner.sessions.get(id).unwrap() else {
+                        panic!("Closed identity must remain cold");
+                    };
+                    *cold.console_list_cache.lock().unwrap() = None;
+                }
+            }
+            let start = Instant::now();
+            let baseline = store.console_lists_for_projects(&projects, Some(100), hooks);
+            uncached_ns += start.elapsed().as_nanos();
+            assert_eq!(serde_json::to_vec(&baseline).unwrap(), encoded);
+        }
+        let start = Instant::now();
+        let warmed = store.console_lists_for_projects(&projects, Some(100), hooks);
+        cached_ns += start.elapsed().as_nanos();
+        assert_eq!(serde_json::to_vec(&warmed).unwrap(), encoded);
+        if round % 2 != 0 {
+            {
+                let inner = store.inner.lock().unwrap();
+                for id in &ids {
+                    let StoredSession::Cold(cold) = inner.sessions.get(id).unwrap() else {
+                        panic!("Closed identity must remain cold");
+                    };
+                    *cold.console_list_cache.lock().unwrap() = None;
+                }
+            }
+            let start = Instant::now();
+            let baseline = store.console_lists_for_projects(&projects, Some(100), hooks);
+            uncached_ns += start.elapsed().as_nanos();
+            assert_eq!(serde_json::to_vec(&baseline).unwrap(), encoded);
+        }
+    }
+    println!(
+        "console_batch sessions={} events_per_session=200 uncached_avg_ms={:.3} cached_avg_ms={:.3} speedup={:.2}x response_bytes={}",
+        ids.len(),
+        uncached_ns as f64 / iterations as f64 / 1e6,
+        cached_ns as f64 / iterations as f64 / 1e6,
+        uncached_ns as f64 / cached_ns as f64,
+        encoded.len(),
+    );
 }

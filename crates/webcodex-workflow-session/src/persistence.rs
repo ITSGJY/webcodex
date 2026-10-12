@@ -473,6 +473,7 @@ pub fn cold_session_from_persisted(
             })?;
     let lifecycle = persisted.lifecycle;
     let raw = Arc::from(serde_json::value::to_raw_value(persisted)?);
+    let revision_raw = Arc::downgrade(&raw);
     Ok(ColdSessionRecord {
         session_id: persisted.session_id.clone(),
         project: persisted.project.clone(),
@@ -483,14 +484,18 @@ pub fn cold_session_from_persisted(
         updated_at: persisted.updated_at,
         project_instructions,
         raw,
+        console_list_cache: Arc::new(std::sync::Mutex::new(None)),
         resident_instructions: None,
         unfenced_completion_ids: Vec::new(),
+        revision_raw,
+        retained_events_observed: persisted.events_observed.max(persisted.events.len() as u64),
+        retained_message_revision: persisted.message_observation_revision,
     })
 }
 
 pub fn materialize_cold_session(
     record: &ColdSessionRecord,
-    max_events_per_session: usize,
+    _max_events_per_session: usize,
 ) -> Option<SessionRecord> {
     let persisted = serde_json::from_str::<PersistedSessionRecord>(record.raw.get()).ok()?;
     if persisted.session_id != record.session_id
@@ -503,13 +508,13 @@ pub fn materialize_cold_session(
     {
         return None;
     }
-    if record.lifecycle.allows_mutation() {
-        // Only our canonical live serializer or the sanitizing stream loader
-        // creates these bytes. Do not apply disk-restore cleanup a second time.
-        Some(resident::materialize(persisted, record))
-    } else {
-        persisted.into_record(max_events_per_session)
-    }
+    // A Cold record is only admitted from our own canonical serializer or
+    // after the stream loader has already sanitized the full persisted row.
+    // Re-sanitizing Closed Sessions at every read would deep-clone and traverse
+    // up to 2,000 retained events, despite these bytes being immutable in RAM.
+    // Keep the exact identity/authority checks above and the single sanitize
+    // boundary in the stream loader; both lifecycles can materialize directly.
+    Some(resident::materialize(persisted, record))
 }
 
 pub struct RestoredSessionLedger {
@@ -913,6 +918,103 @@ pub fn sanitize_persisted_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn closed_cold_ledger_fixture() -> (ColdSessionRecord, usize) {
+        use crate::model::SessionTransport;
+        use crate::store::SessionStore;
+        use crate::SessionToolContract;
+        let max_events = 2_000;
+        let store = SessionStore::new(4, max_events);
+        let id = store
+            .start_session(Some("project".into()), Some("history".into()))
+            .session_id;
+        let contract = SessionToolContract {
+            risk_class: "read_only",
+            read_like: true,
+            write_like: false,
+            shell_like: false,
+            git_like: false,
+            change_summary_like: false,
+            project_write: false,
+            path_hint: crate::events::SessionPathHint::SinglePath,
+        };
+        for index in 0..800 {
+            let start = store.record_tool_call_started(
+                Some(&id),
+                SessionTransport::Api,
+                "read_files",
+                &serde_json::json!({"project":"project", "items":[{"path":format!("file_{index}.rs")}]}),
+                contract,
+            );
+            store.record_tool_call_finished(
+                start,
+                true,
+                &serde_json::json!({"ok":true}),
+                None,
+                None,
+            );
+        }
+        store.close_session(&id).unwrap();
+        let cold = store
+            .with_record_for_query(&id, |record, _| {
+                cold_session_from_record(record, max_events).unwrap()
+            })
+            .unwrap();
+        (cold, max_events)
+    }
+
+    #[test]
+    fn closed_cold_canonical_read_matches_original_sanitizing_materialization() {
+        let (cold, limit) = closed_cold_ledger_fixture();
+        let old = serde_json::from_str::<PersistedSessionRecord>(cold.raw.get())
+            .unwrap()
+            .into_record(limit)
+            .unwrap();
+        let new = materialize_cold_session(&cold, limit).unwrap();
+        assert_eq!(
+            serde_json::to_value(PersistedSessionRecord::from_record(&old, limit)).unwrap(),
+            serde_json::to_value(PersistedSessionRecord::from_record(&new, limit)).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual hot/cold materialization comparison, synthetic 1,600-event closed Session"]
+    fn closed_cold_canonical_read_cost_comparison() {
+        use std::time::Instant;
+        let (cold, limit) = closed_cold_ledger_fixture();
+        let rounds = 25_u128;
+        let mut legacy_ns = 0_u128;
+        let mut canonical_ns = 0_u128;
+        for iteration in 0..rounds {
+            if iteration % 2 == 0 {
+                let begin = Instant::now();
+                let record = serde_json::from_str::<PersistedSessionRecord>(cold.raw.get())
+                    .unwrap()
+                    .into_record(limit)
+                    .unwrap();
+                std::hint::black_box(record);
+                legacy_ns += begin.elapsed().as_nanos();
+            }
+            let begin = Instant::now();
+            std::hint::black_box(materialize_cold_session(&cold, limit).unwrap());
+            canonical_ns += begin.elapsed().as_nanos();
+            if iteration % 2 != 0 {
+                let begin = Instant::now();
+                let record = serde_json::from_str::<PersistedSessionRecord>(cold.raw.get())
+                    .unwrap()
+                    .into_record(limit)
+                    .unwrap();
+                std::hint::black_box(record);
+                legacy_ns += begin.elapsed().as_nanos();
+            }
+        }
+        println!(
+            "closed_cold_materialization events=1600 legacy_avg_ms={:.3} canonical_avg_ms={:.3} speedup={:.2}x",
+            legacy_ns as f64 / rounds as f64 / 1e6,
+            canonical_ns as f64 / rounds as f64 / 1e6,
+            legacy_ns as f64 / canonical_ns as f64
+        );
+    }
 
     #[test]
     fn tombstone_row_is_not_a_session_record() {
