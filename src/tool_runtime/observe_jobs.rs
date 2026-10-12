@@ -468,14 +468,106 @@ fn add_actionable_batch_continuation(
     root.remove("next_index");
 }
 
+// A success ToolResult serializes as {"success":true,"output":<JSON>}.
+// Measure its canonical envelope using the actual ToolResult serializer and
+// replace the literal null payload with the borrowed output's exact JSON size.
+// Unlike ToolResult::ok(output.clone()), this never copies Job stdout/stderr.
 fn serialized_batch_fits(output: &Value) -> bool {
-    serialized_json_len(&ToolResult::ok(output.clone()))
-        .map(|bytes| {
-            bytes
-                <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
-                    .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
+    let size = (|| {
+        let envelope_bytes = serialized_json_len(&ToolResult::ok(Value::Null)).ok()?;
+        let output_bytes = serialized_json_len(output).ok()?;
+        envelope_bytes.checked_sub(4)?.checked_add(output_bytes)
+    })();
+    size.is_some_and(|bytes| {
+        bytes
+            <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+                .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
+    })
+}
+
+// Candidate packing uses a fixed JSON envelope and comma-delimited items
+// array. Measure each item exactly once as it is considered, then measure only
+// this tiny envelope with an empty items array to avoid re-serializing already
+// accepted Job stdout/stderr for every candidate. Unknown envelope metadata
+// remains included; invalid or overflowing input fails closed.
+fn serialized_batch_fits_with_item_sizes(
+    output: &Value,
+    serialized_item_bytes: Option<usize>,
+) -> bool {
+    let Some(serialized_item_bytes) = serialized_item_bytes else {
+        // Preserve the generic canonical behavior for malformed/unsupported
+        // result shapes; accepted Job batches always supply cached sizes.
+        return serialized_batch_fits(output);
+    };
+    let Some(root) = output.as_object() else {
+        return serialized_batch_fits(output);
+    };
+    let Some(items) = root.get("items").and_then(Value::as_array) else {
+        return serialized_batch_fits(output);
+    };
+    let mut empty_batch = serde_json::Map::new();
+    for (key, value) in root {
+        empty_batch.insert(
+            key.clone(),
+            if key == "items" {
+                Value::Array(Vec::new())
+            } else {
+                value.clone()
+            },
+        );
+    }
+    let size = (|| {
+        let base_envelope = serialized_json_len(&ToolResult::ok(Value::Null))
+            .ok()?
+            .checked_sub(4)?;
+        let batch_json = serialized_json_len(&Value::Object(empty_batch)).ok()?;
+        let item_array_bytes = if items.is_empty() {
+            2
+        } else {
+            serialized_item_bytes
+                .checked_add(items.len().checked_sub(1)?)?
+                .checked_add(2)?
+        };
+        // The literal empty array contributes two bytes to batch_json.
+        base_envelope
+            .checked_add(batch_json.checked_sub(2)?)?
+            .checked_add(item_array_bytes)
+    })();
+    size.is_some_and(|bytes| {
+        bytes
+            <= MAX_OBSERVE_JOBS_AGGREGATE_RESULT_BYTES
+                .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES)
+    })
+}
+
+fn refresh_batch_counts(output: &mut Value) {
+    let items = output["items"]
+        .as_array()
+        .expect("observe_jobs batch_output always contains an items array");
+    let returned_count = items.len();
+    let succeeded_count = items
+        .iter()
+        .filter(|item| item["success"].as_bool() == Some(true))
+        .count();
+    let changed_count = items
+        .iter()
+        .filter(|item| {
+            item["success"].as_bool() == Some(true)
+                && item["output"]["changed"].as_bool() == Some(true)
         })
-        .unwrap_or(false)
+        .count();
+    let terminal_count = items
+        .iter()
+        .filter(|item| {
+            item["success"].as_bool() == Some(true)
+                && item["output"]["terminal"].as_bool() == Some(true)
+        })
+        .count();
+    output["returned_count"] = json!(returned_count);
+    output["succeeded_count"] = json!(succeeded_count);
+    output["failed_count"] = json!(returned_count - succeeded_count);
+    output["changed_count"] = json!(changed_count);
+    output["terminal_count"] = json!(terminal_count);
 }
 
 fn apply_output_budget(
@@ -484,26 +576,44 @@ fn apply_output_budget(
     wake_reason: WakeReason,
     waited_ms: u64,
 ) -> Result<Value, String> {
-    let mut returned = Vec::with_capacity(completed.len());
+    let mut output = batch_output(
+        requested_count,
+        Vec::new(),
+        wake_reason,
+        waited_ms,
+        false,
+        None,
+    );
     let mut next_index = None;
+    let mut accepted_item_bytes = Some(0usize);
 
     for item in completed {
-        let index = item["index"].as_u64().unwrap_or(returned.len() as u64) as usize;
-        let mut candidate_items = returned.clone();
-        candidate_items.push(item.clone());
-        let candidate = batch_output(
-            requested_count,
-            candidate_items,
-            wake_reason,
-            waited_ms,
-            false,
-            None,
-        );
-        if serialized_batch_fits(&candidate) {
-            returned.push(item);
+        let item_bytes = serialized_json_len(&item).ok();
+        let candidate_item_bytes = accepted_item_bytes
+            .and_then(|total| item_bytes.and_then(|size| total.checked_add(size)));
+        let index = item["index"]
+            .as_u64()
+            .unwrap_or(output["items"].as_array().expect("canonical batch").len() as u64)
+            as usize;
+        output["items"]
+            .as_array_mut()
+            .expect("canonical batch")
+            .push(item);
+        refresh_batch_counts(&mut output);
+        if serialized_batch_fits_with_item_sizes(&output, candidate_item_bytes) {
+            accepted_item_bytes = candidate_item_bytes;
             continue;
         }
+        let item = output["items"]
+            .as_array_mut()
+            .expect("canonical batch")
+            .pop()
+            .expect("just appended a candidate");
+        refresh_batch_counts(&mut output);
 
+        // Test whether this bounded individual observation could fit alone.
+        // This branch is taken only when the cumulative prefix does not fit;
+        // the ordinary append/probe path does not copy a single Job log.
         let single = batch_output(
             requested_count,
             vec![item.clone()],
@@ -519,18 +629,25 @@ fn apply_output_budget(
 
         let budget_failure =
             output_budget_failure_item(index, item["job_id"].as_str().unwrap_or_default().into());
-        let mut candidate_items = returned.clone();
-        candidate_items.push(budget_failure.clone());
-        let candidate = batch_output(
-            requested_count,
-            candidate_items,
-            wake_reason,
-            waited_ms,
-            false,
-            None,
-        );
-        if !serialized_batch_fits(&candidate) {
-            if returned.is_empty() {
+        let budget_failure_bytes = serialized_json_len(&budget_failure).ok();
+        let failure_candidate_bytes = accepted_item_bytes
+            .and_then(|total| budget_failure_bytes.and_then(|size| total.checked_add(size)));
+        output["items"]
+            .as_array_mut()
+            .expect("canonical batch")
+            .push(budget_failure);
+        refresh_batch_counts(&mut output);
+        if !serialized_batch_fits_with_item_sizes(&output, failure_candidate_bytes) {
+            output["items"]
+                .as_array_mut()
+                .expect("canonical batch")
+                .pop();
+            refresh_batch_counts(&mut output);
+            if output["items"]
+                .as_array()
+                .expect("canonical batch")
+                .is_empty()
+            {
                 return Err(
                     "observe_jobs could not encode a bounded output-budget failure item".into(),
                 );
@@ -538,17 +655,14 @@ fn apply_output_budget(
             next_index = Some(index);
             break;
         }
-        returned.push(budget_failure);
+        accepted_item_bytes = failure_candidate_bytes;
     }
 
-    Ok(batch_output(
-        requested_count,
-        returned,
-        wake_reason,
-        waited_ms,
-        next_index.is_some(),
-        next_index,
-    ))
+    output["output_truncated"] = json!(next_index.is_some());
+    if let Some(index) = next_index {
+        output["next_index"] = json!(index);
+    }
+    Ok(output)
 }
 
 fn copy_non_null(
@@ -1353,6 +1467,10 @@ pub(super) fn sparsify_job_readiness_model_result(result: &mut ToolResult) {
     output.remove("mode");
     output.remove("waited_ms");
 }
+
+#[cfg(test)]
+#[path = "observe_jobs_budget_tests.rs"]
+mod budget_tests;
 
 #[cfg(test)]
 mod tests {
