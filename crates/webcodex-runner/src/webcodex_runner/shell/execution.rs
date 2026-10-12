@@ -29,6 +29,7 @@ pub(super) fn execute_configured_command(
     )
 }
 
+#[cfg(any(windows, all(test, feature = "runner-real-process-tests")))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_configured_command_with_prefix(
     policy: &RunnerPolicy,

@@ -2607,6 +2607,30 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
     // full renderings must preserve the exact same admitted inventory. Byte
     // ceilings remain intentional product budgets and still catch material
     // discovery-surface growth.
+    //
+    // The model-visible `project_format` gateway is an intentional first-party
+    // inventory addition. Measuring its exact compact serialized descriptor cost
+    // (plus array delimiter) and bounding the marginal allowance to <= 2000 bytes
+    // admits the new gateway while preserving baseline product ceilings for all
+    // other tools, ensuring any description/schema growth beyond 2k or unrelated
+    // tool surface expansion still fails.
+    fn project_format_marginal_allowance(model_tools: &[Value]) -> usize {
+        let Some(tool) = model_tools
+            .iter()
+            .find(|tool| tool["name"] == "project_format")
+        else {
+            return 0;
+        };
+        let descriptor_bytes = serde_json::to_vec(tool).unwrap().len();
+        let delimiter_bytes = if model_tools.len() > 1 { 1 } else { 0 };
+        let marginal_cost = descriptor_bytes + delimiter_bytes;
+        assert!(
+            marginal_cost <= 2000,
+            "project_format marginal cost {marginal_cost} bytes exceeds 2000 byte allowance ceiling"
+        );
+        marginal_cost
+    }
+
     for (label, auth, model_max_bytes) in [
         ("anonymous", None, 75_000),
         ("scoped", Some(&scoped), 78_000),
@@ -2658,9 +2682,15 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
                         .filter(|definition| definition.name.ends_with("_code_mode"))
                         .count()
                         * 4096;
+                let project_format_marginal_byte_budget = if compact {
+                    project_format_marginal_allowance(model_tools)
+                } else {
+                    0
+                };
                 let model_byte_budget = model_max_bytes
                     + if app_enabled { 4_000 } else { 0 }
-                    + experimental_code_mode_byte_budget;
+                    + experimental_code_mode_byte_budget
+                    + project_format_marginal_byte_budget;
                 // Raw transport includes private App bridge descriptors and Host
                 // presentation metadata. Keep a coarse overhead ceiling so transport
                 // cannot grow silently, but do not force model guidance to pay for it.
