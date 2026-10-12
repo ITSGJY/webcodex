@@ -633,6 +633,35 @@ pub(crate) fn fence(
     Ok(())
 }
 
+/// Reuse the canonical bounded planner to refresh authority and recipe facts.
+/// Earlier writes in this same batch legitimately change file witnesses, so
+/// compare context separately; each file retains its original compare-and-write
+/// fence and the final pass verifies the complete candidate set.
+fn revalidate_commit_context(
+    policy: &RunnerPolicy,
+    registry: &Path,
+    expected: &ProjectFormatPlan,
+) -> Result<(), &'static str> {
+    let current = plan(policy, registry, &expected.request).map_err(|_| "format_plan_stale")?;
+    let ProjectFormatPlan {
+        request,
+        recipe_root,
+        root_digest,
+        manifest_digest,
+        profile,
+        files: _,
+    } = &current.plan;
+    if request != &expected.request
+        || recipe_root != &expected.recipe_root
+        || root_digest != &expected.root_digest
+        || manifest_digest != &expected.manifest_digest
+        || profile != &expected.profile
+    {
+        return Err("format_plan_stale");
+    }
+    Ok(())
+}
+
 /// Every error means unknown aggregate mutation, even after an earlier write.
 /// There is deliberately no rollback or second write attempt.
 pub(crate) fn commit_candidates(
@@ -687,6 +716,8 @@ pub(super) fn commit_candidates_with_hook(
     let mut changed = false;
     for (index, (source, candidate)) in planned.sources.iter().zip(candidates).enumerate() {
         boundary(index, false);
+        check_stop()?;
+        revalidate_commit_context(policy, registry, &planned.plan)?;
         check_stop()?;
         let witness = &planned.plan.files[index];
         if root_digest(&planned.root)? != planned.plan.root_digest {
@@ -756,6 +787,8 @@ pub(super) fn commit_candidates_with_hook(
     if root_digest(&planned.root)? != planned.plan.root_digest {
         return Err("format_observation_failed");
     }
+    revalidate_commit_context(policy, registry, &planned.plan)?;
+    check_stop()?;
     Ok(if changed {
         ProjectFormatMutationReport::Changed
     } else {

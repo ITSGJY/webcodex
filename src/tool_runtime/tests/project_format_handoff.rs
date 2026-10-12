@@ -63,15 +63,27 @@ fn project_format_retain_utf8_failure_codes() {
 const CLIENT: &str = "project-format";
 
 #[derive(Debug, Default)]
-struct MemoryReceiptStore(std::sync::Mutex<Vec<RetainedJobReceipt>>);
+struct MemoryReceiptStore {
+    rows: std::sync::Mutex<Vec<RetainedJobReceipt>>,
+    fail_writes: std::sync::atomic::AtomicBool,
+}
 
 impl JobReceiptStore for MemoryReceiptStore {
     fn upsert(&self, receipt: &RetainedJobReceipt) -> Result<(), String> {
-        self.0.lock().unwrap().push(receipt.clone());
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("injected receipt write failure".into());
+        }
+        let mut rows = self.rows.lock().unwrap();
+        if !rows
+            .iter()
+            .any(|row| row.snapshot.job_id == receipt.snapshot.job_id)
+        {
+            rows.push(receipt.clone());
+        }
         Ok(())
     }
     fn load(&self, _now: i64) -> Result<Vec<RetainedJobReceipt>, String> {
-        Ok(self.0.lock().unwrap().clone())
+        Ok(self.rows.lock().unwrap().clone())
     }
     fn prune(&self, _now: i64) -> Result<(), String> {
         Ok(())
@@ -88,6 +100,10 @@ async fn setup(grace_ms: u64, with_store: bool) -> ToolRuntime {
     } else {
         RunnerRegistry::default()
     };
+    setup_with_registry(grace_ms, registry).await
+}
+
+async fn setup_with_registry(grace_ms: u64, registry: RunnerRegistry) -> ToolRuntime {
     let runtime = ToolRuntime::new(Arc::new(registry), Arc::new(RuntimeInfo::default()))
         .with_structured_execution_sync_wait(std::time::Duration::from_millis(grace_ms));
     register_agent(
@@ -803,6 +819,71 @@ async fn project_format_invalid_arguments_reject_without_dispatch() {
     assert_eq!(result.output["failure_kind"], json!("invalid_arguments"));
 
     assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
+async fn project_format_receipt_failure_stays_unknown_and_recovery_never_redispatches() {
+    use std::sync::atomic::Ordering;
+    for report in [
+        ProjectFormatMutationReport::Changed,
+        ProjectFormatMutationReport::Unchanged,
+    ] {
+        let store = Arc::new(MemoryReceiptStore::default());
+        store.fail_writes.store(true, Ordering::SeqCst);
+        let registry = RunnerRegistry::with_job_receipt_store(
+            Arc::new(NoopRunnerRegistryTelemetry),
+            store.clone(),
+        )
+        .await;
+        let runtime = setup_with_registry(1, registry).await;
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .dispatch_with_auth(call(), Some(&auth_context(None, true)))
+                    .await
+            }
+        });
+        let (request, job_id) = reply_plan(&runtime).await;
+        assert_eq!(task.await.unwrap().output["execution_state"], "pending");
+        finish_format_job(
+            &runtime,
+            &request,
+            &job_id,
+            "completed",
+            ShellCommandExecutionState::Completed,
+            Some(0),
+            None,
+            Some(report),
+        )
+        .await;
+        let unknown = runtime.runner_registry.get_job(&job_id).await.unwrap();
+        assert_eq!(
+            unknown.format_mutation.unwrap_or_default().state_changed(),
+            None
+        );
+        assert!(store.rows.lock().unwrap().is_empty());
+        assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+
+        store.fail_writes.store(false, Ordering::SeqCst);
+        // Only the existing persistence candidate is retried at unlock. The
+        // first view can precede that commit; the next view sees its durable fact.
+        runtime.runner_registry.get_job(&job_id).await.unwrap();
+        let known = runtime.runner_registry.get_job(&job_id).await.unwrap();
+        assert_eq!(known.format_mutation, Some(report));
+        assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+        assert_eq!(store.rows.lock().unwrap().len(), 1);
+
+        let restored = RunnerRegistry::with_job_receipt_store(
+            Arc::new(NoopRunnerRegistryTelemetry),
+            store.clone(),
+        )
+        .await;
+        let historical = restored.get_job(&job_id).await.unwrap();
+        assert_eq!(historical.format_mutation, Some(report));
+        assert_eq!(historical.status, "completed");
+        assert!(restored.list_runners().await.is_empty());
+    }
 }
 
 #[tokio::test]

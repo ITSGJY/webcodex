@@ -698,6 +698,126 @@ fn project_format_pf09_candidate_commit_detects_source_and_manifest_conflicts() 
 }
 
 #[test]
+fn project_format_commit_rechecks_context_before_each_file() {
+    for revoke_permission in [false, true] {
+        let fixture = Fixture::new();
+        fs::write(fixture.root.join("src/other.rs"), "fn other( ){ }\n").unwrap();
+        let mut request = fixture.request();
+        request.files.push("src/other.rs".into());
+        let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+        let result = super::project_format::commit_candidates_with_hook(
+            &fixture.policy,
+            &fixture.registry,
+            &planned,
+            &["fn main() {}\n".into(), "fn other() {}\n".into()],
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            &std::sync::atomic::AtomicBool::new(false),
+            |index, after| {
+                if index == 0 && after {
+                    if revoke_permission {
+                        fixture.register(false);
+                    } else {
+                        fs::write(
+                            fixture.root.join("Cargo.toml"),
+                            MANIFEST.replace("2021", "2024"),
+                        )
+                        .unwrap();
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            result,
+            Err("format_plan_stale"),
+            "revoked={revoke_permission}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("src/other.rs")).unwrap(),
+            planned.sources[1]
+        );
+    }
+}
+
+#[test]
+fn project_format_commit_rechecks_context_before_known_receipt() {
+    let fixture = Fixture::new();
+    let planned = fixture.plan();
+    let result = super::project_format::commit_candidates_with_hook(
+        &fixture.policy,
+        &fixture.registry,
+        &planned,
+        &["fn main() {}\n".into()],
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        &std::sync::atomic::AtomicBool::new(false),
+        |_, after| {
+            if after {
+                fixture.register(false);
+            }
+        },
+    );
+    assert_eq!(result, Err("format_plan_stale"));
+}
+
+#[test]
+fn project_format_commit_rechecks_python_manifest_between_writes() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    let manifest = "[tool.ruff]\ntarget-version='py311'\n";
+    fs::write(fixture.root.join("pyproject.toml"), manifest).unwrap();
+    fs::write(fixture.root.join("main.py"), "x=1\n").unwrap();
+    fs::write(fixture.root.join("other.py"), "y=2\n").unwrap();
+    let mut request = fixture.request();
+    request.files = vec!["main.py".into(), "other.py".into()];
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let result = super::project_format::commit_candidates_with_hook(
+        &fixture.policy,
+        &fixture.registry,
+        &planned,
+        &["x = 1\n".into(), "y = 2\n".into()],
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        &std::sync::atomic::AtomicBool::new(false),
+        |index, after| {
+            if index == 0 && after {
+                fs::write(
+                    fixture.root.join("pyproject.toml"),
+                    manifest.replace("py311", "py312"),
+                )
+                .unwrap();
+            }
+        },
+    );
+    assert_eq!(result, Err("format_plan_stale"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("other.py")).unwrap(),
+        "y=2\n"
+    );
+}
+
+#[test]
+fn project_format_commit_accepts_its_own_previous_file_writes() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("src/other.rs"), "fn other( ){ }\n").unwrap();
+    let mut request = fixture.request();
+    request.files.push("src/other.rs".into());
+    let planned = plan(&fixture.policy, &fixture.registry, &request).unwrap();
+    let candidates = ["fn main() {}\n".into(), "fn other() {}\n".into()];
+    assert_eq!(
+        commit(&fixture, &planned, &candidates),
+        Ok(ProjectFormatMutationReport::Changed)
+    );
+    for (file, candidate) in planned.plan.files.iter().zip(&candidates) {
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(&file.path)).unwrap(),
+            *candidate
+        );
+    }
+}
+
+#[test]
 fn project_format_pf10_partial_write_and_failed_observation_stay_unknown() {
     use std::sync::atomic::{AtomicBool, Ordering};
     for scenario in 0..3 {
