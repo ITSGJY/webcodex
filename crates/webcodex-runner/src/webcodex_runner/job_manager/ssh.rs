@@ -5,6 +5,49 @@ use super::lifecycle::{
 };
 use super::retained::append_bounded_tail;
 use super::*;
+
+// The local ssh client often exits between two 250 ms Job update ticks.
+// Use the existing direct-SSH 25 ms exit-check cadence for one bounded initial
+// window, then return to the normal Job poll period for long-running commands.
+// This changes only observation of the same local child, never remote dispatch,
+// replay, transport invalidation, timeout authority or process-tree cleanup.
+const SSH_JOB_FAST_EXIT_POLL_WINDOW: Duration = Duration::from_millis(750);
+const SSH_JOB_FAST_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+fn ssh_job_exit_poll_interval(elapsed_since_spawn: Duration) -> Duration {
+    if elapsed_since_spawn < SSH_JOB_FAST_EXIT_POLL_WINDOW {
+        SSH_JOB_FAST_EXIT_POLL_INTERVAL
+    } else {
+        Duration::from_millis(JOB_UPDATE_INTERVAL_MS)
+    }
+}
+
+#[cfg(test)]
+mod fast_exit_poll_tests {
+    use super::*;
+
+    #[test]
+    fn ssh_job_returns_to_normal_interval_after_short_exit_window() {
+        assert_eq!(JOB_UPDATE_INTERVAL_MS, 250);
+        assert_eq!(
+            ssh_job_exit_poll_interval(Duration::ZERO),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            ssh_job_exit_poll_interval(Duration::from_millis(749)),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            ssh_job_exit_poll_interval(Duration::from_millis(750)),
+            Duration::from_millis(JOB_UPDATE_INTERVAL_MS)
+        );
+        assert_eq!(
+            ssh_job_exit_poll_interval(Duration::from_secs(60)),
+            Duration::from_millis(JOB_UPDATE_INTERVAL_MS)
+        );
+    }
+}
+
 impl JobManager {
     /// Start one remote SSH command as a normal runner job. Resource/session
     /// validation and local command preparation happen before spawn, so those
@@ -268,7 +311,7 @@ impl JobManager {
                         );
                     }
                 }
-                std::thread::sleep(Duration::from_millis(JOB_UPDATE_INTERVAL_MS));
+                std::thread::sleep(ssh_job_exit_poll_interval(start.elapsed()));
             };
             // The SSH client is the root of a private process tree. Ensure a
             // background child holding either pipe cannot delay the terminal

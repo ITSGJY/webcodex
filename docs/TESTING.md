@@ -97,6 +97,55 @@ its own result. Without an explicit authorized Session, only in-flight sharing
 is enabled. Snapshot retention is bounded to 64 entries / 8 MiB per runtime,
 and the in-flight index to 128 entries (excess reads bypass sharing).
 
+## Optional shared Cargo cache for Windows linked worktrees
+
+When several linked Git worktrees independently run Rust checks on Windows,
+their default per-worktree `target/` directories can duplicate large amounts of
+dependency build output. This is developer build-time/disk overhead, not a
+WebCodex Runtime or end-to-end task latency claim. The opt-in
+[`scripts/cargo_shared_worktree_target.ps1`](../scripts/cargo_shared_worktree_target.ps1)
+helper selects the **primary checkout's existing `target/` directory** for a
+Cargo invocation from a linked worktree of the same Git repository.
+
+Use PowerShell from the selected worktree:
+
+```powershell
+& ./scripts/cargo_shared_worktree_target.ps1 `
+    -WorktreePath . `
+    -CargoArgs @('test', '--locked', '-p', 'webcodex', '--lib', 'tool_call') `
+    -DryRun
+```
+
+Inspect the reported `worktree`, `primary_checkout`, `shared_target` and
+`cargo_args`. Omit `-DryRun` **only when a focused compilation/test is actually
+needed**. No Cargo build or target directory is created during `-DryRun`.
+Ordinary direct `cargo` commands remain unchanged. This helper is deliberately
+not wired into CI, automatic tool dispatch, desktop release packaging or any
+Server/Runner launch path.
+
+The helper verifies a shared Git common directory with the script's own
+repository, requires both worktrees to contain a workspace-root Cargo manifest,
+rejects a caller-selected target/config/manifest/cwd override, and refuses to
+replace an existing `CARGO_TARGET_DIR`. It restores the caller's working
+directory and environment whether Cargo succeeds or fails. Cargo's own build
+cache locks and fingerprints remain authoritative: a different Rust toolchain,
+features, profile, compiler flags or changed workspace sources can still
+require recompilation, and simultaneous builds may serialize on the shared
+target. The helper is **not** a safety boundary for untrusted Cargo packages:
+build scripts run with the existing caller's authority.
+
+Run the independent no-Cargo smoke test:
+
+```powershell
+& ./scripts/tests/test_cargo_shared_worktree_target.ps1
+```
+
+It uses a disposable fake Cargo executable to validate arguments, shared path,
+dry-run behavior, foreign-repository rejection, error propagation and
+environment restoration. It never runs a real Cargo compile. Do not delete
+existing per-worktree targets automatically; operators should review disk
+usage and worktree ownership before any manual cleanup.
+
 ## Full Local Server Suite
 
 Plain `cargo test` must work without a special environment variable or wrapper,
@@ -135,6 +184,31 @@ cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml desktop_re
 These commands are evidence for the boundary they exercise, not a routine pre-commit
 check. Prefer one exact ignored test while iterating, then the relevant group when the
 change is ready for review.
+
+## No-build guidance preflight
+
+Before compiling Rust after changing model-facing tool guidance or its literal
+test requirements, run `python3 scripts/check_builtin_guidance_contract.py`
+(Windows: `python`). It reads the canonical Direct and Host guidance
+contributors, the corresponding Rust test phrase arrays, and the Rust-owned
+item-count/character limits. It fails closed on unexpected source layouts or
+missing literal phrases; no Cargo command or network access is involved.
+
+The ordinary Linux Server CI Rust shard runs this cheap preflight **before**
+the package compile. It catches straightforward guidance drift before the
+expensive Rust suite, but **does not replace** that suite or prove the dynamic
+standard startup payload is below 16 KiB. All existing Server, experimental
+Code Mode, permission, schema, and platform gates still run after a successful
+preflight. Changing a valid Rust guidance representation may require updating
+this intentionally strict static parser and its fixtures together.
+
+Run `python3 -m unittest scripts.tests.test_check_builtin_guidance_contract`
+for focused non-compiling negative cases. They cover over-budget guidance,
+missing text required by Rust tests, malformed literals, and pre-Cargo CI
+ordering. The verifier also reproduced three historical failed PR guidance
+revisions in less than two milliseconds each, while accepting the corrected
+revision; actual CI savings depend on where the failing build would have
+stopped otherwise.
 
 ## CI Mapping
 

@@ -295,6 +295,9 @@ jobs:
               --exclude webcodex-lsp
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Preflight static model guidance before server Cargo build
+        if: matrix.shard == 'server'
+        run: python3 scripts/check_builtin_guidance_contract.py
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:

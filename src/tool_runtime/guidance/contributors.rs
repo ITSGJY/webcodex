@@ -42,10 +42,10 @@ pub(super) static DIRECT: GuidanceContributor = GuidanceContributor {
     items: &[
         "Inspect → act → review → validate → deliver. Non-Git: list_project_files/read_files; Git/validation/commits as needed.",
         "Text source edits: read_files → edit_project_files with its read_revision fence; use exact edits for unique text and replace_range for deterministic whole-line rewrites. Review with review_changes when Git review is useful.",
-        "Use artifact import/export or transfer_project_artifact for binary files; do not rename or transform binary payloads through text edits. Use run_script/Python for computation or non-source transforms, then independently verify generated/report outputs.",
+        "binary files: artifact import/export or transfer_project_artifact; never rename or transform binaries via text edits. Use run_script/Python for computations; independently verify generated/report outputs.",
         "Never use scripts to bypass edit_project_files revision fences, rollback, or sensitive-path policy.",
         "Coalesce: read_files(items), search_project_texts(queries), search_file_context, project_validate with scope.packages, one edit_project_files batch. Keep result-dependent operations sequential. Avoid ritual turns.",
-        "Simple observation: direct primitive. Batch predetermined independent observations; adaptive follow-ups stay sequential across model calls.",
+        "Simple observation: direct primitive. Batch predetermined independent observations; fixed read-only CLI: run_shell with exit checks. One literal command: run_process.",
         "Known target: bounded targeted reads. Broad discovery: small files/count search then targeted reads. Avoid ritual turns.",
     ],
 };
@@ -54,7 +54,7 @@ pub(super) static HOST_BATCHING: GuidanceContributor = GuidanceContributor {
     target: GuidanceTarget::Strategy(CodingGuidanceProfile::HostCodeMode),
     items: &[
         "Host-native Code Mode is model guidance only: no new authority/effects/retry/idempotency; does not require WebCodex nested Code Mode. Host support is not verified by WebCodex; emit compact evidence. Forward nonempty session_attention/operator_messages/peer_messages/job_attention in text(...) output; never drop.",
-        "Same-kind: batch read_files(items), search_project_texts(queries), project_validate with scope.packages, or one edit_project_files batch; do not Promise.all same-kind micro-calls. Never per-Job waits, Promise.race, or automatic redispatch.",
+        "Same-kind: batch read_files(items), search_project_texts(queries), project_validate with scope.packages, or one edit_project_files batch; do not Promise.all same-kind micro-calls. Read-only CLI: one bounded run_shell with exit checks, no effects. Never per-Job waits, Promise.race, or automatic redispatch.",
         "Independent cross-tool read-only observations: native batches first; then Promise.allSettled for partial evidence or Promise.all for all-or-nothing. Prefer search_file_context for search→read; keep mechanically determined dependent chains in one Host cell. Never use observe_jobs heartbeat polling.",
     ],
 };

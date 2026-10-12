@@ -19,6 +19,7 @@ If a non-sensitive actionable item will not be completed in the current change, 
 - Link the pull request to the relevant Issue. Use a closing keyword only when the merged pull request fully satisfies that Issue's acceptance criteria.
 - Follow [`AGENTS.md`](../AGENTS.md) for focused validation. Documentation-only changes normally require `python3 scripts/check_markdown_links.py`, not Cargo compilation or broad test suites.
 - Follow [`TESTING.md`](TESTING.md) for the current pull-request and `main` CI mapping. Keep workflow trigger details there instead of duplicating them in maintenance policy.
+- For many open PRs, use `python3 scripts/open_pr_health.py --only-perf` (or `python` on Windows) to collect CI/check and merge-state evidence through a **single** bounded `gh pr list` request rather than one `gh pr view` per PR. This is read-only and does not merge, approve, or rerun checks. A fetch at its limit may omit other PRs; explicit per-PR diagnostics still require targeted views.
 
 ## Dependency maintenance
 

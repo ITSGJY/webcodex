@@ -192,6 +192,24 @@ fn internal_posix_interpreter_rejects_wsl_only_bash() {
     );
 }
 
+#[test]
+fn bounded_search_fast_poll_only_applies_during_initial_window() {
+    use super::execution::child_poll_interval;
+
+    for (bounded, elapsed_ms, expected_ms) in [
+        (false, 0, 50),
+        (false, 50, 50),
+        (true, 0, 10),
+        (true, 99, 10),
+        (true, 100, 50),
+        (true, 500, 50),
+    ] {
+        assert_eq!(
+            child_poll_interval(bounded, Duration::from_millis(elapsed_ms)),
+            Duration::from_millis(expected_ms),
+        );
+    }
+}
 #[cfg(windows)]
 #[test]
 fn native_search_spec_builds_bounded_rg_argv() {
