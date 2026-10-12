@@ -55,6 +55,7 @@ mod peer_collaboration;
 mod permission_gate;
 mod process;
 mod project_build_handoff;
+mod project_format_handoff;
 mod project_references;
 mod read_files;
 mod reconnect;

@@ -458,6 +458,7 @@ fn job_structured_execution_metadata_schema() -> Value {
                             "run_detached_process",
                             "run_script",
                             "project_build",
+                            "project_format",
                             "run_skill_resource"
                         ]
                     },
@@ -590,7 +591,9 @@ fn observe_jobs_output_schema() -> Value {
                     {"type": "object", "additionalProperties": true},
                     {"type": "null"}
                 ]
-            }
+            },
+            "state_changed": nullable_schema("boolean", "Authoritative file mutation outcome for project_format."),
+            "failure_kind": nullable_schema("string", "Safe closed failure kind for project_format.")
         },
         "required": [
             "job_id", "status", "exit_code", "stdout_tail", "stderr_tail",
@@ -665,7 +668,9 @@ fn observe_jobs_output_schema() -> Value {
             "purpose": nullable_schema("string", "Declared purpose retained on baseline/reset observations for disambiguation."),
             "command_summary": nullable_schema("string", "Bounded safe command summary retained on baseline/reset observations for disambiguation."),
             "detected_summary": {"type": "object", "additionalProperties": true},
-            "validation": validation_job_projection_schema()
+            "validation": validation_job_projection_schema(),
+            "state_changed": nullable_schema("boolean", "Authoritative file mutation outcome for project_format."),
+            "failure_kind": nullable_schema("string", "Safe closed failure kind for project_format.")
         },
         "required": [
             "job_id", "status", "terminal", "changed", "meaningful_changed", "heartbeat_changed", "log_delta_status",
@@ -986,6 +991,63 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                         }
                     }));
             }
+            Some(schema)
+        }
+        "project_format" => {
+            let mut schema = wrapped_output_schema(vec![
+                ("state_changed", json!({"type":["boolean","null"], "description":"Executor-verified aggregate mutation. Null is unknown, never retry permission."})),
+                ("failure_kind", json!({"type":"string", "maxLength":80})),
+                ("execution_state", json!({"type":"string", "enum":["not_started","outcome_unknown","pending"]})),
+                ("job_id", schema_type("string", "Original Job identity, never a replacement execution.")),
+                ("continuation", observe_job_continuation_schema()),
+                ("error_kind", json!({"type":"string", "maxLength":80, "description":"Safe closed error classification or kernel rejection code."})),
+                ("permission_reason", json!({"type":"string", "maxLength":128, "description":"Authoritative kernel rejection reason."})),
+                ("session_id", json!({"type":"string", "maxLength":128, "description":"Active Workflow Session identity associated with rejection or execution."})),
+                ("command_started", schema_type("boolean", "Whether any underlying process or command started.")),
+                ("command_completed", schema_type("boolean", "Whether any underlying process or command completed.")),
+                ("command_ok", schema_type("boolean", "False on pre-start tool failures.")),
+                ("exit_code", nullable_schema("integer", "Process exit code; null for unstarted responses.")),
+                ("tool_failure", schema_type("boolean", "True for kernel or Runner initiation and capability failures.")),
+                ("tool_name", json!({"type":"string", "maxLength":64, "description":"Authoritative runtime tool name associated with rejection."})),
+                ("guard", json!({"type":"string", "maxLength":64, "description":"Active workflow session guard policy that blocked admission."})),
+                ("mode", json!({"type":"string", "maxLength":32, "description":"Active workflow session mode at admission check."})),
+                ("lifecycle", json!({"type":"string", "maxLength":32, "description":"Workflow session lifecycle state at rejection."})),
+                ("session_project", json!({"type":"string", "maxLength":128, "description":"Bound workflow session project identity."})),
+                ("request_project", json!({"type":"string", "maxLength":128, "description":"Request project identity."})),
+                ("message_id", json!({"type":"string", "maxLength":128, "description":"Workflow session message identity."})),
+            ]);
+            schema["properties"]["output"]["additionalProperties"] = json!(false);
+            schema["allOf"]
+                .as_array_mut()
+                .expect("wrapped_output_schema provides allOf array")
+                .push(json!({
+                    "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
+                    "then": {
+                        "properties": {
+                            "output": {
+                                "not": {
+                                    "anyOf": [
+                                        {"required": ["command_started"]},
+                                        {"required": ["command_completed"]},
+                                        {"required": ["command_ok"]},
+                                        {"required": ["exit_code"]},
+                                        {"required": ["tool_failure"]},
+                                        {"required": ["tool_name"]},
+                                        {"required": ["guard"]},
+                                        {"required": ["mode"]},
+                                        {"required": ["lifecycle"]},
+                                        {"required": ["session_project"]},
+                                        {"required": ["request_project"]},
+                                        {"required": ["message_id"]},
+                                        {"required": ["error_kind"]},
+                                        {"required": ["failure_kind"]},
+                                        {"required": ["permission_reason"]},
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }));
             Some(schema)
         }
         "project_build" => {

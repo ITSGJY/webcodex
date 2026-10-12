@@ -299,6 +299,7 @@ fn test_job_snapshot(job_id: &str) -> ShellJobSnapshot {
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
         test_count_evidence: None,
+        format_mutation: None,
         activity: None,
     }
 }
@@ -335,6 +336,7 @@ struct RunnerJobDelta {
     stream_limit_bytes: Option<usize>,
     validation_progress: Option<ShellJobValidationProgress>,
     test_count_evidence: Option<ShellJobTestCountEvidence>,
+    format_mutation: Option<webcodex_core::project_format::ProjectFormatMutationReport>,
     activity: Option<ShellJobActivity>,
     finished: bool,
 }

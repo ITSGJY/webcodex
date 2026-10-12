@@ -1,4 +1,9 @@
 use super::*;
+#[cfg(unix)]
+use crate::webcodex_runner::file_access::open_regular_file_unix;
+#[cfg(windows)]
+use crate::webcodex_runner::file_access::open_regular_file_windows;
+use crate::webcodex_runner::file_access::unsupported_regular_file_open;
 use std::path::Path;
 
 fn observe(path: &Path) -> RunnerInstructionSnapshotResponse {
@@ -52,7 +57,7 @@ fn instruction_reader_stops_at_byte_cap_even_when_the_source_grows() {
 
 #[test]
 fn unsupported_instruction_open_fails_closed() {
-    let error = unsupported_instruction_file_open(Path::new("ignored")).unwrap_err();
+    let error = unsupported_regular_file_open(Path::new("ignored")).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
@@ -81,7 +86,7 @@ fn instruction_open_supports_search_only_parent_directories() {
 
     let original_permissions = std::fs::metadata(&parent).unwrap().permissions();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o111)).unwrap();
-    let opened = open_instruction_file(&path);
+    let opened = open_regular_file(&path);
     std::fs::set_permissions(&parent, original_permissions).unwrap();
 
     let mut file = opened.unwrap();
@@ -98,7 +103,7 @@ fn instruction_secure_open_reads_ordinary_windows_file() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("AGENTS.md");
     std::fs::write(&path, "ordinary guidance").unwrap();
-    let mut file = open_instruction_file_windows(&path, || {})
+    let mut file = open_regular_file_windows(&path, || {})
         .unwrap_or_else(|error| panic!("ordinary Windows instruction open failed: {error:?}"));
     let mut content = String::new();
     file.read_to_string(&mut content).unwrap();
@@ -196,7 +201,7 @@ fn instruction_open_marks_parent_swap_unavailable_instead_of_following_it() {
     std::fs::write(&path, "configured guidance").unwrap();
     std::fs::write(outside.join("AGENTS.md"), "unconfigured secret").unwrap();
 
-    let error = open_instruction_file_unix(&path, || {
+    let error = open_regular_file_unix(&path, || {
         std::fs::rename(&configured, &moved).unwrap();
         std::os::unix::fs::symlink(&outside, &configured).unwrap();
     })
@@ -216,7 +221,7 @@ fn instruction_open_detects_ordinary_parent_replacement_by_identity() {
     let path = configured.join("AGENTS.md");
     std::fs::write(&path, "configured guidance").unwrap();
 
-    let error = open_instruction_file_unix(&path, || {
+    let error = open_regular_file_unix(&path, || {
         std::fs::rename(&configured, &moved).unwrap();
         std::fs::create_dir(&configured).unwrap();
         std::fs::write(configured.join("AGENTS.md"), "replacement guidance").unwrap();
@@ -239,7 +244,7 @@ fn missing_leaf_during_parent_swap_is_not_confirmed_removal() {
     let path = configured.join("AGENTS.md");
     std::fs::write(outside.join("AGENTS.md"), "unconfigured secret").unwrap();
 
-    let error = open_instruction_file_unix(&path, || {
+    let error = open_regular_file_unix(&path, || {
         std::fs::rename(&configured, &moved).unwrap();
         std::os::unix::fs::symlink(&outside, &configured).unwrap();
     })
@@ -258,7 +263,7 @@ fn instruction_open_rejects_parent_replacement_after_parent_open() {
     let path = configured.join("AGENTS.md");
     std::fs::write(&path, "configured guidance").unwrap();
 
-    let error = open_instruction_file_windows(&path, || {
+    let error = open_regular_file_windows(&path, || {
         std::fs::rename(&configured, &moved).unwrap();
         std::fs::create_dir(&configured).unwrap();
         std::fs::write(configured.join("AGENTS.md"), "replacement guidance").unwrap();
@@ -277,7 +282,7 @@ fn missing_leaf_during_parent_swap_is_not_confirmed_removal_on_windows() {
     std::fs::create_dir(&configured).unwrap();
     let path = configured.join("AGENTS.md");
 
-    let error = open_instruction_file_windows(&path, || {
+    let error = open_regular_file_windows(&path, || {
         std::fs::rename(&configured, &moved).unwrap();
         std::fs::create_dir(&configured).unwrap();
         std::fs::write(configured.join("AGENTS.md"), "replacement guidance").unwrap();

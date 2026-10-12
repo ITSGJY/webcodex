@@ -61,6 +61,31 @@ fn without_observation_refs(output: &Value) -> Value {
 }
 
 #[test]
+fn project_format_sparse_observation_preserves_one_mutation_evidence_location() {
+    let mut observation = canonical_observation(
+        "format-single-evidence",
+        "completed",
+        "baseline",
+        "",
+        "",
+        false,
+        true,
+    );
+    observation["state_changed"] = json!(true);
+    observation["failure_kind"] = Value::Null;
+    let canonical = canonical_batch(vec![canonical_success_item(0, observation)], "terminal", 0);
+    let sparse = compact_projection(&canonical);
+    let item = &sparse.output["items"][0];
+    assert_eq!(item["state_changed"], json!(true));
+    assert_eq!(item["failure_kind"], Value::Null);
+    assert!(
+        item.get("output").is_none(),
+        "no redundant nested formatter mutation evidence"
+    );
+    validate_result(&sparse);
+}
+
+#[test]
 fn summary_only_is_opt_in_closed_and_audited_without_tokens() {
     for value in [None, Some(json!(false)), Some(json!(true))] {
         let mut args = json!({"items": [{"job_id": "job"}]});

@@ -40,19 +40,42 @@
     }
     return null;
   }
+  function canonicalEnvelope(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value)
+      && typeof value.success === 'boolean'
+      && (Object.prototype.hasOwnProperty.call(value, 'output') || Object.prototype.hasOwnProperty.call(value, 'error'));
+  }
+  function textEnvelope(candidate) {
+    if (!Array.isArray(candidate.content)) return null;
+    for (const block of candidate.content) {
+      if (!block || block.type !== 'text' || typeof block.text !== 'string' || block.text.length > 400000) continue;
+      try {
+        const parsed = JSON.parse(block.text);
+        if (canonicalEnvelope(parsed)) return parsed;
+      } catch (_) {}
+    }
+    return null;
+  }
+  // Hosts can project structuredContent independently of the Server envelope.
+  // Prefer the Server text copy, then the private Server copy, and accept a
+  // Host projection only when it is still a canonical success/output envelope.
   function envelope(result, privateKey) {
-    for (const candidate of [result, result?.result, result?.toolResult, result?.tool_result]) {
-      if (!candidate || typeof candidate !== 'object') continue;
-      if (typeof candidate.success === 'boolean') return candidate;
-      const structured = candidate.structuredContent ?? candidate.structured_content;
-      if (structured && typeof structured === 'object') return structured;
+    const candidates = [result, result?.result, result?.toolResult, result?.tool_result]
+      .filter(candidate => candidate && typeof candidate === 'object' && !Array.isArray(candidate));
+    // Apply source precedence across every supported wrapper, not just inside
+    // one wrapper: an outer Host projection must not mask a nested Server error.
+    for (const candidate of candidates) {
+      if (canonicalEnvelope(candidate)) return candidate;
+      const text = textEnvelope(candidate);
+      if (text) return text;
+    }
+    for (const candidate of candidates) {
       const privateResult = privateKey && privateMetadata(candidate, privateKey);
-      if (privateResult) return privateResult;
-      for (const block of candidate.content || []) {
-        if (block.type === 'text' && typeof block.text === 'string' && block.text.length <= 400000) {
-          try { const parsed = JSON.parse(block.text); if (typeof parsed?.success === 'boolean') return parsed; } catch (_) {}
-        }
-      }
+      if (canonicalEnvelope(privateResult)) return privateResult;
+    }
+    for (const candidate of candidates) {
+      const structured = candidate.structuredContent ?? candidate.structured_content;
+      if (canonicalEnvelope(structured)) return structured;
     }
     return null;
   }

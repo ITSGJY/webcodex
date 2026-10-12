@@ -23,7 +23,7 @@ pub(super) fn execute_configured_command(
     spawn_error_prefix: &str,
     on_started: Option<&dyn Fn()>,
 ) -> ShellCommandResult {
-    execute_configured_command_with_prefix(
+    execute_configured_command_impl(
         policy,
         cmd,
         cwd_path,
@@ -34,11 +34,69 @@ pub(super) fn execute_configured_command(
         spawn_error_prefix,
         on_started,
         None,
+        false,
+    )
+}
+
+#[cfg(any(windows, all(test, feature = "runner-real-process-tests")))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_configured_command_with_prefix(
+    policy: &RunnerPolicy,
+    cmd: Command,
+    cwd_path: &Path,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    stop_requested: Option<&AtomicBool>,
+    start: Instant,
+    spawn_error_prefix: &str,
+    on_started: Option<&dyn Fn()>,
+    prefix: Option<super::drains::StdoutPrefixLimit>,
+) -> ShellCommandResult {
+    execute_configured_command_impl(
+        policy,
+        cmd,
+        cwd_path,
+        stdin,
+        timeout_secs,
+        stop_requested,
+        start,
+        spawn_error_prefix,
+        on_started,
+        prefix,
+        false,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn execute_configured_command_with_prefix(
+pub(super) fn execute_configured_command_with_output(
+    policy: &RunnerPolicy,
+    cmd: Command,
+    cwd_path: &Path,
+    stdin: Option<&str>,
+    timeout_secs: u64,
+    stop_requested: Option<&AtomicBool>,
+    start: Instant,
+    spawn_error_prefix: &str,
+    on_started: Option<&dyn Fn()>,
+    exact_utf8: bool,
+) -> ShellCommandResult {
+    execute_configured_command_impl(
+        policy,
+        cmd,
+        cwd_path,
+        stdin,
+        timeout_secs,
+        stop_requested,
+        start,
+        spawn_error_prefix,
+        on_started,
+        None,
+        exact_utf8,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_configured_command_impl(
     policy: &RunnerPolicy,
     mut cmd: Command,
     cwd_path: &Path,
@@ -49,6 +107,7 @@ pub(super) fn execute_configured_command_with_prefix(
     spawn_error_prefix: &str,
     on_started: Option<&dyn Fn()>,
     prefix: Option<super::drains::StdoutPrefixLimit>,
+    exact_utf8: bool,
 ) -> ShellCommandResult {
     cmd.current_dir(cwd_path)
         .stdout(Stdio::piped())
@@ -124,21 +183,30 @@ pub(super) fn execute_configured_command_with_prefix(
         },
         None => None,
     };
+    let mut stdin_broken_pipe: Option<std::io::Error> = None;
     let search_poll_start = Instant::now();
     let mut output_bounded = false;
     loop {
-        if let Err(error) = poll_stdin_writer(&mut stdin_writer) {
-            let cleanup = terminate_and_collect_pipes(child, drains).err();
-            return ShellCommandResult::outcome_unknown(CommandResult {
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: Some(start.elapsed().as_millis() as u64),
-                error: Some(with_cleanup_error(
-                    format!("failed to write command stdin: {error}"),
-                    cleanup,
-                )),
-            });
+        match poll_stdin_writer(&mut stdin_writer, exact_utf8) {
+            Ok(Some(error)) => {
+                if stdin_broken_pipe.is_none() {
+                    stdin_broken_pipe = Some(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let cleanup = terminate_and_collect_pipes(child, drains).err();
+                return ShellCommandResult::outcome_unknown(CommandResult {
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: Some(with_cleanup_error(
+                        format!("failed to write command stdin: {error}"),
+                        cleanup,
+                    )),
+                });
+            }
         }
         if stop_requested
             .map(|flag| flag.load(Ordering::SeqCst))
@@ -235,22 +303,69 @@ pub(super) fn execute_configured_command_with_prefix(
             }
         }
     }
-    if let Err(error) = finish_stdin_writer(stdin_writer) {
-        let cleanup = terminate_and_collect_pipes(child, drains).err();
-        return ShellCommandResult::outcome_unknown(CommandResult {
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(with_cleanup_error(
-                format!("failed to write command stdin: {error}"),
-                cleanup,
-            )),
-        });
+    match finish_stdin_writer(stdin_writer, exact_utf8) {
+        Ok(Some(error)) => {
+            if stdin_broken_pipe.is_none() {
+                stdin_broken_pipe = Some(error);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let cleanup = terminate_and_collect_pipes(child, drains).err();
+            return ShellCommandResult::outcome_unknown(CommandResult {
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(with_cleanup_error(
+                    format!("failed to write command stdin: {error}"),
+                    cleanup,
+                )),
+            });
+        }
     }
     let limit_reached = Arc::clone(&drains.stdout_limit_reached);
     match terminate_and_collect_pipes(child, drains) {
         Ok((status, stdout, stderr)) => {
+            if exact_utf8 {
+                if let Some(error) = stdin_broken_pipe {
+                    if status.code() == Some(0) {
+                        return spawned_output_failure(
+                            start,
+                            format!("failed to write command stdin: {error}"),
+                        );
+                    }
+                }
+                let code = if stdout.raw_truncated
+                    || stderr.raw_truncated
+                    || stdout.bytes.len() > policy.max_output_bytes
+                    || stderr.bytes.len() > policy.max_output_bytes
+                {
+                    Some("format_output_truncated")
+                } else if std::str::from_utf8(&stdout.bytes).is_err()
+                    || std::str::from_utf8(&stderr.bytes).is_err()
+                {
+                    Some("format_output_invalid_utf8")
+                } else if status.code() == Some(0) && !stderr.bytes.is_empty() {
+                    Some("format_stderr_unexpected")
+                } else {
+                    None
+                };
+                if let Some(code) = code {
+                    return spawned_output_failure(start, code.into());
+                }
+                return ShellCommandResult::completed(CommandResult {
+                    exit_code: Some(status.code().unwrap_or(-1)),
+                    stdout: Some(String::from_utf8(stdout.bytes).expect("checked UTF-8")),
+                    stderr: if stderr.bytes.is_empty() {
+                        None
+                    } else {
+                        Some(String::from_utf8(stderr.bytes).expect("checked UTF-8"))
+                    },
+                    duration_ms: Some(start.elapsed().as_millis() as u64),
+                    error: None,
+                });
+            }
             let (stdout, stdout_truncated) =
                 stdout.normalize_with_truncation(policy.max_output_bytes);
             let (stderr, stderr_truncated) =
@@ -285,26 +400,31 @@ pub(super) fn execute_configured_command_with_prefix(
 
 pub(super) fn poll_stdin_writer(
     receiver: &mut Option<mpsc::Receiver<std::io::Result<()>>>,
-) -> Result<(), String> {
+    exact_utf8: bool,
+) -> Result<Option<std::io::Error>, String> {
     let Some(active) = receiver.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     match active.try_recv() {
         Ok(Ok(())) => {
             *receiver = None;
-            Ok(())
+            Ok(None)
         }
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-            // The child may deliberately close stdin before exiting. Its
-            // terminal status and output remain the source of truth.
             *receiver = None;
-            Ok(())
+            if exact_utf8 {
+                Ok(Some(error))
+            } else {
+                // The child may deliberately close stdin before exiting. Its
+                // terminal status and output remain the source of truth.
+                Ok(None)
+            }
         }
         Ok(Err(error)) => {
             *receiver = None;
             Err(error.to_string())
         }
-        Err(mpsc::TryRecvError::Empty) => Ok(()),
+        Err(mpsc::TryRecvError::Empty) => Ok(None),
         Err(mpsc::TryRecvError::Disconnected) => {
             *receiver = None;
             Err("stdin writer ended without a result".to_string())
@@ -314,13 +434,20 @@ pub(super) fn poll_stdin_writer(
 
 pub(super) fn finish_stdin_writer(
     receiver: Option<mpsc::Receiver<std::io::Result<()>>>,
-) -> Result<(), String> {
+    exact_utf8: bool,
+) -> Result<Option<std::io::Error>, String> {
     let Some(receiver) = receiver else {
-        return Ok(());
+        return Ok(None);
     };
     match receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Ok(Ok(())) => Ok(None),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            if exact_utf8 {
+                Ok(Some(error))
+            } else {
+                Ok(None)
+            }
+        }
         Ok(Err(error)) => Err(error.to_string()),
         Err(mpsc::RecvTimeoutError::Timeout) => {
             Err("stdin writer did not finish after process exit".to_string())

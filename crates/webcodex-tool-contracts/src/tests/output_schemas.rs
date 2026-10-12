@@ -86,6 +86,45 @@ fn project_build_schema_accepts_same_job_queued_handoff() {
 }
 
 #[test]
+fn project_format_output_schema_admits_pending_job_handoff() {
+    let schema = output_schema_for_tool("project_format");
+    let states = schema["properties"]["output"]["properties"]["execution_state"]["enum"]
+        .as_array()
+        .expect("project_format lifecycle states");
+    assert!(states.contains(&json!("pending")));
+}
+
+#[test]
+fn project_format_schema_accepts_common_kernel_rejection_fields() {
+    let schema = output_schema_for_tool("project_format");
+    let denied = json!({
+        "success": false,
+        "output": {
+            "state_changed": false,
+            "execution_state": "not_started",
+            "failure_kind": "permission_denied",
+            "error_kind": "permission_denied",
+            "permission_reason": "session_guard",
+            "session_id": "wc_sess_example",
+        },
+        "error": "Project formatting was not admitted."
+    });
+    test_support::validate_schema_instance(&denied, &schema)
+        .expect("shared kernel denial metadata must fit the project_format output schema");
+}
+
+#[test]
+fn project_format_schema_rejects_unknown_success_payload_fields() {
+    let schema = output_schema_for_tool("project_format");
+    let unexpected = json!({
+        "success": true,
+        "output": {"state_changed": false, "unrecognized_metadata": "not part of the formatter contract"},
+        "error": null
+    });
+    assert!(test_support::validate_schema_instance(&unexpected, &schema).is_err());
+}
+
+#[test]
 fn suggested_tool_call_schema_recognizer_is_strict_and_structural() {
     let valid_generated = json!({
         "follow_up_kind": "mechanically_followable",

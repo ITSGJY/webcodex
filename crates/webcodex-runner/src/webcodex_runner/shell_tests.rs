@@ -597,6 +597,59 @@ fn runner_real_process_native_search_directory_globs_and_bounds() {
     assert!(run(&policy, &missing_rg, &payload, None).is_none());
 }
 
+#[test]
+fn exact_utf8_nonzero_child_exit_after_closed_stdin_is_known_failure() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut command = Command::new(process_argv_helper());
+    command.args(["exit", "2"]);
+    // More than an OS pipe buffer: the child exits without consuming stdin.
+    let input = "x".repeat(256 * 1024);
+    let result = super::execution::execute_configured_command_with_output(
+        &unrestricted_policy(),
+        command,
+        cwd.path(),
+        Some(&input),
+        10,
+        None,
+        Instant::now(),
+        "failed to spawn format fixture",
+        None,
+        true,
+    );
+    assert_eq!(
+        result.execution_state,
+        ShellCommandExecutionState::Completed,
+        "a confirmed nonzero child exit must remain a known process failure: {:?}",
+        result.result.error
+    );
+    assert_eq!(result.result.exit_code, Some(2));
+}
+
+#[test]
+fn exact_utf8_early_zero_exit_without_complete_stdin_fails_closed() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut command = Command::new(process_argv_helper());
+    command.args(["exit", "0"]);
+    let input = "x".repeat(256 * 1024);
+    let result = super::execution::execute_configured_command_with_output(
+        &unrestricted_policy(),
+        command,
+        cwd.path(),
+        Some(&input),
+        10,
+        None,
+        Instant::now(),
+        "failed to spawn format fixture",
+        None,
+        true,
+    );
+    assert_eq!(
+        result.execution_state,
+        ShellCommandExecutionState::OutcomeUnknown,
+        "a child that did not accept complete formatter stdin cannot claim success"
+    );
+}
+
 #[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "real child-process timeout and cleanup; run explicitly with runner-real-process-tests"]

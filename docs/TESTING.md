@@ -177,6 +177,7 @@ cargo test --locked -p webcodex-runner -p webcodex-lsp --features runner-real-pr
 cargo test --locked -p webcodex-process --test managed_child -- --ignored --test-threads=1
 cargo test --locked -p webcodex-persistent-shell -- --ignored --test-threads=1
 cargo test --locked -p webcodex --lib tool_runtime_real_process_ -- --ignored --test-threads=1
+cargo test --locked -p webcodex-runner profile_preparation_obeys_total_job_deadline -- --ignored --test-threads=1
 cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml desktop_real_process_windows_ -- --ignored --test-threads=1
 ```
 

@@ -758,6 +758,11 @@ fn sparse_success_item(item: &Value) -> Option<Value> {
         copy_non_null(observation, &mut sparse, key);
     }
 
+    if observation.contains_key("state_changed") || observation.contains_key("failure_kind") {
+        copy_present(observation, &mut sparse, "state_changed");
+        copy_present(observation, &mut sparse, "failure_kind");
+    }
+
     if log_delta_status != "unchanged" {
         copy_present(observation, &mut sparse, "stdout_tail");
         copy_present(observation, &mut sparse, "stderr_tail");

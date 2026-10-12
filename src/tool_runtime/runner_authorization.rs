@@ -147,6 +147,7 @@ impl ToolRuntime {
                         required,
                         RunnerCapabilityRequirement::StructuredProcess
                             | RunnerCapabilityRequirement::ProjectBuild
+                            | RunnerCapabilityRequirement::ProjectFormat
                             | RunnerCapabilityRequirement::SkillResourceExecution
                             | RunnerCapabilityRequirement::DetachedProcess
                             | RunnerCapabilityRequirement::StructuredScript
@@ -157,6 +158,9 @@ impl ToolRuntime {
                             } else if matches!(required, RunnerCapabilityRequirement::ProjectBuild)
                             {
                                 "project build"
+                            } else if matches!(required, RunnerCapabilityRequirement::ProjectFormat)
+                            {
+                                "project formatting"
                             } else if matches!(
                                 required,
                                 RunnerCapabilityRequirement::SkillResourceExecution

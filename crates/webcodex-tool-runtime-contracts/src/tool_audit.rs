@@ -565,6 +565,17 @@ impl ToolCallAuditProjection for ToolCall {
                 }
                 out
             }
+            Self::ProjectFormat {
+                project,
+                cwd,
+                adapter,
+                files,
+                timeout_secs,
+                ..
+            } => serde_json::json!({
+                "project": project, "cwd": cwd, "adapter": adapter,
+                "file_count": files.len(), "timeout_secs": timeout_secs,
+            }),
             Self::ProjectBuild {
                 project,
                 cwd,

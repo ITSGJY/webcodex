@@ -56,6 +56,7 @@ fn runner_concurrency_counts_jobs_across_projects_for_one_client() {
             result: None,
             validation_progress: None,
             test_count_evidence: None,
+            format_mutation: None,
             activity: None,
             validation: None,
             recovery_state: None,
