@@ -3192,3 +3192,94 @@ fn runner_real_process_project_validation_ruff_module_isolation() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn rust_clippy_probe_missing_component_and_pinned_command() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let cargo = temp.path().join("cargo");
+    let mut shell = ShellConfig::default();
+    shell
+        .env
+        .insert("PATH".into(), temp.path().to_string_lossy().into_owned());
+    let step = webcodex_core::runner_protocol::ShellJobValidationStep {
+        name: "lint".into(),
+        program: "cargo".into(),
+        args: ["clippy", "--all-targets", "--", "-D", "clippy::correctness"]
+            .map(str::to_string)
+            .to_vec(),
+        env: vec![],
+    };
+    assert!(configured_clippy_job_command(&shell, None, &step, temp.path(), None).is_err());
+    for available in [false, true] {
+        std::fs::write(&cargo, if available {
+            "#!/bin/sh\n[ \"$1\" = clippy ] && [ \"$2\" = --version ] || exit 9\nprintf 'clippy 0.1\\n'\n"
+        } else { "#!/bin/sh\nexit 1\n" }).unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = configured_clippy_job_command(&shell, None, &step, temp.path(), None);
+        if available {
+            let command = result.unwrap();
+            assert_eq!(PathBuf::from(command.get_program()), cargo);
+            assert_eq!(
+                command
+                    .get_args()
+                    .map(|a| a.to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                step.args
+            );
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                webcodex_core::runner_protocol::VALIDATION_TOOL_UNAVAILABLE_CODE
+            );
+        }
+    }
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "requires installed Cargo Clippy; run explicitly with --ignored"]
+fn runner_real_process_rust_clippy_warnings_pass_and_correctness_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname='clippy_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    let step = webcodex_core::runner_protocol::ShellJobValidationStep {
+        name: "lint".into(),
+        program: "cargo".into(),
+        args: ["clippy", "--all-targets", "--", "-D", "clippy::correctness"]
+            .map(str::to_string)
+            .to_vec(),
+        env: vec![],
+    };
+    for (source, success, diagnostic) in [
+        (
+            "pub fn warning() { let unused_variable = 1; }\n",
+            true,
+            "warning:",
+        ),
+        (
+            "pub fn broken(x: i32) -> bool { x > 1 && x < 0 }\n",
+            false,
+            "clippy::impossible_comparisons",
+        ),
+    ] {
+        std::fs::write(temp.path().join("src/lib.rs"), source).unwrap();
+        let command =
+            configured_clippy_job_command(&ShellConfig::default(), None, &step, temp.path(), None)
+                .expect("Clippy must be installed for explicit real-process evidence");
+        let (status, stdout, stderr) =
+            run_prepare_command(command, Duration::from_secs(30), None).unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(status.success(), success, "{output}");
+        assert!(output.contains(diagnostic), "{output}");
+    }
+}

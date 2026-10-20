@@ -93,6 +93,7 @@ pub struct GoTestOptions {
 pub enum CargoReadOnlyValidationOperation {
     FormatCheck,
     Check(CargoCheckOptions),
+    Clippy(CargoCheckOptions),
     Test(CargoTestOptions),
 }
 
@@ -165,7 +166,8 @@ impl ReadOnlyValidationOperation {
             | Self::Cargo(CargoReadOnlyValidationOperation::FormatCheck) => {
                 return Err("dependency_policy_unsupported")
             }
-            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => {
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
                 options.dependency_mode = Some(policy.mode);
             }
             Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => {
@@ -220,7 +222,8 @@ impl ReadOnlyValidationOperation {
             | Self::NodeScriptCheck
             | Self::NodeNativeTest
             | Self::Cargo(CargoReadOnlyValidationOperation::FormatCheck) => None,
-            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => {
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
                 options.dependency_mode
             }
             Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => options.dependency_mode,
@@ -231,7 +234,10 @@ impl ReadOnlyValidationOperation {
 
     fn selects_all_packages(&self) -> bool {
         match self {
-            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => options.all_packages,
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
+                options.all_packages
+            }
             Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => options.all_packages,
             Self::Go(GoReadOnlyValidationOperation::Check(options)) => options.all_packages,
             Self::Go(GoReadOnlyValidationOperation::Test(options)) => options.all_packages,
@@ -276,6 +282,12 @@ impl ReadOnlyValidationOperation {
                 ValidationCompatibilityProfile {
                     tool_identity: "cargo_check",
                     validation_identity: ToolValidationIdentityKind::CargoCheck,
+                }
+            }
+            Self::Cargo(CargoReadOnlyValidationOperation::Clippy(_)) => {
+                ValidationCompatibilityProfile {
+                    tool_identity: "cargo_clippy",
+                    validation_identity: ToolValidationIdentityKind::CargoClippy,
                 }
             }
             Self::Cargo(CargoReadOnlyValidationOperation::Test(_)) => {
@@ -324,7 +336,8 @@ impl ReadOnlyValidationOperation {
                     check: true,
                     ..ValidationCommandOptions::default()
                 }),
-            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => {
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
                 adapter.build_readonly_plan(ValidationCommandOptions::from(options.clone()))
             }
             Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => {
@@ -355,7 +368,8 @@ impl ReadOnlyValidationOperation {
                 "cwd": cwd,
                 "check": true,
             }),
-            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => serde_json::json!({
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => serde_json::json!({
                 "cwd": cwd,
                 "all_targets": options.all_targets,
                 "all_features": options.all_features,
@@ -439,6 +453,14 @@ pub fn project_validation_operation(
                 ..Default::default()
             }),
         )),
+        ("rust", Lint) => Ok(ReadOnlyValidationOperation::Cargo(
+            CargoReadOnlyValidationOperation::Clippy(CargoCheckOptions {
+                packages,
+                all_packages,
+                ..Default::default()
+            }),
+        )),
+        (_, Lint) => Err("validation_action_unsupported"),
         ("rust", Test) => Ok(ReadOnlyValidationOperation::Cargo(
             CargoReadOnlyValidationOperation::Test(CargoTestOptions {
                 packages,
@@ -662,6 +684,7 @@ pub fn validation_adapter_for_recipe(
     validation_adapter_for_tool(match (backend, action) {
         ("rust", Format) => "cargo_fmt",
         ("rust", Check) => "cargo_check",
+        ("rust", Lint) => "cargo_clippy",
         ("rust", Test) => "cargo_test",
         ("go", Check) => "go_vet",
         ("go", Test) => "go_test",

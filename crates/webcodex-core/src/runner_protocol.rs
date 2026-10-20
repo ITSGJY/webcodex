@@ -552,6 +552,12 @@ runner_capabilities! {
         #[serde(default)]
         pub project_validation_v1: bool = false;
     }
+    /// Runner-owned Cargo Clippy lint, including scope and locked policy.
+    ProjectValidationRustClippy => RUNNER_CAPABILITY_PROJECT_VALIDATION_RUST_CLIPPY("project_validation_rust_clippy_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_validation_rust_clippy_v1: bool = false;
+    }
     /// Runner-owned project build planning plus typed StartBuild admission.
     /// Missing on older Runners is false and must fail closed.
     ProjectBuild => RUNNER_CAPABILITY_PROJECT_BUILD("project_build_v1"),
@@ -2917,6 +2923,7 @@ mod envelope_tests {
                 project_validation_python_ruff_v1: false,
                 project_validation_node_script_check_v1: false,
                 project_validation_node_tap_v1: false,
+                project_validation_rust_clippy_v1: false,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,
                 structured_process_argv: true,

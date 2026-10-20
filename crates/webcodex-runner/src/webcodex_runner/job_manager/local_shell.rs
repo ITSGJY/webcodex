@@ -189,6 +189,14 @@ impl JobManager {
                     &cwd_path,
                     Some(self.shutting_down.as_ref()),
                 )
+            } else if validation && steps[index].program == "cargo" && steps[index].name == "lint" {
+                crate::webcodex_runner::shell::configured_clippy_job_command(
+                    &shell,
+                    prepared_profile.as_deref(),
+                    &steps[index],
+                    &cwd_path,
+                    Some(self.shutting_down.as_ref()),
+                )
             } else if validation {
                 configured_validation_job_command(
                     &shell,

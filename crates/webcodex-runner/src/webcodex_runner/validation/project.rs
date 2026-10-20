@@ -51,7 +51,9 @@ pub(crate) fn plan(
             Some(backend.as_str()),
         ));
     }
-    if request.action == ProjectValidationAction::Lint && backend != RecipeId::Node {
+    if request.action == ProjectValidationAction::Lint
+        && !matches!(backend, RecipeId::Node | RecipeId::Rust)
+    {
         return Err(unavailable(
             "validation_action_unsupported",
             Some(backend.as_str()),
@@ -59,7 +61,9 @@ pub(crate) fn plan(
     }
     let action = match request.action {
         ProjectValidationAction::FormatCheck => SemanticCheck::Format,
-        ProjectValidationAction::Check | ProjectValidationAction::Lint => SemanticCheck::Check,
+        ProjectValidationAction::Check => SemanticCheck::Check,
+        ProjectValidationAction::Lint if backend == RecipeId::Rust => SemanticCheck::Lint,
+        ProjectValidationAction::Lint => SemanticCheck::Check,
         ProjectValidationAction::Test => SemanticCheck::Test,
     };
     let packages = request

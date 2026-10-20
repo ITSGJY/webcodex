@@ -464,6 +464,50 @@ fn configured_python_module_job_command(
     Ok(command)
 }
 
+/// Probe and launch the same native Cargo in the prepared environment. No shell,
+/// installation, dependency fetch, or validation execution happens in preflight.
+pub(crate) fn configured_clippy_job_command(
+    shell: &ShellConfig,
+    profile: Option<&PreparedShellProfile>,
+    step: &ShellJobValidationStep,
+    cwd: &Path,
+    stop_requested: Option<&AtomicBool>,
+) -> Result<Command, String> {
+    let unavailable =
+        || webcodex_core::runner_protocol::VALIDATION_TOOL_UNAVAILABLE_CODE.to_string();
+    if step.name != "lint" || step.program != "cargo" || !step.is_canonical_project_step() {
+        return Err(unavailable());
+    }
+    let path = configured_process_path(shell, profile).map_err(|_| unavailable())?;
+    let Some(crate::webcodex_runner::util::ResolvedProgram::Native(program)) =
+        crate::webcodex_runner::util::resolve_program_in_path("cargo", &path)
+    else {
+        return Err(unavailable());
+    };
+    let mut probe = Command::new(&program);
+    probe
+        .args(["clippy", "--version"])
+        .current_dir(cwd)
+        .stdin(Stdio::null());
+    super::scripts::apply_script_environment(&mut probe, shell, profile)
+        .map_err(|_| unavailable())?;
+    let (status, stdout, _) = run_prepare_command(probe, Duration::from_secs(5), stop_requested)
+        .map_err(|_| unavailable())?;
+    if !status.success()
+        || !std::str::from_utf8(&stdout).is_ok_and(|text| text.trim_start().starts_with("clippy "))
+    {
+        return Err(unavailable());
+    }
+    let mut command = Command::new(program);
+    command
+        .args(&step.args)
+        .current_dir(cwd)
+        .stdin(Stdio::null());
+    super::scripts::apply_script_environment(&mut command, shell, profile)
+        .map_err(|_| unavailable())?;
+    Ok(command)
+}
+
 pub(crate) fn configured_validation_job_command(
     shell: &ShellConfig,
     profile: Option<&PreparedShellProfile>,

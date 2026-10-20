@@ -3588,3 +3588,32 @@ fn node_json_validation_uses_only_owned_report_evidence_and_same_job_policy() {
         }
     }
 }
+
+#[test]
+fn rust_clippy_projection_requires_completed_zero_exit_and_keeps_warnings() {
+    use crate::tool_runtime::jobs::validation_job_projection;
+    for (status, exit, expected) in [
+        ("completed", Some(0), json!(true)),
+        ("completed", None, json!(false)),
+        ("failed", Some(101), json!(false)),
+        ("timed_out", None, serde_json::Value::Null),
+        ("cancelled", None, serde_json::Value::Null),
+        ("lost", None, serde_json::Value::Null),
+    ] {
+        let value = validation_job_projection(
+            Some("cargo_clippy"),
+            Some("lint"),
+            status,
+            exit,
+            "",
+            "warning: unused variable: `x`\n --> src/lib.rs:1:5\n",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(value["passed"], expected, "{status}: {value}");
+        assert_eq!(value["kind"], "lint");
+        assert!(value.get("diagnostics").is_some());
+        assert!(value.get("tests_run_count").is_none());
+    }
+}

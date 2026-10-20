@@ -2807,6 +2807,11 @@ impl RunnerRegistry {
                     RunnerFeature::ProjectValidationNodeScriptCheck
                 },
             );
+        let clippy_capability = (payload.action
+            == webcodex_core::project_validation::ProjectValidationAction::Lint
+            && payload.adapter
+                == webcodex_core::project_validation::ProjectValidationAdapter::Rust)
+            .then_some(RunnerFeature::ProjectValidationRustClippy);
         let requires_package_scope = payload
             .scope
             .as_ref()
@@ -2835,6 +2840,7 @@ impl RunnerRegistry {
             &runner.runner_features,
             [
                 Some(RunnerFeature::ProjectValidation),
+                clippy_capability,
                 python_capability,
                 node_capability,
                 requires_all_packages.then_some(RunnerFeature::ProjectAllPackages),

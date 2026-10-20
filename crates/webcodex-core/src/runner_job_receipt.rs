@@ -151,7 +151,7 @@ impl RetainedJobReceipt {
             || context
                 .validation_steps
                 .iter()
-                .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
+                .any(|step| !matches!(step.as_str(), "format" | "check" | "lint" | "test"))
             || snapshot
                 .validation_progress
                 .as_ref()

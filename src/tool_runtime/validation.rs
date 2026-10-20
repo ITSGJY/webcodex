@@ -539,6 +539,9 @@ impl ToolRuntime {
         }
         let semantic_action = match action {
             ProjectValidationAction::FormatCheck => webcodex_validation::SemanticCheck::Format,
+            ProjectValidationAction::Lint if plan.provenance.backend == "rust" => {
+                webcodex_validation::SemanticCheck::Lint
+            }
             ProjectValidationAction::Check | ProjectValidationAction::Lint => {
                 webcodex_validation::SemanticCheck::Check
             }
@@ -553,7 +556,9 @@ impl ToolRuntime {
                 "validation adapter unavailable; upgrade Server and Runner together",
             );
         };
-        if adapter.tool_identity() != plan.adapter || adapter.validation_kind() != action.kind() {
+        if adapter.tool_identity() != plan.adapter
+            || adapter.validation_kind() != action.kind_for_backend(&plan.provenance.backend)
+        {
             return ToolResult::err("invalid Runner project validation evidence profile");
         }
         let source_fence = self.validation_sources.capture(&resolved.resolved_id);

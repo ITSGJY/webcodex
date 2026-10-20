@@ -14,6 +14,7 @@ use webcodex_core::validation_evidence::{
 enum RustAdapterKind {
     Format,
     Check,
+    Clippy,
     Test,
 }
 
@@ -34,9 +35,14 @@ static CARGO_TEST_ADAPTER: RustValidationAdapter = RustValidationAdapter {
     kind: RustAdapterKind::Test,
     tool_identity: "cargo_test",
 };
-static RUST_ADAPTERS: [&dyn ValidationAdapter; 3] = [
+static CARGO_CLIPPY_ADAPTER: RustValidationAdapter = RustValidationAdapter {
+    kind: RustAdapterKind::Clippy,
+    tool_identity: "cargo_clippy",
+};
+static RUST_ADAPTERS: [&dyn ValidationAdapter; 4] = [
     &CARGO_FMT_ADAPTER,
     &CARGO_CHECK_ADAPTER,
+    &CARGO_CLIPPY_ADAPTER,
     &CARGO_TEST_ADAPTER,
 ];
 
@@ -49,6 +55,7 @@ impl ValidationEvidenceProfile for RustValidationAdapter {
         match self.kind {
             RustAdapterKind::Format => "format",
             RustAdapterKind::Check => "check",
+            RustAdapterKind::Clippy => "lint",
             RustAdapterKind::Test => "test",
         }
     }
@@ -64,7 +71,7 @@ impl ValidationEvidenceProfile for RustValidationAdapter {
         truncated: bool,
     ) -> ValidationDiagnostics {
         match self.kind {
-            RustAdapterKind::Format | RustAdapterKind::Check => {
+            RustAdapterKind::Format | RustAdapterKind::Check | RustAdapterKind::Clippy => {
                 parse_cargo_check_diagnostics(stdout_excerpt, stderr_excerpt, truncated)
             }
             RustAdapterKind::Test => {
@@ -161,6 +168,27 @@ impl ValidationAdapter for RustValidationAdapter {
                         ValidationPlanArg::Literal("--"),
                         ValidationPlanArg::Literal("--check"),
                     ],
+                )
+            }
+            RustAdapterKind::Clippy => {
+                if options.dependency_resolution_policy.is_some() {
+                    return Err("dependency_resolution_policy_unsupported".into());
+                }
+                let mut options = options;
+                options.all_targets = Some(true);
+                let plan = cargo_check_plan(options)?;
+                let mut step = plan.structured_step;
+                step.name = "lint".into();
+                step.args[0] = "clippy".into();
+                step.args
+                    .extend(["--", "-D", "clippy::correctness"].map(str::to_string));
+                read_only_validation_plan(
+                    "lint",
+                    "cargo",
+                    step.args
+                        .into_iter()
+                        .map(ValidationPlanArg::Value)
+                        .collect(),
                 )
             }
             RustAdapterKind::Check => cargo_check_plan(options),

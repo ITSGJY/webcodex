@@ -66,7 +66,7 @@ pub(super) fn validate_detached_recovery_context(
             || context
                 .validation_steps
                 .iter()
-                .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
+                .any(|step| !matches!(step.as_str(), "format" | "check" | "lint" | "test"))
         {
             return Err("detached Job recovery validation_steps are invalid".to_string());
         }

@@ -19,6 +19,7 @@ pub enum ToolValidationIdentityKind {
     None,
     CargoFmt,
     CargoCheck,
+    CargoClippy,
     CargoTest,
     GoTest,
     GoVet,
@@ -38,6 +39,7 @@ impl ToolValidationIdentityKind {
             Self::None | Self::Project => None,
             Self::CargoFmt => Some("cargo_fmt"),
             Self::CargoCheck => Some("cargo_check"),
+            Self::CargoClippy => Some("cargo_clippy"),
             Self::CargoTest => Some("cargo_test"),
             Self::GoTest => Some("go_test"),
             Self::GoVet => Some("go_vet"),
@@ -142,6 +144,21 @@ pub fn structured_validation_target_identity(
             // Preserve the established identity encoding for omitted and
             // single-package requests. Multi-package scopes use the additive
             // canonical array shape.
+            if packages.as_ref().is_some_and(|packages| packages.len() > 1) {
+                semantic["packages"] = serde_json::json!(packages);
+            } else {
+                semantic["package"] =
+                    serde_json::json!(packages.and_then(|mut values| values.pop()));
+            }
+            semantic
+        }
+        ToolValidationIdentityKind::CargoClippy => {
+            let packages =
+                normalized_cargo_target_packages(obj.get("package"), obj.get("packages"))?;
+            let mut semantic = serde_json::json!({
+                "tool": tool_name, "kind": "lint", "cwd": cwd,
+                "all_targets": true, "deny": "clippy::correctness",
+            });
             if packages.as_ref().is_some_and(|packages| packages.len() > 1) {
                 semantic["packages"] = serde_json::json!(packages);
             } else {

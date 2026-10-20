@@ -156,7 +156,7 @@ pub(crate) fn detected_job_summary_with_activity(
                 "summary": "Waiting for Cargo build lock",
             }))
         } else if cargo_command
-            && matches!(kind, "test" | "check" | "build" | "format")
+            && matches!(kind, "test" | "check" | "lint" | "build" | "format")
             && lower
                 .lines()
                 .any(|line| line.trim_start().starts_with("compiling "))
@@ -167,7 +167,7 @@ pub(crate) fn detected_job_summary_with_activity(
                 "summary": "Cargo compilation in progress",
             }))
         } else if cargo_command
-            && matches!(kind, "test" | "check" | "build" | "format")
+            && matches!(kind, "test" | "check" | "lint" | "build" | "format")
             && lower
                 .lines()
                 .any(|line| line.trim_start().starts_with("checking "))
@@ -427,7 +427,7 @@ pub(crate) fn structured_validation_evidence(
     truncated: bool,
 ) -> StructuredValidationEvidence {
     let combined = format!("{stdout}\n{stderr}");
-    let profile = (matches!(kind, "check" | "test")
+    let profile = (matches!(kind, "check" | "lint" | "test")
         || (kind == "format" && tool == "python:ruff:format"))
         .then(|| super::validation_profile::validation_evidence_profile_for_tool(tool))
         .flatten()
@@ -505,7 +505,7 @@ pub(crate) fn structured_validation_evidence(
         }
         // Preserve the existing check counter projection for known Cargo/Go
         // adapters; unknown check identities must not inherit Rustc parsing.
-        Some("cargo_check" | "go_vet") if !truncated => {
+        Some("cargo_check" | "cargo_clippy" | "go_vet") if !truncated => {
             evidence.warnings_count =
                 Some(super::cargo::count_rustc_diagnostics(&combined, "warning:") as u64);
             evidence.errors_count =

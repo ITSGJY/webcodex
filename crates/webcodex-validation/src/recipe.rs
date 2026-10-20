@@ -44,11 +44,12 @@ pub enum SemanticCheck {
     Format,
     Check,
     Test,
+    Lint,
 }
 
 impl SemanticCheck {
     pub fn as_str(self) -> &'static str {
-        ["format", "check", "test"][self as usize]
+        ["format", "check", "test", "lint"][self as usize]
     }
 }
 
@@ -764,6 +765,7 @@ fn select_node_script(
     let names: &[&str] = match check {
         SemanticCheck::Format => &["format:check", "format-check", "check:format"],
         SemanticCheck::Check => &["check", "typecheck", "lint"],
+        SemanticCheck::Lint => return Err(check_unavailable()),
         SemanticCheck::Test => &["test"],
     };
     let name = names
@@ -855,7 +857,9 @@ fn python_manifestless_steps(
                     .map(|a| (*a).to_string())
                     .collect(),
             )),
-            SemanticCheck::Format | SemanticCheck::Check => Err(check_unavailable()),
+            SemanticCheck::Format | SemanticCheck::Check | SemanticCheck::Lint => {
+                Err(check_unavailable())
+            }
         })
         .collect()
 }
@@ -871,6 +875,7 @@ fn step(check: SemanticCheck, program: &str, args: Vec<String>) -> ShellJobValid
 
 fn tool_identity(step: &ShellJobValidationStep) -> String {
     match step.program.as_str() {
+        "cargo" if step.name == "lint" => "cargo_clippy".to_string(),
         "cargo" if step.name == "format" => "cargo_fmt".to_string(),
         "cargo" => format!("cargo_{}", step.name),
         "python" => format!(
