@@ -40,6 +40,7 @@ use invocation::{
 pub(super) use invocation::{parse_mcp_invocation_envelope, McpInvocationEnvelope};
 
 pub(super) const WORK_RESULT_APP_RESULT_META_KEY: &str = "webcodex/workResult";
+pub(super) const WORK_RESULT_INPUT_META_KEY: &str = "webcodex/workResultInput";
 pub(super) const WORK_RESULT_THREAD_CONTEXT_META_KEY: &str = "webcodex/workResultThread";
 const WORK_RESULT_THREAD_ENTRYPOINT_TOOL_NAME: &str = "work_result_thread_panel";
 
@@ -1095,7 +1096,24 @@ fn attach_app_tool_content_fallback(result: &mut Value) {
     result["content"] = json!([{ "type": "text", "text": text }]);
 }
 
-fn attach_work_result_app_private_result(result: &mut Value) {
+fn work_result_input_selectors(arguments: &Value) -> Option<Value> {
+    use webcodex_core::model_reference::{parse_model_reference, ModelReferenceKind};
+    let mut selectors = serde_json::Map::new();
+    for (field, kind) in [
+        ("project", ModelReferenceKind::Project),
+        ("session_id", ModelReferenceKind::Session),
+    ] {
+        if let Some(value) = arguments.get(field).and_then(Value::as_str) {
+            let value = value.trim();
+            if matches!(parse_model_reference(value, kind), Some(Ok(_))) {
+                selectors.insert(field.to_string(), json!(value));
+            }
+        }
+    }
+    (!selectors.is_empty()).then_some(Value::Object(selectors))
+}
+
+fn attach_work_result_app_private_result(result: &mut Value, input_selectors: Option<Value>) {
     let Some(structured) = result.get("structuredContent").cloned() else {
         return;
     };
@@ -1106,7 +1124,63 @@ fn attach_work_result_app_private_result(result: &mut Value) {
             .as_object_mut()
     });
     if let Some(meta) = meta {
+        if structured.get("success") == Some(&Value::Bool(true)) {
+            if let Some(selectors) = input_selectors {
+                meta.insert(WORK_RESULT_INPUT_META_KEY.to_string(), selectors);
+            }
+        }
         meta.insert(WORK_RESULT_APP_RESULT_META_KEY.to_string(), structured);
+    }
+}
+
+#[cfg(test)]
+mod work_result_input_tests {
+    use super::*;
+
+    #[test]
+    fn work_result_input_projection_contains_only_valid_typed_selectors() {
+        assert_eq!(
+            work_result_input_selectors(&json!({
+                "project": " ~p1 ", "session_id": "~s18446744073709551615", "instruction": "private"
+            })),
+            Some(json!({"project": "~p1", "session_id": "~s18446744073709551615"}))
+        );
+        for invalid in [
+            "~p0",
+            "~p01",
+            "~p18446744073709551616",
+            "~p-1",
+            "~s1",
+            "private",
+        ] {
+            assert!(work_result_input_selectors(&json!({"project": invalid})).is_none());
+        }
+        assert!(work_result_input_selectors(
+            &json!({"project": "agent:r:p", "session_id": "wc_sess_1111111111111111"})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn work_result_selector_binding_is_private_and_requires_success() {
+        for success in [false, true] {
+            let structured =
+                json!({"success": success, "output": {"work_result": {"project": "agent:r:p"}}});
+            let mut result = json!({"structuredContent": structured, "content": [{"type": "text", "text": "compact"}]});
+            let public = result.clone();
+            attach_work_result_app_private_result(&mut result, Some(json!({"project": "~p1"})));
+            assert_eq!(result["structuredContent"], public["structuredContent"]);
+            assert_eq!(result["content"], public["content"]);
+            assert_eq!(result["_meta"][WORK_RESULT_APP_RESULT_META_KEY], structured);
+            assert_eq!(
+                result["_meta"][WORK_RESULT_INPUT_META_KEY],
+                if success {
+                    json!({"project": "~p1"})
+                } else {
+                    Value::Null
+                }
+            );
+        }
     }
 }
 

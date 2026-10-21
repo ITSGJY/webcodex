@@ -13,6 +13,61 @@ use crate::input_property_schema_for_tool;
 use crate::schema_generation::typed_host_schema;
 use crate::tool_definition::exploration_tool_names;
 
+pub(super) fn review_evidence_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": true,
+        "properties": {
+            "available": schema_type("boolean", "True when review evidence summary is available."),
+            "source": schema_type("string", "Review evidence source, usually session_ledger."),
+            "total": schema_type("integer", "Total successful review evidence tool calls counted."),
+            "read_only_inspection_count": schema_type("integer", "Successful read-only inspection tool calls counted."),
+            "search_count": schema_type("integer", "Successful search tool calls counted."),
+            "diff_review_count": schema_type("integer", "Successful diff review tool calls counted."),
+            "workspace_review_count": schema_type("integer", "Successful workspace review tool calls counted."),
+            "hygiene_review_count": schema_type("integer", "Successful hygiene review tool calls counted."),
+            "tools": {
+                "type": "array",
+                "maxItems": 20,
+                "description": "Bounded unique review evidence tool names only; never file contents, diff hunks, stdout/stderr, command text, tokens, secrets, or raw input payloads.",
+                "items": schema_type("string", "Review evidence tool name.")
+            }
+        }
+    })
+}
+
+pub(super) fn cargo_diagnostic_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "severity": { "type": "string", "enum": ["error", "warning", "unknown"] },
+            "code": { "type": "string", "maxLength": 64 },
+            "file": { "type": "string", "maxLength": 512 },
+            "line": { "type": "integer", "minimum": 1 },
+            "column": { "type": "integer", "minimum": 1 },
+            "message": { "type": "string", "maxLength": 240 }
+        },
+        "required": ["severity", "message"]
+    })
+}
+
+pub(super) fn failed_test_detail_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "name": { "type": "string", "maxLength": 240 },
+            "failure_kind": { "type": "string", "enum": ["assertion", "panic", "unknown"] },
+            "file": { "anyOf": [{"type": "string", "maxLength": 512}, {"type": "null"}] },
+            "line": { "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}] },
+            "column": { "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}] }
+        },
+        "required": ["name", "failure_kind", "file", "line", "column"]
+    })
+}
+
 pub(super) fn validation_source_state_schema() -> Value {
     json!({
         "type": "object",

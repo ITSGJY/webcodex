@@ -10,6 +10,7 @@ pub(super) struct RuntimeResponse {
     pub(super) result_presentation: McpToolResultPresentation,
     pub(super) invocation_facts: InvocationFacts,
     pub(super) app_call_id: Option<String>,
+    pub(super) work_result_input: Option<Value>,
 }
 
 impl RuntimeResponse {
@@ -28,6 +29,7 @@ impl RuntimeResponse {
             result_presentation,
             invocation_facts,
             app_call_id,
+            work_result_input,
         } = self;
         let work_result_thread_panel = surface.work_result_thread_context.is_some();
         let work_result_thread_context = surface.work_result_thread_context;
@@ -173,7 +175,7 @@ impl RuntimeResponse {
             // Initial model-originated presentation keeps normal model content compact.
             // The private MCP App result channel lets the mounted View recover the exact
             // bounded Work Result when a Host omits structuredContent from tool-result.
-            attach_work_result_app_private_result(&mut result);
+            attach_work_result_app_private_result(&mut result, work_result_input);
             if let Some(context) = work_result_thread_context {
                 // The admitted native entrypoint can omit discovery's UI capability
                 // on this call. Its exact authorized binding must still reach the View.

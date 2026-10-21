@@ -414,6 +414,9 @@ impl PreparedRuntimeCall {
             return Err(McpOutcome::BadRequest(rpc_error(id, -32602, message)));
         }
 
+        let work_result_input = (context.app_enabled && params.name == "present_work_result")
+            .then(|| work_result_input_selectors(&params.arguments))
+            .flatten();
         Ok(Self {
             params,
             metadata,
@@ -425,6 +428,7 @@ impl PreparedRuntimeCall {
                 result_presentation,
                 invocation_facts,
                 app_call_id,
+                work_result_input,
             },
         })
     }

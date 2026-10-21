@@ -83,7 +83,7 @@ impl RuntimeSurface {
                         runtime.runtime_info.mcp_text_json_compat_enabled,
                         result_presentation,
                     );
-                    attach_work_result_app_private_result(&mut result);
+                    attach_work_result_app_private_result(&mut result, None);
                     result["_meta"][WORK_RESULT_THREAD_CONTEXT_META_KEY] =
                         json!({"empty": true, "session_id": null});
                     if let Some(lc) = lifecycle.as_deref() {

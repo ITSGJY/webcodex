@@ -563,6 +563,7 @@ select:disabled { opacity: .48; cursor: default; }
     </section>
     <details id="diagnostics" class="details" hidden>
       <summary>Diagnostics</summary>
+      <p id="initialDelivery" class="secondary">Initial delivery: waiting</p>
       <div id="diagnosticContent"></div>
     </details>
   </div>
@@ -1429,6 +1430,7 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
   "use strict";
   const APP_PROTOCOL = "2026-01-26";
   const WORK_RESULT_META_KEY = "webcodex/workResult";
+  const WORK_RESULT_INPUT_META_KEY = "webcodex/workResultInput";
   const THREAD_CONTEXT_META_KEY = "webcodex/workResultThread";
   const SESSION_ID = /^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$/;
   const STATE_VERSION = /^wr2_[0-9a-f]{64}$/;
@@ -1457,6 +1459,8 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
   const VALIDATION = new Set(["not_run", "unproven", "passed", "failed", "mixed", "expected", "inconclusive", "stale", "unknown"]);
   let nextId = 1;
   let identity = null;
+  let inputSelectors = null;
+  let pendingSelectorInput = null;
   let lastStateVersion = null;
   let hostInitialized = false;
   let explicitSession = null;
@@ -1473,6 +1477,7 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
   let collaborationSendState = "idle";
   let tornDown = false;
   let initialResultTransportMissing = false;
+  const initialDelivery = { first: null, input: false, result: false, structured: false, private: false, selectors: false };
   let selectedPane = "Activity";
   const pending = new Map();
   const el = id => document.getElementById(id);
@@ -1569,6 +1574,7 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
   // failure text, identities, or Host-delivered payloads into diagnostics.
   const FAIL_CLOSED_CODES = Object.freeze({
     "Invalid or conflicting Work identity": "WR-IDENTITY-INVALID",
+    "Unresolved Work input selector": "WR-INPUT-UNRESOLVED",
     "Conflicting sealed Work identity": "WR-FROZEN-IDENTITY-CONFLICT",
     "Invalid file changes": "WR-FILE-CHANGES-INVALID",
     "Work Result state unavailable": "WR-STATE-INVALID",
@@ -1612,6 +1618,39 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
     updateRefreshControl();
     if (hostInitialized && lastStateVersion === null) el("status").textContent = "Waiting for Work snapshot · Refresh available";
     return true;
+  }
+
+  function modelSelector(value, kind) {
+    if (typeof value !== "string" || !new RegExp("^~" + kind + "[1-9][0-9]{0,19}$").test(value)) return false;
+    const digits = value.slice(2);
+    return digits.length < 20 || digits <= "18446744073709551615";
+  }
+
+  function acceptInputSelectors(result, state) {
+    const selectors = callToolResultOf(result)?._meta?.[WORK_RESULT_INPUT_META_KEY];
+    if (selectors !== undefined) {
+      if (!selectors || typeof selectors !== "object" || Array.isArray(selectors)
+        || !Object.keys(selectors).length
+        || !Object.keys(selectors).every(key => key === "project" || key === "session_id")
+        || (selectors.project !== undefined && !modelSelector(selectors.project, "p"))
+        || (selectors.session_id !== undefined && (!modelSelector(selectors.session_id, "s") || !validSession(state.session_id)))
+        || (inputSelectors && (inputSelectors.project !== state.project
+          || (selectors.session_id !== undefined && inputSelectors.session_id !== state.session_id)
+          || inputSelectors.selectors.project !== selectors.project
+          || inputSelectors.selectors.session_id !== selectors.session_id))) {
+        failClosed("Unresolved Work input selector"); return false;
+      }
+      // Only a successful admitted presentation supplies this private projection.
+      // Selectors are not identities; every subsequent read uses canonical state.
+      inputSelectors = Object.freeze({ selectors: Object.freeze({ ...selectors }), project: state.project, session_id: state.session_id });
+    }
+    if (pendingSelectorInput) {
+      const args = pendingSelectorInput;
+      pendingSelectorInput = null;
+      if (!inputSelectors) { failClosed("Unresolved Work input selector"); return false; }
+      acceptToolInput({ arguments: args });
+    }
+    return !tornDown;
   }
 
   function safeCount(value) {
@@ -3287,7 +3326,13 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
   }
 
   function acceptToolInput(params) {
-    const args = params && params.arguments;
+    let args = params && params.arguments;
+    const projectSelector = typeof args?.project === "string" ? args.project.trim() : null;
+    const sessionSelector = typeof args?.session_id === "string" ? args.session_id.trim() : null;
+    if (modelSelector(projectSelector, "p") || modelSelector(sessionSelector, "s")) {
+      args = { ...args, project: modelSelector(projectSelector, "p") ? projectSelector : args?.project,
+        ...(modelSelector(sessionSelector, "s") ? { session_id: sessionSelector } : {}) };
+    }
     // ChatGPT thread entrypoints are invoked with an empty object. In that case
     // identity arrives from the entrypoint ToolResult after WebCodex resolves the
     // Work Result previously presented in this exact Host Window.
@@ -3295,6 +3340,28 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
       threadInput = true;
       if (lastRenderedState && threadSession === undefined) failClosed("Thread binding unavailable");
       return;
+    }
+    const projectRef = modelSelector(args?.project, "p");
+    const sessionRef = modelSelector(args?.session_id, "s");
+    if (projectRef || sessionRef) {
+      if (!validProject(args?.project)
+        || (args?.session_id !== undefined && !sessionRef && !validSession(args.session_id))) {
+        failClosed("Unresolved Work input selector"); return;
+      }
+      if (!inputSelectors) {
+        if (lastRenderedState || initialResultTransportMissing || (pendingSelectorInput
+          && (pendingSelectorInput.project !== args.project || pendingSelectorInput.session_id !== args.session_id))) {
+          failClosed("Unresolved Work input selector"); return;
+        }
+        pendingSelectorInput = { project: args.project, ...(args.session_id !== undefined ? { session_id: args.session_id } : {}) };
+        return;
+      }
+      if ((projectRef && inputSelectors.selectors.project !== args.project)
+        || (sessionRef && inputSelectors.selectors.session_id !== args.session_id)) {
+        failClosed("Unresolved Work input selector"); return;
+      }
+      args = { ...args, project: projectRef ? inputSelectors.project : args.project,
+        ...(sessionRef ? { session_id: inputSelectors.session_id } : {}) };
     }
     if (args?.session_id !== undefined) {
       if (!validSession(args.session_id) || (explicitSession && explicitSession !== args.session_id)
@@ -3306,6 +3373,21 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
     }
     if (!acceptIdentity(target(args && !Array.isArray(args) && args.project))) return;
     if (initialResultTransportMissing && hostInitialized && lastStateVersion === null) void refresh(false);
+  }
+
+  function noteInitialDelivery(kind, result) {
+    if (initialDelivery.first === null) initialDelivery.first = kind;
+    if (!initialDelivery[kind]) {
+      initialDelivery[kind] = true;
+      if (kind === "result") {
+        const call = callToolResultOf(result);
+        initialDelivery.structured = call?.structuredContent !== undefined;
+        initialDelivery.private = call?._meta?.[WORK_RESULT_META_KEY] !== undefined;
+        initialDelivery.selectors = call?._meta?.[WORK_RESULT_INPUT_META_KEY] !== undefined;
+      }
+    }
+    el("initialDelivery").textContent = "Initial delivery · first: " + initialDelivery.first
+      + ["input", "result", "structured", "private", "selectors"].map(key => " · " + key + ": " + (initialDelivery[key] ? "yes" : "no")).join("");
   }
 
   function acceptToolResult(result) {
@@ -3331,10 +3413,13 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
       // to the View. Preserve exact identity from tool-input and recover once
       // through the app-only state read instead of permanently disabling the card.
       initialResultTransportMissing = true;
+      if (pendingSelectorInput) { failClosed("Unresolved Work input selector"); return; }
       if (identity && hostInitialized && lastStateVersion === null) void refresh(false);
       return;
     }
     const state = extractState(structured);
+    if (structured.success === true && state && !acceptInputSelectors(result, state)) return;
+    if (state && !validState(state)) { failClosed("Work Result state unavailable"); return; }
     if (structured.success === false || !state || !acceptIdentity(target(state.project))) {
       if (!tornDown) failClosed("Work Result state unavailable");
       return;
@@ -3415,10 +3500,12 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
       return;
     }
     if (msg.method === "ui/notifications/tool-input") {
+      noteInitialDelivery("input");
       acceptToolInput(msg.params);
       return;
     }
     if (msg.method === "ui/notifications/tool-result") {
+      noteInitialDelivery("result", msg.params);
       acceptToolResult(msg.params);
       return;
     }

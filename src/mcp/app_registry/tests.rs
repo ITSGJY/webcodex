@@ -8,7 +8,7 @@ fn bundled_app_registry_has_unique_exact_identities_and_stable_discovery() {
         "ui://webcodex/spreadsheet/v4",
         "ui://webcodex/computer/v12",
         "ui://webcodex/workbench/v8",
-        "ui://webcodex/work-result/v33",
+        "ui://webcodex/work-result/v35",
         "ui://webcodex/goal-plan/v9",
         "ui://webcodex/agent-continuation/v21",
         "ui://webcodex/job-terminal-continuation/v2",

@@ -5,10 +5,11 @@ use webcodex_core::workflow_session_contract::{
 };
 
 use super::common::{
-    acceptance_evidence_schema, array_schema, cargo_test_count_assertion_schema,
-    continuation_feedback_schema, evidence_history_schema, evidence_integrity_schema,
-    external_observation_schema, handoff_brief_schema, job_lifecycle_summary_schema,
-    nullable_schema, open_object_schema, permission_summary_schema, schema_type,
+    acceptance_evidence_schema, array_schema, cargo_diagnostic_schema,
+    cargo_test_count_assertion_schema, continuation_feedback_schema, evidence_history_schema,
+    evidence_integrity_schema, external_observation_schema, failed_test_detail_schema,
+    handoff_brief_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
+    permission_summary_schema, review_evidence_schema, schema_type,
     session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
     session_mode_schema, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
 };
@@ -1159,37 +1160,6 @@ fn validation_diagnostics_schema() -> Value {
     })
 }
 
-fn cargo_diagnostic_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "severity": { "type": "string", "enum": ["error", "warning", "unknown"] },
-            "code": { "type": "string", "maxLength": 64 },
-            "file": { "type": "string", "maxLength": 512 },
-            "line": { "type": "integer", "minimum": 1 },
-            "column": { "type": "integer", "minimum": 1 },
-            "message": { "type": "string", "maxLength": 240 }
-        },
-        "required": ["severity", "message"]
-    })
-}
-
-fn failed_test_detail_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "name": { "type": "string", "maxLength": 240 },
-            "failure_kind": { "type": "string", "enum": ["assertion", "panic", "unknown"] },
-            "file": { "anyOf": [{"type": "string", "maxLength": 512}, {"type": "null"}] },
-            "line": { "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}] },
-            "column": { "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}] }
-        },
-        "required": ["name", "failure_kind", "file", "line", "column"]
-    })
-}
-
 fn cargo_test_summary_schema() -> Value {
     json!({
         "type": "object",
@@ -1198,30 +1168,6 @@ fn cargo_test_summary_schema() -> Value {
             "passed": { "type": "integer", "minimum": 0 },
             "failed": { "type": "integer", "minimum": 0 },
             "ignored": { "type": "integer", "minimum": 0 }
-        }
-    })
-}
-
-fn review_evidence_schema(description: &str) -> Value {
-    json!({
-        "type": "object",
-        "description": description,
-        "additionalProperties": true,
-        "properties": {
-            "available": schema_type("boolean", "True when review evidence summary is available."),
-            "source": schema_type("string", "Review evidence source, usually session_ledger."),
-            "total": schema_type("integer", "Total successful review evidence tool calls counted."),
-            "read_only_inspection_count": schema_type("integer", "Successful read-only inspection tool calls counted."),
-            "search_count": schema_type("integer", "Successful search tool calls counted."),
-            "diff_review_count": schema_type("integer", "Successful diff review tool calls counted."),
-            "workspace_review_count": schema_type("integer", "Successful workspace review tool calls counted."),
-            "hygiene_review_count": schema_type("integer", "Successful hygiene review tool calls counted."),
-            "tools": {
-                "type": "array",
-                "maxItems": 20,
-                "description": "Bounded unique review evidence tool names only; never file contents, diff hunks, stdout/stderr, command text, tokens, secrets, or raw input payloads.",
-                "items": schema_type("string", "Review evidence tool name.")
-            }
         }
     })
 }
