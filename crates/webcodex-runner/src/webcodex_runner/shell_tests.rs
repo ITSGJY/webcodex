@@ -3192,3 +3192,235 @@ fn runner_real_process_project_validation_ruff_module_isolation() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn rust_clippy_probe_missing_component_and_pinned_command() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let clippy = temp.path().join("cargo-clippy");
+    let cargo = temp.path().join("cargo");
+    // Dispatching through Cargo would run an alias (or this sentinel).
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\nprintf dispatched > side-effect\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut shell = ShellConfig::default();
+    shell
+        .env
+        .insert("PATH".into(), temp.path().to_string_lossy().into_owned());
+    shell.env.insert("RUSTUP_AUTO_INSTALL".into(), "1".into());
+    let profile = PreparedShellProfile {
+        profile_name: "clippy".into(),
+        program: "/bin/sh".into(),
+        args: vec![],
+        dialect: ShellDialect::Posix,
+        env_snapshot: shell.env.clone(),
+    };
+    let step = webcodex_core::runner_protocol::ShellJobValidationStep {
+        name: "lint".into(),
+        program: "cargo".into(),
+        args: ["clippy", "--all-targets", "--", "-D", "clippy::correctness"]
+            .map(str::to_string)
+            .to_vec(),
+        env: vec![],
+    };
+    for profile in [None, Some(&profile)] {
+        assert!(configured_clippy_job_command(&shell, profile, &step, temp.path(), None).is_err());
+    }
+    for available in [false, true] {
+        std::fs::write(&clippy, if available {
+            "#!/bin/sh\n[ \"$RUSTUP_AUTO_INSTALL\" = 0 ] || exit 8\n[ \"$1\" = clippy ] || exit 9\nshift\nif [ \"$1\" = --version ]; then printf 'clippy 0.1\\n'; else [ \"$*\" = '--all-targets -- -D clippy::correctness' ] || exit 10; printf 'stable diagnostic\\n' >&2; fi\n"
+        } else { "#!/bin/sh\nexit 1\n" }).unwrap();
+        std::fs::set_permissions(&clippy, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for profile in [None, Some(&profile)] {
+            let result = configured_clippy_job_command(&shell, profile, &step, temp.path(), None);
+            if available {
+                let mut command = result.unwrap();
+                assert_eq!(PathBuf::from(command.get_program()), clippy);
+                assert_eq!(
+                    command
+                        .get_args()
+                        .map(|a| a.to_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    step.args
+                );
+                let output = command.output().unwrap();
+                assert!(output.status.success());
+                assert!(output.stdout.is_empty());
+                assert_eq!(output.stderr, b"stable diagnostic\n");
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    webcodex_core::runner_protocol::VALIDATION_TOOL_UNAVAILABLE_CODE
+                );
+            }
+            assert!(!temp.path().join("side-effect").exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_clippy_disables_auto_install_for_probe_and_execution() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = crate::tests::executable_tempdir();
+    let cargo = temp.path().join("cargo");
+    // Model a rustup proxy without touching installed toolchains or the network.
+    // Any opt-in records an installation attempt, even if tooling is available.
+    std::fs::write(
+        &cargo,
+        r#"#!/bin/sh
+[ "$1" = clippy ] || exit 9
+printf '%s:%s\n' "$2" "$RUSTUP_AUTO_INSTALL" >> calls
+if [ "$RUSTUP_AUTO_INSTALL" != 0 ]; then
+    : > install-attempt
+    exit 98
+fi
+if [ -f missing-toolchain ] || [ -f missing-component ]; then
+    exit 1
+fi
+if [ "$2" = --version ]; then
+    printf 'clippy 0.1\n'
+else
+    [ "$2" = --all-targets ] || exit 9
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink("cargo", temp.path().join("cargo-clippy")).unwrap();
+    std::fs::write(
+        temp.path().join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = 'nightly-2099-01-01'\ncomponents = ['clippy']\n",
+    )
+    .unwrap();
+    let mut shell = ShellConfig::default();
+    shell
+        .env
+        .insert("PATH".into(), temp.path().to_string_lossy().into_owned());
+    shell.env.insert("RUSTUP_AUTO_INSTALL".into(), "1".into());
+    let profile = PreparedShellProfile {
+        profile_name: "auto-install-enabled".into(),
+        program: "/bin/sh".into(),
+        args: vec![],
+        dialect: ShellDialect::Posix,
+        env_snapshot: shell.env.clone(),
+    };
+    let step = webcodex_core::runner_protocol::ShellJobValidationStep {
+        name: "lint".into(),
+        program: "cargo".into(),
+        args: ["clippy", "--all-targets", "--", "-D", "clippy::correctness"]
+            .map(str::to_string)
+            .to_vec(),
+        env: vec![],
+    };
+    for profile in [None, Some(&profile)] {
+        for missing in ["missing-toolchain", "missing-component"] {
+            let marker = temp.path().join(missing);
+            std::fs::write(&marker, "").unwrap();
+            assert_eq!(
+                configured_clippy_job_command(&shell, profile, &step, temp.path(), None)
+                    .unwrap_err(),
+                webcodex_core::runner_protocol::VALIDATION_TOOL_UNAVAILABLE_CODE
+            );
+            std::fs::remove_file(&marker).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("calls")).unwrap(),
+                "--version:0\n"
+            );
+            std::fs::remove_file(temp.path().join("calls")).unwrap();
+
+            // Loss after preflight must fail at execution without installing.
+            let command =
+                configured_clippy_job_command(&shell, profile, &step, temp.path(), None).unwrap();
+            std::fs::write(&marker, "").unwrap();
+            let (status, _, _) =
+                run_prepare_command(command, Duration::from_secs(5), None).unwrap();
+            assert_eq!(status.code(), Some(1));
+            std::fs::remove_file(&marker).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("calls")).unwrap(),
+                "--version:0\n--all-targets:0\n"
+            );
+            std::fs::remove_file(temp.path().join("calls")).unwrap();
+            assert!(!temp.path().join("install-attempt").exists());
+        }
+    }
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "requires installed Cargo Clippy; run explicitly with --ignored"]
+fn runner_real_process_rust_clippy_warnings_pass_and_correctness_fails() {
+    let step = webcodex_core::runner_protocol::ShellJobValidationStep {
+        name: "lint".into(),
+        program: "cargo".into(),
+        args: ["clippy", "--all-targets", "--", "-D", "clippy::correctness"]
+            .map(str::to_string)
+            .to_vec(),
+        env: vec![],
+    };
+    for (source, success, diagnostic) in [
+        (
+            "pub fn warning() -> i32 { return 1; }\n",
+            true,
+            "clippy::needless_return",
+        ),
+        (
+            "pub fn broken(x: i32) -> bool { x > 1 && x < 0 }\n",
+            false,
+            "clippy::impossible_comparisons",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname='clippy_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), source).unwrap();
+        let cargo_home = temp.path().join("cargo-home");
+        std::fs::create_dir(&cargo_home).unwrap();
+        // Cover global and project aliases, including a command with an effect.
+        let (config_dir, alias) = if success {
+            (cargo_home.clone(), "version")
+        } else {
+            let config_dir = temp.path().join(".cargo");
+            std::fs::create_dir(&config_dir).unwrap();
+            (config_dir, "!echo alias-executed > alias-side-effect")
+        };
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("[alias]\nclippy = '{alias}'\n"),
+        )
+        .unwrap();
+        let mut shell = ShellConfig::default();
+        shell.env.insert(
+            "CARGO_HOME".into(),
+            cargo_home.to_string_lossy().into_owned(),
+        );
+        shell.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+        shell.env.insert(
+            "CARGO_TARGET_DIR".into(),
+            temp.path().join("target").to_string_lossy().into_owned(),
+        );
+        let mut command = configured_clippy_job_command(&shell, None, &step, temp.path(), None)
+            .expect("Clippy must be installed for explicit real-process evidence");
+        command.env("CARGO_TERM_COLOR", "never");
+        let (status, stdout, stderr) =
+            run_prepare_command(command, Duration::from_secs(30), None).unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(status.success(), success, "{output}");
+        assert!(output.contains(diagnostic), "{output}");
+        assert!(stdout.is_empty(), "{output}");
+        assert!(!temp.path().join("alias-side-effect").exists());
+    }
+}

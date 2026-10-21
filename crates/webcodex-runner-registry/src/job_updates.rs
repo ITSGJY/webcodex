@@ -1574,6 +1574,10 @@ impl RunnerRegistry {
                     .iter()
                     .any(|step| step.node_json_framework().is_some())
                     .then_some(RunnerFeature::ProjectValidationNodeJson),
+                validation_steps
+                    .iter()
+                    .any(|step| step.program == "cargo" && step.name == "lint")
+                    .then_some(RunnerFeature::ProjectValidationRustClippy),
                 node_test.then_some(RunnerFeature::ProjectValidationNodeTap),
                 (project_test_options || go_test_filter)
                     .then_some(RunnerFeature::ProjectValidationTestOptions),

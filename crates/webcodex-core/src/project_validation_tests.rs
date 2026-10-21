@@ -97,7 +97,7 @@ fn project_node_check_step_identity_capability_and_metadata_are_closed() {
 }
 
 #[test]
-fn explicit_lint_provenance_is_node_only() {
+fn explicit_lint_provenance_has_closed_backend_set() {
     let mut provenance = ProjectValidationProvenance {
         request: ProjectValidationRequest {
             project_id: "demo".into(),
@@ -116,7 +116,13 @@ fn explicit_lint_provenance_is_node_only() {
         invocation_digest: "c".repeat(64),
     };
     assert!(provenance.is_valid());
-    for backend in ["rust", "go", "python"] {
+    provenance.backend = "rust".into();
+    assert!(provenance.is_valid());
+    provenance.request.dependency_resolution_policy =
+        Some(ProjectDependencyResolutionPolicy::Offline);
+    assert!(!provenance.is_valid());
+    provenance.request.dependency_resolution_policy = None;
+    for backend in ["go", "python"] {
         provenance.backend = backend.into();
         assert!(!provenance.is_valid(), "unsupported lint backend {backend}");
     }
@@ -346,6 +352,28 @@ fn project_validation_package_scope_roundtrips_and_is_bounded() {
             all_packages: false,
         });
         assert!(invalid.validate().is_err());
+    }
+}
+
+#[test]
+fn project_validation_locked_policy_accepts_rust_lint() {
+    for adapter in [
+        ProjectValidationAdapter::Rust,
+        ProjectValidationAdapter::Auto,
+    ] {
+        let request = ProjectValidationRequest {
+            project_id: "demo".into(),
+            cwd: None,
+            action: ProjectValidationAction::Lint,
+            adapter,
+            scope: None,
+            dependency_policy: Some(ProjectDependencyPolicy {
+                mode: ProjectDependencyMode::Locked,
+            }),
+            dependency_resolution_policy: None,
+            test: None,
+        };
+        assert!(request.validate().is_ok());
     }
 }
 

@@ -191,8 +191,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
         fields.extend([
             ("execution_source", json!({"const":"project_validate"})),
             ("backend", json!({"type":"string", "enum":["rust","go","python","node"]})),
-            ("action", json!({"type":"string", "enum":["format_check","check","test"]})),
-            ("adapter", json!({"type":"string", "enum":["cargo_fmt","cargo_check","cargo_test","go_vet","go_test","python:pytest:test","python:ruff:check","python:ruff:format","node:script:check","node:tap:test","node:vitest:test","node:jest:test"]})),
+            ("action", json!({"type":"string", "enum":["format_check","check","lint","test"]})),
+            ("adapter", json!({"type":"string", "enum":["cargo_fmt","cargo_check","cargo_clippy","cargo_test","go_vet","go_test","python:pytest:test","python:ruff:check","python:ruff:format","node:script:check","node:tap:test","node:vitest:test","node:jest:test"]})),
             ("validation_target_id", schema_type("string", "Canonical resolved validation target, independent of source freshness.")),
             ("detected_backend", json!({"type":["string","null"], "enum":["rust","go","node","python",null]})),
         ]);
@@ -612,7 +612,8 @@ fn validation_success_evidence_schema(tool: &str, rich_required: &[&str]) -> Val
         rich["allOf"] = json!([rich_assertion_schema(), {"oneOf":[
             {"properties":{"action":{"const":"format_check"}}},
             {"properties":{"action":{"const":"check"},"adapter":{"not":{"const":"node:script:check"}}},"required":["warnings_count","errors_count","diagnostics"]},
-            {"properties":{"action":{"const":"check"},"adapter":{"const":"node:script:check"},
+            {"properties":{"action":{"const":"lint"},"adapter":{"const":"cargo_clippy"}},"required":["warnings_count","errors_count","diagnostics"]},
+            {"properties":{"action":{"enum":["check","lint"]},"adapter":{"const":"node:script:check"},
                 "warnings_count":{"type":"null"},"errors_count":{"type":"null"},
                 "tests_detected":{"enum":[]},"tests_run_count":{"enum":[]},
                 "tests_passed":{"enum":[]},"tests_failed":{"enum":[]},
@@ -654,7 +655,7 @@ fn validation_success_evidence_schema(tool: &str, rich_required: &[&str]) -> Val
         "project_validate" => {
             compact["required"] = json!(["source_state", "adapter", "validation_target_id"]);
             compact["oneOf"] = json!([
-                {"properties":{"adapter":{"const":"cargo_check"},"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
+                {"properties":{"adapter":{"enum":["cargo_check","cargo_clippy"]},"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
                 {"properties":{"adapter":{"const":"go_vet"},"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
                 {"allOf":[test["oneOf"][0].clone()],"properties":{"adapter":{"const":"cargo_test"},"test_count_assertion":{"enum":[]}}},
                 {"allOf":[test["oneOf"][0].clone()],"properties":{"adapter":{"const":"go_test"},"test_count_assertion":{"enum":[]}}},

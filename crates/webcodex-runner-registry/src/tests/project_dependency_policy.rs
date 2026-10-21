@@ -707,3 +707,69 @@ async fn project_validation_python_preplan_selects_capability_by_action() {
         }
     }
 }
+
+#[tokio::test]
+async fn rust_clippy_old_runner_is_fenced_at_planning_and_job_admission() {
+    for hint in [
+        ProjectValidationAdapter::Rust,
+        ProjectValidationAdapter::Auto,
+    ] {
+        let registry = RunnerRegistry::default();
+        let mut runner = registration(true);
+        runner.capabilities.project_validation_rust_clippy_v1 = false;
+        registry.register(runner).await.unwrap();
+        let mut request = locked_validation_request();
+        request.action = ProjectValidationAction::Lint;
+        request.adapter = hint;
+        let access = auth_context(None, true);
+        if hint == ProjectValidationAdapter::Rust {
+            let error = registry
+                .enqueue_project_validation_plan(
+                    "policy-runner".into(),
+                    request.clone(),
+                    Some(&access),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("project_validation_rust_clippy_v1"),
+                "{error}"
+            );
+        } // Auto planning stays available for existing Node lint; resolved Clippy is gated below.
+        let mut metadata = locked_validation_metadata();
+        let validation = metadata.validation.as_mut().unwrap();
+        validation.project_validation.as_mut().unwrap().request = request;
+        validation.adapter = "cargo_clippy".into();
+        validation.kind = "lint".into();
+        validation.steps[0].name = "lint".into();
+        validation.steps[0].args = [
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--",
+            "-D",
+            "clippy::correctness",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        metadata.validation_steps = validation.steps.clone();
+        assert!(validation.is_valid());
+        let error = registry
+            .start_job_with_metadata(start_request("cargo clippy"), "test".into(), metadata)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("project_validation_rust_clippy_v1"),
+            "{error}"
+        );
+        assert!(registry.list_jobs(Some(10)).await.is_empty());
+        assert!(registry
+            .poll(RunnerPollRequest {
+                client_id: "policy-runner".into(),
+                runner_instance_id: "inst".into()
+            })
+            .await
+            .unwrap()
+            .is_none());
+    }
+}

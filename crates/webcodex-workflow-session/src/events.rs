@@ -1654,6 +1654,7 @@ fn copy_project_validation_evidence(summary: &mut Value, output: &Value) {
             &[
                 "cargo_fmt",
                 "cargo_check",
+                "cargo_clippy",
                 "cargo_test",
                 "go_vet",
                 "go_test",
@@ -1664,7 +1665,7 @@ fn copy_project_validation_evidence(summary: &mut Value, output: &Value) {
                 "node:tap:test",
             ][..],
         ),
-        ("action", &["format_check", "check", "test"][..]),
+        ("action", &["format_check", "check", "lint", "test"][..]),
         ("backend", &["rust", "go", "python", "node"][..]),
     ] {
         if let Some(value) = output

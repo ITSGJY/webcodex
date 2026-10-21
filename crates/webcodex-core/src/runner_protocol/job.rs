@@ -298,6 +298,25 @@ impl ShellJobValidationStep {
         let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
         match (self.name.as_str(), self.program.as_str()) {
             ("format", "cargo") => args == ["fmt", "--", "--check"],
+            ("lint", "cargo") => {
+                args.starts_with(&["clippy"])
+                    && args.ends_with(&["--", "-D", "clippy::correctness"])
+                    && args.len() >= 5
+                    && args.iter().filter(|arg| **arg == "-p").count() <= 8
+                    && args[1..args.len() - 3].contains(&"--all-targets")
+                    && args[1..args.len() - 3].iter().all(|a| {
+                        !matches!(
+                            *a,
+                            "--offline" | "--all-features" | "--no-default-features" | "--features"
+                        )
+                    })
+                    && is_canonical_cargo_flags(
+                        &args[1..args.len() - 3],
+                        false,
+                        true,
+                        allow_project_workspace,
+                    )
+            }
             ("check", "cargo") => is_canonical_cargo_check_args(&args, allow_project_workspace),
             ("test", "cargo") => is_canonical_cargo_test_args(&args, allow_project_workspace),
             ("check", "go") => is_canonical_go_vet_args(&args),
@@ -406,7 +425,7 @@ impl ShellJobValidationStep {
 
     pub fn is_project_workspace_cargo(&self) -> bool {
         self.program == "cargo"
-            && matches!(self.name.as_str(), "check" | "test")
+            && matches!(self.name.as_str(), "check" | "lint" | "test")
             && self.args.iter().any(|arg| arg == "--workspace")
             && self.is_canonical_project_step()
     }
@@ -1003,14 +1022,20 @@ impl ShellJobValidationMetadata {
                 return false;
             };
             if !provenance.is_valid()
-                || provenance.request.action.kind() != self.kind
+                || provenance
+                    .request
+                    .action
+                    .kind_for_backend(&provenance.backend)
+                    != self.kind
                 || (provenance.backend == "rust"
                     && project_all_packages
                     && !self.steps[0].is_project_workspace_cargo())
                 || !matches!(
                     (provenance.backend.as_str(), self.adapter.as_str()),
-                    ("rust", "cargo_fmt" | "cargo_check" | "cargo_test")
-                        | ("go", "go_vet" | "go_test")
+                    (
+                        "rust",
+                        "cargo_fmt" | "cargo_check" | "cargo_clippy" | "cargo_test"
+                    ) | ("go", "go_vet" | "go_test")
                         | (
                             "python",
                             "python:pytest:test" | "python:ruff:check" | "python:ruff:format"
@@ -1054,6 +1079,15 @@ impl ShellJobValidationMetadata {
         match self.adapter.as_str() {
             "cargo_fmt" => {
                 self.kind == "format" && step.name == "format" && step.program == "cargo"
+            }
+            "cargo_clippy" => {
+                self.tool == "project_validate"
+                    && self.kind == "lint"
+                    && step.name == "lint"
+                    && step.program == "cargo"
+                    && self.project_validation.as_ref().is_some_and(|p| {
+                        p.request.action == crate::project_validation::ProjectValidationAction::Lint
+                    })
             }
             "cargo_check" => {
                 self.kind == "check" && step.name == "check" && step.program == "cargo"

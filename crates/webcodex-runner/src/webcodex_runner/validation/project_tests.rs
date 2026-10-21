@@ -826,11 +826,11 @@ fn start_project_validation_operation(
     use webcodex_core::runner_operation::{RunnerJobOperation, RunnerJobValidationOperation};
     use webcodex_core::runner_protocol::{ShellJobContext, ShellJobValidationMetadata};
 
-    let kind = match plan.provenance.request.action {
-        ProjectValidationAction::FormatCheck => "format",
-        ProjectValidationAction::Check | ProjectValidationAction::Lint => "check",
-        ProjectValidationAction::Test => "test",
-    };
+    let kind = plan
+        .provenance
+        .request
+        .action
+        .kind_for_backend(&plan.provenance.backend);
     let metadata = ShellJobValidationMetadata {
         project_validation: Some(plan.provenance.clone()),
         tool: "project_validate".into(),
@@ -1224,18 +1224,18 @@ fn explicit_node_lint_plan_preserves_target_identity_and_stale_fence() {
 }
 
 #[test]
-fn explicit_lint_rejects_non_node_backend() {
-    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname='demo'\nversion='0.1.0'\n",
-    )
-    .unwrap();
-    let mut req = request(ProjectValidationAction::Lint);
-    req.adapter = ProjectValidationAdapter::Rust;
-    assert!(
-        matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable { code, .. }) if code == "validation_action_unsupported")
-    );
+fn explicit_lint_rejects_unsupported_backends() {
+    for (marker, adapter) in [
+        ("go.mod", ProjectValidationAdapter::Go),
+        ("pyproject.toml", ProjectValidationAdapter::Python),
+    ] {
+        let (_tmp, _root, registry, policy) = fixture(marker);
+        let mut req = request(ProjectValidationAction::Lint);
+        req.adapter = adapter;
+        assert!(
+            matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable { code, .. }) if code == "validation_action_unsupported")
+        );
+    }
 }
 
 #[test]
@@ -1258,4 +1258,166 @@ fn rust_dependency_offline_plan_is_runner_owned_and_fenced() {
     let mut unsupported = offline.clone();
     unsupported.action = ProjectValidationAction::FormatCheck;
     assert!(project::plan(&policy, &registry, &unsupported).is_err());
+}
+
+#[test]
+fn rust_clippy_plan_identity_and_queue_fence() {
+    use webcodex_core::runner_operation::{RunnerJobOperation, RunnerJobValidationOperation};
+    use webcodex_core::runner_protocol::{ShellJobContext, ShellJobValidationMetadata};
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    let req = request(ProjectValidationAction::Lint);
+    let (plan, cwd) = project::plan(&policy, &registry, &req).unwrap();
+    assert_eq!(plan.adapter, "cargo_clippy");
+    assert_eq!(
+        plan.step.args,
+        ["clippy", "--all-targets", "--", "-D", "clippy::correctness"]
+    );
+    let mut explicit = req.clone();
+    explicit.adapter = ProjectValidationAdapter::Rust;
+    assert_eq!(
+        plan.step,
+        project::plan(&policy, &registry, &explicit).unwrap().0.step
+    );
+    for action in [
+        ProjectValidationAction::Check,
+        ProjectValidationAction::Test,
+    ] {
+        assert_ne!(
+            plan.validation_target_id,
+            project::plan(&policy, &registry, &request(action))
+                .unwrap()
+                .0
+                .validation_target_id
+        );
+    }
+    let metadata = ShellJobValidationMetadata {
+        project_validation: Some(plan.provenance),
+        tool: "project_validate".into(),
+        kind: "lint".into(),
+        adapter: plan.adapter,
+        steps: vec![plan.step.clone()],
+        effective_timeout_secs: 60,
+        sync_wait_secs: 1,
+        validation_target_id: Some(plan.validation_target_id),
+        source_fence: None,
+        minimum_tests: None,
+        require_tests: None,
+        no_run: None,
+    };
+    assert!(metadata.is_valid());
+    let mut substituted = metadata.clone();
+    substituted.adapter = "cargo_check".into();
+    assert!(!substituted.is_valid());
+    let operation = RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+        job_id: "clippy-job".into(),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        steps: metadata.steps.clone(),
+        timeout_secs: 60,
+        context: ShellJobContext {
+            runtime_project_id: Some("agent:runner:demo".into()),
+            validation: Some(metadata),
+            workflow_session_id: None,
+            ssh_resource: None,
+            project_cwd: Some(".".into()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            purpose: Some("validation".into()),
+            shell: None,
+            command_preview: "cargo clippy".into(),
+            validation_steps: vec!["lint".into()],
+            structured_execution: None,
+        },
+    });
+    project::fence(&policy, &registry, &operation).unwrap();
+    fs::write(root.join("Cargo.lock"), "# changed after planning\n").unwrap();
+    assert!(project::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("validation_plan_stale"));
+    let mut offline = req;
+    offline.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
+    assert!(project::plan(&policy, &registry, &offline).is_err());
+}
+
+#[test]
+fn rust_clippy_workspace_scope_and_locked_policy_are_fenced() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['a','b']\nresolver='2'\n",
+    )
+    .unwrap();
+    for name in ["a", "b"] {
+        fs::create_dir_all(root.join(name).join("src")).unwrap();
+        fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        )
+        .unwrap();
+        fs::write(root.join(name).join("src/lib.rs"), "").unwrap();
+    }
+    let req = request(ProjectValidationAction::Lint);
+    let plain = project::plan(&policy, &registry, &req).unwrap().0;
+    let mut scoped = req.clone();
+    scoped.scope = Some(ProjectValidationScope {
+        packages: vec!["b".into(), "a".into(), "a".into()],
+        all_packages: false,
+    });
+    let selected = project::plan(&policy, &registry, &scoped).unwrap().0;
+    assert_eq!(
+        selected.step.args,
+        [
+            "clippy",
+            "--all-targets",
+            "-p",
+            "a",
+            "-p",
+            "b",
+            "--",
+            "-D",
+            "clippy::correctness"
+        ]
+    );
+    assert_ne!(selected.validation_target_id, plain.validation_target_id);
+    scoped.scope = Some(ProjectValidationScope {
+        packages: vec![],
+        all_packages: true,
+    });
+    scoped.dependency_policy = Some(ProjectDependencyPolicy {
+        mode: ProjectDependencyMode::Locked,
+    });
+    let all = project::plan(&policy, &registry, &scoped).unwrap().0;
+    assert_eq!(
+        all.step.args,
+        [
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--workspace",
+            "--",
+            "-D",
+            "clippy::correctness"
+        ]
+    );
+    assert!(all.step.is_project_workspace_cargo());
+    assert_ne!(all.validation_target_id, selected.validation_target_id);
+    let operation = start_project_validation_operation(&all, &root);
+    project::fence(&policy, &registry, &operation).unwrap();
+    fs::write(
+        root.join("a/Cargo.toml"),
+        "[package]\nname='a'\nversion='0.2.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    assert!(project::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("validation_plan_stale"));
+    let changed = project::plan(&policy, &registry, &scoped).unwrap().0;
+    assert_ne!(
+        all.provenance.manifest_digest,
+        changed.provenance.manifest_digest
+    );
+    scoped.cwd = Some("a".into());
+    assert!(project::plan(&policy, &registry, &scoped).is_ok());
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
+    scoped.cwd = Some("nested".into());
+    assert!(project::plan(&policy, &registry, &scoped).is_err());
 }

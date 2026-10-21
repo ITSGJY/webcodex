@@ -12,11 +12,18 @@ pub use crate::project_operation::{
 pub enum ProjectValidationAction {
     FormatCheck,
     Check,
-    /// Run only a Runner-selected Node `lint` script; never fall back to check/typecheck.
+    /// Run Runner-owned Rust Clippy or a Node `lint` script.
     Lint,
     Test,
 }
 impl ProjectValidationAction {
+    pub fn kind_for_backend(self, backend: &str) -> &'static str {
+        if self == Self::Lint && backend == "rust" {
+            "lint"
+        } else {
+            self.kind()
+        }
+    }
     pub fn kind(self) -> &'static str {
         match self {
             Self::FormatCheck => "format",
@@ -128,6 +135,9 @@ impl ProjectValidationRequest {
             })?;
         }
         if self.dependency_resolution_policy.is_some() {
+            if self.action == ProjectValidationAction::Lint {
+                return Err("dependency_resolution_policy_unsupported: lint offline policy requires maintainer approval".into());
+            }
             if !matches!(
                 self.action,
                 ProjectValidationAction::Check | ProjectValidationAction::Test
@@ -192,8 +202,8 @@ impl ProjectValidationProvenance {
         self.request.validate().is_ok()
             && validate_relative(&self.recipe_root).is_ok()
             && matches!(self.backend.as_str(), "rust" | "go" | "python" | "node")
-            // Explicit lint is Node-only, including retained provenance.
-            && (self.request.action != ProjectValidationAction::Lint || self.backend == "node")
+            // Lint has a closed backend set, including retained provenance.
+            && (self.request.action != ProjectValidationAction::Lint || matches!(self.backend.as_str(), "node" | "rust"))
             && (self.request.dependency_resolution_policy.is_none() || self.backend == "rust")
             && [
                 &self.root_digest,

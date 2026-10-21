@@ -97,7 +97,7 @@ fn safe_kind(job: &ShellJobInfo, execution_source: Option<&str>) -> Option<Strin
         .filter(|metadata| metadata.is_valid())
     {
         return match validation.kind.as_str() {
-            "format" | "check" | "test" => Some(validation.kind.clone()),
+            "format" | "check" | "lint" | "test" => Some(validation.kind.clone()),
             _ => None,
         };
     }

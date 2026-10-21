@@ -312,6 +312,9 @@ jobs:
         env:
           CI_RUST_SHARD: ${{ matrix.shard }}
         run: python3 scripts/ci_rust_test.py --report target/ci-test-reports/${{ matrix.shard }}.json -- cargo test --locked ${{ matrix.packages }}
+      - name: Run real Clippy smoke regression
+        if: matrix.shard == 'runner'
+        run: cargo test --locked -p webcodex-runner --features runner-real-process-tests --bin webcodex-runner runner_real_process_rust_clippy_warnings_pass_and_correctness_fails -- --ignored
       - name: Run experimental Code Mode and receipt tests
         if: matrix.shard == 'server'
         run: |

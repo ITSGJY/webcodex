@@ -1077,7 +1077,7 @@ fn validation_event_schema() -> Value {
             "identity": { "type": "string", "maxLength": 256 },
             "assertion_name": { "type": "string", "minLength": 1, "maxLength": MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS },
             "purpose": { "type": "string", "enum": validation_like_purposes },
-            "validation_kind": { "type": "string", "enum": ["format", "check", "test", "build", "release", "validation"] },
+            "validation_kind": { "type": "string", "enum": ["format", "check", "lint", "test", "build", "release", "validation"] },
             "success": { "type": "boolean", "description": "Immutable raw ToolResult success recorded by the Workflow Session. A request-scoped evidence assertion can make this false even when validator execution and correctness passed." },
             "validation_passed": { "type": "boolean", "description": "True when the validator/correctness execution itself passed. This can remain true while the invocation's evidence assertion is insufficient." },
             "failure_class": { "type": "string", "enum": ["none", "execution_or_correctness", "outcome_unknown", "evidence_assertion", "evidence_insufficient", "expected_result"] },

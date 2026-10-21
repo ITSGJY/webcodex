@@ -273,6 +273,7 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     capabilities.set(RunnerCapabilityId::ProjectValidationPythonRuff, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationNodeScriptCheck, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationNodeTap, true);
+    capabilities.set(RunnerCapabilityId::ProjectValidationRustClippy, true);
     // This binary also understands the first-class go_test durable metadata
     // identity. Keep this independent from JSON parsing so an old Runner that
     // supported Connector Go evidence cannot be mistaken for a first-class

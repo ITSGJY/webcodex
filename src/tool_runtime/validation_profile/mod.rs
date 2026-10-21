@@ -45,7 +45,7 @@ pub(crate) fn runtime_profile(operation: &ReadOnlyValidationOperation) -> Valida
                 invalid_argument_guidance: "fix the cargo argument format, then retry.",
             }
         }
-        ReadOnlyValidationOperation::Cargo(CargoReadOnlyValidationOperation::Check(_)) => {
+        ReadOnlyValidationOperation::Cargo(CargoReadOnlyValidationOperation::Check(_) | CargoReadOnlyValidationOperation::Clippy(_)) => {
             ValidationRuntimeProfile {
                 default_timeout_secs: DEFAULT_CARGO_CHECK_TIMEOUT_SECS,
                 force_agent_handoff: false,

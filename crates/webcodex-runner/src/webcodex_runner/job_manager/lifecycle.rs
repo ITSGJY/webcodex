@@ -12,7 +12,7 @@ pub(super) fn process_running_activity() -> ShellJobActivity {
 pub(super) fn validation_step_activity(step: &ShellJobValidationStep) -> ShellJobActivity {
     let phase = match step.name.as_str() {
         "format" => ShellJobActivityPhase::ValidationFormat,
-        "check" => ShellJobActivityPhase::ValidationCheck,
+        "check" | "lint" => ShellJobActivityPhase::ValidationCheck,
         "test" => ShellJobActivityPhase::ValidationTest,
         _ => unreachable!("canonical validation step name"),
     };

@@ -1573,3 +1573,27 @@ fn project_validation_node_contract_advertises_bounded_test_and_execution_effect
         );
     }
 }
+
+#[test]
+fn rust_clippy_uses_project_validate_without_new_tool_or_argv() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "project_validate");
+    for phrase in [
+        "cargo clippy --all-targets -- -D clippy::correctness",
+        "project_validation_rust_clippy_v1",
+        "Rust lint explicitly rejects offline",
+    ] {
+        assert!(spec.description.contains(phrase), "{phrase}");
+    }
+    for hint in ["rust", "auto"] {
+        let value = json!({"project":"demo", "action":"lint", "adapter":hint, "scope":{"packages":["demo"]}, "dependency_policy":{"mode":"locked"}});
+        test_support::validate_schema_instance(&value, &spec.input_schema).unwrap();
+        assert!(ToolCall::from_tool_name("project_validate", value).is_ok());
+    }
+    assert!(!specs.iter().any(|s| s.name == "cargo_clippy"));
+    for field in ["argv", "command", "executable"] {
+        let value = json!({"project":"demo", "action":"lint", (field): "cargo clippy"});
+        assert!(test_support::validate_schema_instance(&value, &spec.input_schema).is_err());
+        assert!(ToolCall::from_tool_name("project_validate", value).is_err());
+    }
+}

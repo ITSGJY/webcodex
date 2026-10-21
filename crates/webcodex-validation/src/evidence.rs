@@ -1027,7 +1027,7 @@ fn execution_purpose(event: &SessionEvent) -> Option<String> {
         return Some(
             match action {
                 "format_check" => "format",
-                "check" => "validation",
+                "check" | "lint" => "validation",
                 "test" => "test",
                 _ => return None,
             }

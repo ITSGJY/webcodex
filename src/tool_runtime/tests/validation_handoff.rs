@@ -55,6 +55,9 @@ pub(super) async fn complete_project_validation_plan_request(
     assert_eq!(semantic.action, expected_action);
     let check = match semantic.action {
         ProjectValidationAction::FormatCheck => webcodex_validation::SemanticCheck::Format,
+        ProjectValidationAction::Lint if backend == "rust" => {
+            webcodex_validation::SemanticCheck::Lint
+        }
         ProjectValidationAction::Check | ProjectValidationAction::Lint => {
             webcodex_validation::SemanticCheck::Check
         }

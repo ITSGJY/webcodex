@@ -688,7 +688,7 @@ pub(super) fn passive_job_attention_schema() -> Value {
         "description": "Historical validation proof; source_state independently describes the mutation fence.",
         "properties": {
             "tool": {"type": "string", "maxLength": 64},
-            "kind": {"type": "string", "enum": ["format", "check", "test", "validation", "build", "release"]},
+            "kind": {"type": "string", "enum": ["format", "check", "lint", "test", "validation", "build", "release"]},
             "state": {"type": "string", "enum": ["pending", "running", "completed", "timed_out", "cancelled", "lost"]},
             "passed": nullable_schema("boolean", "Authoritative validation verdict; null is unproven."),
             "tests_detected": nullable_schema("boolean", "Tests detected by authoritative evidence."),
