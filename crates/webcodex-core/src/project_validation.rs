@@ -149,9 +149,7 @@ impl ProjectValidationRequest {
             }
         }
         if self.dependency_policy.is_some() && self.action == ProjectValidationAction::FormatCheck {
-            return Err(
-                "dependency_policy requires project_validate action=check, lint or test".into(),
-            );
+            return Err("dependency_policy requires project_validate action=check or test".into());
         }
         if let Some(test) = &self.test {
             if self.action != ProjectValidationAction::Test {

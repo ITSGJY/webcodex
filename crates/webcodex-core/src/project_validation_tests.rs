@@ -356,6 +356,28 @@ fn project_validation_package_scope_roundtrips_and_is_bounded() {
 }
 
 #[test]
+fn project_validation_locked_policy_accepts_rust_lint() {
+    for adapter in [
+        ProjectValidationAdapter::Rust,
+        ProjectValidationAdapter::Auto,
+    ] {
+        let request = ProjectValidationRequest {
+            project_id: "demo".into(),
+            cwd: None,
+            action: ProjectValidationAction::Lint,
+            adapter,
+            scope: None,
+            dependency_policy: Some(ProjectDependencyPolicy {
+                mode: ProjectDependencyMode::Locked,
+            }),
+            dependency_resolution_policy: None,
+            test: None,
+        };
+        assert!(request.validate().is_ok());
+    }
+}
+
+#[test]
 fn project_validation_locked_policy_rejects_format_check_without_silent_ignore() {
     let request = ProjectValidationRequest {
         project_id: "demo".into(),
