@@ -57,6 +57,7 @@ pub(super) fn sparsify_structured_validation_success_evidence(
         };
         let (backend, action) = match adapter {
             "cargo_check" => ("rust", "check"),
+            "cargo_clippy" => ("rust", "lint"),
             "cargo_test" => ("rust", "test"),
             "go_vet" => ("go", "check"),
             "go_test" => ("go", "test"),

@@ -1227,6 +1227,17 @@ async fn rust_clippy_pending_observes_same_job_and_exit_status_controls_outcome(
             "{observed:?}"
         );
         assert_eq!(observed.output["validation"]["adapter"], "cargo_clippy");
+        assert_eq!(
+            observed.output["validation"].get("warnings_count"),
+            Some(&json!(u64::from(exit == 0)))
+        );
+        assert_eq!(
+            observed.output["validation"].get("errors_count"),
+            Some(&json!(u64::from(exit != 0)))
+        );
+        // Re-observation retains the same Job and its structured evidence.
+        let retained = runtime.job_status_for_auth(job_id, false, None).await;
+        assert_eq!(retained.output["validation"], observed.output["validation"]);
         assert!(probe_patch_agent_request(&runtime, "project-validation")
             .await
             .is_none());

@@ -604,7 +604,7 @@ pub(crate) fn validation_job_projection_with_policy(
                 value["tests_failed"] = Value::Null;
                 value["zero_tests_run"] = Value::Null;
             }
-            "check" => {
+            "check" | "lint" if kind == "check" || tool == "cargo_clippy" => {
                 value["warnings_count"] = Value::Null;
                 value["errors_count"] = Value::Null;
             }
@@ -700,7 +700,7 @@ pub(crate) fn validation_job_projection_with_policy(
             value["tests_failed"] = json!(evidence.tests_failed);
             value["zero_tests_run"] = json!(evidence.zero_tests_run);
         }
-        "check" => {
+        "check" | "lint" if kind == "check" || tool == "cargo_clippy" => {
             value["warnings_count"] = json!(evidence.warnings_count);
             value["errors_count"] = json!(evidence.errors_count);
         }
@@ -2336,7 +2336,7 @@ mod recovery_projection_tests {
         validation_job_projection, validation_job_projection_with_policy,
     };
     use crate::runner_protocol::{ShellJobInfo, ShellJobTestCountEvidence};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
 
     #[test]
@@ -2891,6 +2891,85 @@ mod recovery_projection_tests {
         assert!(truncated["warnings_count"].is_null());
         assert!(truncated["errors_count"].is_null());
         assert_eq!(truncated["diagnostics"]["truncated"], true);
+    }
+
+    #[test]
+    fn clippy_projection_delivers_counts_without_changing_check_or_node_defaults() {
+        for (tool, kind) in [("cargo_clippy", "lint"), ("cargo_check", "check")] {
+            for (status, exit, stderr, warnings, errors) in [
+                ("completed", Some(0), "warning: unused import\n", 1, 0),
+                ("failed", Some(101), "error: impossible comparison\n", 0, 1),
+            ] {
+                for truncated in [false, true] {
+                    let value = validation_job_projection(
+                        Some(tool),
+                        Some(kind),
+                        status,
+                        exit,
+                        "",
+                        stderr,
+                        truncated,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        value.get("warnings_count"),
+                        Some(&if truncated {
+                            Value::Null
+                        } else {
+                            json!(warnings)
+                        }),
+                        "{value}"
+                    );
+                    assert_eq!(
+                        value.get("errors_count"),
+                        Some(&if truncated {
+                            Value::Null
+                        } else {
+                            json!(errors)
+                        }),
+                        "{value}"
+                    );
+                    assert_eq!(value["passed"], exit == Some(0));
+                }
+            }
+            for status in ["timed_out", "cancelled", "lost"] {
+                let value = validation_job_projection(
+                    Some(tool),
+                    Some(kind),
+                    status,
+                    None,
+                    "",
+                    "warning: partial\n",
+                    false,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(value.get("warnings_count"), Some(&Value::Null), "{value}");
+                assert_eq!(value.get("errors_count"), Some(&Value::Null), "{value}");
+                assert_eq!(value["passed"], Value::Null);
+            }
+        }
+        for kind in ["check", "lint"] {
+            let value = validation_job_projection(
+                Some("node:script:check"),
+                Some(kind),
+                "completed",
+                Some(0),
+                "",
+                "warning: opaque script output\n",
+                false,
+                None,
+            )
+            .unwrap();
+            if kind == "check" {
+                assert_eq!(value.get("warnings_count"), Some(&Value::Null));
+                assert_eq!(value.get("errors_count"), Some(&Value::Null));
+            } else {
+                assert!(value.get("warnings_count").is_none());
+                assert!(value.get("errors_count").is_none());
+            }
+        }
     }
 
     #[test]

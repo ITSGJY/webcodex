@@ -45,11 +45,19 @@ fn fixture(
     if tool == "project_validate" {
         result.output["backend"] = json!(if adapter.starts_with("go_") {
             "go"
+        } else if adapter.starts_with("node:") {
+            "node"
         } else {
             "rust"
         });
         result.output["adapter"] = json!(adapter);
-        result.output["action"] = json!(if test { "test" } else { "check" });
+        result.output["action"] = json!(if adapter == "cargo_clippy" {
+            "lint"
+        } else if test {
+            "test"
+        } else {
+            "check"
+        });
         result.output["validation_target_id"] = json!("target:0123456789abcdef01234567");
     }
     result
@@ -489,4 +497,76 @@ fn validation_success_registry_capture_preserves_cargo_postconditions() {
             );
         }
     }
+}
+
+#[test]
+fn clippy_rich_terminal_projection_matches_schema() {
+    let policy = ValidationSuccessPolicy::default();
+    for stderr in ["", "warning: unused variable\n --> src/lib.rs:1:1\n"] {
+        let mut result = fixture("project_validate", "cargo_clippy", policy, "", stderr);
+        // Uncertain source coverage must keep the rich evidence receipt.
+        result.output["source_state"]["observed_mutation_fence"] = json!("unknown");
+        project("project_validate", policy, &mut result);
+        assert_eq!(result.output["action"], "lint");
+        validate("project_validate", &result).unwrap_or_else(|e| panic!("{e}: {}", result.output));
+        for field in ["warnings_count", "errors_count", "diagnostics"] {
+            let mut invalid = ToolResult::ok(result.output.clone());
+            invalid.output.as_object_mut().unwrap().remove(field);
+            assert!(
+                validate("project_validate", &invalid).is_err(),
+                "missing {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn clippy_compact_terminal_projection_matches_schema() {
+    let policy = ValidationSuccessPolicy::default();
+    for stderr in ["", "warning: unused variable\n --> src/lib.rs:1:1\n"] {
+        let mut result = fixture("project_validate", "cargo_clippy", policy, "", stderr);
+        project("project_validate", policy, &mut result);
+        assert!(result.output.get("action").is_none(), "{}", result.output);
+        assert_eq!(
+            result.output.get("warnings_count"),
+            (!stderr.is_empty()).then_some(&json!(1))
+        );
+        assert!(result.output.get("errors_count").is_none());
+        validate("project_validate", &result).unwrap_or_else(|e| panic!("{e}: {}", result.output));
+        for (field, value) in [
+            ("errors_count", json!(0)),
+            ("warnings_count", json!(0)),
+            ("action", json!("lint")),
+            ("tests_run_count", json!(1)),
+        ] {
+            let mut invalid = ToolResult::ok(result.output.clone());
+            invalid.output[field] = value;
+            assert!(
+                validate("project_validate", &invalid).is_err(),
+                "unexpected {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn node_lint_terminal_projection_preserves_script_defaults_and_schema() {
+    let policy = ValidationSuccessPolicy::default();
+    let mut result = fixture(
+        "project_validate",
+        "node:script:check",
+        policy,
+        "",
+        "warning: opaque script output\n",
+    );
+    result.output["action"] = json!("lint");
+    project("project_validate", policy, &mut result);
+    validate("project_validate", &result).unwrap_or_else(|e| panic!("{e}: {}", result.output));
+    assert_eq!(result.output["action"], "lint");
+    // Node check counters remain unknown, even for a lint script.
+    assert_eq!(result.output.get("warnings_count"), Some(&Value::Null));
+    assert_eq!(result.output.get("errors_count"), Some(&Value::Null));
+    let mut invalid = ToolResult::ok(result.output.clone());
+    invalid.output["warnings_count"] = json!(1);
+    assert!(validate("project_validate", &invalid).is_err());
 }
