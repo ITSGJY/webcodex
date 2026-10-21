@@ -5,6 +5,146 @@ use webcodex_core::runner_operation::{
 };
 
 #[test]
+fn node_project_build_admission_accepts_runner_selected_package_manager() {
+    for manager in ["npm", "pnpm", "yarn", "bun"] {
+        for adapter in [ProjectBuildAdapter::Node, ProjectBuildAdapter::Auto] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("project");
+            let registry = temp.path().join("registry");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&registry).unwrap();
+            std::fs::write(
+                root.join("package.json"),
+                format!(
+                    r#"{{"packageManager":"{manager}@1","scripts":{{"build":"node build.js"}}}}"#
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                registry.join("demo.toml"),
+                format!(
+                    "id = 'demo'\nname = 'Demo'\npath = {}\nallow_patch = true\n",
+                    serde_json::to_string(root.to_str().unwrap()).unwrap(),
+                ),
+            )
+            .unwrap();
+            let policy = RunnerPolicy {
+                allowed_roots: vec![root.clone()],
+                ..Default::default()
+            };
+            let request = ProjectBuildRequest {
+                project_id: "demo".into(),
+                cwd: None,
+                adapter,
+                scope: None,
+                dependency_policy: None,
+                dependency_resolution_policy: None,
+            };
+            let (plan, cwd) =
+                crate::webcodex_runner::project_build::plan(&policy, &registry, &request).unwrap();
+            assert!(
+                plan.is_valid(),
+                "{manager}/{adapter:?}: invalid Runner plan"
+            );
+            assert_eq!(plan.process.executable, manager);
+            assert_eq!(
+                plan.process.args,
+                if manager == "yarn" {
+                    vec!["run", "build"]
+                } else {
+                    vec!["run", "--silent", "build"]
+                },
+                "{manager}/{adapter:?}"
+            );
+            let mut context = structured_process_context(&cwd, plan.process.args.len(), false);
+            context.runtime_project_id = Some("agent:structured-agent:demo".into());
+            context.project_cwd = Some(".".into());
+            context.purpose = Some("build".into());
+            context
+                .structured_execution
+                .as_mut()
+                .unwrap()
+                .execution_source = "project_build".into();
+            // A different allowed manager is a valid command shape, but it is
+            // not authorized unless the Runner's current manifest selected it.
+            let other_manager = if manager == "npm" { "pnpm" } else { "npm" };
+            let other_process =
+                webcodex_core::project_build::canonical_project_build_process_with_manager(
+                    "node",
+                    &request,
+                    other_manager,
+                )
+                .unwrap();
+            let mut other_provenance = plan.provenance.clone();
+            other_provenance.invocation_digest =
+                webcodex_core::project_build::project_build_invocation_digest(&other_process);
+            let spoofed = RunnerJobOperation::StartBuild(RunnerJobBuildOperation {
+                job_id: "spoofed-node-build".into(),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                process: other_process,
+                provenance: other_provenance,
+                timeout_secs: 10,
+                context: context.clone(),
+            });
+            assert!(
+                crate::webcodex_runner::project_build::fence(&policy, &registry, &spoofed)
+                    .unwrap_err()
+                    .contains("build_plan_stale"),
+                "{manager}/{adapter:?}: manager substitution bypassed source provenance"
+            );
+            let operation = RunnerJobOperation::StartBuild(RunnerJobBuildOperation {
+                job_id: "node-build-admission".into(),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                process: plan.process,
+                provenance: plan.provenance,
+                timeout_secs: 10,
+                context: context.clone(),
+            });
+            let wire = RunnerRequest::from_operation(
+                RunnerInvocationMetadata {
+                    request_id: "node-build-admission-request".into(),
+                    client_id: "structured-agent".into(),
+                    requested_by: "test".into(),
+                    created_at: chrono::Utc::now().timestamp(),
+                },
+                RunnerOperation::Job(operation),
+            )
+            .unwrap();
+            assert!(
+                validate_runner_job_context(&context, &wire, "structured-agent").is_ok(),
+                "{manager}/{adapter:?}: Runner rejected its own canonical Node build plan"
+            );
+            let manager_jobs = JobManager::new(1);
+            let (sink, _rx) = structured_test_sink("structured-agent", "structured-instance");
+            let mut blocker = retained_terminal_job("blocker", 0);
+            blocker.client_id = "structured-agent".into();
+            blocker.snapshot.status = "running".into();
+            blocker.snapshot.ended_at = None;
+            blocker.slot_reserved = true;
+            lock_unpoison(&manager_jobs.jobs).insert("blocker".into(), blocker);
+            manager_jobs.enqueue(
+                sink,
+                PendingJobStart::from_wire(
+                    1,
+                    policy,
+                    ShellConfig::default(),
+                    SshConfig::default(),
+                    registry,
+                    wire,
+                ),
+            );
+            assert_eq!(
+                lock_unpoison(&manager_jobs.queued).len(),
+                1,
+                "{manager}/{adapter:?}: valid Node build was not admitted to the queue"
+            );
+            assert_eq!(manager_jobs.worker_count(), 0);
+            manager_jobs.stop_all();
+        }
+    }
+}
+
+#[test]
 fn project_build_rechecks_manifest_and_dependency_state_after_queueing() {
     for (marker, dependency, change_dependency, member_cwd) in [
         ("Cargo.toml", "Cargo.lock", false, false),
