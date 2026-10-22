@@ -254,17 +254,15 @@ impl JobManager {
                 .stderr(Stdio::piped());
             commands.push_back(command);
         }
-        // Profile initialization and interpreter probes may themselves change
-        // project files. For native Node scripts repeat the authoritative
-        // manifest/argv/cwd fence after ALL preparation, immediately before
-        // handing the prepared command to the managed process worker.
-        // Node's later manifest read is not an atomic source snapshot.
+        // Profile initialization and tool probes can change Project inputs.
+        // Recheck the retained source truth for every project validation after
+        // ALL preparation, before handing commands to the managed worker.
+        // Direct validations have no project provenance to recheck.
         if validation
-            && steps.iter().any(|step| {
-                step.is_structured_node_check()
-                    || step.is_structured_node_tap_test()
-                    || step.node_json_framework().is_some()
-            })
+            && context
+                .validation
+                .as_ref()
+                .is_some_and(|metadata| metadata.project_validation.is_some())
         {
             if let Err(error) = crate::webcodex_runner::validation::project::fence(
                 &policy,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::webcodex_runner::ShellProfileConfig;
 use webcodex_core::project_validation::{
     ProjectValidationAction, ProjectValidationAdapter, ProjectValidationRequest,
 };
@@ -677,4 +678,191 @@ fn rust_clippy_activity_keeps_lint_step_identity() {
         Some(activity)
     );
     assert_eq!(step.name, "lint");
+}
+
+#[test]
+fn project_validation_rechecks_provenance_after_shell_profile_preparation() {
+    // A profile initializer runs *after* the worker's queue-time fence.
+    // Its filesystem effects must not authorize a stale native validation.
+    for (backend, marker, change_source) in [
+        ("rust", "Cargo.lock", true),
+        ("rust", "Cargo.lock", false),
+        ("go", "go.mod", true),
+        ("go", "go.mod", false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let registry = temp.path().join("registry");
+        let executable_temp = crate::tests::executable_tempdir();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let (adapter, manifest) = if backend == "rust" {
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .unwrap();
+            (ProjectValidationAdapter::Rust, "version = 3\n")
+        } else {
+            (
+                ProjectValidationAdapter::Go,
+                "module example.test/demo\ngo 1.22\n",
+            )
+        };
+        std::fs::write(root.join(marker), manifest).unwrap();
+        std::fs::write(
+            registry.join("demo.toml"),
+            format!(
+                "id='demo'\nname='Demo'\npath={}\nallow_patch=true\n",
+                serde_json::to_string(root.to_str().unwrap()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let policy = RunnerPolicy {
+            allowed_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let request = ProjectValidationRequest {
+            project_id: "demo".into(),
+            cwd: None,
+            action: ProjectValidationAction::Check,
+            adapter,
+            scope: None,
+            dependency_policy: None,
+            dependency_resolution_policy: None,
+            test: None,
+        };
+        let (plan, cwd) =
+            crate::webcodex_runner::validation::project::plan(&policy, &registry, &request)
+                .unwrap();
+        let metadata = ShellJobValidationMetadata {
+            project_validation: Some(plan.provenance),
+            source_fence: None,
+            tool: "project_validate".into(),
+            kind: "check".into(),
+            steps: vec![plan.step.clone()],
+            effective_timeout_secs: 30,
+            sync_wait_secs: 1,
+            adapter: plan.adapter,
+            validation_target_id: Some(plan.validation_target_id),
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
+        };
+        assert!(metadata.is_valid());
+        let context = ShellJobContext {
+            runtime_project_id: Some("agent:validation-agent:demo".into()),
+            validation: Some(metadata),
+            workflow_session_id: None,
+            ssh_resource: None,
+            project_cwd: Some(".".into()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            purpose: Some("validation".into()),
+            shell: None,
+            command_preview: "project validation".into(),
+            validation_steps: vec!["check".into()],
+            structured_execution: None,
+        };
+        let job_id = format!("profile-fence-{backend}-{change_source}");
+        let operation = RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+            job_id: job_id.clone(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            steps: vec![plan.step],
+            timeout_secs: 30,
+            context,
+        });
+        let wire = RunnerRequest::from_operation(
+            RunnerInvocationMetadata {
+                request_id: format!("{job_id}-request"),
+                client_id: "validation-agent".into(),
+                requested_by: "test".into(),
+                created_at: chrono::Utc::now().timestamp(),
+            },
+            RunnerOperation::Job(operation),
+        )
+        .unwrap();
+
+        let helper = structured_process_helper();
+        let fake_tool = executable_temp.path().join(format!(
+            "{}{}",
+            if backend == "rust" { "cargo" } else { "go" },
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::copy(&helper.path, fake_tool).unwrap();
+        let capture = root.join("native-tool-invoked.txt");
+        let mut shell = ShellConfig::default();
+        shell
+            .path_prepend
+            .push(executable_temp.path().to_path_buf());
+        if backend == "go" {
+            shell.env.insert(
+                "WEBCODEX_TEST_CAPTURE_GO_MODULE_ENV".into(),
+                capture.to_string_lossy().into_owned(),
+            );
+        }
+        let init_script = if change_source {
+            if cfg!(windows) {
+                format!("Set-Content -LiteralPath '{marker}' -Value 'profile changed this input'")
+            } else {
+                format!("printf 'profile changed this input\\n' > '{marker}'")
+            }
+        } else if cfg!(windows) {
+            "$null = 1".to_string()
+        } else {
+            ":".to_string()
+        };
+        shell.default_profile = Some("source-test".into());
+        shell.profiles.insert(
+            "source-test".into(),
+            ShellProfileConfig {
+                init_script: Some(init_script),
+                ..Default::default()
+            },
+        );
+        let manager = JobManager::new(1);
+        let (sink, _rx) = structured_test_sink("validation-agent", "validation-instance");
+        manager.enqueue(
+            sink,
+            PendingJobStart::from_wire(1, policy, shell, SshConfig::default(), registry, wire),
+        );
+        assert!(manager.wait_for_workers(Instant::now() + Duration::from_secs(15)));
+        let snapshot = lock_unpoison(&manager.jobs)[&job_id].snapshot.clone();
+        manager.stop_all();
+        if change_source {
+            assert_eq!(snapshot.status, "failed", "{backend}: {snapshot:?}");
+            assert_eq!(
+                snapshot.command_execution_state,
+                Some(ShellCommandExecutionState::NotStarted),
+                "{backend}: {snapshot:?}"
+            );
+            assert!(
+                snapshot
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("validation_plan_stale")),
+                "{backend}: {snapshot:?}"
+            );
+            if backend == "go" {
+                let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+                assert!(
+                    !captured.contains("ARGV=vet"),
+                    "stale Go vet subprocess was launched: {captured}"
+                );
+            }
+        } else {
+            assert_eq!(snapshot.status, "completed", "{backend}: {snapshot:?}");
+            assert_eq!(snapshot.exit_code, Some(0), "{backend}: {snapshot:?}");
+            if backend == "go" {
+                assert!(
+                    std::fs::read_to_string(&capture)
+                        .unwrap()
+                        .contains("ARGV=vet"),
+                    "fresh Go validation must run"
+                );
+            } else {
+                assert!(snapshot.stdout.tail.contains("JOB_STDIN_EOF"));
+            }
+        }
+    }
 }
