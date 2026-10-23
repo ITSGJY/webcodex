@@ -1558,6 +1558,9 @@ pub enum ToolCall {
         #[serde(default)]
         dependency_resolution_policy:
             Option<webcodex_core::project_build::ProjectDependencyResolutionPolicy>,
+        /// Rust-only Cargo profile / named binary selection; no arbitrary argv.
+        #[serde(default)]
+        rust: Option<webcodex_core::project_build::RustBuildSelection>,
         /// Total build execution budget, default 1800 seconds, clamped to 7 days.
         /// Host handoff timing never extends this budget or starts a second build.
         #[serde(default)]

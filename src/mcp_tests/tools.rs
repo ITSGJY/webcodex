@@ -2698,6 +2698,26 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
         marginal_cost
     }
 
+    // Cargo profile/bin selection adds one bounded schema field to project_build.
+    // Account for its serialized property cost, not a global inventory increase.
+    fn project_build_rust_selection_marginal_allowance(model_tools: &[Value]) -> usize {
+        let Some(tool) = model_tools
+            .iter()
+            .find(|tool| tool["name"] == "project_build")
+        else {
+            return 0;
+        };
+        let Some(selection) = tool.pointer("/inputSchema/properties/rust") else {
+            return 0;
+        };
+        let marginal_cost = "\"rust\":".len() + serde_json::to_vec(selection).unwrap().len() + 1;
+        assert!(
+            marginal_cost <= 512,
+            "project_build Rust selection schema cost {marginal_cost} exceeds 512 byte allowance ceiling"
+        );
+        marginal_cost
+    }
+
     // Exclusion support adds one bounded scope field and its all-packages schema
     // branch to each Rust-capable project tool. Measure that per-tool marginal
     // descriptor cost while retaining the existing global model ceilings.
@@ -2819,12 +2839,18 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
                 } else {
                     0
                 };
+                let project_build_rust_selection_marginal_byte_budget = if compact {
+                    project_build_rust_selection_marginal_allowance(model_tools)
+                } else {
+                    0
+                };
                 let model_byte_budget = model_max_bytes
                     + NODE_LINT_SCHEMA_ALLOWANCE_BYTES
                     + if app_enabled { 4_000 } else { 0 }
                     + experimental_code_mode_byte_budget
                     + project_format_marginal_byte_budget
                     + project_build_offline_marginal_byte_budget
+                    + project_build_rust_selection_marginal_byte_budget
                     + project_exclusions_schema_marginal_byte_budget;
                 // Raw transport includes private App bridge descriptors and Host
                 // presentation metadata. Keep a coarse overhead ceiling so transport

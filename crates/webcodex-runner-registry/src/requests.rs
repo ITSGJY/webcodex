@@ -2783,6 +2783,7 @@ impl RunnerRegistry {
             .is_some_and(|scope| !scope.exclude_packages.is_empty());
         let requires_dependency_policy = payload.dependency_policy.is_some();
         let requires_resolution_offline = payload.dependency_resolution_policy.is_some();
+        let requires_rust_selection = payload.rust.is_some();
         let requires_python =
             payload.adapter == webcodex_core::project_build::ProjectBuildAdapter::Python;
         let request_id = next_request_id();
@@ -2802,6 +2803,7 @@ impl RunnerRegistry {
             &runner.runner_features,
             [
                 Some(RunnerFeature::ProjectBuild),
+                requires_rust_selection.then_some(RunnerFeature::ProjectBuildRustSelection),
                 requires_node.then_some(RunnerFeature::ProjectBuildNode),
                 requires_python.then_some(RunnerFeature::ProjectBuildPython),
                 requires_all_packages.then_some(RunnerFeature::ProjectAllPackages),

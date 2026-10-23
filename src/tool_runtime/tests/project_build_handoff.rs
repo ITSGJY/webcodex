@@ -44,6 +44,7 @@ fn call() -> ToolCall {
         scope: None,
         dependency_policy: None,
         dependency_resolution_policy: None,
+        rust: None,
         timeout_secs: Some(60),
     }
 }
@@ -300,6 +301,94 @@ async fn project_build_workspace_exclusion_handoff_keeps_same_job() {
         runtime.runner_registry.get_job(&job_id).await.unwrap().kind,
         "project_build"
     );
+}
+
+#[tokio::test]
+async fn rust_build_selection_requires_capability_before_runner_planning() {
+    let runtime = runtime_with_agent_project(CLIENT);
+    register_agent(
+        &runtime,
+        CLIENT,
+        None,
+        RunnerCapabilities {
+            project_build_v1: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut input = call();
+    if let ToolCall::ProjectBuild { rust, .. } = &mut input {
+        *rust = Some(webcodex_core::project_build::RustBuildSelection {
+            profile: Some("release".into()),
+            bin: Some("demo".into()),
+        });
+    }
+    let result = runtime
+        .dispatch_with_auth(input, Some(&auth_context(None, true)))
+        .await;
+    assert!(!result.success);
+    assert!(result
+        .error
+        .unwrap()
+        .contains("project_build_rust_selection_v1"));
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
+async fn rust_build_selection_is_preserved_through_typed_job_handoff() {
+    let runtime = runtime_with_agent_project(CLIENT);
+    register_agent(
+        &runtime,
+        CLIENT,
+        None,
+        RunnerCapabilities {
+            project_build_v1: true,
+            project_build_rust_selection_v1: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut input = call();
+    if let ToolCall::ProjectBuild { rust, .. } = &mut input {
+        *rust = Some(webcodex_core::project_build::RustBuildSelection {
+            profile: Some("release".into()),
+            bin: Some("demo".into()),
+        });
+    }
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(input, Some(&auth_context(None, true)))
+                .await
+        }
+    });
+    let (request, job_id) = reply_plan(&runtime).await;
+    let operation = request.decode_operation().unwrap();
+    let webcodex_core::runner_operation::RunnerOperation::Job(
+        webcodex_core::runner_operation::RunnerJobOperation::StartBuild(build),
+    ) = operation
+    else {
+        panic!("expected typed StartBuild");
+    };
+    assert_eq!(
+        build.process.args,
+        ["build", "--profile", "release", "--bin", "demo"]
+    );
+    assert!(build.provenance.request.rust.is_some());
+    finish_build_job(
+        &runtime,
+        &request,
+        &job_id,
+        "completed",
+        ShellCommandExecutionState::Completed,
+        Some(0),
+        None,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(result.success, "{result:?}");
 }
 
 #[tokio::test]

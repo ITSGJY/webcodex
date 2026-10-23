@@ -334,6 +334,38 @@ fn project_build_schema_is_closed_bounded_and_has_no_raw_execution_fields() {
         &schema
     )
     .is_err());
+    for selection in [
+        serde_json::json!({"profile":"dogfood"}),
+        serde_json::json!({"bin":"webcodex-runner"}),
+        serde_json::json!({"profile":"release","bin":"webcodex-runner"}),
+    ] {
+        let selected = serde_json::json!({"project":"demo","adapter":"rust","rust":selection});
+        assert!(
+            test_support::validate_schema_instance(&selected, &schema).is_ok(),
+            "{selected}"
+        );
+    }
+    // The test helper is intentionally not a full JSON Schema evaluator;
+    // assert the emitted minProperties/pattern contracts directly.
+    let rust_schema = &schema["properties"]["rust"];
+    assert_eq!(rust_schema["minProperties"], 1);
+    for field in ["profile", "bin"] {
+        let field_schema = &rust_schema["properties"][field];
+        assert_eq!(field_schema["minLength"], 1);
+        assert_eq!(field_schema["maxLength"], 128);
+        assert_eq!(field_schema["pattern"], "^[A-Za-z0-9_][A-Za-z0-9_-]*$");
+    }
+    for selection in [
+        serde_json::json!({"profile":""}),
+        serde_json::json!({"bin":"x".repeat(129)}),
+        serde_json::json!({"bin":"demo","args":["--release"]}),
+    ] {
+        let invalid = serde_json::json!({"project":"demo","adapter":"rust","rust":selection});
+        assert!(
+            test_support::validate_schema_instance(&invalid, &schema).is_err(),
+            "{invalid}"
+        );
+    }
     for forbidden in [
         "executable",
         "args",

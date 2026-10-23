@@ -34,6 +34,7 @@ fn fixture(marker: &str) -> (tempfile::TempDir, PathBuf, PathBuf, RunnerPolicy) 
 
 fn request() -> ProjectBuildRequest {
     ProjectBuildRequest {
+        rust: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: None,
@@ -41,6 +42,89 @@ fn request() -> ProjectBuildRequest {
         scope: None,
         dependency_policy: None,
     }
+}
+
+#[test]
+fn rust_build_selection_is_runner_owned_and_fenced() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crate-a\"]\n[profile.dogfood]\ninherits = \"dev\"\n",
+    )
+    .unwrap();
+    fs::create_dir(root.join("crate-a")).unwrap();
+    fs::write(
+        root.join("crate-a/Cargo.toml"),
+        "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let mut request = request();
+    request.adapter = ProjectBuildAdapter::Rust;
+    request.scope = Some(ProjectBuildScope {
+        packages: vec!["crate-a".into()],
+        all_packages: false,
+        exclude_packages: Vec::new(),
+    });
+    request.rust = Some(RustBuildSelection {
+        profile: Some("dogfood".into()),
+        bin: Some("crate-a".into()),
+    });
+    let (plan, cwd) = project_build::plan(&policy, &registry, &request).unwrap();
+    assert_eq!(plan.provenance.backend, "rust");
+    assert_eq!(
+        plan.process.args,
+        [
+            "build",
+            "-p",
+            "crate-a",
+            "--profile",
+            "dogfood",
+            "--bin",
+            "crate-a"
+        ]
+    );
+    let mut automatic = request.clone();
+    automatic.adapter = ProjectBuildAdapter::Auto;
+    let (auto_plan, _) = project_build::plan(&policy, &registry, &automatic).unwrap();
+    assert_eq!(auto_plan.provenance.backend, "rust");
+    assert_eq!(auto_plan.process, plan.process);
+
+    project_build::fence(&policy, &registry, &start_build_operation(&plan, &cwd)).unwrap();
+
+    let mut other = request.clone();
+    other.rust.as_mut().unwrap().bin = Some("other".into());
+    let (other_plan, _) = project_build::plan(&policy, &registry, &other).unwrap();
+    assert_ne!(
+        plan.provenance.invocation_digest,
+        other_plan.provenance.invocation_digest
+    );
+    assert_ne!(plan.provenance.request, other_plan.provenance.request);
+
+    // A policy or target change after planning never rewrites the retained Job.
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crate-a\"]\n[profile.dogfood]\ninherits = \"release\"\n",
+    )
+    .unwrap();
+    assert!(
+        project_build::fence(&policy, &registry, &start_build_operation(&plan, &cwd))
+            .unwrap_err()
+            .contains("build_plan_stale")
+    );
+
+    let (_tmp, _root, registry, policy) = fixture("go.mod");
+    let mut non_rust = request.clone();
+    non_rust.adapter = ProjectBuildAdapter::Auto;
+    non_rust.scope = None;
+    non_rust.rust = Some(RustBuildSelection {
+        profile: Some("release".into()),
+        bin: None,
+    });
+    assert!(matches!(
+        project_build::plan(&policy, &registry, &non_rust),
+        Err(ProjectBuildPlanningResult::Unavailable { code, .. })
+            if code == "build_scope_invalid"
+    ));
 }
 
 #[test]
@@ -90,6 +174,7 @@ fn project_build_runner_plans_locked_dependency_policy_for_rust_and_go() {
     ] {
         let (_tmp, _root, registry, policy) = fixture(marker);
         let request = ProjectBuildRequest {
+            rust: None,
             dependency_resolution_policy: None,
             project_id: "demo".into(),
             cwd: None,

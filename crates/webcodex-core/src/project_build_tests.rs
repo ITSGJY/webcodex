@@ -6,6 +6,7 @@ use crate::runner_protocol::{RunnerRequest, ShellJobContext, ShellJobStructuredE
 
 fn request() -> ProjectBuildRequest {
     ProjectBuildRequest {
+        rust: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: Some("src".into()),
@@ -17,6 +18,157 @@ fn request() -> ProjectBuildRequest {
 
 fn digest(fill: char) -> String {
     std::iter::repeat_n(fill, 64).collect()
+}
+
+#[test]
+fn rust_build_selection_is_bounded_and_preserves_omitted_defaults() {
+    let old = request();
+    assert_eq!(
+        canonical_project_build_process("rust", &old).unwrap().args,
+        ["build"]
+    );
+    assert!(serde_json::to_value(&old).unwrap().get("rust").is_none());
+
+    let mut request = old.clone();
+    request.rust = Some(RustBuildSelection {
+        profile: Some("dogfood".into()),
+        bin: Some("webcodex-runner".into()),
+    });
+    assert!(request.validate().is_ok());
+    let process = canonical_project_build_process("rust", &request).unwrap();
+    assert_eq!(
+        process.args,
+        ["build", "--profile", "dogfood", "--bin", "webcodex-runner"]
+    );
+    assert_ne!(
+        project_build_invocation_digest(&process),
+        project_build_invocation_digest(&canonical_project_build_process("rust", &old).unwrap())
+    );
+    assert_eq!(
+        serde_json::from_value::<ProjectBuildRequest>(serde_json::to_value(&request).unwrap())
+            .unwrap(),
+        request
+    );
+
+    for (selection, expected) in [
+        (
+            RustBuildSelection {
+                profile: Some("dogfood".into()),
+                bin: None,
+            },
+            vec!["build", "--profile", "dogfood"],
+        ),
+        (
+            RustBuildSelection {
+                profile: None,
+                bin: Some("webcodex-runner".into()),
+            },
+            vec!["build", "--bin", "webcodex-runner"],
+        ),
+    ] {
+        let mut selected = old.clone();
+        selected.rust = Some(selection);
+        assert!(selected.validate().is_ok());
+        assert_eq!(
+            canonical_project_build_process("rust", &selected)
+                .unwrap()
+                .args,
+            expected
+        );
+    }
+
+    let mut locked = request.clone();
+    locked.dependency_policy = Some(ProjectDependencyPolicy {
+        mode: ProjectDependencyMode::Locked,
+    });
+    locked.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
+    locked.scope = Some(ProjectBuildScope {
+        packages: vec!["crate-a".into()],
+        all_packages: false,
+        exclude_packages: Vec::new(),
+    });
+    assert_eq!(
+        canonical_project_build_process("rust", &locked)
+            .unwrap()
+            .args,
+        [
+            "build",
+            "--locked",
+            "--offline",
+            "-p",
+            "crate-a",
+            "--profile",
+            "dogfood",
+            "--bin",
+            "webcodex-runner"
+        ]
+    );
+
+    let mut excluded = request.clone();
+    excluded.scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+        exclude_packages: vec!["crate-b".into()],
+    });
+    assert_eq!(
+        canonical_project_build_process("rust", &excluded)
+            .unwrap()
+            .args,
+        [
+            "build",
+            "--workspace",
+            "--exclude",
+            "crate-b",
+            "--profile",
+            "dogfood",
+            "--bin",
+            "webcodex-runner"
+        ]
+    );
+
+    for invalid in [
+        "".to_string(),
+        "-p".into(),
+        "foo/bar".into(),
+        "a*b".into(),
+        "dot.name".into(),
+        "has space".into(),
+        "line\nbreak".into(),
+        "x".repeat(129),
+    ] {
+        let mut selected = request.clone();
+        selected.rust.as_mut().unwrap().bin = Some(invalid);
+        assert!(selected.validate().is_err());
+    }
+    let mut empty = request.clone();
+    empty.rust = Some(RustBuildSelection {
+        profile: None,
+        bin: None,
+    });
+    assert!(empty.validate().is_err());
+
+    for backend in [
+        ProjectBuildAdapter::Go,
+        ProjectBuildAdapter::Python,
+        ProjectBuildAdapter::Node,
+    ] {
+        let mut selected = request.clone();
+        selected.adapter = backend;
+        assert!(selected.validate().is_err());
+        assert!(canonical_project_build_process_with_manager(
+            match backend {
+                ProjectBuildAdapter::Go => "go",
+                ProjectBuildAdapter::Python => "python",
+                _ => "node",
+            },
+            &request,
+            "npm",
+        )
+        .is_err());
+    }
+    let mut unknown = serde_json::to_value(&request).unwrap();
+    unknown["rust"]["argv"] = serde_json::json!(["--anything"]);
+    assert!(serde_json::from_value::<ProjectBuildRequest>(unknown).is_err());
 }
 
 #[test]
@@ -149,6 +301,7 @@ fn project_build_workspace_exclusions_are_canonical_and_rust_only() {
 #[test]
 fn start_build_wire_roundtrip_preserves_typed_process_and_provenance() {
     let request = ProjectBuildRequest {
+        rust: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: None,
@@ -316,6 +469,7 @@ fn project_build_locked_dependency_policy_maps_to_native_readonly_flags() {
         ("go", vec!["build", "-mod=readonly", "./..."]),
     ] {
         let request = ProjectBuildRequest {
+            rust: None,
             dependency_resolution_policy: None,
             project_id: "demo".into(),
             cwd: None,
@@ -331,6 +485,7 @@ fn project_build_locked_dependency_policy_maps_to_native_readonly_flags() {
 #[test]
 fn project_build_default_dependency_policy_preserves_historical_argv() {
     let request = ProjectBuildRequest {
+        rust: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: None,
@@ -449,6 +604,7 @@ fn build_artifact_observations_are_bounded_private_and_never_validation_evidence
 #[test]
 fn node_build_canonical_manager_process_rejects_extra_authority() {
     let request = ProjectBuildRequest {
+        rust: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: None,
@@ -479,6 +635,7 @@ fn node_build_canonical_manager_process_rejects_extra_authority() {
 fn node_build_provenance_rejects_explicit_backend_mismatch() {
     let mut provenance = ProjectBuildProvenance {
         request: ProjectBuildRequest {
+            rust: None,
             dependency_resolution_policy: None,
             project_id: "demo".into(),
             cwd: None,

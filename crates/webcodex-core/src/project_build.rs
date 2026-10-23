@@ -27,6 +27,38 @@ pub enum ProjectBuildAdapter {
     Python,
 }
 
+// Rust-specific bounded Cargo selectors. No arbitrary CLI or output-path authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("minProperties" = 1))]
+pub struct RustBuildSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 128))]
+    #[schemars(regex(pattern = "^[A-Za-z0-9_][A-Za-z0-9_-]*$"))]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 128))]
+    #[schemars(regex(pattern = "^[A-Za-z0-9_][A-Za-z0-9_-]*$"))]
+    pub bin: Option<String>,
+}
+
+impl RustBuildSelection {
+    fn is_valid(&self) -> bool {
+        fn valid_label(value: &str) -> bool {
+            value.len() <= 128
+                && !value.is_empty()
+                && value.bytes().enumerate().all(|(index, byte)| match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' => true,
+                    b'-' if index > 0 => true,
+                    _ => false,
+                })
+        }
+        (self.profile.is_some() || self.bin.is_some())
+            && self.profile.as_deref().is_none_or(valid_label)
+            && self.bin.as_deref().is_none_or(valid_label)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectBuildRequest {
@@ -40,6 +72,9 @@ pub struct ProjectBuildRequest {
     pub dependency_policy: Option<ProjectDependencyPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_resolution_policy: Option<ProjectDependencyResolutionPolicy>,
+    /// Optional Cargo-only profile / named binary selectors, never raw argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust: Option<RustBuildSelection>,
 }
 
 impl ProjectBuildRequest {
@@ -80,6 +115,17 @@ impl ProjectBuildRequest {
             )
         {
             return Err("dependency_resolution_policy requires Rust project_build".into());
+        }
+        if let Some(rust) = &self.rust {
+            if !matches!(
+                self.adapter,
+                ProjectBuildAdapter::Auto | ProjectBuildAdapter::Rust
+            ) {
+                return Err("rust build selection requires Rust project_build".into());
+            }
+            if !rust.is_valid() {
+                return Err("invalid rust build selection".into());
+            }
         }
         Ok(())
     }
@@ -184,6 +230,16 @@ pub fn canonical_project_build_process_with_manager(
     if request.dependency_resolution_policy.is_some() && backend != "rust" {
         return Err("dependency_resolution_policy_unsupported");
     }
+    if request.rust.is_some() && backend != "rust" {
+        return Err("rust_build_selection_unsupported");
+    }
+    if request
+        .rust
+        .as_ref()
+        .is_some_and(|selection| !selection.is_valid())
+    {
+        return Err("invalid_rust_build_selection");
+    }
     let packages = request
         .scope
         .as_ref()
@@ -226,6 +282,16 @@ pub fn canonical_project_build_process_with_manager(
                 for package in packages {
                     args.push("-p".to_string());
                     args.push(package);
+                }
+            }
+            if let Some(selection) = &request.rust {
+                if let Some(profile) = &selection.profile {
+                    args.push("--profile".to_string());
+                    args.push(profile.clone());
+                }
+                if let Some(bin) = &selection.bin {
+                    args.push("--bin".to_string());
+                    args.push(bin.clone());
                 }
             }
             Ok(ShellProcessArgv {

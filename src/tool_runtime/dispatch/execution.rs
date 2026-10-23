@@ -93,6 +93,7 @@ impl ToolRuntime {
                 scope,
                 dependency_policy,
                 dependency_resolution_policy,
+                rust,
                 timeout_secs,
             } => {
                 self.project_build(
@@ -103,6 +104,7 @@ impl ToolRuntime {
                     scope,
                     dependency_policy,
                     dependency_resolution_policy,
+                    rust,
                     timeout_secs,
                     structured_handoff_max_secs,
                     ssh_resource.as_deref(),

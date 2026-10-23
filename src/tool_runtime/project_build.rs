@@ -16,6 +16,7 @@ use crate::runner_http::{
 use crate::runner_protocol::{ShellCommandExecutionState, ShellJobInfo};
 use webcodex_core::project_build::{
     ProjectBuildAdapter, ProjectBuildPlanningResult, ProjectBuildRequest, ProjectBuildScope,
+    RustBuildSelection,
 };
 
 const PROJECT_BUILD_DEFAULT_TIMEOUT_SECS: u64 = 1800;
@@ -59,6 +60,7 @@ impl ToolRuntime {
         dependency_resolution_policy: Option<
             webcodex_core::project_build::ProjectDependencyResolutionPolicy,
         >,
+        rust: Option<RustBuildSelection>,
         timeout_secs: Option<u64>,
         handoff_max_secs: Option<u64>,
         ssh_resource: Option<&str>,
@@ -125,6 +127,7 @@ impl ToolRuntime {
             scope,
             dependency_policy,
             dependency_resolution_policy,
+            rust,
         };
         if let Err(error) = request.validate() {
             return process_tool_failure_result(

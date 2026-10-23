@@ -571,6 +571,12 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_build_v1: bool = false;
     }
+    /// Additive bounded Cargo profile/named-bin selection in project_build.
+    ProjectBuildRustSelection => RUNNER_CAPABILITY_PROJECT_BUILD_RUST_SELECTION("project_build_rust_selection_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_build_rust_selection_v1: bool = false;
+    }
     /// Manifest-declared Node build with bounded canonical manager argv.
     ProjectBuildNode => RUNNER_CAPABILITY_PROJECT_BUILD_NODE("project_build_node_v1"),
     v2_baseline = false {
@@ -2922,6 +2928,7 @@ mod envelope_tests {
                 structured_go_test_json: true,
                 project_validation_v1: false,
                 project_build_v1: false,
+                project_build_rust_selection_v1: false,
                 project_build_node_v1: false,
                 project_validation_node_json_v1: false,
                 project_build_python_v1: false,

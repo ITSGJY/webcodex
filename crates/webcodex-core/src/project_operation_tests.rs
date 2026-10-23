@@ -7,6 +7,7 @@ use crate::project_validation::{
 
 fn build_request(scope: ProjectBuildScope) -> ProjectBuildRequest {
     ProjectBuildRequest {
+        rust: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: None,

@@ -7,6 +7,7 @@ use webcodex_core::runner_operation::{RunnerJobOperation, RunnerOperation};
 
 fn build_request() -> ProjectBuildRequest {
     ProjectBuildRequest {
+        rust: None,
         project_id: "demo".into(),
         cwd: None,
         adapter: ProjectBuildAdapter::Rust,
@@ -34,6 +35,7 @@ fn build_plan() -> ProjectBuildPlan {
 
 fn go_build_request() -> ProjectBuildRequest {
     ProjectBuildRequest {
+        rust: None,
         project_id: "demo".into(),
         cwd: None,
         adapter: ProjectBuildAdapter::Go,
@@ -83,6 +85,68 @@ fn registration(project_build: bool) -> RunnerRegisterRequest {
         ..runner_registration("build-runner", "inst", Vec::new())
     })
 }
+#[tokio::test]
+async fn cargo_selection_requires_new_runner_capability_at_plan_and_job_admission() {
+    use webcodex_core::project_build::RustBuildSelection;
+
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let access = auth_context(None, true);
+        let mut registration = registration(true);
+        registration.capabilities.project_build_rust_selection_v1 = supported;
+        registry.register(registration).await.unwrap();
+
+        let mut request = build_request();
+        request.rust = Some(RustBuildSelection {
+            profile: Some("release".into()),
+            bin: Some("demo".into()),
+        });
+        let process = canonical_project_build_process("rust", &request).unwrap();
+        let plan = ProjectBuildPlan {
+            provenance: ProjectBuildProvenance {
+                request: request.clone(),
+                backend: "rust".into(),
+                recipe_root: ".".into(),
+                root_digest: "1".repeat(64),
+                manifest_digest: "2".repeat(64),
+                invocation_digest: project_build_invocation_digest(&process),
+            },
+            process,
+        };
+        assert!(plan.is_valid());
+
+        let result = registry
+            .enqueue_project_build_plan("build-runner".into(), request, Some(&access))
+            .await;
+        let admission = registry
+            .start_job(build_job_request(plan), "test".into(), Some(&access), None)
+            .await;
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(admission.is_ok(), "{admission:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.contains("project_build_rust_selection_v1"), "{error}");
+            let error = admission.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("project_build_rust_selection_v1"),
+                "{error}"
+            );
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+            assert!(registry
+                .poll(RunnerPollRequest {
+                    client_id: "build-runner".into(),
+                    runner_instance_id: "inst".into(),
+                })
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn missing_build_capabilities_preserve_stage_order_without_admission() {
     for (base, node, planning_feature, job_feature) in [

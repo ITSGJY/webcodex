@@ -44,6 +44,7 @@ fn registration(supported: bool) -> RunnerRegisterRequest {
 
 fn locked_build_request() -> ProjectBuildRequest {
     ProjectBuildRequest {
+        rust: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: None,
