@@ -97,6 +97,55 @@ fn project_node_check_step_identity_capability_and_metadata_are_closed() {
 }
 
 #[test]
+fn node_native_name_filter_identity_and_canonical_argv_are_closed() {
+    use crate::runner_protocol::{RunnerCapabilities, ShellJobValidationStep};
+    use crate::validation_identity::{
+        structured_validation_target_identity, ToolValidationIdentityKind,
+    };
+    let legacy: RunnerCapabilities =
+        serde_json::from_value(serde_json::json!({"project_validation_node_tap_v1":true})).unwrap();
+    assert!(!legacy.project_validation_node_name_filter_v1);
+    let id = |filter: Option<&str>| {
+        structured_validation_target_identity(
+            ToolValidationIdentityKind::NodeNativeTest,
+            &serde_json::json!({"cwd":".","filter":filter}),
+        )
+        .unwrap()
+    };
+    let old = structured_validation_target_identity(
+        ToolValidationIdentityKind::NodeNativeTest,
+        &serde_json::json!({"cwd":"."}),
+    )
+    .unwrap();
+    assert_eq!(old, id(None));
+    assert_eq!(old, id(Some("")));
+    assert_ne!(old, id(Some("alpha")));
+    assert_ne!(id(Some("alpha")), id(Some("beta")));
+    let step = |filter: Option<&str>| {
+        let mut args = vec!["--test".to_string(), "--test-reporter=tap".to_string()];
+        if let Some(filter) = filter {
+            args.push(format!("--test-name-pattern={filter}"));
+        }
+        ShellJobValidationStep {
+            name: "test".into(),
+            program: "node".into(),
+            args,
+            env: vec![],
+        }
+    };
+    assert!(step(None).is_canonical());
+    assert!(step(Some("alpha|beta")).is_canonical());
+    assert!(step(Some(" alpha ")).is_canonical());
+    assert_ne!(id(Some("alpha")), id(Some(" alpha ")));
+    for bad in ["", "\n", "-oops", &"x".repeat(201)] {
+        assert!(!step(Some(bad)).is_canonical(), "{bad:?}");
+    }
+    let mut malformed = step(Some("alpha"));
+    malformed.args.push("--eval=process.exit(0)".into());
+    assert!(!malformed.is_canonical());
+}
+
+#[test]
 fn only_canonical_project_cargo_steps_accept_sorted_workspace_exclusions() {
     use crate::runner_protocol::ShellJobValidationStep;
     let step = |args: &[&str]| ShellJobValidationStep {

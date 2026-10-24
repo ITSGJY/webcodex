@@ -246,9 +246,22 @@ pub fn structured_validation_target_identity(
             }
             serde_json::json!({"tool": tool_name, "kind": "check", "cwd": cwd, "script": script, "engine": "node-native-run-v1"})
         }
-        ToolValidationIdentityKind::NodeNativeTest
-        | ToolValidationIdentityKind::NodeVitestTest
-        | ToolValidationIdentityKind::NodeJestTest => {
+        ToolValidationIdentityKind::NodeNativeTest => {
+            let filter = match obj.get("filter") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    crate::runner_protocol::normalize_node_native_test_filter(value.as_str()?)
+                        .ok()?
+                }
+            };
+            // Keep the existing unfiltered Node target identity unchanged.
+            let mut semantic = serde_json::json!({"tool":tool_name,"kind":"test","cwd":cwd});
+            if let Some(filter) = filter {
+                semantic["filter"] = Value::String(filter);
+            }
+            semantic
+        }
+        ToolValidationIdentityKind::NodeVitestTest | ToolValidationIdentityKind::NodeJestTest => {
             serde_json::json!({"tool":tool_name,"kind":"test","cwd":cwd})
         }
         ToolValidationIdentityKind::PythonPytest => {

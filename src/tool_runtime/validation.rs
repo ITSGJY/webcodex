@@ -528,6 +528,32 @@ impl ToolRuntime {
                 json!({"execution_source":"project_validate", "execution_state":"not_started", "command_started":false, "command_completed":false, "failure_kind":code, "detected_backend":detected_backend})),
             Err(_) => return ToolResult::err("invalid Runner validation plan; upgrade Server and Runner together"),
         };
+        // For auto-selected Node, the Runner owns backend resolution. Gate
+        // the expanded argv after planning; Job admission rechecks the bit.
+        if plan.provenance.backend == "node"
+            && request
+                .test
+                .as_ref()
+                .and_then(|test| test.filter.as_deref())
+                .is_some_and(|filter| !filter.trim().is_empty())
+        {
+            let feature = self
+                .runner_registry
+                .get_runner_feature_set(&resolved.config.client_id)
+                .await;
+            if !feature.is_ok_and(|set| {
+                set.supports(
+                webcodex_core::runner_protocol::RunnerCapabilityId::ProjectValidationNodeNameFilter
+            )
+            }) {
+                return ToolResult::err_with_output(
+                    "capability_unavailable: filtered native Node tests require a newer Runner",
+                    json!({"execution_source":"project_validate", "execution_state":"not_started",
+                        "command_started":false, "command_completed":false,
+                        "failure_kind":"capability_unavailable"}),
+                );
+            }
+        }
         let project_workspace = plan.provenance.backend == "rust"
             && request.scope.as_ref().is_some_and(
                 webcodex_core::project_validation::ProjectValidationScope::selects_all_packages,

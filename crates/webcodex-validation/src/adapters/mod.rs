@@ -120,7 +120,9 @@ pub enum ReadOnlyValidationOperation {
     PythonRuffCheck,
     PythonRuffFormat,
     NodeScriptCheck,
-    NodeNativeTest,
+    /// Native Node built-in test runner. Carries an optional bounded JS regexp
+    /// filter that is appended as `--test-name-pattern=<pattern>`.
+    NodeNativeTest(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +151,11 @@ impl ReadOnlyValidationOperation {
                 options.filter = webcodex_core::runner_protocol::normalize_pytest_filter(filter)
                     .map_err(|_| "test_filter_unsupported")?;
             }
+            Self::NodeNativeTest(stored_filter) => {
+                *stored_filter =
+                    webcodex_core::runner_protocol::normalize_node_native_test_filter(filter)
+                        .map_err(|_| "test_filter_unsupported")?;
+            }
             _ => return Err("test_filter_unsupported"),
         }
         Ok(self)
@@ -166,7 +173,7 @@ impl ReadOnlyValidationOperation {
             | Self::PythonRuffCheck
             | Self::PythonRuffFormat
             | Self::NodeScriptCheck
-            | Self::NodeNativeTest
+            | Self::NodeNativeTest(_)
             | Self::Cargo(CargoReadOnlyValidationOperation::FormatCheck) => {
                 return Err("dependency_policy_unsupported")
             }
@@ -248,7 +255,7 @@ impl ReadOnlyValidationOperation {
             | Self::PythonRuffCheck
             | Self::PythonRuffFormat
             | Self::NodeScriptCheck
-            | Self::NodeNativeTest
+            | Self::NodeNativeTest(_)
             | Self::Cargo(CargoReadOnlyValidationOperation::FormatCheck) => None,
             Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
             | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
@@ -273,14 +280,14 @@ impl ReadOnlyValidationOperation {
             | Self::PythonRuffCheck
             | Self::PythonRuffFormat
             | Self::NodeScriptCheck
-            | Self::NodeNativeTest
+            | Self::NodeNativeTest(_)
             | Self::Cargo(CargoReadOnlyValidationOperation::FormatCheck) => false,
         }
     }
 
     pub fn compatibility_profile(&self) -> ValidationCompatibilityProfile {
         match self {
-            Self::NodeNativeTest => ValidationCompatibilityProfile {
+            Self::NodeNativeTest(_) => ValidationCompatibilityProfile {
                 tool_identity: "node:tap:test",
                 validation_identity: ToolValidationIdentityKind::NodeNativeTest,
             },
@@ -343,7 +350,7 @@ impl ReadOnlyValidationOperation {
     pub fn build_readonly_plan(&self) -> Result<ReadOnlyValidationPlan, String> {
         let adapter = validation_adapter_for_tool(self.compatibility_profile().tool_identity)
             .ok_or_else(|| match self {
-                Self::NodeScriptCheck | Self::NodeNativeTest => {
+                Self::NodeScriptCheck | Self::NodeNativeTest(_) => {
                     "Node requires Runner-owned package manifest resolution"
                 }
                 _ => "Ruff requires Runner-owned project manifest resolution",
@@ -352,7 +359,7 @@ impl ReadOnlyValidationOperation {
             Self::PythonRuffCheck
             | Self::PythonRuffFormat
             | Self::NodeScriptCheck
-            | Self::NodeNativeTest => {
+            | Self::NodeNativeTest(_) => {
                 unreachable!("project-local adapter has no static command")
             }
             Self::Python(options) => adapter.build_readonly_plan(ValidationCommandOptions {
@@ -385,11 +392,15 @@ impl ReadOnlyValidationOperation {
     pub fn validation_target_id(&self, cwd: Option<&str>) -> Option<String> {
         let profile = self.compatibility_profile();
         let arguments = match self {
-            Self::PythonRuffCheck
-            | Self::PythonRuffFormat
-            | Self::NodeScriptCheck
-            | Self::NodeNativeTest => {
+            Self::PythonRuffCheck | Self::PythonRuffFormat | Self::NodeScriptCheck => {
                 serde_json::json!({"cwd":cwd})
+            }
+            Self::NodeNativeTest(filter) => {
+                let mut arguments = serde_json::json!({"cwd": cwd});
+                if let Some(filter) = filter {
+                    arguments["filter"] = serde_json::json!(filter);
+                }
+                arguments
             }
             Self::Python(options) => serde_json::json!({"cwd":cwd,"filter":options.filter}),
             Self::Cargo(CargoReadOnlyValidationOperation::FormatCheck) => serde_json::json!({
@@ -531,7 +542,7 @@ pub fn project_validation_operation(
         ("python", Format) => Ok(ReadOnlyValidationOperation::PythonRuffFormat),
         ("node", _) if packages.is_some() || all_packages => Err("validation_scope_unsupported"),
         ("node", Check) => Ok(ReadOnlyValidationOperation::NodeScriptCheck),
-        ("node", Test) => Ok(ReadOnlyValidationOperation::NodeNativeTest),
+        ("node", Test) => Ok(ReadOnlyValidationOperation::NodeNativeTest(None)),
         ("node", _) => Err("validation_action_unsupported"),
         _ => Err("validation_adapter_unavailable"),
     }

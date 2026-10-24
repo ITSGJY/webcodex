@@ -8,7 +8,8 @@ use webcodex_core::validation_identity::{
 };
 use webcodex_validation::{
     detect_validation_recipe, resolve_node_native_project_check, resolve_node_native_project_lint,
-    resolve_node_native_project_test, validate_node_project_markers, RecipeId, SemanticCheck,
+    resolve_node_native_project_test_with_filter, validate_node_project_markers, RecipeId,
+    SemanticCheck,
 };
 
 pub(crate) fn plan(
@@ -105,7 +106,7 @@ pub(crate) fn plan(
         if request.action == ProjectValidationAction::Lint {
             resolve_node_native_project_lint(&root, request.cwd.as_deref())
         } else if action == SemanticCheck::Test {
-            resolve_node_native_project_test(&root, request.cwd.as_deref())
+            resolve_node_native_project_test_with_filter(&root, request.cwd.as_deref(), filter)
         } else {
             resolve_node_native_project_check(&root, request.cwd.as_deref())
         }

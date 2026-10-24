@@ -714,6 +714,23 @@ impl JobStartPlan {
                 .any(ShellJobValidationStep::is_structured_node_tap_test);
         let project_test_options =
             validation_provenance.is_some_and(|provenance| provenance.request.test.is_some());
+        // Re-evaluate the resolved backend at Job admission, including queued
+        // requests and auto Node plans after a rolling Runner replacement.
+        let node_name_filter = validation_provenance.is_some_and(|provenance| {
+            provenance.backend == "node"
+                && provenance
+                    .request
+                    .test
+                    .as_ref()
+                    .and_then(|test| test.filter.as_deref())
+                    .is_some_and(|filter| !filter.trim().is_empty())
+        }) || steps.iter().any(|step| {
+            step.program == "node"
+                && step
+                    .args
+                    .get(2)
+                    .is_some_and(|arg| arg.starts_with("--test-name-pattern="))
+        });
         let go_test_filter = steps.iter().any(|step| {
             step.is_structured_go_test_json() && step.args.get(2).is_some_and(|arg| arg == "-run")
         });
@@ -754,6 +771,10 @@ impl JobStartPlan {
                 RunnerFeature::ProjectValidationRustClippyOffline,
             ),
             (node_test, RunnerFeature::ProjectValidationNodeTap),
+            (
+                node_name_filter,
+                RunnerFeature::ProjectValidationNodeNameFilter,
+            ),
             (
                 project_test_options || go_test_filter,
                 RunnerFeature::ProjectValidationTestOptions,

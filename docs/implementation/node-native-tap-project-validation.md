@@ -6,7 +6,7 @@ An additive `project_validate(action=test)` profile under [#962](https://github.
 
 - Runner resolves the canonical Project root and selects a regular, Project-local `package.json` via the existing Node manifest guard.
 - The `scripts.test` value must be **exactly** `node --test` or `node --test --test-reporter=tap`. The manifest is used as an explicit opt-in signal; its script is never executed by `npm` or `node --run`.
-- The Runner-owned command is always `node --test --test-reporter=tap`, with no caller-controlled argv, package/workspace scope, filter, dependency policy or environment additions.
+- The Runner-owned command is always `node --test --test-reporter=tap`, with no caller-selected program or arbitrary argv. Bounded native `test.filter` adds one literal `--test-name-pattern=<pattern>` argv under its own capability; default argv is unchanged, with no package/workspace scope, dependency policy or environment additions.
 - The same configured Node interpreter is probed and executed. The existing bounded version probe requires Node 22.3+, strips `NODE_OPTIONS`, and does not install or download any tooling.
 - An independent, non-baseline Runner capability `project_validation_node_tap_v1` gates both planning of explicit Node requests and Job admission. Auto-detected Node jobs receive an admission check against the **actual** retained Node test adapter.
 - Provenance binds the manifest content, command identity and Project root into durable source fences. The native Node path repeats the source recheck after interpreter preparation and before process handoff.
@@ -22,7 +22,7 @@ Node tests themselves execute Project-authored code and can have filesystem/netw
 ## Excluded
 
 - General npm/pnpm/yarn/bun scripts, Vitest, Jest, TypeScript compilation, arbitrary TAP reporters.
-- Custom test filters or package/workspace scope.
+- Arbitrary framework/script filters or package/workspace scope. Native TAP name selection has its own additive `project_validation_node_name_filter_v1` Runner capability.
 - Any implicit dependency installation, isolation guarantee, or externally interpreted diagnostics.
 
 ## Regression requirements

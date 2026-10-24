@@ -101,10 +101,17 @@ pub(super) async fn complete_project_validation_plan_request(
             r#"{"scripts":{"test":"node --test"}}"#,
         )
         .unwrap();
-        webcodex_validation::resolve_node_native_project_test(root.path(), None)
-            .unwrap()
-            .steps
-            .remove(0)
+        webcodex_validation::resolve_node_native_project_test_with_filter(
+            root.path(),
+            None,
+            semantic
+                .test
+                .as_ref()
+                .and_then(|test| test.filter.as_deref()),
+        )
+        .unwrap()
+        .steps
+        .remove(0)
     } else if backend == "python" && check != webcodex_validation::SemanticCheck::Test {
         // Mock Runner planning still resolves a real local manifest. The Server
         // fixture is not proof of a real Ruff execution.

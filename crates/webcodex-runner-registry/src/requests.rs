@@ -2933,6 +2933,15 @@ impl RunnerRegistry {
             && payload.action == webcodex_core::project_validation::ProjectValidationAction::Lint)
             .then_some(RunnerFeature::ProjectValidationRustClippyOffline);
         let requires_test_options = payload.test.is_some();
+        // Explicit Node selection must not reach a Runner with the older
+        // unfiltered TAP contract; auto selection is fenced after resolution.
+        let node_name_filter = payload.adapter
+            == webcodex_core::project_validation::ProjectValidationAdapter::Node
+            && payload
+                .test
+                .as_ref()
+                .and_then(|test| test.filter.as_deref())
+                .is_some_and(|filter| !filter.trim().is_empty());
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let request = encode_runner_operation(
@@ -2954,6 +2963,7 @@ impl RunnerRegistry {
                 clippy_offline_capability,
                 python_capability,
                 node_capability,
+                node_name_filter.then_some(RunnerFeature::ProjectValidationNodeNameFilter),
                 requires_all_packages.then_some(RunnerFeature::ProjectAllPackages),
                 requires_workspace_exclusions.then_some(RunnerFeature::ProjectWorkspaceExclusions),
                 requires_dependency_policy.then_some(RunnerFeature::ProjectDependencyPolicy),

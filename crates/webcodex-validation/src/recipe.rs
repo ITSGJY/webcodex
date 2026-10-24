@@ -733,13 +733,61 @@ pub fn resolve_node_native_project_test(
     resolve_node_native_project_action(execution_root, cwd, SemanticCheck::Test, None)
 }
 
+/// Like [`resolve_node_native_project_test`] but with an optional bounded
+/// `--test-name-pattern` filter. The filter is normalized and appended as a
+/// single literal argv; empty/None preserves the old two-arg canonical step.
+pub fn resolve_node_native_project_test_with_filter(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    filter: Option<&str>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_node_native_project_action_with_filter(
+        execution_root,
+        cwd,
+        SemanticCheck::Test,
+        None,
+        filter,
+    )
+}
+
 fn resolve_node_native_project_action(
     execution_root: &Path,
     cwd: Option<&str>,
     action: SemanticCheck,
     selected_script: Option<&'static str>,
 ) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_node_native_project_action_with_filter(
+        execution_root,
+        cwd,
+        action,
+        selected_script,
+        None,
+    )
+}
+
+fn resolve_node_native_project_action_with_filter(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    action: SemanticCheck,
+    selected_script: Option<&'static str>,
+    test_filter: Option<&str>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
     const MAX_NODE_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+    // Normalize and validate the filter before any I/O so invalid filters fail fast.
+    let normalized_filter = if action == SemanticCheck::Test {
+        test_filter
+            .map(webcodex_core::runner_protocol::normalize_node_native_test_filter)
+            .transpose()
+            .map_err(|_| filter_unsupported())?
+            .flatten()
+    } else {
+        // Filters are only valid for Test; check/lint must reject them.
+        if test_filter.is_some() {
+            return Err(filter_unsupported());
+        }
+        None
+    };
 
     validate_node_project_markers(execution_root, cwd)?;
     let resolved = resolve_project_recipe_root(execution_root, cwd, Some(RecipeId::Node))
@@ -771,7 +819,7 @@ fn resolve_node_native_project_action(
     {
         return Err(manifest_invalid());
     }
-    let step = if action == SemanticCheck::Test {
+    let mut step = if action == SemanticCheck::Test {
         let body = scripts
             .and_then(|scripts| scripts.get(selected))
             .and_then(Value::as_str)
@@ -795,6 +843,17 @@ fn resolve_node_native_project_action(
             env: Vec::new(),
         }
     };
+    // Append the filter as a single literal argv for native Node test runs.
+    // vitest/jest framework steps do not support this filter path.
+    if let Some(ref filter) = normalized_filter {
+        if step.is_structured_node_tap_test() {
+            step.args.push(format!("--test-name-pattern={filter}"));
+        } else {
+            // Filter was requested but this script uses a framework that
+            // cannot accept it (vitest/jest).
+            return Err(filter_unsupported());
+        }
+    }
     debug_assert!(step.is_canonical());
     let mut hasher = Sha256::new();
     let relative = canonical
@@ -826,7 +885,7 @@ fn resolve_node_native_project_action(
         steps: vec![step],
         invocation_digest,
         manifest_digest,
-        test_filter: None,
+        test_filter: normalized_filter,
     })
 }
 
@@ -984,6 +1043,8 @@ fn normalize_test_filter(
             .map(Option::flatten)
             .map_err(|_| filter_unsupported()),
         _ => {
+            // Generic Node scripts cannot consume test-name selection. The
+            // native TAP resolver has a distinct, canonical filtered path.
             reject_filter(filter)?;
             Ok(None)
         }

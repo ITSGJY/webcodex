@@ -238,11 +238,26 @@ impl ShellJobValidationStep {
     }
 
     /// Exact native Node test executor; manifest and Runner capability are separate fences.
+    /// Accepts the canonical two-arg unfiltered form or the three-arg form with a
+    /// validated `--test-name-pattern=<pattern>` appended by the Runner.
     pub fn is_structured_node_tap_test(&self) -> bool {
         self.name == "test"
             && self.program == "node"
             && self.env.is_empty()
-            && self.args == ["--test", "--test-reporter=tap"]
+            && self.args.first().map(String::as_str) == Some("--test")
+            && self.args.get(1).map(String::as_str) == Some("--test-reporter=tap")
+            && match self.args.len() {
+                2 => true,
+                3 => self.args[2]
+                    .strip_prefix("--test-name-pattern=")
+                    .is_some_and(|pattern| {
+                        matches!(
+                            normalize_node_native_test_filter(pattern),
+                            Ok(Some(normalized)) if normalized == pattern
+                        )
+                    }),
+                _ => false,
+            }
     }
 
     /// Fixed local framework CLI and report placeholder, rewritten only by the
@@ -661,6 +676,27 @@ pub fn normalize_go_test_filter(raw: &str) -> Result<Option<String>, &'static st
         return Err("Go test filter exceeds 200 bytes or contains control characters");
     }
     Ok((!raw.is_empty()).then(|| raw.to_owned()))
+}
+
+/// Bounded native Node `--test-name-pattern` JavaScript regexp. Preserve
+/// meaningful whitespace; blank-only input means no filter. Empty
+/// means no filter. Rejects control characters, option-shaped values (leading
+/// `-`), and values exceeding the shared 200-byte bound. The Runner transports
+/// this as one literal argv `--test-name-pattern=<pattern>`, never as shell.
+pub fn normalize_node_native_test_filter(raw: &str) -> Result<Option<String>, &'static str> {
+    if raw.len() > RUST_TEST_FILTER_MAX_BYTES {
+        return Err("Node test filter exceeds 200 bytes");
+    }
+    if raw.chars().any(char::is_control) {
+        return Err("Node test filter contains control characters");
+    }
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    if raw.trim_start().starts_with('-') {
+        return Err("Node test filter must not start with '-'");
+    }
+    Ok(Some(raw.to_string()))
 }
 
 fn is_canonical_go_vet_args(args: &[&str]) -> bool {
@@ -1113,6 +1149,29 @@ impl ShellJobValidationMetadata {
                         )
                     ) || provenance.request.scope.is_some()
                         || provenance.request.dependency_policy.is_some()
+                        || (self.adapter.starts_with("node:")
+                            && self.adapter.ends_with(":test")
+                            && {
+                                let requested = provenance
+                                    .request
+                                    .test
+                                    .as_ref()
+                                    .and_then(|test| test.filter.as_deref())
+                                    .map(normalize_node_native_test_filter)
+                                    .transpose();
+                                match (self.adapter.as_str(), requested) {
+                                    ("node:tap:test", Ok(filter)) => {
+                                        self.steps[0].args.get(2).and_then(|arg| {
+                                            arg.strip_prefix("--test-name-pattern=")
+                                        }) != filter.flatten().as_deref()
+                                    }
+                                    ("node:vitest:test" | "node:jest:test", Ok(Some(Some(_)))) => {
+                                        true
+                                    }
+                                    (_, Err(_)) => true,
+                                    _ => false,
+                                }
+                            })
                         || (provenance.request.action
                             == crate::project_validation::ProjectValidationAction::Lint
                             && self.steps[0].args != ["--run", "lint"])
@@ -1168,10 +1227,7 @@ impl ShellJobValidationMetadata {
             "node:tap:test" => {
                 self.tool == "project_validate"
                     && self.kind == "test"
-                    && step.name == "test"
-                    && step.program == "node"
-                    && step.args == ["--test", "--test-reporter=tap"]
-                    && step.env.is_empty()
+                    && step.is_structured_node_tap_test()
             }
             "node:script:check" => {
                 self.tool == "project_validate"

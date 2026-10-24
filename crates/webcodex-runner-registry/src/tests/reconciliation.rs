@@ -680,6 +680,64 @@ async fn project_test_options_are_fenced_again_at_job_admission() {
 }
 
 #[tokio::test]
+async fn node_native_name_filter_requires_additive_capability_at_job_admission() {
+    use webcodex_core::project_validation::*;
+    use webcodex_core::validation_identity::{
+        structured_validation_target_identity, ToolValidationIdentityKind,
+    };
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut registration = register_request(INSTANCE_A, empty_inventory());
+        registration.capabilities.project_validation_v1 = true;
+        registration.capabilities.project_validation_test_options_v1 = true;
+        registration.capabilities.project_validation_node_tap_v1 = true;
+        registration.capabilities.project_validation_node_name_filter_v1 = supported;
+        registry.register(registration).await.unwrap();
+        let mut metadata = cargo_validation_metadata(None, None, None);
+        // project_validate defaults to require_tests=true and min_tests=1.
+        metadata.require_tests = Some(true);
+        metadata.minimum_tests = Some(1);
+        metadata.tool = "project_validate".into();
+        metadata.adapter = "node:tap:test".into();
+        metadata.steps = vec![ShellJobValidationStep {
+            name: "test".into(),
+            program: "node".into(),
+            args: ["--test", "--test-reporter=tap", "--test-name-pattern=alpha"]
+                .into_iter().map(str::to_owned).collect(),
+            env: vec![],
+        }];
+        metadata.validation_target_id = structured_validation_target_identity(
+            ToolValidationIdentityKind::NodeNativeTest,
+            &serde_json::json!({"cwd":".","filter":"alpha"}),
+        );
+        metadata.project_validation = Some(ProjectValidationProvenance {
+            request: ProjectValidationRequest {
+                project_id: "demo".into(), cwd: None,
+                action: ProjectValidationAction::Test, adapter: ProjectValidationAdapter::Node,
+                scope: None, dependency_policy: None, dependency_resolution_policy: None,
+                test: Some(ProjectValidationTestOptions {
+                    filter: Some("alpha".into()), ..Default::default()
+                }),
+            },
+            backend: "node".into(), recipe_root: ".".into(),
+            root_digest: "a".repeat(64), manifest_digest: "b".repeat(64),
+            invocation_digest: "c".repeat(64),
+        });
+        assert!(metadata.is_valid());
+        let result = registry.start_job(
+            validation_start_request(metadata, "test"), "tester".into(), None, None
+        ).await;
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("project_validation_node_name_filter_v1"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn old_count_capable_runner_fails_closed_on_explicit_cargo_execution_policy() {
     for (label, require_tests, no_run, minimum_tests) in [
         ("require-false", Some(false), None, None),

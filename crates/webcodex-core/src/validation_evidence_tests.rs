@@ -843,6 +843,44 @@ fn node_native_tap_counts_only_complete_conservative_reporter_trailers() {
 }
 
 #[test]
+fn node_native_tap_filtered_file_wrappers_never_inflate_real_test_count() {
+    use crate::validation_evidence::parse_node_native_test_diagnostics;
+    // Native Node 24 emits a synthetic passing file-level assertion when a
+    // test file has no names matching --test-name-pattern. In a multi-file
+    // run those assertions must not be counted as executed tests.
+    let mixed = "TAP version 13\n# Subtest: alpha\nok 1 - alpha\n1..0\n# Subtest: b.test.js\nok 2 - b.test.js\n1..2\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 87.4\n";
+    let summary = parse_node_native_test_diagnostics(mixed, false)
+        .test_summary
+        .expect("one matched Node test can be proven despite a nonmatching file");
+    assert_eq!(
+        (summary.passed, summary.failed, summary.ignored),
+        (Some(1), Some(0), Some(0))
+    );
+    for forged in [
+        mixed.replace("# Subtest: b.test.js", "# Subtest: other.test.js"),
+        mixed.replace("# Subtest: b.test.js\n", ""),
+        mixed.replace("1..0\n# Subtest:", "1..0\n# diagnostic: fake\n# Subtest:"),
+        mixed.replace("ok 2 - b.test.js", "not ok 2 - b.test.js"),
+        mixed.replace("ok 2 - b.test.js", "ok 2 - b.test.js # SKIP"),
+        mixed.replace("1..0", "1..0\n1..0"),
+    ] {
+        assert!(
+            parse_node_native_test_diagnostics(&forged, false)
+                .test_summary
+                .is_none(),
+            "malformed file wrapper must not prove any executed tests"
+        );
+    }
+    let none = "TAP version 13\n1..0\n# Subtest: a.test.js\nok 1 - a.test.js\n1..0\n# Subtest: b.test.js\nok 2 - b.test.js\n1..2\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 80.0\n";
+    assert!(
+        parse_node_native_test_diagnostics(none, false)
+            .test_summary
+            .is_none(),
+        "zero matching tests must not become a successful test-count receipt"
+    );
+}
+
+#[test]
 fn node_native_tap_root_plan_and_footer_are_authoritative() {
     use crate::validation_evidence::parse_node_native_test_diagnostics;
     // Native Node v26.10.0 TAP indentation and trailer shape.
