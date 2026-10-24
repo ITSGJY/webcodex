@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from scripts import agent_loop_report as report
+from scripts import json_bounds
 
 
 def code_mode_composition(**overrides: object) -> dict[str, object]:
@@ -1394,6 +1395,23 @@ class AgentLoopReportTests(unittest.TestCase):
             huge_int.write_text("{" + '"schema_version":' + "1" * 10000 + "}", encoding="utf-8")
             with self.assertRaisesRegex(report.ReportError, "bounded JSON"):
                 report.load_case_manifest(huge_int)
+
+    def test_bounded_json_recognizes_structure_outside_quoted_strings(self) -> None:
+        literal = '"}[]{' * 100
+        expected = {"literal": literal, "data": {"ok": True}}
+        self.assertEqual(json_bounds.loads(json.dumps(expected)), expected)
+        with self.assertRaises(json.JSONDecodeError):
+            json_bounds.loads('{"value":]}')
+
+    def test_bounded_json_enforces_explicit_depth_and_integer_limits(self) -> None:
+        depth = json_bounds.MAX_NESTING
+        self.assertIsInstance(
+            json_bounds.loads("[" * depth + "0" + "]" * depth), list
+        )
+        with self.assertRaisesRegex(ValueError, "bounded depth"):
+            json_bounds.loads("[" * (depth + 1) + "0" + "]" * (depth + 1))
+        with self.assertRaisesRegex(ValueError, "bounded digits"):
+            json_bounds.loads("1" * (json_bounds.MAX_INTEGER_DIGITS + 1))
 
     def test_manifest_requires_fields_and_stable_serialization(self) -> None:
         manifest = report.load_case_manifest(report.DEFAULT_CASE_MANIFEST)
