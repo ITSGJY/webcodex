@@ -20,6 +20,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    from scripts import json_bounds
+except ModuleNotFoundError:
+    import json_bounds
+
 SCHEMA_VERSION = 1
 DEFAULT_CASE_MANIFEST = Path(__file__).with_name("agent_loop_cases.json")
 CODE_MODE_TOOLS = frozenset(("execute_code_mode", "execute_effectful_code_mode", "execute_mutating_code_mode"))
@@ -177,7 +182,7 @@ def load_case_manifest(path: Path) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise ReportError(f"case manifest must be UTF-8: {path}") from exc
     try:
-        value = json.loads(text)
+        value = json_bounds.loads(text)
     except json.JSONDecodeError as exc:
         raise ReportError(f"case manifest is not valid JSON: {path}:{exc.lineno}") from exc
     except (RecursionError, ValueError) as exc:

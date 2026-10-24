@@ -28,12 +28,14 @@ from typing import Any
 
 try:
     from scripts import agent_loop_report as report
+    from scripts import json_bounds
     from scripts import agent_temporal_evidence as temporal
     from scripts.e2e_generic_agent_ws import GenericFixture, GENERIC_CASES, pressure_script, mixed_note_script, encoded_csv_script
     from scripts.agent_knowledge_fixture import KnowledgeFixture, CASE_IDS as KNOWLEDGE_CASES
     from scripts import agent_knowledge_evidence as knowledge
 except ModuleNotFoundError:
     import agent_loop_report as report
+    import json_bounds
     import agent_temporal_evidence as temporal
     from e2e_generic_agent_ws import GenericFixture, GENERIC_CASES, pressure_script, mixed_note_script, encoded_csv_script
     from agent_knowledge_fixture import KnowledgeFixture, CASE_IDS as KNOWLEDGE_CASES
@@ -439,7 +441,7 @@ def _load_driver_receipt(path: Path) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise BenchmarkError("driver result must be UTF-8 JSON") from exc
     try:
-        value = json.loads(text)
+        value = json_bounds.loads(text)
     except json.JSONDecodeError as exc:
         raise BenchmarkError(f"driver result is not valid JSON: {exc}") from exc
     except (RecursionError, ValueError) as exc:

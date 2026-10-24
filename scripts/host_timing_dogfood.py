@@ -18,6 +18,11 @@ import re
 import sqlite3
 import sys
 
+try:
+    from scripts import json_bounds
+except ModuleNotFoundError:
+    import json_bounds
+
 MAX_ROWS = 100_000
 # Read only bounded diagnostic projections from potentially larger audit rows.
 # Oversized summaries remain selected events but cannot provide canonical proof.
@@ -73,7 +78,7 @@ def _read_bounded_json(path: Path) -> object:
     if len(raw) > MAX_INPUT_JSON_BYTES:
         raise ReportError("input JSON exceeds bounded size")
     try:
-        return json.loads(raw.decode("utf-8"))
+        return json_bounds.loads(raw.decode("utf-8"))
     except (UnicodeError, ValueError, RecursionError) as exc:
         # Deeply nested JSON can exhaust the parser stack below the byte cap.
         raise ReportError("invalid input JSON") from exc
