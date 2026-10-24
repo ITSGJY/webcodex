@@ -308,6 +308,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             project_validation_python_ruff_v1: false,
             project_validation_node_script_check_v1: false,
             project_validation_node_tap_v1: false,
+            project_validation_node_name_filter_v1: false,
             project_validation_rust_clippy_v1: false,
             project_validation_rust_clippy_offline_v1: false,
             // Like JSON parsing, first-class durable go_test support is

@@ -18,10 +18,10 @@ pub(crate) struct ValidationRuntimeProfile {
 
 pub(crate) fn runtime_profile(operation: &ReadOnlyValidationOperation) -> ValidationRuntimeProfile {
     match operation {
-        ReadOnlyValidationOperation::NodeNativeTest => ValidationRuntimeProfile {
+        ReadOnlyValidationOperation::NodeNativeTest(_) => ValidationRuntimeProfile {
             default_timeout_secs: DEFAULT_CARGO_TEST_TIMEOUT_SECS,
             force_agent_handoff: true,
-            invalid_argument_guidance: "Native Node TAP or recognized direct Vitest/Jest only; no compound scripts, filter or package scope.",
+            invalid_argument_guidance: "Native Node TAP or recognized direct Vitest/Jest only; Node TAP accepts a bounded test-name filter, not compound scripts or package scope.",
         },
         ReadOnlyValidationOperation::NodeScriptCheck => ValidationRuntimeProfile {
             default_timeout_secs: DEFAULT_CARGO_CHECK_TIMEOUT_SECS,

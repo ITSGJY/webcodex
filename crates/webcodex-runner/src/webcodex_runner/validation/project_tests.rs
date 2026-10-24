@@ -1160,7 +1160,44 @@ fn project_validation_node_native_test_has_exact_plan_and_stale_source_fence() {
         filter: Some("selected".into()),
         ..Default::default()
     });
-    assert!(project::plan(&policy, &registry, &filtered).is_err());
+    let selected = project::plan(&policy, &registry, &filtered)
+        .expect("bounded native Node test-name selection must be planned")
+        .0;
+    assert_eq!(
+        selected.step.args,
+        [
+            "--test",
+            "--test-reporter=tap",
+            "--test-name-pattern=selected"
+        ]
+    );
+    assert!(selected.step.is_structured_node_tap_test());
+    assert!(selected.provenance.is_valid());
+    assert_ne!(selected.validation_target_id, plan.validation_target_id);
+    assert_ne!(
+        selected.provenance.invocation_digest,
+        plan.provenance.invocation_digest
+    );
+    let mut explicit = filtered.clone();
+    explicit.adapter = ProjectValidationAdapter::Node;
+    let explicit_plan = project::plan(&policy, &registry, &explicit).unwrap().0;
+    assert_eq!(selected.step, explicit_plan.step);
+    assert_eq!(
+        selected.validation_target_id,
+        explicit_plan.validation_target_id
+    );
+    // A name filter is native Node-only, never a Jest/Vitest/opaque script arg.
+    for body in ["jest", "vitest run", "node --test && echo other"] {
+        fs::write(
+            root.join("package.json"),
+            format!(r#"{{"scripts":{{"test":"{body}"}}}}"#),
+        )
+        .unwrap();
+        assert!(
+            project::plan(&policy, &registry, &filtered).is_err(),
+            "script {body} must not inherit native Node filtering"
+        );
+    }
 }
 
 #[test]

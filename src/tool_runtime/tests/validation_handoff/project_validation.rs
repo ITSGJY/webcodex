@@ -27,6 +27,7 @@ async fn setup(grace_ms: u64) -> ToolRuntime {
             project_validation_python_pytest_v1: true,
             project_validation_python_ruff_v1: true,
             project_validation_node_tap_v1: true,
+            project_validation_node_name_filter_v1: true,
             project_validation_node_json_v1: true,
             structured_go_test_json: true,
             structured_go_test_tool: true,
@@ -553,6 +554,137 @@ fn call_with_test(test: ProjectValidationTestOptions) -> ToolCall {
         *options = Some(test);
     }
     call
+}
+
+#[tokio::test]
+async fn auto_node_filter_preserves_canonical_job_and_real_test_count() {
+    let runtime = setup(1).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    call_with_test(ProjectValidationTestOptions {
+                        filter: Some("alpha".into()),
+                        min_tests: Some(1),
+                        ..Default::default()
+                    }),
+                    Some(&auth_context(None, true)),
+                )
+                .await
+        }
+    });
+    let (request, job_id) = reply_plan(&runtime, "node", ProjectValidationAction::Test).await;
+    let validation = request
+        .job_context
+        .as_ref()
+        .unwrap()
+        .validation
+        .as_ref()
+        .unwrap();
+    assert!(validation.is_valid());
+    assert_eq!(validation.adapter, "node:tap:test");
+    assert_eq!(
+        validation.steps[0].args,
+        ["--test", "--test-reporter=tap", "--test-name-pattern=alpha"]
+    );
+    assert_eq!(
+        validation
+            .project_validation
+            .as_ref()
+            .unwrap()
+            .request
+            .test
+            .as_ref()
+            .and_then(|test| test.filter.as_deref()),
+        Some("alpha")
+    );
+    let pending = task.await.unwrap();
+    assert_eq!(pending.output["execution_state"], "pending");
+    assert_eq!(
+        pending.output["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
+    let native = "TAP version 13\n# Subtest: alpha\nok 1 - alpha\n1..0\n# Subtest: b.test.js\nok 2 - b.test.js\n1..2\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 87.4\n";
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            "project-validation",
+            &request.request_id,
+            &job_id,
+            "completed",
+            native,
+            "",
+            Some(0),
+            completed_progress(),
+            true,
+        ))
+        .await
+        .unwrap();
+    let status = runtime.job_status_for_auth(job_id, false, None).await;
+    assert_eq!(status.output["validation"]["passed"], true, "{status:?}");
+    assert_eq!(status.output["validation"]["tests_run_count"], 1);
+}
+
+#[tokio::test]
+async fn auto_node_filter_rejects_old_runner_after_backend_resolution() {
+    let runtime = runtime_with_agent_project("project-validation");
+    register_agent(
+        &runtime,
+        "project-validation",
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            project_validation_v1: true,
+            project_validation_test_options_v1: true,
+            project_validation_node_tap_v1: true,
+            project_validation_node_name_filter_v1: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    call_with_test(ProjectValidationTestOptions {
+                        filter: Some("alpha".into()),
+                        ..Default::default()
+                    }),
+                    Some(&auth_context(None, true)),
+                )
+                .await
+        }
+    });
+    let planning = wait_for_patch_agent_request(&runtime, "project-validation").await;
+    assert_eq!(planning.kind, "plan_project_validation");
+    // Answer the one planning request without polling for a Job: old Runners
+    // must fail closed before admission, not create a second request.
+    complete_project_validation_plan_request(
+        &runtime,
+        "project-validation",
+        planning,
+        "agent-proj",
+        "node",
+        ProjectValidationAction::Test,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("capability_unavailable"),
+        "{result:?}"
+    );
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, "project-validation")
+        .await
+        .is_none());
 }
 
 #[tokio::test]

@@ -1561,7 +1561,10 @@ fn project_validation_node_contract_advertises_bounded_test_and_execution_effect
         "Node TAP test only for exact scripts.test=node --test",
         "fixed installed CLI",
         "project_validation_node_json_v1",
-        "not for Node",
+        "Node native TAP only",
+        "--test-name-pattern=",
+        "project_validation_node_name_filter_v1",
+        "not for Vitest/Jest or custom scripts",
         "Project scripts may modify files or access network",
         "No arbitrary executable, argv or shell",
     ] {
@@ -1586,6 +1589,11 @@ fn project_validation_node_contract_advertises_bounded_test_and_execution_effect
         "test":{"require_tests":false, "min_tests":2}});
     assert!(test_support::validate_schema_instance(&with_count, schema).is_ok());
     assert!(ToolCall::from_tool_name("project_validate", with_count).is_ok());
+    let with_native_name_filter = json!({"project":"demo", "adapter":"node", "action":"test",
+        "test":{"filter":"selected.*", "min_tests":1}});
+    assert!(test_support::validate_schema_instance(&with_native_name_filter, schema).is_ok());
+    assert!(ToolCall::from_tool_name("project_validate", with_native_name_filter).is_ok());
+
     for (field, value) in [
         ("executable", json!("node")),
         ("argv", json!(["--test"])),

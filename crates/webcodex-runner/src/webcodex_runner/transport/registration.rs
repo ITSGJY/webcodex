@@ -275,6 +275,7 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     capabilities.set(RunnerCapabilityId::ProjectValidationPythonRuff, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationNodeScriptCheck, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationNodeTap, true);
+    capabilities.set(RunnerCapabilityId::ProjectValidationNodeNameFilter, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationRustClippy, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationRustClippyOffline, true);
     // This binary also understands the first-class go_test durable metadata

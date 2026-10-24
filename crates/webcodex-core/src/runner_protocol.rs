@@ -29,18 +29,18 @@ mod tests;
 pub use job::{
     normalize_cargo_excluded_packages, normalize_cargo_packages, normalize_cargo_value,
     normalize_go_packages, normalize_go_test_filter, normalize_go_test_packages,
-    normalize_pytest_filter, normalize_rust_test_filter, valid_rust_test_filter,
-    RunnerJobLogRequest, RunnerJobLogResponse, RunnerJobResult, RunnerJobStatusRequest,
-    RunnerJobStatusResponse, RunnerJobStopRequest, RunnerJobStopResponse, RunnerJobUpdateRequest,
-    RunnerJobUpdateResponse, RunnerJobsListRequest, RunnerJobsListResponse, RunnerShellJobResult,
-    ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
-    ShellJobCodexMetadata, ShellJobContext, ShellJobInfo, ShellJobInventory, ShellJobLogSnapshot,
-    ShellJobOpRequest, ShellJobOpResponse, ShellJobSnapshot, ShellJobStreamSnapshot,
-    ShellJobStructuredExecutionMetadata, ShellJobTestCountEvidence, ShellJobValidationMetadata,
-    ShellJobValidationProgress, ShellJobValidationStep, CARGO_PACKAGE_MAX_ITEMS,
-    CARGO_TEST_MIN_TESTS_MAX, CARGO_VALUE_MAX_BYTES, GO_TEST_PACKAGE_MAX_BYTES,
-    GO_TEST_PACKAGE_MAX_ITEMS, JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS,
-    JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
+    normalize_node_native_test_filter, normalize_pytest_filter, normalize_rust_test_filter,
+    valid_rust_test_filter, RunnerJobLogRequest, RunnerJobLogResponse, RunnerJobResult,
+    RunnerJobStatusRequest, RunnerJobStatusResponse, RunnerJobStopRequest, RunnerJobStopResponse,
+    RunnerJobUpdateRequest, RunnerJobUpdateResponse, RunnerJobsListRequest, RunnerJobsListResponse,
+    RunnerShellJobResult, ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource,
+    ShellJobActivityState, ShellJobCodexMetadata, ShellJobContext, ShellJobInfo, ShellJobInventory,
+    ShellJobLogSnapshot, ShellJobOpRequest, ShellJobOpResponse, ShellJobSnapshot,
+    ShellJobStreamSnapshot, ShellJobStructuredExecutionMetadata, ShellJobTestCountEvidence,
+    ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
+    CARGO_PACKAGE_MAX_ITEMS, CARGO_TEST_MIN_TESTS_MAX, CARGO_VALUE_MAX_BYTES,
+    GO_TEST_PACKAGE_MAX_BYTES, GO_TEST_PACKAGE_MAX_ITEMS, JOB_INVENTORY_MAX_ACTIVE_JOBS,
+    JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
     JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, RUNNER_JOB_CONCURRENCY_MAX,
     RUNNER_JOB_CONCURRENCY_MIN, RUST_TEST_FILTER_MAX_BYTES, VALIDATION_ASSERTION_NAME_MAX_CHARS,
 };
@@ -694,6 +694,12 @@ runner_capabilities! {
     v2_baseline = false {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_validation_node_tap_v1: bool = false;
+    }
+    /// Node native TAP test-name pattern (separate rolling-upgrade capability).
+    ProjectValidationNodeNameFilter => RUNNER_CAPABILITY_PROJECT_VALIDATION_NODE_NAME_FILTER("project_validation_node_name_filter_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_validation_node_name_filter_v1: bool = false;
     }
     /// The Runner understands the first-class model-facing `go_test` tool identity
     /// and its durable `ShellJobValidationMetadata` contract. This is deliberately
@@ -2945,6 +2951,7 @@ mod envelope_tests {
                 project_validation_python_ruff_v1: false,
                 project_validation_node_script_check_v1: false,
                 project_validation_node_tap_v1: false,
+                project_validation_node_name_filter_v1: false,
                 project_validation_rust_clippy_v1: false,
                 project_validation_rust_clippy_offline_v1: false,
                 structured_go_test_tool: true,

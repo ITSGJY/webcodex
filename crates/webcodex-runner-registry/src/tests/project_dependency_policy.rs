@@ -342,6 +342,20 @@ async fn project_validation_base_capability_error_identifies_runner_without_job_
 async fn project_validation_optional_capability_errors_identify_runner_without_dispatch() {
     let cases = [
         (
+            RunnerCapabilityId::ProjectValidationNodeNameFilter,
+            ProjectValidationRequest {
+                action: ProjectValidationAction::Test,
+                adapter: ProjectValidationAdapter::Node,
+                dependency_policy: None,
+                dependency_resolution_policy: None,
+                test: Some(ProjectValidationTestOptions {
+                    filter: Some("alpha".into()),
+                    ..Default::default()
+                }),
+                ..locked_validation_request()
+            },
+        ),
+        (
             RunnerCapabilityId::ProjectValidationPythonRuff,
             ProjectValidationRequest {
                 action: ProjectValidationAction::Check,
@@ -440,6 +454,10 @@ async fn project_validation_optional_capability_errors_identify_runner_without_d
         let mut registration = registration(true);
         if capability == RunnerCapabilityId::ProjectWorkspaceExclusions {
             registration.capabilities.project_all_packages_v1 = true;
+        }
+        if capability == RunnerCapabilityId::ProjectValidationNodeNameFilter {
+            registration.capabilities.project_validation_node_tap_v1 = true;
+            registration.capabilities.project_validation_test_options_v1 = true;
         }
         registration.capabilities.set(capability, false);
         registry.register(registration).await.unwrap();

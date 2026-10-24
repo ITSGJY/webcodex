@@ -253,6 +253,11 @@ fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
     // Its N counts top-level assertions, not all nested tests in # tests.
     let root_count = body.last()?.strip_prefix("1..")?.parse::<u64>().ok()?;
     let mut root_assertions = 0u64;
+    // Native Node may emit a synthetic passing file assertion after root 1..0.
+    // Require that exact adjacent named wrapper before excluding its count.
+    let mut pending_empty_file_wrapper = false;
+    let mut empty_file_wrapper_name: Option<&str> = None;
+    let mut synthetic_file_wrappers = 0u64;
     let fields = [
         "# tests ",
         "# suites ",
@@ -274,11 +279,31 @@ fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
             .strip_prefix("# duration_ms ")
             .and_then(|value| value.parse::<f64>().ok())
             .is_some_and(|value| value.is_finite() && value >= 0.0);
-        if line.starts_with("1..")
-            || line.starts_with("TAP version ")
-            || repeated_count
-            || repeated_duration
-        {
+        if line.starts_with("TAP version ") || repeated_count || repeated_duration {
+            return None;
+        }
+        if pending_empty_file_wrapper {
+            let name = line.strip_prefix("# Subtest: ")?;
+            if name.is_empty() {
+                return None;
+            }
+            empty_file_wrapper_name = Some(name);
+            pending_empty_file_wrapper = false;
+            continue;
+        }
+        if let Some(name) = empty_file_wrapper_name.take() {
+            root_assertions = root_assertions.checked_add(1)?;
+            if *line != format!("ok {root_assertions} - {name}") {
+                return None;
+            }
+            synthetic_file_wrappers = synthetic_file_wrappers.checked_add(1)?;
+            continue;
+        }
+        if *line == "1..0" {
+            pending_empty_file_wrapper = true;
+            continue;
+        }
+        if line.starts_with("1..") {
             return None;
         }
         let ordinal = line
@@ -291,7 +316,10 @@ fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
             }
         }
     }
-    if root_assertions != root_count {
+    if pending_empty_file_wrapper
+        || empty_file_wrapper_name.is_some()
+        || root_assertions != root_count
+    {
         return None;
     }
     // Accounting lines must themselves be top-level (unindented).
@@ -319,8 +347,12 @@ fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
     {
         return None;
     }
+    let real_passed = passed.checked_sub(synthetic_file_wrappers)?;
+    if synthetic_file_wrappers > 0 && real_passed == 0 && failed == 0 && skipped == 0 && todo == 0 {
+        return None;
+    }
     Some(CargoTestSummary {
-        passed: Some(passed),
+        passed: Some(real_passed),
         failed: Some(failed),
         ignored: skipped.checked_add(todo),
     })
